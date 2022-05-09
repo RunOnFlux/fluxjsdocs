@@ -1,0 +1,34 @@
+name: BuildJSDocs
+
+on:
+  push:
+    paths-ignore:
+      - '**/JSDocsDeploy/**'
+
+jobs:
+  build:
+
+    runs-on: ubuntu-20.04
+
+    strategy:
+      matrix:
+        node-version: [14.x]
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v1
+      with:
+        node-version: ${{ matrix.node-version }}
+    - name: Build
+      uses: andstor/jsdoc-action@v1
+      with:
+        source_dir: ./services # The folder holding the source files imported from RunOnFlux/flux.
+        output_dir: ./JSDocsBuild # The temp folder the action should build files in.
+    - name: Deploy 🚀
+      uses: JamesIves/github-pages-deploy-action@4.0.0
+      with:
+        branch: master # The branch the action should deploy to.
+        folder: ./JSDocsBuild # The temp folder the action should deploy files from.
+        target-folder: ./JSDocsDeploy # The folder the action should deploy to.
+        token: ${{ secrets.ACTIONS_TOKEN_GITHUB }}
