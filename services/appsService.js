@@ -8,11 +8,9 @@ const LRU = require('lru-cache');
 const systemcrontab = require('crontab');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const util = require('util');
+const fluxCommunication = require('./fluxCommunication');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
-const {
-  outgoingPeers, incomingPeers,
-} = require('./utils/establishedConnections');
 const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
@@ -4819,10 +4817,10 @@ async function registerAppGlobalyApi(req, res) {
         return;
       }
       // first check if this node is available for application registration
-      if (outgoingPeers.length < config.fluxapps.minOutgoing) {
+      if (fluxCommunication.outgoingPeers.length < config.fluxapps.minOutgoing) {
         throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application registration');
       }
-      if (incomingPeers.length < config.fluxapps.minIncoming) {
+      if (fluxCommunication.incomingPeers.length < config.fluxapps.minIncoming) {
         throw new Error('Sorry, This Flux does not have enough incoming peers for safe application registration');
       }
       const processedBody = serviceHelper.ensureObject(body);
@@ -4936,10 +4934,10 @@ async function updateAppGlobalyApi(req, res) {
         return;
       }
       // first check if this node is available for application update
-      if (outgoingPeers.length < config.fluxapps.minOutgoing) {
+      if (fluxCommunication.outgoingPeers.length < config.fluxapps.minOutgoing) {
         throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application update');
       }
-      if (incomingPeers.length < config.fluxapps.minIncoming) {
+      if (fluxCommunication.incomingPeers.length < config.fluxapps.minIncoming) {
         throw new Error('Sorry, This Flux does not have enough incoming peers for safe application update');
       }
       const processedBody = serviceHelper.ensureObject(body);
