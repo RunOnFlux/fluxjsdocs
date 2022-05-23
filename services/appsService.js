@@ -2015,7 +2015,7 @@ function totalAppHWRequirements(appSpecifications, myNodeTier) {
 }
 
 /**
- * To check app requirements of geolocation restrictions
+ * To check app requirements of geolocation restrictions for a node
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
  */
@@ -2042,16 +2042,16 @@ function checkAppGeolocationRequirements(appSpecs) {
       }
     }
   }
+
   return true;
 }
 
 /**
- * To check app requirements to include HDD space, CPU power and RAM.
- * To check app requirements of geolocation restrictions
+ * To check app requirements of HW for a node
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
  */
-async function checkAppRequirements(appSpecs) {
+async function checkAppHWRequirements(appSpecs) {
   // appSpecs has hdd, cpu and ram assigned to correct tier
   const tier = await generalService.nodeTier();
   const resourcesLocked = await appsResources();
@@ -2090,7 +2090,19 @@ async function checkAppRequirements(appSpecs) {
     throw new Error('Insufficient RAM on Flux Node to spawn an application');
   }
 
+  return true;
+}
+
+/**
+ * To check app requirements to include HDD space, CPU power, RAM and GEO for a node
+ * @param {object} appSpecs App specifications.
+ * @returns {boolean} True if all checks passed.
+ */
+async function checkAppRequirements(appSpecs) {
+  // appSpecs has hdd, cpu and ram assigned to correct tier
+  await checkAppHWRequirements(appSpecs);
   // check geolocation
+
   checkAppGeolocationRequirements(appSpecs);
 
   return true;
@@ -3261,7 +3273,7 @@ async function checkApplicationImagesComplience(appSpecs) {
  * @param {object} appSpecification App specifications.
  * @returns {boolean} True if no errors are thrown.
  */
-function verifyCorrectnessOfApp(appSpecification) {
+function verifyTypeCorrectnessOfApp(appSpecification) {
   const { version } = appSpecification;
   const { name } = appSpecification;
   const { description } = appSpecification;
@@ -3530,6 +3542,11 @@ function verifyCorrectnessOfApp(appSpecification) {
   return true;
 }
 
+/**
+ * To verify correctness of attribute values within an app specification object. Checks for if restrictions of specs are valid.
+ * @param {object} appSpecification App specifications.
+ * @returns {boolean} True if no errors are thrown.
+ */
 function verifyRestrictionCorrectnessOfApp(appSpecifications) {
   if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5) {
     throw new Error('Flux App message version specification is invalid');
@@ -3761,6 +3778,11 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
   }
 }
 
+/**
+ * To verify correctness of attribute values within an app specification object. Checks if all object keys are assigned and no excess present
+ * @param {object} appSpecification App specifications.
+ * @returns {boolean} True if no errors are thrown.
+ */
 function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
   if (appSpecifications.version === 1) {
     // appSpecs: {
@@ -3870,10 +3892,20 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
   }
 }
 
+/**
+ * To convert an array of ports to a set object containing a list of unique ports.
+ * @param {number[]} portsArray Array of ports.
+ * @returns {object} Set object.
+ */
 function appPortsUnique(portsArray) {
   return (new Set(portsArray)).size === portsArray.length;
 }
 
+/**
+ * To ensure that the app ports are unique.
+ * @param {object} appSpecFormatted App specifications.
+ * @returns True if Docker version 1. If Docker version 2 to 3, returns true if no errors are thrown.
+ */
 function ensureAppUniquePorts(appSpecFormatted) {
   if (appSpecFormatted.version === 1) {
     return true;
@@ -3898,6 +3930,12 @@ function ensureAppUniquePorts(appSpecFormatted) {
   return true;
 }
 
+/**
+ * To verify app specifications. Checks the attribute values of the appSpecifications object.
+ * @param {object} appSpecifications App specifications.
+ * @param {number} height Block height.
+ * @param {boolean} checkDockerAndWhitelist Defaults to false.
+ */
 async function verifyAppSpecifications(appSpecifications, height, checkDockerAndWhitelist = false) {
   if (!appSpecifications) {
     throw new Error('Invalid Flux App Specifications');
@@ -4062,6 +4100,9 @@ async function assignedPortsGlobalApps(appNames) {
   return apps;
 }
 
+/**
+ * Restores FluxOS firewall, UPNP rules
+ */
 async function restoreFluxPortsSupport() {
   try {
     const isUPNP = upnpService.isUPNP();
@@ -4083,6 +4124,9 @@ async function restoreFluxPortsSupport() {
   }
 }
 
+/**
+ * Restores applications firewall, UPNP rules
+ */
 async function restoreAppsPortsSupport() {
   try {
     const currentAppsPorts = await assignedPortsInstalledApps();
@@ -4115,6 +4159,9 @@ async function restoreAppsPortsSupport() {
   }
 }
 
+/**
+ * Restores FluxOS and applications firewall, UPNP rules
+ */
 async function restorePortsSupport() {
   try {
     await restoreFluxPortsSupport();
