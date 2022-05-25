@@ -69,6 +69,8 @@ async function startFluxFunctions() {
     log.info('Preparing Flux Apps locations');
     // more than 1 hour. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
     await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 3900 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ hash: 1, ip: 1 }, { name: 'query for getting app based on ip and hash' });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ hash: 1, ip: 1, broadcastedAt: 1 }, { name: 'query for getting app to ensure we possess a message' });
     log.info('Flux Apps locations prepared');
     fluxNetworkHelper.adjustFirewall();
     log.info('Firewalls checked');
@@ -91,9 +93,12 @@ async function startFluxFunctions() {
       explorerService.initiateBlockProcessor(true, true);
       log.info('Flux Block Processing Service started');
     }, 2 * 60 * 1000);
-    setInterval(() => { // every 19 mins (~10 blocks)
-      appsService.checkAndNotifyPeersOfRunningApps();
-    }, 19 * 60 * 1000);
+    setTimeout(() => {
+      appsService.checkAndNotifyPeersOfRunningApps(); // first broadcast after 4m of starting fluxos
+      setInterval(() => { // every 20 mins (~10 blocks) messages stay on db for 65m
+        appsService.checkAndNotifyPeersOfRunningApps();
+      }, 20 * 60 * 1000);
+    }, 4 * 60 * 1000);
     setInterval(() => { // every 12 mins (6 blocks)
       appsService.continuousFluxAppHashesCheck();
     }, 12 * 60 * 1000);
