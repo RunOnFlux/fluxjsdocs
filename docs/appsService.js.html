@@ -50,7 +50,6 @@ const benchmarkService = require('./benchmarkService');
 const dockerService = require('./dockerService');
 const generalService = require('./generalService');
 const upnpService = require('./upnpService');
-const fluxService = require('./fluxService');
 const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
@@ -2043,43 +2042,11 @@ function totalAppHWRequirements(appSpecifications, myNodeTier) {
 }
 
 /**
- * To check app requirements of geolocation restrictions for a node
+ * To check app requirements to include HDD space, CPU power and RAM.
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
  */
-function checkAppGeolocationRequirements(appSpecs) {
-  // check geolocation
-  if (appSpecs.version >= 5) {
-    const nodeGeo = fluxService.getNodeGeolocation();
-    if (!nodeGeo) {
-      throw new Error('Node Geolocation not set. Aborting.');
-    }
-    if (appSpecs.geolocation &amp;&amp; appSpecs.geolocation.length > 0) {
-      const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
-      if (appContinent) {
-        if (appContinent.slice(1) !== nodeGeo.continentCode) {
-          throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
-        }
-
-        const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
-        if (appCountry) {
-          if (appCountry.slice(1) !== nodeGeo.countryCode) {
-            throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
-          }
-        }
-      }
-    }
-  }
-
-  return true;
-}
-
-/**
- * To check app requirements of HW for a node
- * @param {object} appSpecs App specifications.
- * @returns {boolean} True if all checks passed.
- */
-async function checkAppHWRequirements(appSpecs) {
+async function checkAppRequirements(appSpecs) {
   // appSpecs has hdd, cpu and ram assigned to correct tier
   const tier = await generalService.nodeTier();
   const resourcesLocked = await appsResources();
@@ -2117,22 +2084,6 @@ async function checkAppHWRequirements(appSpecs) {
   if (appHWrequirements.ram > availableRamForApps) {
     throw new Error('Insufficient RAM on Flux Node to spawn an application');
   }
-
-  return true;
-}
-
-/**
- * To check app requirements to include HDD space, CPU power, RAM and GEO for a node
- * @param {object} appSpecs App specifications.
- * @returns {boolean} True if all checks passed.
- */
-async function checkAppRequirements(appSpecs) {
-  // appSpecs has hdd, cpu and ram assigned to correct tier
-  await checkAppHWRequirements(appSpecs);
-  // check geolocation
-
-  checkAppGeolocationRequirements(appSpecs);
-
   return true;
 }
 
@@ -3301,7 +3252,7 @@ async function checkApplicationImagesComplience(appSpecs) {
  * @param {object} appSpecification App specifications.
  * @returns {boolean} True if no errors are thrown.
  */
-function verifyTypeCorrectnessOfApp(appSpecification) {
+function verifyCorrectnessOfApp(appSpecification) {
   const { version } = appSpecification;
   const { name } = appSpecification;
   const { description } = appSpecification;
@@ -3321,8 +3272,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
   const { ram } = appSpecification;
   const { hdd } = appSpecification;
   const { tiered } = appSpecification;
-  const { contacts } = appSpecification;
-  const { geolocation } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -3439,12 +3388,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     if (!compose) {
       throw new Error('Missing Flux App specification parameter');
     }
-    if (typeof compose !== 'object') {
-      throw new Error('Invalid Flux App Specifications');
-    }
-    if (!Array.isArray(compose)) {
-      throw new Error('Invalid Flux App Specifications');
-    }
     if (compose.length &lt; 1) {
       throw new Error('Flux App does not contain any components');
     }
@@ -3452,9 +3395,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       throw new Error('Flux App has too many components');
     }
     compose.forEach((appComponent) => {
-      if (Array.isArray(appComponent)) {
-        throw new Error('Invalid Flux App Specifications');
-      }
       if (typeof appComponent.name !== 'string') {
         throw new Error('Invalid Flux App component name');
       }
@@ -3544,26 +3484,11 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     if (Number.isInteger(instances) !== true) {
       throw new Error('Invalid instances specified');
     }
-  }
-
-  if (version >= 5) {
-    if (Array.isArray(contacts)) {
-      contacts.forEach((parameter) => {
-        if (typeof parameter !== 'string') {
-          throw new Error('Contacts for Flux App are invalid');
-        }
-      });
-    } else {
-      throw new Error('Contacts for Flux App are invalid');
+    if (instances &lt; config.fluxapps.minimumInstances) {
+      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
     }
-    if (Array.isArray(geolocation)) {
-      geolocation.forEach((parameter) => {
-        if (typeof parameter !== 'string') {
-          throw new Error('Geolocation for Flux App are invalid');
-        }
-      });
-    } else {
-      throw new Error('Geolocation for Flux App are invalid');
+    if (instances > config.fluxapps.maximumInstances) {
+      throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
     }
   }
 
@@ -3571,13 +3496,69 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 }
 
 /**
- * To verify correctness of attribute values within an app specification object. Checks for if restrictions of specs are valid.
- * @param {object} appSpecification App specifications.
- * @returns {boolean} True if no errors are thrown.
+ * To convert an array of ports to a set object containing a list of unique ports.
+ * @param {number[]} portsArray Array of ports.
+ * @returns {object} Set object.
  */
-function verifyRestrictionCorrectnessOfApp(appSpecifications) {
-  if (appSpecifications.version !== 1 &amp;&amp; appSpecifications.version !== 2 &amp;&amp; appSpecifications.version !== 3 &amp;&amp; appSpecifications.version !== 4 &amp;&amp; appSpecifications.version !== 5) {
+function appPortsUnique(portsArray) {
+  return (new Set(portsArray)).size === portsArray.length;
+}
+
+/**
+ * To ensure that the app ports are unique.
+ * @param {object} appSpecFormatted App specifications.
+ * @returns True if Docker version 1. If Docker version 2 to 3, returns true if no errors are thrown.
+ */
+function ensureAppUniquePorts(appSpecFormatted) {
+  if (appSpecFormatted.version === 1) {
+    return true;
+  }
+  if (appSpecFormatted.version &lt;= 3) {
+    const portsUnique = appPortsUnique(appSpecFormatted.ports);
+    if (!portsUnique) {
+      throw new Error(`Flux App ${appSpecFormatted.name} must have unique ports specified`);
+    }
+  } else {
+    const allPorts = [];
+    appSpecFormatted.compose.forEach((component) => {
+      component.ports.forEach((port) => {
+        allPorts.push(port);
+      });
+    });
+    const portsUnique = appPortsUnique(allPorts);
+    if (!portsUnique) {
+      throw new Error(`Flux App ${appSpecFormatted.name} must have unique ports specified accross all composition`);
+    }
+  }
+  return true;
+}
+
+/**
+ * To verify app specifications. Checks the attribute values of the appSpecifications object.
+ * @param {object} appSpecifications App specifications.
+ * @param {number} height Block height.
+ * @param {boolean} checkDockerAndWhitelist Defaults to false.
+ */
+async function verifyAppSpecifications(appSpecifications, height, checkDockerAndWhitelist = false) {
+  if (!appSpecifications) {
+    throw new Error('Invalid Flux App Specifications');
+  }
+  if (typeof appSpecifications !== 'object') {
+    throw new Error('Invalid Flux App Specifications');
+  }
+  if (Array.isArray(appSpecifications)) {
+    throw new Error('Invalid Flux App Specifications');
+  }
+  const typeCheckVerification = verifyCorrectnessOfApp(appSpecifications); // throw if wrong
+  if (typeCheckVerification !== true) {
+    const errorMessage = typeCheckVerification;
+    throw new Error(errorMessage);
+  }
+  if (appSpecifications.version !== 1 &amp;&amp; appSpecifications.version !== 2 &amp;&amp; appSpecifications.version !== 3 &amp;&amp; appSpecifications.version !== 4) {
     throw new Error('Flux App message version specification is invalid');
+  }
+  if (height &lt; config.fluxapps.appSpecsEnforcementHeights[appSpecifications.version]) {
+    throw new Error(`Flux apps specifications of version ${appSpecifications.version} not yet supported`);
   }
   if (appSpecifications.name.length > 32) {
     throw new Error('Flux App name is too long');
@@ -3601,32 +3582,11 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
     if (appSpecifications.port &lt; config.fluxapps.portMin || appSpecifications.port > config.fluxapps.portMax) {
       throw new Error(`Assigned port ${appSpecifications.port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
     }
-    // check if containerPort makes sense
+
+    // check if containerPort makes sense{
     if (appSpecifications.containerPort &lt; 0 || appSpecifications.containerPort > 65535) {
       throw new Error(`Container Port ${appSpecifications.containerPort} is not within system limits 0-65535`);
     }
-    if (appSpecifications.repotag.length > 100) {
-      throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
-    }
-    if (appSpecifications.containerData.length > 100) {
-      throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
-    }
-    if (appSpecifications.enviromentParameters.length > 10) {
-      throw new Error(`App ${appSpecifications.name} environment invalid. Maximum of 10 environment variables allowed.`);
-    }
-    appSpecifications.enviromentParameters.forEach((env) => {
-      if (env.length > 50) {
-        throw new Error(`App ${appSpecifications.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
-      }
-    });
-    if (appSpecifications.commands.length > 10) {
-      throw new Error(`App ${appSpecifications.name} commands invalid. Maximum of 10 commands allowed.`);
-    }
-    appSpecifications.commands.forEach((com) => {
-      if (com.length > 50) {
-        throw new Error(`App ${appSpecifications.name} command ${com} is too long. Maximum of 50 characters is allowed`);
-      }
-    });
   } else if (appSpecifications.version &lt;= 3) {
     // check port is within range
     appSpecifications.ports.forEach((port) => {
@@ -3634,61 +3594,46 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
         throw new Error(`Assigned port ${port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
       }
     });
+
     // check if containerPort makes sense
     appSpecifications.containerPorts.forEach((port) => {
       if (port &lt; 0 || port > 65535) {
         throw new Error(`Container Port ${port} is not within system limits 0-65535`);
       }
     });
+
     if (appSpecifications.containerPorts.length !== appSpecifications.ports.length) {
       throw new Error('Ports specifications do not match');
     }
+
     if (appSpecifications.domains.length !== appSpecifications.ports.length) {
       throw new Error('Domains specifications do not match available ports');
     }
+
     if (appSpecifications.ports.length > 5) {
       throw new Error('Too many ports defined. Maximum of 5 allowed.');
     }
-    if (appSpecifications.repotag.length > 100) {
-      throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
-    }
-    if (appSpecifications.containerData.length > 100) {
-      throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
-    }
-    if (appSpecifications.enviromentParameters.length > 10) {
-      throw new Error(`App ${appSpecifications.name} environment invalid. Maximum of 10 environment variables allowed.`);
-    }
-    appSpecifications.enviromentParameters.forEach((env) => {
-      if (env.length > 50) {
-        throw new Error(`App ${appSpecifications.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
-      }
-    });
-    if (appSpecifications.commands.length > 10) {
-      throw new Error(`App ${appSpecifications.name} commands invalid. Maximum of 10 commands allowed.`);
-    }
-    appSpecifications.commands.forEach((com) => {
-      if (com.length > 50) {
-        throw new Error(`App ${appSpecifications.name} command ${com} is too long. Maximum of 50 characters is allowed`);
-      }
-    });
-    appSpecifications.domains.forEach((dom) => {
-      if (dom.length > 50) {
-        throw new Error(`App ${appSpecifications.name} domain ${dom} is too long. Maximum of 50 characters is allowed`);
-      }
-    });
   }
 
   if (appSpecifications.version &lt;= 3) {
+    checkHWParameters(appSpecifications);
+
     // check wheter shared Folder is not root
     if (appSpecifications.containerData.length &lt; 2) {
       throw new Error('Flux App container data folder not specified. If no data folder is whished, use /tmp');
     }
-  } else {
-    if (appSpecifications.instances &lt; config.fluxapps.minimumInstances) {
-      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
+
+    if (checkDockerAndWhitelist) {
+      // check repository whitelisted
+      await generalService.checkWhitelistedRepository(appSpecifications.repotag);
+
+      // check repotag if available for download
+      await verifyRepository(appSpecifications.repotag);
     }
-    if (appSpecifications.instances > config.fluxapps.maximumInstances) {
-      throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
+  } else {
+    console.log(appSpecifications);
+    if (!Array.isArray(appSpecifications.compose)) {
+      throw new Error('Invalid Flux App Specifications');
     }
     if (appSpecifications.compose.length &lt; 1) {
       throw new Error('Flux App does not contain any composition');
@@ -3704,6 +3649,9 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
         throw new Error('Invalid Flux App Specifications');
       }
       if (typeof appComponent !== 'object') {
+        throw new Error('Invalid Flux App Specifications');
+      }
+      if (Array.isArray(appComponent)) {
         throw new Error('Invalid Flux App Specifications');
       }
       if (appComponent.name.length > 32) {
@@ -3724,88 +3672,76 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
       }
       usedNames.push(appComponent.name);
       if (appComponent.description.length > 256) {
-        throw new Error('Description is too long. Maximum of 256 characters is allowed.');
+        throw new Error('Description is too long. Maximum of 256 characters is allowed');
       }
       appComponent.ports.forEach((port) => {
         if (port &lt; config.fluxapps.portMin || port > config.fluxapps.portMax) {
           throw new Error(`Assigned port ${port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
         }
       });
-      if (appComponent.repotag.length > 100) {
-        throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
-      }
-      if (appComponent.containerData.length > 100) {
-        throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
-      }
-      if (appComponent.environmentParameters.length > 10) {
-        throw new Error(`App component ${appComponent.name} environment invalid. Maximum of 10 environment variables allowed.`);
-      }
-      appComponent.environmentParameters.forEach((env) => {
-        if (env.length > 50) {
-          throw new Error(`App component ${appComponent.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
-        }
-      });
-      if (appComponent.commands.length > 10) {
-        throw new Error(`App component ${appComponent.name} commands invalid. Maximum of 10 commands allowed.`);
-      }
-      appComponent.commands.forEach((com) => {
-        if (com.length > 50) {
-          throw new Error(`App component ${appComponent.name} command ${com} is too long. Maximum of 50 characters is allowed`);
-        }
-      });
-      appComponent.domains.forEach((dom) => {
-        if (dom.length > 50) {
-          throw new Error(`App component ${appComponent.name} domain ${dom} is too long. Maximum of 50 characters is allowed`);
-        }
-      });
+
       // check if containerPort makes sense
       appComponent.containerPorts.forEach((port) => {
         if (port &lt; 0 || port > 65535) {
           throw new Error(`Container Port ${port} in in ${appComponent.name} is not within system limits 0-65535`);
         }
       });
+
       if (appComponent.containerPorts.length !== appComponent.ports.length) {
         throw new Error(`Ports specifications in ${appComponent.name} do not match`);
       }
+
       if (appComponent.domains.length !== appComponent.ports.length) {
         throw new Error(`Domains specifications in ${appComponent.name} do not match available ports`);
       }
+
       if (appComponent.ports.length > 5) {
         throw new Error(`Too many ports defined in ${appComponent.name}. Maximum of 5 allowed.`);
       }
+
       // check wheter shared Folder is not root
       if (appComponent.containerData.length &lt; 2) {
         throw new Error(`Flux App container data folder not specified in in ${appComponent.name}. If no data folder is whished, use /tmp`);
       }
+
+      checkHWParameters(appComponent);
+
+      checkComposeHWParameters(appSpecifications);
+
+      if (checkDockerAndWhitelist) {
+        // check repository whitelisted
+        // eslint-disable-next-line no-await-in-loop
+        await generalService.checkWhitelistedRepository(appComponent.repotag);
+
+        // check repotag if available for download
+        // eslint-disable-next-line no-await-in-loop
+        await verifyRepository(appComponent.repotag);
+      }
     }
   }
 
-  if (appSpecifications.version >= 5) {
-    if (appSpecifications.contacts.length > 5) {
-      throw new Error('Too many contacts defined. Maximum of 5 allowed.');
+  if (appSpecifications.version >= 3) {
+    if (typeof appSpecifications.instances !== 'number') {
+      throw new Error('Instances is not a number');
     }
-    appSpecifications.contacts.forEach((contact) => {
-      if (contact.length > 75) {
-        throw new Error(`Contact ${contact} is too long. Maximum of 75 characters is allowed.`);
-      }
-    });
-    if (appSpecifications.geolocation.length > 10) { // we only expect 2
-      throw new Error('Invalid geolocation submited.'); // for now we are only accepting continent and country.
+    if (Number.isInteger(appSpecifications.instances) !== true) {
+      throw new Error('Instances is not an integer');
     }
-    appSpecifications.geolocation.forEach((geo) => {
-      if (geo.length > 5) { // for now we only treat aXX and bXX as continent and country specs.
-        throw new Error(`Geolocation ${geo} is not valid.`); // firt letter for what represents and next two for the code
-      }
-    });
+    if (appSpecifications.instances &lt; config.fluxapps.minimumInstances) {
+      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
+    }
+    if (appSpecifications.instances > config.fluxapps.maximumInstances) {
+      throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
+    }
   }
-}
 
-/**
- * To verify correctness of attribute values within an app specification object. Checks if all object keys are assigned and no excess present
- * @param {object} appSpecification App specifications.
- * @returns {boolean} True if no errors are thrown.
- */
-function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
+  // verify ports are unique accross app
+  const portsAreUnique = ensureAppUniquePorts(appSpecifications);
+  if (portsAreUnique !== true) {
+    throw new Error('Application ports are not unique');
+  }
+
+  // check for Object.keys in applications. App can have only the fields that are in the version specification.
   if (appSpecifications.version === 1) {
     // appSpecs: {
     //   version: 2,
@@ -3867,7 +3803,7 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
         throw new Error('Unsupported parameter for v3 app specifications');
       }
     });
-  } else if (appSpecifications.version === 4) {
+  } else {
     const specifications = [
       'version', 'name', 'description', 'owner', 'compose', 'instances',
     ];
@@ -3889,138 +3825,10 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
         }
       });
     });
-  } else {
-    const specifications = [
-      'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts', 'geolocation',
-    ];
-    const componentSpecifications = [
-      'name', 'description', 'repotag', 'ports', 'containerPorts', 'environmentParameters', 'commands', 'containerData', 'domains',
-      'cpu', 'ram', 'hdd', 'tiered', 'cpubasic', 'rambasic', 'hddbasic', 'cpusuper', 'ramsuper', 'hddsuper', 'cpubamf', 'rambamf', 'hddbamf',
-    ];
-    const specsKeys = Object.keys(appSpecifications);
-    specsKeys.forEach((sKey) => {
-      if (!specifications.includes((sKey))) {
-        throw new Error('Unsupported parameter for v5 app specifications');
-      }
-    });
-    appSpecifications.compose.forEach((appComponent) => {
-      const specsKeysComponent = Object.keys(appComponent);
-      specsKeysComponent.forEach((sKey) => {
-        if (!componentSpecifications.includes((sKey))) {
-          throw new Error('Unsupported parameter for v5 app specifications');
-        }
-      });
-    });
-  }
-}
-
-/**
- * To convert an array of ports to a set object containing a list of unique ports.
- * @param {number[]} portsArray Array of ports.
- * @returns {object} Set object.
- */
-function appPortsUnique(portsArray) {
-  return (new Set(portsArray)).size === portsArray.length;
-}
-
-/**
- * To ensure that the app ports are unique.
- * @param {object} appSpecFormatted App specifications.
- * @returns True if Docker version 1. If Docker version 2 to 3, returns true if no errors are thrown.
- */
-function ensureAppUniquePorts(appSpecFormatted) {
-  if (appSpecFormatted.version === 1) {
-    return true;
-  }
-  if (appSpecFormatted.version &lt;= 3) {
-    const portsUnique = appPortsUnique(appSpecFormatted.ports);
-    if (!portsUnique) {
-      throw new Error(`Flux App ${appSpecFormatted.name} must have unique ports specified`);
-    }
-  } else {
-    const allPorts = [];
-    appSpecFormatted.compose.forEach((component) => {
-      component.ports.forEach((port) => {
-        allPorts.push(port);
-      });
-    });
-    const portsUnique = appPortsUnique(allPorts);
-    if (!portsUnique) {
-      throw new Error(`Flux App ${appSpecFormatted.name} must have unique ports specified accross all composition`);
-    }
-  }
-  return true;
-}
-
-/**
- * To verify app specifications. Checks the attribute values of the appSpecifications object.
- * @param {object} appSpecifications App specifications.
- * @param {number} height Block height.
- * @param {boolean} checkDockerAndWhitelist Defaults to false.
- */
-async function verifyAppSpecifications(appSpecifications, height, checkDockerAndWhitelist = false) {
-  if (!appSpecifications) {
-    throw new Error('Invalid Flux App Specifications');
-  }
-  if (typeof appSpecifications !== 'object') {
-    throw new Error('Invalid Flux App Specifications');
-  }
-  if (Array.isArray(appSpecifications)) {
-    throw new Error('Invalid Flux App Specifications');
   }
 
-  // TYPE CHECKS
-  verifyTypeCorrectnessOfApp(appSpecifications);
-
-  // RESTRICTION CHECKS
-  verifyRestrictionCorrectnessOfApp(appSpecifications);
-
-  // SPECS VALIDIT TIME
-  if (height &lt; config.fluxapps.appSpecsEnforcementHeights[appSpecifications.version]) {
-    throw new Error(`Flux apps specifications of version ${appSpecifications.version} not yet supported`);
-  }
-
-  // OBJECT KEY CHECKS
-  // check for Object.keys in applications. App can have only the fields that are in the version specification.
-  verifyObjectKeysCorrectnessOfApp(appSpecifications);
-
-  // PORTS UNIQUE CHECKS
-  // verify ports are unique accross app
-  ensureAppUniquePorts(appSpecifications);
-
-  // HW Checks
-  if (appSpecifications.version &lt;= 3) {
-    checkHWParameters(appSpecifications);
-  } else {
-    checkComposeHWParameters(appSpecifications);
-    // eslint-disable-next-line no-restricted-syntax
-    for (const appComponent of appSpecifications.compose) {
-      checkHWParameters(appComponent);
-    }
-  }
-
-  // Whitelist, repository checks
   if (checkDockerAndWhitelist) {
-    if (appSpecifications.version &lt;= 3) {
-      // check repository whitelisted
-      await generalService.checkWhitelistedRepository(appSpecifications.repotag);
-
-      // check repotag if available for download
-      await verifyRepository(appSpecifications.repotag);
-    } else {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const appComponent of appSpecifications.compose) {
-        // check repository whitelisted
-        // eslint-disable-next-line no-await-in-loop
-        await generalService.checkWhitelistedRepository(appComponent.repotag);
-
-        // check repotag if available for download
-        // eslint-disable-next-line no-await-in-loop
-        await verifyRepository(appComponent.repotag);
-      }
-    }
-    // check blacklist
-    await checkApplicationImagesComplience(appSpecifications);
+    await checkApplicationImagesComplience(appSpecifications); // check blacklist
   }
 }
 
@@ -4122,9 +3930,6 @@ async function assignedPortsGlobalApps(appNames) {
   return apps;
 }
 
-/**
- * Restores FluxOS firewall, UPNP rules
- */
 async function restoreFluxPortsSupport() {
   try {
     const isUPNP = upnpService.isUPNP();
@@ -4146,9 +3951,6 @@ async function restoreFluxPortsSupport() {
   }
 }
 
-/**
- * Restores applications firewall, UPNP rules
- */
 async function restoreAppsPortsSupport() {
   try {
     const currentAppsPorts = await assignedPortsInstalledApps();
@@ -4181,9 +3983,6 @@ async function restoreAppsPortsSupport() {
   }
 }
 
-/**
- * Restores FluxOS and applications firewall, UPNP rules
- */
 async function restorePortsSupport() {
   try {
     await restoreFluxPortsSupport();
@@ -4752,8 +4551,6 @@ function specificationFormatter(appSpecification) {
   let { ram } = appSpecification;
   let { hdd } = appSpecification;
   const { tiered } = appSpecification;
-  let { contacts } = appSpecification;
-  let { geolocation } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -5025,35 +4822,6 @@ function specificationFormatter(appSpecification) {
       throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
     }
     appSpecFormatted.instances = instances;
-  }
-
-  if (version >= 5) {
-    if (!contacts || !geolocation) { // can be empty array for no contact or no geolocation requirements
-      throw new Error('Missing Flux App specification parameter');
-    }
-    contacts = serviceHelper.ensureObject(contacts);
-    const contactsCorrect = [];
-    if (Array.isArray(contacts)) {
-      contacts.forEach((parameter) => {
-        const param = serviceHelper.ensureString(parameter); // string
-        contactsCorrect.push(param);
-      });
-    } else {
-      throw new Error('Contacts for Flux App are invalid');
-    }
-    appSpecFormatted.contacts = contactsCorrect;
-
-    geolocation = serviceHelper.ensureObject(geolocation);
-    const geolocationCorrect = [];
-    if (Array.isArray(geolocation)) {
-      geolocation.forEach((parameter) => {
-        const param = serviceHelper.ensureString(parameter); // string
-        geolocationCorrect.push(param);
-      });
-    } else {
-      throw new Error('Geolocation for Flux App is invalid');
-    }
-    appSpecFormatted.geolocation = geolocationCorrect;
   }
 
   return appSpecFormatted;
@@ -7588,13 +7356,13 @@ module.exports = {
 
 <nav>
     <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="Contains%2520utility%2520functions%2520to%2520be%2520used%2520only%2520by%2520verificationHelper.%250ATo%2520verify%2520privilege%2520use%2520verifyPrivilege%2520from%2520verificationHelper%2520module.module_.html">Contains utility functions to be used only by verificationHelper.
-To verify privilege use verifyPrivilege from verificationHelper module.</a></li><li><a href="module-Helper%2520module%2520used%2520for%2520all%2520interactions%2520with%2520database.html">Helper module used for all interactions with database</a></li></ul><h3>Global</h3><ul><li><a href="global.html#activeLoginPhrases">activeLoginPhrases</a></li><li><a href="global.html#addMultiSigAddress">addMultiSigAddress</a></li><li><a href="global.html#addMultiSigAddressPost">addMultiSigAddressPost</a></li><li><a href="global.html#addNode">addNode</a></li><li><a href="global.html#addPeer">addPeer</a></li><li><a href="global.html#adjustCruxID">adjustCruxID</a></li><li><a href="global.html#adjustKadenaAccount">adjustKadenaAccount</a></li><li><a href="global.html#appChanges">appChanges</a></li><li><a href="global.html#appDockerCreate">appDockerCreate</a></li><li><a href="global.html#appDockerImageRemove">appDockerImageRemove</a></li><li><a href="global.html#appDockerKill">appDockerKill</a></li><li><a href="global.html#appDockerPause">appDockerPause</a></li><li><a href="global.html#appDockerRemove">appDockerRemove</a></li><li><a href="global.html#appDockerRestart">appDockerRestart</a></li><li><a href="global.html#appDockerStart">appDockerStart</a></li><li><a href="global.html#appDockerStop">appDockerStop</a></li><li><a href="global.html#appDockerTop">appDockerTop</a></li><li><a href="global.html#appDockerUnpause">appDockerUnpause</a></li><li><a href="global.html#appExec">appExec</a></li><li><a href="global.html#appHashHasMessage">appHashHasMessage</a></li><li><a href="global.html#appInspect">appInspect</a></li><li><a href="global.html#appKill">appKill</a></li><li><a href="global.html#appLog">appLog</a></li><li><a href="global.html#appLogStream">appLogStream</a></li><li><a href="global.html#appPause">appPause</a></li><li><a href="global.html#appPortsUnique">appPortsUnique</a></li><li><a href="global.html#appPricePerMonth">appPricePerMonth</a></li><li><a href="global.html#appRestart">appRestart</a></li><li><a href="global.html#appsResources">appsResources</a></li><li><a href="global.html#appStart">appStart</a></li><li><a href="global.html#appStats">appStats</a></li><li><a href="global.html#appStop">appStop</a></li><li><a href="global.html#appTop">appTop</a></li><li><a href="global.html#appUninstallHard">appUninstallHard</a></li><li><a href="global.html#appUninstallSoft">appUninstallSoft</a></li><li><a href="global.html#appUnpause">appUnpause</a></li><li><a href="global.html#assignedPortsGlobalApps">assignedPortsGlobalApps</a></li><li><a href="global.html#assignedPortsInstalledApps">assignedPortsInstalledApps</a></li><li><a href="global.html#availableApps">availableApps</a></li><li><a href="global.html#axiosGet">axiosGet</a></li><li><a href="global.html#backupWallet">backupWallet</a></li><li><a href="global.html#benchmarkDebug">benchmarkDebug</a></li><li><a href="global.html#checkAndNotifyPeersOfRunningApps">checkAndNotifyPeersOfRunningApps</a></li><li><a href="global.html#checkAndRemoveApplicationInstance">checkAndRemoveApplicationInstance</a></li><li><a href="global.html#checkAndRequestApp">checkAndRequestApp</a></li><li><a href="global.html#checkAppGeolocationRequirements">checkAppGeolocationRequirements</a></li><li><a href="global.html#checkAppHWRequirements">checkAppHWRequirements</a></li><li><a href="global.html#checkApplicationImagesComplience">checkApplicationImagesComplience</a></li><li><a href="global.html#checkApplicationRegistrationNameConflicts">checkApplicationRegistrationNameConflicts</a></li><li><a href="global.html#checkApplicationUpdateNameRepositoryConflicts">checkApplicationUpdateNameRepositoryConflicts</a></li><li><a href="global.html#checkAppMessageExistence">checkAppMessageExistence</a></li><li><a href="global.html#checkAppRequirements">checkAppRequirements</a></li><li><a href="global.html#checkAppTemporaryMessageExistence">checkAppTemporaryMessageExistence</a></li><li><a href="global.html#checkBlockProcessingStopped">checkBlockProcessingStopped</a></li><li><a href="global.html#checkComposeHWParameters">checkComposeHWParameters</a></li><li><a href="global.html#checkDockerAccessibility">checkDockerAccessibility</a></li><li><a href="global.html#checkHWParameters">checkHWParameters</a></li><li><a href="global.html#checkLoggedUser">checkLoggedUser</a></li><li><a href="global.html#checkSynced">checkSynced</a></li><li><a href="global.html#checkWhitelistedRepository">checkWhitelistedRepository</a></li><li><a href="global.html#clearBanned">clearBanned</a></li><li><a href="global.html#confirmNodeTierHardware">confirmNodeTierHardware</a></li><li><a href="global.html#connectedPeers">connectedPeers</a></li><li><a href="global.html#connectedPeersInfo">connectedPeersInfo</a></li><li><a href="global.html#continuousFluxAppHashesCheck">continuousFluxAppHashesCheck</a></li><li><a href="global.html#createAppVolume">createAppVolume</a></li><li><a href="global.html#createConfirmationTransaction">createConfirmationTransaction</a></li><li><a href="global.html#createDataMessage">createDataMessage</a></li><li><a href="global.html#createErrorMessage">createErrorMessage</a></li><li><a href="global.html#createFluxDockerNetwork">createFluxDockerNetwork</a></li><li><a href="global.html#createFluxNetworkAPI">createFluxNetworkAPI</a></li><li><a href="global.html#createMultiSig">createMultiSig</a></li><li><a href="global.html#createMultiSigPost">createMultiSigPost</a></li><li><a href="global.html#createRawTransaction">createRawTransaction</a></li><li><a href="global.html#createRawTransactionPost">createRawTransactionPost</a></li><li><a href="global.html#createSuccessMessage">createSuccessMessage</a></li><li><a href="global.html#createWarningMessage">createWarningMessage</a></li><li><a href="global.html#createZelNodeBroadcast">createZelNodeBroadcast</a></li><li><a href="global.html#createZelNodeKey">createZelNodeKey</a></li><li><a href="global.html#daemonBlockchainInfoService">daemonBlockchainInfoService</a></li><li><a href="global.html#daemonDebug">daemonDebug</a></li><li><a href="global.html#decodeMessage">decodeMessage</a></li><li><a href="global.html#decodeRawTransaction">decodeRawTransaction</a></li><li><a href="global.html#decodeRawTransactionPost">decodeRawTransactionPost</a></li><li><a href="global.html#decodeScript">decodeScript</a></li><li><a href="global.html#decodeScriptPost">decodeScriptPost</a></li><li><a href="global.html#decodeZelNodeBroadcast">decodeZelNodeBroadcast</a></li><li><a href="global.html#delay">delay</a></li><li><a href="global.html#deleteLoginPhrase">deleteLoginPhrase</a></li><li><a href="global.html#deploymentInformation">deploymentInformation</a></li><li><a href="global.html#disconnectNode">disconnectNode</a></li><li><a href="global.html#dockerContainerChanges">dockerContainerChanges</a></li><li><a href="global.html#dockerContainerExec">dockerContainerExec</a></li><li><a href="global.html#dockerContainerInspect">dockerContainerInspect</a></li><li><a href="global.html#dockerContainerLogs">dockerContainerLogs</a></li><li><a href="global.html#dockerContainerLogsStream">dockerContainerLogsStream</a></li><li><a href="global.html#dockerContainerStats">dockerContainerStats</a></li><li><a href="global.html#dockerCreateNetwork">dockerCreateNetwork</a></li><li><a href="global.html#dockerListContainers">dockerListContainers</a></li><li><a href="global.html#dockerListImages">dockerListImages</a></li><li><a href="global.html#dockerNetworkInspect">dockerNetworkInspect</a></li><li><a href="global.html#dockerRemoveNetwork">dockerRemoveNetwork</a></li><li><a href="global.html#dumpPrivKey">dumpPrivKey</a></li><li><a href="global.html#emergencyPhrase">emergencyPhrase</a></li><li><a href="global.html#ensureApplicationImagesExistsForPlatform">ensureApplicationImagesExistsForPlatform</a></li><li><a href="global.html#ensureApplicationPortsNotUsed">ensureApplicationPortsNotUsed</a></li><li><a href="global.html#ensureAppUniquePorts">ensureAppUniquePorts</a></li><li><a href="global.html#ensureBoolean">ensureBoolean</a></li><li><a href="global.html#ensureNumber">ensureNumber</a></li><li><a href="global.html#ensureObject">ensureObject</a></li><li><a href="global.html#ensureString">ensureString</a></li><li><a href="global.html#errUnauthorizedMessage">errUnauthorizedMessage</a></li><li><a href="global.html#estimateFee">estimateFee</a></li><li><a href="global.html#estimatePriority">estimatePriority</a></li><li><a href="global.html#executeCall">executeCall</a></li><li><a href="global.html#expireGlobalApplications">expireGlobalApplications</a></li><li><a href="global.html#fluxBackendFolder">fluxBackendFolder</a></li><li><a href="global.html#fluxDaemonBlockchainInfo">fluxDaemonBlockchainInfo</a></li><li><a href="global.html#fluxDebugLog">fluxDebugLog</a></li><li><a href="global.html#fluxDiscovery">fluxDiscovery</a></li><li><a href="global.html#fluxErrorLog">fluxErrorLog</a></li><li><a href="global.html#fluxInfoLog">fluxInfoLog</a></li><li><a href="global.html#fluxLog">fluxLog</a></li><li><a href="global.html#fluxShareCreateFolder">fluxShareCreateFolder</a></li><li><a href="global.html#fluxShareDatabaseFileDelete">fluxShareDatabaseFileDelete</a></li><li><a href="global.html#fluxShareDatabaseFileDeleteMultiple">fluxShareDatabaseFileDeleteMultiple</a></li><li><a href="global.html#fluxShareDatabaseShareFile">fluxShareDatabaseShareFile</a></li><li><a href="global.html#fluxShareDownloadFile">fluxShareDownloadFile</a></li><li><a href="global.html#fluxShareDownloadFolder">fluxShareDownloadFolder</a></li><li><a href="global.html#fluxShareFileExists">fluxShareFileExists</a></li><li><a href="global.html#fluxShareGetFolder">fluxShareGetFolder</a></li><li><a href="global.html#fluxShareGetSharedFiles">fluxShareGetSharedFiles</a></li><li><a href="global.html#fluxShareRemoveFile">fluxShareRemoveFile</a></li><li><a href="global.html#fluxShareRemoveFolder">fluxShareRemoveFolder</a></li><li><a href="global.html#fluxShareRename">fluxShareRename</a></li><li><a href="global.html#fluxShareSharedFiles">fluxShareSharedFiles</a></li><li><a href="global.html#fluxShareShareFile">fluxShareShareFile</a></li><li><a href="global.html#fluxShareStorageStats">fluxShareStorageStats</a></li><li><a href="global.html#fluxShareUnshareFile">fluxShareUnshareFile</a></li><li><a href="global.html#fluxShareUpload">fluxShareUpload</a></li><li><a href="global.html#fluxUsage">fluxUsage</a></li><li><a href="global.html#fluxWarnLog">fluxWarnLog</a></li><li><a href="global.html#fundRawTransaction">fundRawTransaction</a></li><li><a href="global.html#fundRawTransactionPost">fundRawTransactionPost</a></li><li><a href="global.html#getAddedNodeInfo">getAddedNodeInfo</a></li><li><a href="global.html#getAddressBalance">getAddressBalance</a></li><li><a href="global.html#getAddressDeltas">getAddressDeltas</a></li><li><a href="global.html#getAddressFusionCoinbase">getAddressFusionCoinbase</a></li><li><a href="global.html#getAddressMempool">getAddressMempool</a></li><li><a href="global.html#getAddressTransactions">getAddressTransactions</a></li><li><a href="global.html#getAddressTxids">getAddressTxids</a></li><li><a href="global.html#getAddressUtxos">getAddressUtxos</a></li><li><a href="global.html#getAllAddresses">getAllAddresses</a></li><li><a href="global.html#getAllAddressesWithTransactions">getAllAddressesWithTransactions</a></li><li><a href="global.html#getAllFiles">getAllFiles</a></li><li><a href="global.html#getAllFluxTransactions">getAllFluxTransactions</a></li><li><a href="global.html#getAllFusionCoinbase">getAllFusionCoinbase</a></li><li><a href="global.html#getAllGlobalApplicationsNames">getAllGlobalApplicationsNames</a></li><li><a href="global.html#getAllUtxos">getAllUtxos</a></li><li><a href="global.html#getAppDockerNameIdentifier">getAppDockerNameIdentifier</a></li><li><a href="global.html#getAppHashes">getAppHashes</a></li><li><a href="global.html#getAppIdentifier">getAppIdentifier</a></li><li><a href="global.html#getApplicationGlobalSpecifications">getApplicationGlobalSpecifications</a></li><li><a href="global.html#getApplicationLocalSpecifications">getApplicationLocalSpecifications</a></li><li><a href="global.html#getApplicationOwner">getApplicationOwner</a></li><li><a href="global.html#getApplicationOwnerAPI">getApplicationOwnerAPI</a></li><li><a href="global.html#getApplicationSpecificationAPI">getApplicationSpecificationAPI</a></li><li><a href="global.html#getApplicationSpecifications">getApplicationSpecifications</a></li><li><a href="global.html#getAppPrice">getAppPrice</a></li><li><a href="global.html#getAppsLocation">getAppsLocation</a></li><li><a href="global.html#getAppsLocations">getAppsLocations</a></li><li><a href="global.html#getAppsPermanentMessages">getAppsPermanentMessages</a></li><li><a href="global.html#getAppsTemporaryMessages">getAppsTemporaryMessages</a></li><li><a href="global.html#getBalance">getBalance</a></li><li><a href="global.html#getBenchmarks">getBenchmarks</a></li><li><a href="global.html#getBenchStatus">getBenchStatus</a></li><li><a href="global.html#getBestBlockHash">getBestBlockHash</a></li><li><a href="global.html#getBlock">getBlock</a></li><li><a href="global.html#getBlockchainInfo">getBlockchainInfo</a></li><li><a href="global.html#getBlockCount">getBlockCount</a></li><li><a href="global.html#getBlockDeltas">getBlockDeltas</a></li><li><a href="global.html#getBlockHash">getBlockHash</a></li><li><a href="global.html#getBlockHashes">getBlockHashes</a></li><li><a href="global.html#getBlockHashesPost">getBlockHashesPost</a></li><li><a href="global.html#getBlockHeader">getBlockHeader</a></li><li><a href="global.html#getBlockSubsidy">getBlockSubsidy</a></li><li><a href="global.html#getBlockTemplate">getBlockTemplate</a></li><li><a href="global.html#getChainTips">getChainTips</a></li><li><a href="global.html#getCollateralInfo">getCollateralInfo</a></li><li><a href="global.html#getConfigValue">getConfigValue</a></li><li><a href="global.html#getConnectionCount">getConnectionCount</a></li><li><a href="global.html#getDeprecationInfo">getDeprecationInfo</a></li><li><a href="global.html#getDifficulty">getDifficulty</a></li><li><a href="global.html#getDockerContainer">getDockerContainer</a></li><li><a href="global.html#getDockerContainerByIdOrName">getDockerContainerByIdOrName</a></li><li><a href="global.html#getDOSList">getDOSList</a></li><li><a href="global.html#getDosMessage">getDosMessage</a></li><li><a href="global.html#getDosStateValue">getDosStateValue</a></li><li><a href="global.html#getFilteredFluxTxs">getFilteredFluxTxs</a></li><li><a href="global.html#getFluxCruxID">getFluxCruxID</a></li><li><a href="global.html#getFluxInfo">getFluxInfo</a></li><li><a href="global.html#getFluxIP">getFluxIP</a></li><li><a href="global.html#getFluxKadena">getFluxKadena</a></li><li><a href="global.html#getFluxShareSize">getFluxShareSize</a></li><li><a href="global.html#getFluxShareSpecificFolderSize">getFluxShareSpecificFolderSize</a></li><li><a href="global.html#getFluxTimezone">getFluxTimezone</a></li><li><a href="global.html#getFluxVersion">getFluxVersion</a></li><li><a href="global.html#getFluxZelID">getFluxZelID</a></li><li><a href="global.html#getGatewayApi">getGatewayApi</a></li><li><a href="global.html#getGlobalAppsSpecifications">getGlobalAppsSpecifications</a></li><li><a href="global.html#getInfo">getInfo</a></li><li><a href="global.html#getIpApi">getIpApi</a></li><li><a href="global.html#getLocalSolPs">getLocalSolPs</a></li><li><a href="global.html#getMapApi">getMapApi</a></li><li><a href="global.html#getMempoolInfo">getMempoolInfo</a></li><li><a href="global.html#getMiningInfo">getMiningInfo</a></li><li><a href="global.html#getNetTotals">getNetTotals</a></li><li><a href="global.html#getNetworkHashPs">getNetworkHashPs</a></li><li><a href="global.html#getNetworkInfo">getNetworkInfo</a></li><li><a href="global.html#getNetworkSolPs">getNetworkSolPs</a></li><li><a href="global.html#getNewAddress">getNewAddress</a></li><li><a href="global.html#getNewNodeTier">getNewNodeTier</a></li><li><a href="global.html#getNodeGeolocation">getNodeGeolocation</a></li><li><a href="global.html#getNodeSpecs">getNodeSpecs</a></li><li><a href="global.html#getNodeTier">getNodeTier</a></li><li><a href="global.html#getPeerInfo">getPeerInfo</a></li><li><a href="global.html#getPreviousAppSpecifications">getPreviousAppSpecifications</a></li><li><a href="global.html#getPublicIp">getPublicIp</a></li><li><a href="global.html#getRawChangeAddress">getRawChangeAddress</a></li><li><a href="global.html#getRawMemPool">getRawMemPool</a></li><li><a href="global.html#getRawTransaction">getRawTransaction</a></li><li><a href="global.html#getReceivedByAddress">getReceivedByAddress</a></li><li><a href="global.html#getRunningAppIpList">getRunningAppIpList</a></li><li><a href="global.html#getRunningAppList">getRunningAppList</a></li><li><a href="global.html#getScannedHeight">getScannedHeight</a></li><li><a href="global.html#getSender">getSender</a></li><li><a href="global.html#getSenderForFluxTx">getSenderForFluxTx</a></li><li><a href="global.html#getSenderForFluxTxInsight">getSenderForFluxTxInsight</a></li><li><a href="global.html#getSenderTransactionFromDaemon">getSenderTransactionFromDaemon</a></li><li><a href="global.html#getSingleAddressBalance">getSingleAddressBalance</a></li><li><a href="global.html#getSingleAddressDeltas">getSingleAddressDeltas</a></li><li><a href="global.html#getSingleAddressMempool">getSingleAddressMempool</a></li><li><a href="global.html#getSingleAddresssTxids">getSingleAddresssTxids</a></li><li><a href="global.html#getSingleAddressUtxos">getSingleAddressUtxos</a></li><li><a href="global.html#getSpaceAvailableForFluxShare">getSpaceAvailableForFluxShare</a></li><li><a href="global.html#getSpentInfo">getSpentInfo</a></li><li><a href="global.html#getSpentInfoPost">getSpentInfoPost</a></li><li><a href="global.html#getStartList">getStartList</a></li><li><a href="global.html#getStatus">getStatus</a></li><li><a href="global.html#getStoredFluxBenchAllowed">getStoredFluxBenchAllowed</a></li><li><a href="global.html#getStrictApplicationSpecifications">getStrictApplicationSpecifications</a></li><li><a href="global.html#getTransaction">getTransaction</a></li><li><a href="global.html#getTxOut">getTxOut</a></li><li><a href="global.html#getTxOutProof">getTxOutProof</a></li><li><a href="global.html#getTxOutSetInfo">getTxOutSetInfo</a></li><li><a href="global.html#getUnconfirmedBalance">getUnconfirmedBalance</a></li><li><a href="global.html#getVerboseBlock">getVerboseBlock</a></li><li><a href="global.html#getWalletInfo">getWalletInfo</a></li><li><a href="global.html#getZelNodeCount">getZelNodeCount</a></li><li><a href="global.html#getZelNodeOutputs">getZelNodeOutputs</a></li><li><a href="global.html#getZelNodeScores">getZelNodeScores</a></li><li><a href="global.html#getZelNodeStatus">getZelNodeStatus</a></li><li><a href="global.html#getZelNodeWinners">getZelNodeWinners</a></li><li><a href="global.html#handleAppMessages">handleAppMessages</a></li><li><a href="global.html#handleAppRunningMessage">handleAppRunningMessage</a></li><li><a href="global.html#handleIncomingConnection">handleIncomingConnection</a></li><li><a href="global.html#hardRedeploy">hardRedeploy</a></li><li><a href="global.html#hardUpdateFlux">hardUpdateFlux</a></li><li><a href="global.html#help">help</a></li><li><a href="global.html#importAddress">importAddress</a></li><li><a href="global.html#importPrivKey">importPrivKey</a></li><li><a href="global.html#importWallet">importWallet</a></li><li><a href="global.html#initiateAndHandleConnection">initiateAndHandleConnection</a></li><li><a href="global.html#initiateBlockProcessor">initiateBlockProcessor</a></li><li><a href="global.html#installApplicationHard">installApplicationHard</a></li><li><a href="global.html#installApplicationSoft">installApplicationSoft</a></li><li><a href="global.html#installedApps">installedApps</a></li><li><a href="global.html#InstallFluxWatchTower">InstallFluxWatchTower</a></li><li><a href="global.html#installTemporaryLocalApplication">installTemporaryLocalApplication</a></li><li><a href="global.html#isCommunicationEstablished">isCommunicationEstablished</a></li><li><a href="global.html#isDaemonSynced">isDaemonSynced</a></li><li><a href="global.html#isInsightExplorer">isInsightExplorer</a></li><li><a href="global.html#isNodeStatusConfirmed">isNodeStatusConfirmed</a></li><li><a href="global.html#isUPNP">isUPNP</a></li><li><a href="global.html#keepConnectionsAlive">keepConnectionsAlive</a></li><li><a href="global.html#keyPoolRefill">keyPoolRefill</a></li><li><a href="global.html#listAddressGroupings">listAddressGroupings</a></li><li><a href="global.html#listAllApps">listAllApps</a></li><li><a href="global.html#listAppsImages">listAppsImages</a></li><li><a href="global.html#listBanned">listBanned</a></li><li><a href="global.html#listLockUnspent">listLockUnspent</a></li><li><a href="global.html#listReceivedByAddress">listReceivedByAddress</a></li><li><a href="global.html#listRunningApps">listRunningApps</a></li><li><a href="global.html#listSinceBlock">listSinceBlock</a></li><li><a href="global.html#listTransactions">listTransactions</a></li><li><a href="global.html#listUnspent">listUnspent</a></li><li><a href="global.html#listZelNodeConf">listZelNodeConf</a></li><li><a href="global.html#listZelNodes">listZelNodes</a></li><li><a href="global.html#lockUnspent">lockUnspent</a></li><li><a href="global.html#loggedSessions">loggedSessions</a></li><li><a href="global.html#loggedUsers">loggedUsers</a></li><li><a href="global.html#loginPhrase">loginPhrase</a></li><li><a href="global.html#logoutAllSessions">logoutAllSessions</a></li><li><a href="global.html#logoutAllUsers">logoutAllUsers</a></li><li><a href="global.html#logoutCurrentSession">logoutCurrentSession</a></li><li><a href="global.html#logoutSpecificSession">logoutSpecificSession</a></li><li><a href="global.html#mapPortApi">mapPortApi</a></li><li><a href="global.html#mapUpnpPort">mapUpnpPort</a></li><li><a href="global.html#messageHash">messageHash</a></li><li><a href="global.html#nodeCollateral">nodeCollateral</a></li><li><a href="global.html#nodeTier">nodeTier</a></li><li><a href="global.html#ping">ping</a></li><li><a href="global.html#prioritiseTransaction">prioritiseTransaction</a></li><li><a href="global.html#processBlock">processBlock</a></li><li><a href="global.html#processBlockTransactions">processBlockTransactions</a></li><li><a href="global.html#processInsight">processInsight</a></li><li><a href="global.html#processStandard">processStandard</a></li><li><a href="global.html#processTransaction">processTransaction</a></li><li><a href="global.html#provideSign">provideSign</a></li><li><a href="global.html#rebuildHome">rebuildHome</a></li><li><a href="global.html#reconstructAppMessagesHashCollection">reconstructAppMessagesHashCollection</a></li><li><a href="global.html#reconstructAppMessagesHashCollectionAPI">reconstructAppMessagesHashCollectionAPI</a></li><li><a href="global.html#redeployAPI">redeployAPI</a></li><li><a href="global.html#registerAppGlobalyApi">registerAppGlobalyApi</a></li><li><a href="global.html#registerAppLocally">registerAppLocally</a></li><li><a href="global.html#registrationInformation">registrationInformation</a></li><li><a href="global.html#reindexDaemon">reindexDaemon</a></li><li><a href="global.html#reindexExplorer">reindexExplorer</a></li><li><a href="global.html#reindexGlobalAppsInformation">reindexGlobalAppsInformation</a></li><li><a href="global.html#reindexGlobalAppsInformationAPI">reindexGlobalAppsInformationAPI</a></li><li><a href="global.html#reindexGlobalAppsLocation">reindexGlobalAppsLocation</a></li><li><a href="global.html#reindexGlobalAppsLocationAPI">reindexGlobalAppsLocationAPI</a></li><li><a href="global.html#reinstallOldApplications">reinstallOldApplications</a></li><li><a href="global.html#relayZelNodeBroadcast">relayZelNodeBroadcast</a></li><li><a href="global.html#removeAppLocally">removeAppLocally</a></li><li><a href="global.html#removeAppLocallyApi">removeAppLocallyApi</a></li><li><a href="global.html#removeIncomingPeer">removeIncomingPeer</a></li><li><a href="global.html#removeMapPortApi">removeMapPortApi</a></li><li><a href="global.html#removeMapUpnpPort">removeMapUpnpPort</a></li><li><a href="global.html#removePeer">removePeer</a></li><li><a href="global.html#repositoryArchitectures">repositoryArchitectures</a></li><li><a href="global.html#requestAppMessage">requestAppMessage</a></li><li><a href="global.html#rescanBlockchain">rescanBlockchain</a></li><li><a href="global.html#rescanExplorer">rescanExplorer</a></li><li><a href="global.html#rescanGlobalAppsInformation">rescanGlobalAppsInformation</a></li><li><a href="global.html#rescanGlobalAppsInformationAPI">rescanGlobalAppsInformationAPI</a></li><li><a href="global.html#restartBenchmark">restartBenchmark</a></li><li><a href="global.html#restartBlockProcessing">restartBlockProcessing</a></li><li><a href="global.html#restartDaemon">restartDaemon</a></li><li><a href="global.html#restartNodeBenchmarks">restartNodeBenchmarks</a></li><li><a href="global.html#restoreAppsPortsSupport">restoreAppsPortsSupport</a></li><li><a href="global.html#restoreDatabaseToBlockheightState">restoreDatabaseToBlockheightState</a></li><li><a href="global.html#restoreFluxPortsSupport">restoreFluxPortsSupport</a></li><li><a href="global.html#restorePortsSupport">restorePortsSupport</a></li><li><a href="global.html#sendFrom">sendFrom</a></li><li><a href="global.html#sendFromPost">sendFromPost</a></li><li><a href="global.html#sendMany">sendMany</a></li><li><a href="global.html#sendManyPost">sendManyPost</a></li><li><a href="global.html#sendRawTransaction">sendRawTransaction</a></li><li><a href="global.html#sendRawTransactionPost">sendRawTransactionPost</a></li><li><a href="global.html#sendToAddress">sendToAddress</a></li><li><a href="global.html#sendToAddressPost">sendToAddressPost</a></li><li><a href="global.html#setBan">setBan</a></li><li><a href="global.html#setDosMessage">setDosMessage</a></li><li><a href="global.html#setDosStateValue">setDosStateValue</a></li><li><a href="global.html#setMyFluxIp">setMyFluxIp</a></li><li><a href="global.html#setNodeGeolocation">setNodeGeolocation</a></li><li><a href="global.html#setStoredFluxBenchAllowed">setStoredFluxBenchAllowed</a></li><li><a href="global.html#setTxFee">setTxFee</a></li><li><a href="global.html#setupUPNP">setupUPNP</a></li><li><a href="global.html#signFluxTransaction">signFluxTransaction</a></li><li><a href="global.html#signFluxTransactionPost">signFluxTransactionPost</a></li><li><a href="global.html#signMessage">signMessage</a></li><li><a href="global.html#signMessagePost">signMessagePost</a></li><li><a href="global.html#signRawTransaction">signRawTransaction</a></li><li><a href="global.html#signRawTransactionPost">signRawTransactionPost</a></li><li><a href="global.html#softRedeploy">softRedeploy</a></li><li><a href="global.html#softRegisterAppLocally">softRegisterAppLocally</a></li><li><a href="global.html#softRemoveAppLocally">softRemoveAppLocally</a></li><li><a href="global.html#softUpdateFlux">softUpdateFlux</a></li><li><a href="global.html#softUpdateFluxInstall">softUpdateFluxInstall</a></li><li><a href="global.html#specificationFormatter">specificationFormatter</a></li><li><a href="global.html#spork">spork</a></li><li><a href="global.html#startBenchmark">startBenchmark</a></li><li><a href="global.html#startBenchmarkD">startBenchmarkD</a></li><li><a href="global.html#startDaemon">startDaemon</a></li><li><a href="global.html#startDeterministicZelNode">startDeterministicZelNode</a></li><li><a href="global.html#startFluxFunctions">startFluxFunctions</a></li><li><a href="global.html#startZelNode">startZelNode</a></li><li><a href="global.html#stop">stop</a></li><li><a href="global.html#stopAllNonFluxRunningApps">stopAllNonFluxRunningApps</a></li><li><a href="global.html#stopBenchmarkD">stopBenchmarkD</a></li><li><a href="global.html#stopBlockProcessing">stopBlockProcessing</a></li><li><a href="global.html#storeAppPermanentMessage">storeAppPermanentMessage</a></li><li><a href="global.html#storeAppRunningMessage">storeAppRunningMessage</a></li><li><a href="global.html#storeAppTemporaryMessage">storeAppTemporaryMessage</a></li><li><a href="global.html#submitBlock">submitBlock</a></li><li><a href="global.html#submitBlockPost">submitBlockPost</a></li><li><a href="global.html#systemArchitecture">systemArchitecture</a></li><li><a href="global.html#tailBenchmarkDebug">tailBenchmarkDebug</a></li><li><a href="global.html#tailDaemonDebug">tailDaemonDebug</a></li><li><a href="global.html#tailFluxDebugLog">tailFluxDebugLog</a></li><li><a href="global.html#tailFluxErrorLog">tailFluxErrorLog</a></li><li><a href="global.html#tailFluxInfoLog">tailFluxInfoLog</a></li><li><a href="global.html#tailFluxLog">tailFluxLog</a></li><li><a href="global.html#tailFluxWarnLog">tailFluxWarnLog</a></li><li><a href="global.html#totalAppHWRequirements">totalAppHWRequirements</a></li><li><a href="global.html#trySpawningGlobalApplication">trySpawningGlobalApplication</a></li><li><a href="global.html#updateAppGlobalyApi">updateAppGlobalyApi</a></li><li><a href="global.html#updateAppSpecifications">updateAppSpecifications</a></li><li><a href="global.html#updateAppSpecsForRescanReindex">updateAppSpecsForRescanReindex</a></li><li><a href="global.html#updateBenchmark">updateBenchmark</a></li><li><a href="global.html#updateDaemon">updateDaemon</a></li><li><a href="global.html#updateFlux">updateFlux</a></li><li><a href="global.html#validateAddress">validateAddress</a></li><li><a href="global.html#verifyAppHash">verifyAppHash</a></li><li><a href="global.html#verifyAppMessageSignature">verifyAppMessageSignature</a></li><li><a href="global.html#verifyAppMessageUpdateSignature">verifyAppMessageUpdateSignature</a></li><li><a href="global.html#verifyAppRegistrationParameters">verifyAppRegistrationParameters</a></li><li><a href="global.html#verifyAppSpecifications">verifyAppSpecifications</a></li><li><a href="global.html#verifyAppUpdateParameters">verifyAppUpdateParameters</a></li><li><a href="global.html#verifyChain">verifyChain</a></li><li><a href="global.html#verifyLogin">verifyLogin</a></li><li><a href="global.html#verifyMessage">verifyMessage</a></li><li><a href="global.html#verifyMessagePost">verifyMessagePost</a></li><li><a href="global.html#verifyObjectKeysCorrectnessOfApp">verifyObjectKeysCorrectnessOfApp</a></li><li><a href="global.html#verifyPrivilege">verifyPrivilege</a></li><li><a href="global.html#verifyRepository">verifyRepository</a></li><li><a href="global.html#verifyRestrictionCorrectnessOfApp">verifyRestrictionCorrectnessOfApp</a></li><li><a href="global.html#verifyTxOutProof">verifyTxOutProof</a></li><li><a href="global.html#verifyTypeCorrectnessOfApp">verifyTypeCorrectnessOfApp</a></li><li><a href="global.html#verifyUPNPsupport">verifyUPNPsupport</a></li><li><a href="global.html#verifyZelID">verifyZelID</a></li><li><a href="global.html#viewDeterministicZelNodeList">viewDeterministicZelNodeList</a></li><li><a href="global.html#whitelistedRepositories">whitelistedRepositories</a></li><li><a href="global.html#wsRespondLoginPhrase">wsRespondLoginPhrase</a></li><li><a href="global.html#wsRespondSignature">wsRespondSignature</a></li><li><a href="global.html#zcBenchmark">zcBenchmark</a></li><li><a href="global.html#zcRawJoinSplit">zcRawJoinSplit</a></li><li><a href="global.html#zcRawJoinSplitPost">zcRawJoinSplitPost</a></li><li><a href="global.html#zcRawKeygen">zcRawKeygen</a></li><li><a href="global.html#zcRawReceive">zcRawReceive</a></li><li><a href="global.html#zcRawReceivePost">zcRawReceivePost</a></li><li><a href="global.html#zcSampleJoinSplit">zcSampleJoinSplit</a></li><li><a href="global.html#zelNodeCurrentWinner">zelNodeCurrentWinner</a></li><li><a href="global.html#zelNodeDebug">zelNodeDebug</a></li><li><a href="global.html#zExportKey">zExportKey</a></li><li><a href="global.html#zExportViewingKey">zExportViewingKey</a></li><li><a href="global.html#zGetBalance">zGetBalance</a></li><li><a href="global.html#zGetMigrationStatus">zGetMigrationStatus</a></li><li><a href="global.html#zGetNewAddress">zGetNewAddress</a></li><li><a href="global.html#zGetOperationResult">zGetOperationResult</a></li><li><a href="global.html#zGetOperationStatus">zGetOperationStatus</a></li><li><a href="global.html#zGetTotalBalance">zGetTotalBalance</a></li><li><a href="global.html#zImportKey">zImportKey</a></li><li><a href="global.html#zImportViewingKey">zImportViewingKey</a></li><li><a href="global.html#zImportWallet">zImportWallet</a></li><li><a href="global.html#zListAddresses">zListAddresses</a></li><li><a href="global.html#zListOperationIds">zListOperationIds</a></li><li><a href="global.html#zListReceivedByAddress">zListReceivedByAddress</a></li><li><a href="global.html#zListUnspent">zListUnspent</a></li><li><a href="global.html#zMergeToAddress">zMergeToAddress</a></li><li><a href="global.html#znsync">znsync</a></li><li><a href="global.html#zSendMany">zSendMany</a></li><li><a href="global.html#zSendManyPost">zSendManyPost</a></li><li><a href="global.html#zSetMigration">zSetMigration</a></li><li><a href="global.html#zShieldCoinBase">zShieldCoinBase</a></li><li><a href="global.html#zValidateAddress">zValidateAddress</a></li></ul>
+To verify privilege use verifyPrivilege from verificationHelper module.</a></li><li><a href="module-Helper%2520module%2520used%2520for%2520all%2520interactions%2520with%2520database.html">Helper module used for all interactions with database</a></li></ul><h3>Global</h3><ul><li><a href="global.html#activeLoginPhrases">activeLoginPhrases</a></li><li><a href="global.html#addMultiSigAddress">addMultiSigAddress</a></li><li><a href="global.html#addMultiSigAddressPost">addMultiSigAddressPost</a></li><li><a href="global.html#addNode">addNode</a></li><li><a href="global.html#addPeer">addPeer</a></li><li><a href="global.html#adjustCruxID">adjustCruxID</a></li><li><a href="global.html#adjustKadenaAccount">adjustKadenaAccount</a></li><li><a href="global.html#appChanges">appChanges</a></li><li><a href="global.html#appDockerCreate">appDockerCreate</a></li><li><a href="global.html#appDockerImageRemove">appDockerImageRemove</a></li><li><a href="global.html#appDockerKill">appDockerKill</a></li><li><a href="global.html#appDockerPause">appDockerPause</a></li><li><a href="global.html#appDockerRemove">appDockerRemove</a></li><li><a href="global.html#appDockerRestart">appDockerRestart</a></li><li><a href="global.html#appDockerStart">appDockerStart</a></li><li><a href="global.html#appDockerStop">appDockerStop</a></li><li><a href="global.html#appDockerTop">appDockerTop</a></li><li><a href="global.html#appDockerUnpause">appDockerUnpause</a></li><li><a href="global.html#appExec">appExec</a></li><li><a href="global.html#appHashHasMessage">appHashHasMessage</a></li><li><a href="global.html#appInspect">appInspect</a></li><li><a href="global.html#appKill">appKill</a></li><li><a href="global.html#appLog">appLog</a></li><li><a href="global.html#appLogStream">appLogStream</a></li><li><a href="global.html#appPause">appPause</a></li><li><a href="global.html#appPortsUnique">appPortsUnique</a></li><li><a href="global.html#appPricePerMonth">appPricePerMonth</a></li><li><a href="global.html#appRestart">appRestart</a></li><li><a href="global.html#appsResources">appsResources</a></li><li><a href="global.html#appStart">appStart</a></li><li><a href="global.html#appStats">appStats</a></li><li><a href="global.html#appStop">appStop</a></li><li><a href="global.html#appTop">appTop</a></li><li><a href="global.html#appUninstallHard">appUninstallHard</a></li><li><a href="global.html#appUninstallSoft">appUninstallSoft</a></li><li><a href="global.html#appUnpause">appUnpause</a></li><li><a href="global.html#assignedPortsGlobalApps">assignedPortsGlobalApps</a></li><li><a href="global.html#assignedPortsInstalledApps">assignedPortsInstalledApps</a></li><li><a href="global.html#availableApps">availableApps</a></li><li><a href="global.html#axiosGet">axiosGet</a></li><li><a href="global.html#backupWallet">backupWallet</a></li><li><a href="global.html#benchmarkDebug">benchmarkDebug</a></li><li><a href="global.html#checkAndNotifyPeersOfRunningApps">checkAndNotifyPeersOfRunningApps</a></li><li><a href="global.html#checkAndRemoveApplicationInstance">checkAndRemoveApplicationInstance</a></li><li><a href="global.html#checkAndRequestApp">checkAndRequestApp</a></li><li><a href="global.html#checkApplicationImagesComplience">checkApplicationImagesComplience</a></li><li><a href="global.html#checkApplicationRegistrationNameConflicts">checkApplicationRegistrationNameConflicts</a></li><li><a href="global.html#checkApplicationUpdateNameRepositoryConflicts">checkApplicationUpdateNameRepositoryConflicts</a></li><li><a href="global.html#checkAppMessageExistence">checkAppMessageExistence</a></li><li><a href="global.html#checkAppRequirements">checkAppRequirements</a></li><li><a href="global.html#checkAppTemporaryMessageExistence">checkAppTemporaryMessageExistence</a></li><li><a href="global.html#checkBlockProcessingStopped">checkBlockProcessingStopped</a></li><li><a href="global.html#checkComposeHWParameters">checkComposeHWParameters</a></li><li><a href="global.html#checkDockerAccessibility">checkDockerAccessibility</a></li><li><a href="global.html#checkHWParameters">checkHWParameters</a></li><li><a href="global.html#checkLoggedUser">checkLoggedUser</a></li><li><a href="global.html#checkSynced">checkSynced</a></li><li><a href="global.html#checkWhitelistedRepository">checkWhitelistedRepository</a></li><li><a href="global.html#clearBanned">clearBanned</a></li><li><a href="global.html#confirmNodeTierHardware">confirmNodeTierHardware</a></li><li><a href="global.html#connectedPeers">connectedPeers</a></li><li><a href="global.html#connectedPeersInfo">connectedPeersInfo</a></li><li><a href="global.html#continuousFluxAppHashesCheck">continuousFluxAppHashesCheck</a></li><li><a href="global.html#createAppVolume">createAppVolume</a></li><li><a href="global.html#createConfirmationTransaction">createConfirmationTransaction</a></li><li><a href="global.html#createDataMessage">createDataMessage</a></li><li><a href="global.html#createErrorMessage">createErrorMessage</a></li><li><a href="global.html#createFluxDockerNetwork">createFluxDockerNetwork</a></li><li><a href="global.html#createFluxNetworkAPI">createFluxNetworkAPI</a></li><li><a href="global.html#createMultiSig">createMultiSig</a></li><li><a href="global.html#createMultiSigPost">createMultiSigPost</a></li><li><a href="global.html#createRawTransaction">createRawTransaction</a></li><li><a href="global.html#createRawTransactionPost">createRawTransactionPost</a></li><li><a href="global.html#createSuccessMessage">createSuccessMessage</a></li><li><a href="global.html#createWarningMessage">createWarningMessage</a></li><li><a href="global.html#createZelNodeBroadcast">createZelNodeBroadcast</a></li><li><a href="global.html#createZelNodeKey">createZelNodeKey</a></li><li><a href="global.html#daemonBlockchainInfoService">daemonBlockchainInfoService</a></li><li><a href="global.html#daemonDebug">daemonDebug</a></li><li><a href="global.html#decodeMessage">decodeMessage</a></li><li><a href="global.html#decodeRawTransaction">decodeRawTransaction</a></li><li><a href="global.html#decodeRawTransactionPost">decodeRawTransactionPost</a></li><li><a href="global.html#decodeScript">decodeScript</a></li><li><a href="global.html#decodeScriptPost">decodeScriptPost</a></li><li><a href="global.html#decodeZelNodeBroadcast">decodeZelNodeBroadcast</a></li><li><a href="global.html#delay">delay</a></li><li><a href="global.html#deleteLoginPhrase">deleteLoginPhrase</a></li><li><a href="global.html#deploymentInformation">deploymentInformation</a></li><li><a href="global.html#disconnectNode">disconnectNode</a></li><li><a href="global.html#dockerContainerChanges">dockerContainerChanges</a></li><li><a href="global.html#dockerContainerExec">dockerContainerExec</a></li><li><a href="global.html#dockerContainerInspect">dockerContainerInspect</a></li><li><a href="global.html#dockerContainerLogs">dockerContainerLogs</a></li><li><a href="global.html#dockerContainerLogsStream">dockerContainerLogsStream</a></li><li><a href="global.html#dockerContainerStats">dockerContainerStats</a></li><li><a href="global.html#dockerCreateNetwork">dockerCreateNetwork</a></li><li><a href="global.html#dockerListContainers">dockerListContainers</a></li><li><a href="global.html#dockerListImages">dockerListImages</a></li><li><a href="global.html#dockerNetworkInspect">dockerNetworkInspect</a></li><li><a href="global.html#dockerRemoveNetwork">dockerRemoveNetwork</a></li><li><a href="global.html#dumpPrivKey">dumpPrivKey</a></li><li><a href="global.html#emergencyPhrase">emergencyPhrase</a></li><li><a href="global.html#ensureApplicationImagesExistsForPlatform">ensureApplicationImagesExistsForPlatform</a></li><li><a href="global.html#ensureApplicationPortsNotUsed">ensureApplicationPortsNotUsed</a></li><li><a href="global.html#ensureAppUniquePorts">ensureAppUniquePorts</a></li><li><a href="global.html#ensureBoolean">ensureBoolean</a></li><li><a href="global.html#ensureNumber">ensureNumber</a></li><li><a href="global.html#ensureObject">ensureObject</a></li><li><a href="global.html#ensureString">ensureString</a></li><li><a href="global.html#errUnauthorizedMessage">errUnauthorizedMessage</a></li><li><a href="global.html#estimateFee">estimateFee</a></li><li><a href="global.html#estimatePriority">estimatePriority</a></li><li><a href="global.html#executeCall">executeCall</a></li><li><a href="global.html#expireGlobalApplications">expireGlobalApplications</a></li><li><a href="global.html#fluxBackendFolder">fluxBackendFolder</a></li><li><a href="global.html#fluxDaemonBlockchainInfo">fluxDaemonBlockchainInfo</a></li><li><a href="global.html#fluxDebugLog">fluxDebugLog</a></li><li><a href="global.html#fluxDiscovery">fluxDiscovery</a></li><li><a href="global.html#fluxErrorLog">fluxErrorLog</a></li><li><a href="global.html#fluxInfoLog">fluxInfoLog</a></li><li><a href="global.html#fluxLog">fluxLog</a></li><li><a href="global.html#fluxShareCreateFolder">fluxShareCreateFolder</a></li><li><a href="global.html#fluxShareDatabaseFileDelete">fluxShareDatabaseFileDelete</a></li><li><a href="global.html#fluxShareDatabaseFileDeleteMultiple">fluxShareDatabaseFileDeleteMultiple</a></li><li><a href="global.html#fluxShareDatabaseShareFile">fluxShareDatabaseShareFile</a></li><li><a href="global.html#fluxShareDownloadFile">fluxShareDownloadFile</a></li><li><a href="global.html#fluxShareDownloadFolder">fluxShareDownloadFolder</a></li><li><a href="global.html#fluxShareFileExists">fluxShareFileExists</a></li><li><a href="global.html#fluxShareGetFolder">fluxShareGetFolder</a></li><li><a href="global.html#fluxShareGetSharedFiles">fluxShareGetSharedFiles</a></li><li><a href="global.html#fluxShareRemoveFile">fluxShareRemoveFile</a></li><li><a href="global.html#fluxShareRemoveFolder">fluxShareRemoveFolder</a></li><li><a href="global.html#fluxShareRename">fluxShareRename</a></li><li><a href="global.html#fluxShareSharedFiles">fluxShareSharedFiles</a></li><li><a href="global.html#fluxShareShareFile">fluxShareShareFile</a></li><li><a href="global.html#fluxShareStorageStats">fluxShareStorageStats</a></li><li><a href="global.html#fluxShareUnshareFile">fluxShareUnshareFile</a></li><li><a href="global.html#fluxShareUpload">fluxShareUpload</a></li><li><a href="global.html#fluxUsage">fluxUsage</a></li><li><a href="global.html#fluxWarnLog">fluxWarnLog</a></li><li><a href="global.html#fundRawTransaction">fundRawTransaction</a></li><li><a href="global.html#fundRawTransactionPost">fundRawTransactionPost</a></li><li><a href="global.html#getAddedNodeInfo">getAddedNodeInfo</a></li><li><a href="global.html#getAddressBalance">getAddressBalance</a></li><li><a href="global.html#getAddressDeltas">getAddressDeltas</a></li><li><a href="global.html#getAddressFusionCoinbase">getAddressFusionCoinbase</a></li><li><a href="global.html#getAddressMempool">getAddressMempool</a></li><li><a href="global.html#getAddressTransactions">getAddressTransactions</a></li><li><a href="global.html#getAddressTxids">getAddressTxids</a></li><li><a href="global.html#getAddressUtxos">getAddressUtxos</a></li><li><a href="global.html#getAllAddresses">getAllAddresses</a></li><li><a href="global.html#getAllAddressesWithTransactions">getAllAddressesWithTransactions</a></li><li><a href="global.html#getAllFiles">getAllFiles</a></li><li><a href="global.html#getAllFluxTransactions">getAllFluxTransactions</a></li><li><a href="global.html#getAllFusionCoinbase">getAllFusionCoinbase</a></li><li><a href="global.html#getAllGlobalApplicationsNames">getAllGlobalApplicationsNames</a></li><li><a href="global.html#getAllUtxos">getAllUtxos</a></li><li><a href="global.html#getAppDockerNameIdentifier">getAppDockerNameIdentifier</a></li><li><a href="global.html#getAppHashes">getAppHashes</a></li><li><a href="global.html#getAppIdentifier">getAppIdentifier</a></li><li><a href="global.html#getApplicationGlobalSpecifications">getApplicationGlobalSpecifications</a></li><li><a href="global.html#getApplicationLocalSpecifications">getApplicationLocalSpecifications</a></li><li><a href="global.html#getApplicationOwner">getApplicationOwner</a></li><li><a href="global.html#getApplicationOwnerAPI">getApplicationOwnerAPI</a></li><li><a href="global.html#getApplicationSpecificationAPI">getApplicationSpecificationAPI</a></li><li><a href="global.html#getApplicationSpecifications">getApplicationSpecifications</a></li><li><a href="global.html#getAppPrice">getAppPrice</a></li><li><a href="global.html#getAppsLocation">getAppsLocation</a></li><li><a href="global.html#getAppsLocations">getAppsLocations</a></li><li><a href="global.html#getAppsPermanentMessages">getAppsPermanentMessages</a></li><li><a href="global.html#getAppsTemporaryMessages">getAppsTemporaryMessages</a></li><li><a href="global.html#getBalance">getBalance</a></li><li><a href="global.html#getBenchmarks">getBenchmarks</a></li><li><a href="global.html#getBenchStatus">getBenchStatus</a></li><li><a href="global.html#getBestBlockHash">getBestBlockHash</a></li><li><a href="global.html#getBlock">getBlock</a></li><li><a href="global.html#getBlockchainInfo">getBlockchainInfo</a></li><li><a href="global.html#getBlockCount">getBlockCount</a></li><li><a href="global.html#getBlockDeltas">getBlockDeltas</a></li><li><a href="global.html#getBlockHash">getBlockHash</a></li><li><a href="global.html#getBlockHashes">getBlockHashes</a></li><li><a href="global.html#getBlockHashesPost">getBlockHashesPost</a></li><li><a href="global.html#getBlockHeader">getBlockHeader</a></li><li><a href="global.html#getBlockSubsidy">getBlockSubsidy</a></li><li><a href="global.html#getBlockTemplate">getBlockTemplate</a></li><li><a href="global.html#getChainTips">getChainTips</a></li><li><a href="global.html#getCollateralInfo">getCollateralInfo</a></li><li><a href="global.html#getConfigValue">getConfigValue</a></li><li><a href="global.html#getConnectionCount">getConnectionCount</a></li><li><a href="global.html#getDeprecationInfo">getDeprecationInfo</a></li><li><a href="global.html#getDifficulty">getDifficulty</a></li><li><a href="global.html#getDockerContainer">getDockerContainer</a></li><li><a href="global.html#getDockerContainerByIdOrName">getDockerContainerByIdOrName</a></li><li><a href="global.html#getDOSList">getDOSList</a></li><li><a href="global.html#getDosMessage">getDosMessage</a></li><li><a href="global.html#getDosStateValue">getDosStateValue</a></li><li><a href="global.html#getFilteredFluxTxs">getFilteredFluxTxs</a></li><li><a href="global.html#getFluxCruxID">getFluxCruxID</a></li><li><a href="global.html#getFluxInfo">getFluxInfo</a></li><li><a href="global.html#getFluxIP">getFluxIP</a></li><li><a href="global.html#getFluxKadena">getFluxKadena</a></li><li><a href="global.html#getFluxShareSize">getFluxShareSize</a></li><li><a href="global.html#getFluxShareSpecificFolderSize">getFluxShareSpecificFolderSize</a></li><li><a href="global.html#getFluxTimezone">getFluxTimezone</a></li><li><a href="global.html#getFluxVersion">getFluxVersion</a></li><li><a href="global.html#getFluxZelID">getFluxZelID</a></li><li><a href="global.html#getGatewayApi">getGatewayApi</a></li><li><a href="global.html#getGlobalAppsSpecifications">getGlobalAppsSpecifications</a></li><li><a href="global.html#getInfo">getInfo</a></li><li><a href="global.html#getIpApi">getIpApi</a></li><li><a href="global.html#getLocalSolPs">getLocalSolPs</a></li><li><a href="global.html#getMapApi">getMapApi</a></li><li><a href="global.html#getMempoolInfo">getMempoolInfo</a></li><li><a href="global.html#getMiningInfo">getMiningInfo</a></li><li><a href="global.html#getNetTotals">getNetTotals</a></li><li><a href="global.html#getNetworkHashPs">getNetworkHashPs</a></li><li><a href="global.html#getNetworkInfo">getNetworkInfo</a></li><li><a href="global.html#getNetworkSolPs">getNetworkSolPs</a></li><li><a href="global.html#getNewAddress">getNewAddress</a></li><li><a href="global.html#getNewNodeTier">getNewNodeTier</a></li><li><a href="global.html#getNodeSpecs">getNodeSpecs</a></li><li><a href="global.html#getNodeTier">getNodeTier</a></li><li><a href="global.html#getPeerInfo">getPeerInfo</a></li><li><a href="global.html#getPreviousAppSpecifications">getPreviousAppSpecifications</a></li><li><a href="global.html#getPublicIp">getPublicIp</a></li><li><a href="global.html#getRawChangeAddress">getRawChangeAddress</a></li><li><a href="global.html#getRawMemPool">getRawMemPool</a></li><li><a href="global.html#getRawTransaction">getRawTransaction</a></li><li><a href="global.html#getReceivedByAddress">getReceivedByAddress</a></li><li><a href="global.html#getRunningAppIpList">getRunningAppIpList</a></li><li><a href="global.html#getRunningAppList">getRunningAppList</a></li><li><a href="global.html#getScannedHeight">getScannedHeight</a></li><li><a href="global.html#getSender">getSender</a></li><li><a href="global.html#getSenderForFluxTx">getSenderForFluxTx</a></li><li><a href="global.html#getSenderForFluxTxInsight">getSenderForFluxTxInsight</a></li><li><a href="global.html#getSenderTransactionFromDaemon">getSenderTransactionFromDaemon</a></li><li><a href="global.html#getSingleAddressBalance">getSingleAddressBalance</a></li><li><a href="global.html#getSingleAddressDeltas">getSingleAddressDeltas</a></li><li><a href="global.html#getSingleAddressMempool">getSingleAddressMempool</a></li><li><a href="global.html#getSingleAddresssTxids">getSingleAddresssTxids</a></li><li><a href="global.html#getSingleAddressUtxos">getSingleAddressUtxos</a></li><li><a href="global.html#getSpaceAvailableForFluxShare">getSpaceAvailableForFluxShare</a></li><li><a href="global.html#getSpentInfo">getSpentInfo</a></li><li><a href="global.html#getSpentInfoPost">getSpentInfoPost</a></li><li><a href="global.html#getStartList">getStartList</a></li><li><a href="global.html#getStatus">getStatus</a></li><li><a href="global.html#getStoredFluxBenchAllowed">getStoredFluxBenchAllowed</a></li><li><a href="global.html#getStrictApplicationSpecifications">getStrictApplicationSpecifications</a></li><li><a href="global.html#getTransaction">getTransaction</a></li><li><a href="global.html#getTxOut">getTxOut</a></li><li><a href="global.html#getTxOutProof">getTxOutProof</a></li><li><a href="global.html#getTxOutSetInfo">getTxOutSetInfo</a></li><li><a href="global.html#getUnconfirmedBalance">getUnconfirmedBalance</a></li><li><a href="global.html#getVerboseBlock">getVerboseBlock</a></li><li><a href="global.html#getWalletInfo">getWalletInfo</a></li><li><a href="global.html#getZelNodeCount">getZelNodeCount</a></li><li><a href="global.html#getZelNodeOutputs">getZelNodeOutputs</a></li><li><a href="global.html#getZelNodeScores">getZelNodeScores</a></li><li><a href="global.html#getZelNodeStatus">getZelNodeStatus</a></li><li><a href="global.html#getZelNodeWinners">getZelNodeWinners</a></li><li><a href="global.html#handleAppMessages">handleAppMessages</a></li><li><a href="global.html#handleAppRunningMessage">handleAppRunningMessage</a></li><li><a href="global.html#handleIncomingConnection">handleIncomingConnection</a></li><li><a href="global.html#hardRedeploy">hardRedeploy</a></li><li><a href="global.html#hardUpdateFlux">hardUpdateFlux</a></li><li><a href="global.html#help">help</a></li><li><a href="global.html#importAddress">importAddress</a></li><li><a href="global.html#importPrivKey">importPrivKey</a></li><li><a href="global.html#importWallet">importWallet</a></li><li><a href="global.html#initiateAndHandleConnection">initiateAndHandleConnection</a></li><li><a href="global.html#initiateBlockProcessor">initiateBlockProcessor</a></li><li><a href="global.html#installApplicationHard">installApplicationHard</a></li><li><a href="global.html#installApplicationSoft">installApplicationSoft</a></li><li><a href="global.html#installedApps">installedApps</a></li><li><a href="global.html#InstallFluxWatchTower">InstallFluxWatchTower</a></li><li><a href="global.html#installTemporaryLocalApplication">installTemporaryLocalApplication</a></li><li><a href="global.html#isCommunicationEstablished">isCommunicationEstablished</a></li><li><a href="global.html#isDaemonSynced">isDaemonSynced</a></li><li><a href="global.html#isInsightExplorer">isInsightExplorer</a></li><li><a href="global.html#isNodeStatusConfirmed">isNodeStatusConfirmed</a></li><li><a href="global.html#isUPNP">isUPNP</a></li><li><a href="global.html#keepConnectionsAlive">keepConnectionsAlive</a></li><li><a href="global.html#keyPoolRefill">keyPoolRefill</a></li><li><a href="global.html#listAddressGroupings">listAddressGroupings</a></li><li><a href="global.html#listAllApps">listAllApps</a></li><li><a href="global.html#listAppsImages">listAppsImages</a></li><li><a href="global.html#listBanned">listBanned</a></li><li><a href="global.html#listLockUnspent">listLockUnspent</a></li><li><a href="global.html#listReceivedByAddress">listReceivedByAddress</a></li><li><a href="global.html#listRunningApps">listRunningApps</a></li><li><a href="global.html#listSinceBlock">listSinceBlock</a></li><li><a href="global.html#listTransactions">listTransactions</a></li><li><a href="global.html#listUnspent">listUnspent</a></li><li><a href="global.html#listZelNodeConf">listZelNodeConf</a></li><li><a href="global.html#listZelNodes">listZelNodes</a></li><li><a href="global.html#lockUnspent">lockUnspent</a></li><li><a href="global.html#loggedSessions">loggedSessions</a></li><li><a href="global.html#loggedUsers">loggedUsers</a></li><li><a href="global.html#loginPhrase">loginPhrase</a></li><li><a href="global.html#logoutAllSessions">logoutAllSessions</a></li><li><a href="global.html#logoutAllUsers">logoutAllUsers</a></li><li><a href="global.html#logoutCurrentSession">logoutCurrentSession</a></li><li><a href="global.html#logoutSpecificSession">logoutSpecificSession</a></li><li><a href="global.html#mapPortApi">mapPortApi</a></li><li><a href="global.html#mapUpnpPort">mapUpnpPort</a></li><li><a href="global.html#messageHash">messageHash</a></li><li><a href="global.html#nodeCollateral">nodeCollateral</a></li><li><a href="global.html#nodeTier">nodeTier</a></li><li><a href="global.html#ping">ping</a></li><li><a href="global.html#prioritiseTransaction">prioritiseTransaction</a></li><li><a href="global.html#processBlock">processBlock</a></li><li><a href="global.html#processBlockTransactions">processBlockTransactions</a></li><li><a href="global.html#processInsight">processInsight</a></li><li><a href="global.html#processStandard">processStandard</a></li><li><a href="global.html#processTransaction">processTransaction</a></li><li><a href="global.html#provideSign">provideSign</a></li><li><a href="global.html#rebuildHome">rebuildHome</a></li><li><a href="global.html#reconstructAppMessagesHashCollection">reconstructAppMessagesHashCollection</a></li><li><a href="global.html#reconstructAppMessagesHashCollectionAPI">reconstructAppMessagesHashCollectionAPI</a></li><li><a href="global.html#redeployAPI">redeployAPI</a></li><li><a href="global.html#registerAppGlobalyApi">registerAppGlobalyApi</a></li><li><a href="global.html#registerAppLocally">registerAppLocally</a></li><li><a href="global.html#registrationInformation">registrationInformation</a></li><li><a href="global.html#reindexDaemon">reindexDaemon</a></li><li><a href="global.html#reindexExplorer">reindexExplorer</a></li><li><a href="global.html#reindexGlobalAppsInformation">reindexGlobalAppsInformation</a></li><li><a href="global.html#reindexGlobalAppsInformationAPI">reindexGlobalAppsInformationAPI</a></li><li><a href="global.html#reindexGlobalAppsLocation">reindexGlobalAppsLocation</a></li><li><a href="global.html#reindexGlobalAppsLocationAPI">reindexGlobalAppsLocationAPI</a></li><li><a href="global.html#reinstallOldApplications">reinstallOldApplications</a></li><li><a href="global.html#relayZelNodeBroadcast">relayZelNodeBroadcast</a></li><li><a href="global.html#removeAppLocally">removeAppLocally</a></li><li><a href="global.html#removeAppLocallyApi">removeAppLocallyApi</a></li><li><a href="global.html#removeIncomingPeer">removeIncomingPeer</a></li><li><a href="global.html#removeMapPortApi">removeMapPortApi</a></li><li><a href="global.html#removeMapUpnpPort">removeMapUpnpPort</a></li><li><a href="global.html#removePeer">removePeer</a></li><li><a href="global.html#repositoryArchitectures">repositoryArchitectures</a></li><li><a href="global.html#requestAppMessage">requestAppMessage</a></li><li><a href="global.html#rescanBlockchain">rescanBlockchain</a></li><li><a href="global.html#rescanExplorer">rescanExplorer</a></li><li><a href="global.html#rescanGlobalAppsInformation">rescanGlobalAppsInformation</a></li><li><a href="global.html#rescanGlobalAppsInformationAPI">rescanGlobalAppsInformationAPI</a></li><li><a href="global.html#restartBenchmark">restartBenchmark</a></li><li><a href="global.html#restartBlockProcessing">restartBlockProcessing</a></li><li><a href="global.html#restartDaemon">restartDaemon</a></li><li><a href="global.html#restartNodeBenchmarks">restartNodeBenchmarks</a></li><li><a href="global.html#restoreDatabaseToBlockheightState">restoreDatabaseToBlockheightState</a></li><li><a href="global.html#sendFrom">sendFrom</a></li><li><a href="global.html#sendFromPost">sendFromPost</a></li><li><a href="global.html#sendMany">sendMany</a></li><li><a href="global.html#sendManyPost">sendManyPost</a></li><li><a href="global.html#sendRawTransaction">sendRawTransaction</a></li><li><a href="global.html#sendRawTransactionPost">sendRawTransactionPost</a></li><li><a href="global.html#sendToAddress">sendToAddress</a></li><li><a href="global.html#sendToAddressPost">sendToAddressPost</a></li><li><a href="global.html#setBan">setBan</a></li><li><a href="global.html#setDosMessage">setDosMessage</a></li><li><a href="global.html#setDosStateValue">setDosStateValue</a></li><li><a href="global.html#setMyFluxIp">setMyFluxIp</a></li><li><a href="global.html#setStoredFluxBenchAllowed">setStoredFluxBenchAllowed</a></li><li><a href="global.html#setTxFee">setTxFee</a></li><li><a href="global.html#setupUPNP">setupUPNP</a></li><li><a href="global.html#signFluxTransaction">signFluxTransaction</a></li><li><a href="global.html#signFluxTransactionPost">signFluxTransactionPost</a></li><li><a href="global.html#signMessage">signMessage</a></li><li><a href="global.html#signMessagePost">signMessagePost</a></li><li><a href="global.html#signRawTransaction">signRawTransaction</a></li><li><a href="global.html#signRawTransactionPost">signRawTransactionPost</a></li><li><a href="global.html#softRedeploy">softRedeploy</a></li><li><a href="global.html#softRegisterAppLocally">softRegisterAppLocally</a></li><li><a href="global.html#softRemoveAppLocally">softRemoveAppLocally</a></li><li><a href="global.html#softUpdateFlux">softUpdateFlux</a></li><li><a href="global.html#softUpdateFluxInstall">softUpdateFluxInstall</a></li><li><a href="global.html#specificationFormatter">specificationFormatter</a></li><li><a href="global.html#spork">spork</a></li><li><a href="global.html#startBenchmark">startBenchmark</a></li><li><a href="global.html#startBenchmarkD">startBenchmarkD</a></li><li><a href="global.html#startDaemon">startDaemon</a></li><li><a href="global.html#startDeterministicZelNode">startDeterministicZelNode</a></li><li><a href="global.html#startFluxFunctions">startFluxFunctions</a></li><li><a href="global.html#startZelNode">startZelNode</a></li><li><a href="global.html#stop">stop</a></li><li><a href="global.html#stopAllNonFluxRunningApps">stopAllNonFluxRunningApps</a></li><li><a href="global.html#stopBenchmarkD">stopBenchmarkD</a></li><li><a href="global.html#stopBlockProcessing">stopBlockProcessing</a></li><li><a href="global.html#storeAppPermanentMessage">storeAppPermanentMessage</a></li><li><a href="global.html#storeAppRunningMessage">storeAppRunningMessage</a></li><li><a href="global.html#storeAppTemporaryMessage">storeAppTemporaryMessage</a></li><li><a href="global.html#submitBlock">submitBlock</a></li><li><a href="global.html#submitBlockPost">submitBlockPost</a></li><li><a href="global.html#systemArchitecture">systemArchitecture</a></li><li><a href="global.html#tailBenchmarkDebug">tailBenchmarkDebug</a></li><li><a href="global.html#tailDaemonDebug">tailDaemonDebug</a></li><li><a href="global.html#tailFluxDebugLog">tailFluxDebugLog</a></li><li><a href="global.html#tailFluxErrorLog">tailFluxErrorLog</a></li><li><a href="global.html#tailFluxInfoLog">tailFluxInfoLog</a></li><li><a href="global.html#tailFluxLog">tailFluxLog</a></li><li><a href="global.html#tailFluxWarnLog">tailFluxWarnLog</a></li><li><a href="global.html#totalAppHWRequirements">totalAppHWRequirements</a></li><li><a href="global.html#trySpawningGlobalApplication">trySpawningGlobalApplication</a></li><li><a href="global.html#updateAppGlobalyApi">updateAppGlobalyApi</a></li><li><a href="global.html#updateAppSpecifications">updateAppSpecifications</a></li><li><a href="global.html#updateAppSpecsForRescanReindex">updateAppSpecsForRescanReindex</a></li><li><a href="global.html#updateBenchmark">updateBenchmark</a></li><li><a href="global.html#updateDaemon">updateDaemon</a></li><li><a href="global.html#updateFlux">updateFlux</a></li><li><a href="global.html#validateAddress">validateAddress</a></li><li><a href="global.html#verifyAppHash">verifyAppHash</a></li><li><a href="global.html#verifyAppMessageSignature">verifyAppMessageSignature</a></li><li><a href="global.html#verifyAppMessageUpdateSignature">verifyAppMessageUpdateSignature</a></li><li><a href="global.html#verifyAppRegistrationParameters">verifyAppRegistrationParameters</a></li><li><a href="global.html#verifyAppSpecifications">verifyAppSpecifications</a></li><li><a href="global.html#verifyAppUpdateParameters">verifyAppUpdateParameters</a></li><li><a href="global.html#verifyChain">verifyChain</a></li><li><a href="global.html#verifyCorrectnessOfApp">verifyCorrectnessOfApp</a></li><li><a href="global.html#verifyLogin">verifyLogin</a></li><li><a href="global.html#verifyMessage">verifyMessage</a></li><li><a href="global.html#verifyMessagePost">verifyMessagePost</a></li><li><a href="global.html#verifyPrivilege">verifyPrivilege</a></li><li><a href="global.html#verifyRepository">verifyRepository</a></li><li><a href="global.html#verifyTxOutProof">verifyTxOutProof</a></li><li><a href="global.html#verifyUPNPsupport">verifyUPNPsupport</a></li><li><a href="global.html#verifyZelID">verifyZelID</a></li><li><a href="global.html#viewDeterministicZelNodeList">viewDeterministicZelNodeList</a></li><li><a href="global.html#whitelistedRepositories">whitelistedRepositories</a></li><li><a href="global.html#wsRespondLoginPhrase">wsRespondLoginPhrase</a></li><li><a href="global.html#wsRespondSignature">wsRespondSignature</a></li><li><a href="global.html#zcBenchmark">zcBenchmark</a></li><li><a href="global.html#zcRawJoinSplit">zcRawJoinSplit</a></li><li><a href="global.html#zcRawJoinSplitPost">zcRawJoinSplitPost</a></li><li><a href="global.html#zcRawKeygen">zcRawKeygen</a></li><li><a href="global.html#zcRawReceive">zcRawReceive</a></li><li><a href="global.html#zcRawReceivePost">zcRawReceivePost</a></li><li><a href="global.html#zcSampleJoinSplit">zcSampleJoinSplit</a></li><li><a href="global.html#zelNodeCurrentWinner">zelNodeCurrentWinner</a></li><li><a href="global.html#zelNodeDebug">zelNodeDebug</a></li><li><a href="global.html#zExportKey">zExportKey</a></li><li><a href="global.html#zExportViewingKey">zExportViewingKey</a></li><li><a href="global.html#zGetBalance">zGetBalance</a></li><li><a href="global.html#zGetMigrationStatus">zGetMigrationStatus</a></li><li><a href="global.html#zGetNewAddress">zGetNewAddress</a></li><li><a href="global.html#zGetOperationResult">zGetOperationResult</a></li><li><a href="global.html#zGetOperationStatus">zGetOperationStatus</a></li><li><a href="global.html#zGetTotalBalance">zGetTotalBalance</a></li><li><a href="global.html#zImportKey">zImportKey</a></li><li><a href="global.html#zImportViewingKey">zImportViewingKey</a></li><li><a href="global.html#zImportWallet">zImportWallet</a></li><li><a href="global.html#zListAddresses">zListAddresses</a></li><li><a href="global.html#zListOperationIds">zListOperationIds</a></li><li><a href="global.html#zListReceivedByAddress">zListReceivedByAddress</a></li><li><a href="global.html#zListUnspent">zListUnspent</a></li><li><a href="global.html#zMergeToAddress">zMergeToAddress</a></li><li><a href="global.html#znsync">znsync</a></li><li><a href="global.html#zSendMany">zSendMany</a></li><li><a href="global.html#zSendManyPost">zSendManyPost</a></li><li><a href="global.html#zSetMigration">zSetMigration</a></li><li><a href="global.html#zShieldCoinBase">zShieldCoinBase</a></li><li><a href="global.html#zValidateAddress">zValidateAddress</a></li></ul>
 </nav>
 
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Wed May 25 2022 05:20:16 GMT+0000 (Coordinated Universal Time)
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Wed May 25 2022 07:59:57 GMT+0000 (Coordinated Universal Time)
 </footer>
 
 <script> prettyPrint(); </script>
