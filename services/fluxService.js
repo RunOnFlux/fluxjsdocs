@@ -1,4 +1,4 @@
-const nodecmd = require('node-cmd');
+const cmd = require('node-cmd');
 const path = require('path');
 const config = require('config');
 const fullnode = require('fullnode');
@@ -16,13 +16,8 @@ const daemonService = require('./daemonService');
 const benchmarkService = require('./benchmarkService');
 const appsService = require('./appsService');
 const generalService = require('./generalService');
-const explorerService = require('./explorerService');
-const fluxCommunication = require('./fluxCommunication');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const userconfig = require('../../../config/userconfig');
-
-let storedGeolocation = null;
-let storedIp = null;
 
 /**
  * To show the directory on the node machine where FluxOS files are stored.
@@ -49,7 +44,7 @@ async function updateFlux(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../');
     const exec = `cd ${nodedpath} && npm run updateflux`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error updating Flux: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -75,7 +70,7 @@ async function softUpdateFlux(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../');
     const exec = `cd ${nodedpath} && npm run softupdate`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error softly updating Flux: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -101,7 +96,7 @@ async function softUpdateFluxInstall(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../');
     const exec = `cd ${nodedpath} && npm run softupdateinstall`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error softly updating Flux with installation: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -127,7 +122,7 @@ async function hardUpdateFlux(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../');
     const exec = `cd ${nodedpath} && npm run hardupdateflux`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error hardupdating Flux: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -153,7 +148,7 @@ async function rebuildHome(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../');
     const exec = `cd ${nodedpath} && npm run homebuild`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error rebuilding Flux: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -179,7 +174,7 @@ async function updateDaemon(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash updateDaemon.sh`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error updating Daemon: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -205,7 +200,7 @@ async function updateBenchmark(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash updateBenchmark.sh`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error updating Benchmark: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -233,7 +228,7 @@ async function startBenchmark(req, res) {
     if (fs.existsSync('/usr/local/bin/fluxbenchd')) {
       exec = 'fluxbenchd -daemon';
     }
-    nodecmd.get(exec, (err, data) => {
+    cmd.get(exec, (err, data) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error starting Benchmark: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -260,7 +255,7 @@ async function restartBenchmark(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash restartBenchmark.sh`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error restarting Benchmark: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -289,7 +284,7 @@ async function startDaemon(req, res) {
     if (fs.existsSync('/usr/local/bin/fluxd')) {
       exec = 'fluxd';
     }
-    nodecmd.get(exec, (err, data) => {
+    cmd.get(exec, (err, data) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error starting Daemon: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -316,7 +311,7 @@ async function restartDaemon(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash restartDaemon.sh`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error restarting Daemon: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -343,7 +338,7 @@ async function reindexDaemon(req, res) {
   if (authorized === true) {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash reindexDaemon.sh`;
-    nodecmd.get(exec, (err) => {
+    cmd.get(exec, (err) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error reindexing Daemon: ${err.message}`, err.name, err.code);
         return res.json(errMessage);
@@ -479,7 +474,7 @@ async function tailDaemonDebug(req, res) {
     const datadir = daemonService.getConfigValue('datadir') || defaultDir;
     const filepath = `${datadir}/debug.log`;
     const exec = `tail -n 100 ${filepath}`;
-    nodecmd.get(exec, (err, data) => {
+    cmd.get(exec, (err, data) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error obtaining Daemon debug file: ${err.message}`, err.name, err.code);
         res.json(errMessage);
@@ -510,7 +505,7 @@ async function tailBenchmarkDebug(req, res) {
     }
     const filepath = `${datadir}/debug.log`;
     const exec = `tail -n 100 ${filepath}`;
-    nodecmd.get(exec, (err, data) => {
+    cmd.get(exec, (err, data) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error obtaining Benchmark debug file: ${err.message}`, err.name, err.code);
         res.json(errMessage);
@@ -630,7 +625,7 @@ async function tailFluxLog(req, res, logfile) {
     const homeDirPath = path.join(__dirname, '../../../');
     const filepath = `${homeDirPath}${logfile}.log`;
     const exec = `tail -n 100 ${filepath}`;
-    nodecmd.get(exec, (err, data) => {
+    cmd.get(exec, (err, data) => {
       if (err) {
         const errMessage = messageHelper.createErrorMessage(`Error obtaining Flux ${logfile} file: ${err.message}`, err.name, err.code);
         res.json(errMessage);
@@ -753,7 +748,6 @@ async function getFluxInfo(req, res) {
       benchmark: {},
       flux: {},
       apps: {},
-      geolocation: storedGeolocation,
     };
     const versionRes = await getFluxVersion();
     if (versionRes.status === 'error') {
@@ -829,26 +823,6 @@ async function getFluxInfo(req, res) {
       throw appsResources.data;
     }
     info.apps.resources = appsResources.data;
-    const appHashes = await appsService.getAppHashes();
-    if (appHashes.status === 'error') {
-      throw appHashes.data;
-    }
-    info.apps.hashes = appHashes.data;
-    const explorerScannedHeight = await explorerService.getScannedHeight();
-    if (explorerScannedHeight.status === 'error') {
-      throw explorerScannedHeight.data;
-    }
-    info.flux.explorerScannedHeigth = explorerScannedHeight.data;
-    const connectionsOut = fluxCommunication.connectedPeersInfo();
-    if (connectionsOut.status === 'error') {
-      throw connectionsOut.data;
-    }
-    info.flux.connectionsOut = connectionsOut.data;
-    const connectionsIn = fluxNetworkHelper.getIncomingConnectionsInfo();
-    if (connectionsIn.status === 'error') {
-      throw connectionsIn.data;
-    }
-    info.flux.connectionsIn = connectionsIn.data;
 
     const response = messageHelper.createDataMessage(info);
     return res ? res.json(response) : response;
@@ -1000,63 +974,12 @@ async function InstallFluxWatchTower() {
   try {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash fluxwatchtower.sh`;
-    const cmdAsync = util.promisify(nodecmd.get);
+    const cmdAsync = util.promisify(cmd.get);
     const cmdres = await cmdAsync(exec);
     log.info(cmdres);
   } catch (error) {
     log.error(error);
   }
-}
-
-/**
- * Method responsable for setting node geolocation information
- */
-async function setNodeGeolocation() {
-  try {
-    const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-    if (!myIP) {
-      throw new Error('Flux IP not detected. Flux geolocation service is awaiting');
-    }
-    if (!storedGeolocation || myIP !== storedIp) {
-      log.info(`Checking geolocation of ${myIP}`);
-      storedIp = myIP;
-      // consider another service failover or stats db
-      const ipApiUrl = `http://ip-api.com/json/${myIP.split(':')[0]}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org`;
-      const ipRes = await serviceHelper.axiosGet(ipApiUrl);
-      if (ipRes.data.status !== 'success') {
-        throw new Error(`Geolocation of IP ${myIP} is unavailable`);
-      }
-      storedGeolocation = {
-        ip: ipRes.data.query,
-        continent: ipRes.data.continent,
-        continentCode: ipRes.data.continentCode,
-        country: ipRes.data.country,
-        countryCode: ipRes.data.countryCode,
-        region: ipRes.data.region,
-        regionName: ipRes.data.regionName,
-        lat: ipRes.data.lat,
-        lon: ipRes.data.lon,
-        org: ipRes.data.org,
-      };
-    }
-    log.info(`Geolocation of ${myIP} is ${JSON.stringify(storedGeolocation)}`);
-    setTimeout(() => { // executes again in 12h
-      setNodeGeolocation();
-    }, 12 * 60 * 60 * 1000);
-  } catch (error) {
-    log.error(`Failed to get Geolocation with ${error}`);
-    log.error(error);
-    setTimeout(() => {
-      setNodeGeolocation();
-    }, 5 * 60 * 1000);
-  }
-}
-
-/**
- * Method responsable for getting stored node geolocation information
- */
-function getNodeGeolocation() {
-  return storedGeolocation;
 }
 
 module.exports = {
@@ -1096,6 +1019,4 @@ module.exports = {
   fluxBackendFolder,
   getNodeTier,
   InstallFluxWatchTower,
-  setNodeGeolocation,
-  getNodeGeolocation,
 };
