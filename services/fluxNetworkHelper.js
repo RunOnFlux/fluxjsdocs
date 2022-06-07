@@ -9,11 +9,7 @@ const util = require('util');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const messageHelper = require('./messageHelper');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
-const daemonServiceZelnodeRpcs = require('./daemonService/daemonServiceZelnodeRpcs');
-const daemonServiceBenchmarkRpcs = require('./daemonService/daemonServiceBenchmarkRpcs');
-const daemonServiceWalletRpcs = require('./daemonService/daemonServiceWalletRpcs');
+const daemonService = require('./daemonService');
 const benchmarkService = require('./benchmarkService');
 const verificationHelper = require('./verificationHelper');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
@@ -70,12 +66,7 @@ class TokenBucket {
   }
 }
 
-/**
- * To perform a basic check of current FluxOS version.
- * @param {string} ip IP address.
- * @param {string} port Port. Defaults to config.server.apiport.
- * @returns {boolean} False unless FluxOS version meets or exceeds the minimum allowed version.
- */
+// basic check for a version of other flux.
 async function isFluxAvailable(ip, port = config.server.apiport) {
   try {
     const fluxResponse = await serviceHelper.axiosGet(`http://${ip}:${port}/flux/version`, axiosConfig);
@@ -92,12 +83,7 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
   }
 }
 
-/**
- * To check Flux availability for specific IP address/port.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
+// basic check for a version of other flux.
 async function checkFluxAvailability(req, res) {
   let { ip } = req.params;
   ip = ip || req.query.ip;
@@ -170,12 +156,8 @@ function getDosStateValue() {
   return dosState;
 }
 
-/**
- * To get Flux IP adress and port.
- * @returns {string} IP address and port.
- */
 async function getMyFluxIPandPort() {
-  const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+  const benchmarkResponse = await daemonService.getBenchmarks();
   let myIP = null;
   if (benchmarkResponse.status === 'success') {
     const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -187,21 +169,11 @@ async function getMyFluxIPandPort() {
   return myIP;
 }
 
-/**
- * To get FluxNode private key.
- * @param {string} privatekey Private Key.
- * @returns {string} Private key, if already input as parameter or otherwise from the daemon config.
- */
 async function getFluxNodePrivateKey(privatekey) {
-  const privKey = privatekey || daemonServiceUtils.getConfigValue('zelnodeprivkey');
+  const privKey = privatekey || daemonService.getConfigValue('zelnodeprivkey');
   return privKey;
 }
 
-/**
- * To get FluxNode public key.
- * @param {string} privatekey Private key.
- * @returns {string} Public key.
- */
 async function getFluxNodePublicKey(privatekey) {
   try {
     const pkWIF = await getFluxNodePrivateKey(privatekey);
@@ -213,11 +185,7 @@ async function getFluxNodePublicKey(privatekey) {
   }
 }
 
-/**
- * To get a random connection.
- * @returns {string} IP:Port or just IP if default.
- */
-async function getRandomConnection() {
+async function getRandomConnection() { // returns ip:port or just ip if default
   const nodeList = await fluxCommunicationUtils.deterministicFluxList();
   const zlLength = nodeList.length;
   if (zlLength === 0) {
@@ -233,11 +201,6 @@ async function getRandomConnection() {
   return ip;
 }
 
-/**
- * To close an outgoing connection.
- * @param {string} ip IP address.
- * @returns {object} Message.
- */
 async function closeConnection(ip) {
   if (!ip) return messageHelper.createWarningMessage('To close a connection please provide a proper IP number.');
   const wsObj = outgoingConnections.find((client) => client._socket.remoteAddress === ip);
@@ -261,13 +224,6 @@ async function closeConnection(ip) {
   return messageHelper.createSuccessMessage(`Outgoing connection to ${ip} closed`);
 }
 
-/**
- * To close an incoming connection.
- * @param {string} ip IP address.
- * @param {object} expressWS Express web socket.
- * @param {object} clientToClose Web socket for client to close.
- * @returns {object} Message.
- */
 async function closeIncomingConnection(ip, expressWS, clientToClose) {
   if (!ip) return messageHelper.createWarningMessage('To close a connection please provide a proper IP number.');
   const clientsSet = expressWS.clients || [];
@@ -297,13 +253,6 @@ async function closeIncomingConnection(ip, expressWS, clientToClose) {
   return messageHelper.createSuccessMessage(`Incoming connection to ${ip} closed`);
 }
 
-/**
- * To check rate limit.
- * @param {string} ip IP address.
- * @param {number} fillPerSecond Defaults to value of 10.
- * @param {number} maxBurst Defaults to value of 15.
- * @returns {boolean} True if a token is taken from the IP's token bucket. Otherwise false.
- */
 function checkRateLimit(ip, fillPerSecond = 10, maxBurst = 15) {
   if (!buckets.has(ip)) {
     buckets.set(ip, new TokenBucket(maxBurst, fillPerSecond));
@@ -317,12 +266,6 @@ function checkRateLimit(ip, fillPerSecond = 10, maxBurst = 15) {
   return false;
 }
 
-/**
- * To get IP addresses for incoming connections.
- * @param {object} req Request.
- * @param {object} res Response.
- * @param {object} expressWS Express web socket.
- */
 function getIncomingConnections(req, res, expressWS) {
   const clientsSet = expressWS.clients;
   const connections = [];
@@ -334,11 +277,6 @@ function getIncomingConnections(req, res, expressWS) {
   res.json(response);
 }
 
-/**
- * To get info for incoming connections.
- * @param {object} req Request.
- * @param {object} res Response.
- */
 function getIncomingConnectionsInfo(req, res) {
   const connections = incomingPeers;
   const message = messageHelper.createDataMessage(connections);
@@ -366,10 +304,6 @@ function getStoredFluxBenchAllowed() {
   return storedFluxBenchAllowed;
 }
 
-/**
- * To check if Flux benchmark version is allowed.
- * @returns {boolean} True if version is verified as allowed. Otherwise false.
- */
 async function checkFluxbenchVersionAllowed() {
   if (storedFluxBenchAllowed) {
     return storedFluxBenchAllowed >= minimumFluxBenchAllowedVersion;
@@ -402,11 +336,6 @@ async function checkFluxbenchVersionAllowed() {
   }
 }
 
-/**
- * To check user's FluxNode availability.
- * @param {number} retryNumber Number of retries.
- * @returns {boolean} True if all checks passed.
- */
 async function checkMyFluxAvailability(retryNumber = 0) {
   const fluxBenchVersionAllowed = await checkFluxbenchVersionAllowed();
   if (!fluxBenchVersionAllowed) {
@@ -464,7 +393,7 @@ async function checkMyFluxAvailability(retryNumber = 0) {
       if (benchMyIP && benchMyIP !== myIP) {
         log.info('New public Ip detected, updating the FluxNode info in the network');
         myIP = benchMyIP;
-        daemonServiceWalletRpcs.createConfirmationTransaction();
+        daemonService.createConfirmationTransaction();
         await serviceHelper.delay(4 * 60 * 1000); // lets wait 2 blocks time for the transaction to be mined
         return true;
       } if (benchMyIP && benchMyIP === myIP) {
@@ -497,11 +426,6 @@ async function checkMyFluxAvailability(retryNumber = 0) {
   return true;
 }
 
-/**
- * To adjust an external IP.
- * @param {string} ip IP address.
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
- */
 async function adjustExternalIP(ip) {
   try {
     const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
@@ -532,10 +456,6 @@ async function adjustExternalIP(ip) {
   }
 }
 
-/**
- * To check deterministic node collisions (i.e. if multiple FluxNode instances detected).
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
- */
 async function checkDeterministicNodesCollisions() {
   try {
     // get my external ip address
@@ -544,7 +464,7 @@ async function checkDeterministicNodesCollisions() {
     // another precatuion might be comparing node list on multiple nodes. evaulate in the future
     const myIP = await getMyFluxIPandPort();
     if (myIP) {
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         setTimeout(() => {
           checkDeterministicNodesCollisions();
@@ -553,7 +473,7 @@ async function checkDeterministicNodesCollisions() {
       }
       const nodeList = await fluxCommunicationUtils.deterministicFluxList();
       const result = nodeList.filter((node) => node.ip === myIP);
-      const nodeStatus = await daemonServiceZelnodeRpcs.getZelNodeStatus();
+      const nodeStatus = await daemonService.getZelNodeStatus();
       if (nodeStatus.status === 'success') { // different scenario is caught elsewhere
         const myCollateral = nodeStatus.data.collateral;
         const myNode = result.find((node) => node.collateral === myCollateral);
@@ -602,12 +522,6 @@ async function checkDeterministicNodesCollisions() {
   }
 }
 
-/**
- * To get DOS state.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
 async function getDOSState(req, res) {
   const data = {
     dosState,
@@ -617,11 +531,6 @@ async function getDOSState(req, res) {
   return res ? res.json(response) : response;
 }
 
-/**
- * To allow a port.
- * @param {string} port Port.
- * @returns {object} Command status.
- */
 async function allowPort(port) {
   const exec = `sudo ufw allow ${port} && sudo ufw allow out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
@@ -641,11 +550,6 @@ async function allowPort(port) {
   return cmdStat;
 }
 
-/**
- * To deny a port.
- * @param {string} port Port.
- * @returns {object} Command status.
- */
 async function denyPort(port) {
   const exec = `sudo ufw deny ${port} && sudo ufw deny out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
@@ -665,12 +569,6 @@ async function denyPort(port) {
   return cmdStat;
 }
 
-/**
- * To allow a port via API. Only accessible by admins and Flux team members.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
 async function allowPortApi(req, res) {
   let { port } = req.params;
   port = port || req.query.port;
@@ -695,10 +593,6 @@ async function allowPortApi(req, res) {
   return res.json(response);
 }
 
-/**
- * To check if a firewall is active.
- * @returns {boolean} True if a firewall is active. Otherwise false.
- */
 async function isFirewallActive() {
   try {
     const cmdAsync = util.promisify(nodecmd.get);
@@ -715,9 +609,6 @@ async function isFirewallActive() {
   }
 }
 
-/**
- * To adjust a firewall to allow ports for Flux.
- */
 async function adjustFirewall() {
   try {
     const cmdAsync = util.promisify(nodecmd.get);

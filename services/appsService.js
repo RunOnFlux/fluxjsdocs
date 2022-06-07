@@ -17,8 +17,7 @@ const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const daemonServiceBenchmarkRpcs = require('./daemonService/daemonServiceBenchmarkRpcs');
+const daemonService = require('./daemonService');
 const benchmarkService = require('./benchmarkService');
 const dockerService = require('./dockerService');
 const generalService = require('./generalService');
@@ -871,7 +870,7 @@ async function fluxUsage(req, res) {
     if (result) {
       explorerHeight = serviceHelper.ensureNumber(result.generalScannedHeight) || 999999999;
     }
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const syncStatus = daemonService.isDaemonSynced();
     const daemonHeight = syncStatus.data.height;
     let cpuCores = 0;
     const cpus = os.cpus();
@@ -1018,7 +1017,7 @@ async function getNodeSpecs() {
     }
     if (nodeSpecs.ssdStorage === 0) {
       // get my external IP and check that it is longer than 5 in length.
-      const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+      const benchmarkResponse = await daemonService.getBenchmarks();
       if (benchmarkResponse.status === 'success') {
         const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
         log.info(`Gathered ssdstorage ${benchmarkResponseData.ssd}`);
@@ -4555,14 +4554,14 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
   // this takes roughly at least 1 second
   if (furtherVerification) {
     if (message.type === 'zelappregister' || message.type === 'fluxappregister') {
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       await verifyAppSpecifications(specifications, daemonHeight);
       await verifyAppHash(message);
       await checkApplicationRegistrationNameConflicts(specifications);
       await verifyAppMessageSignature(message.type, message.version, specifications, message.timestamp, message.signature);
     } else if (message.type === 'zelappupdate' || message.type === 'fluxappupdate') {
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       // stadard verifications
       await verifyAppSpecifications(specifications, daemonHeight);
@@ -5065,7 +5064,7 @@ async function registerAppGlobalyApi(req, res) {
 
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -5182,7 +5181,7 @@ async function updateAppGlobalyApi(req, res) {
 
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -6412,7 +6411,7 @@ async function trySpawningGlobalApplication() {
     const adjustedDelay = delay / probLn;
 
     // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    const benchmarkResponse = await daemonService.getBenchmarks();
     let myIP = null;
     if (benchmarkResponse.status === 'success') {
       const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -6597,7 +6596,7 @@ async function trySpawningGlobalApplication() {
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    const benchmarkResponse = await daemonService.getBenchmarks();
     let myIP = null;
     if (benchmarkResponse.status === 'success') {
       const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -7152,7 +7151,7 @@ async function getAppPrice(req, res) {
           _id: 0,
         },
       };
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -7260,7 +7259,7 @@ async function verifyAppRegistrationParameters(req, res) {
       appSpecification = serviceHelper.ensureObject(appSpecification);
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -7307,7 +7306,7 @@ async function verifyAppUpdateParameters(req, res) {
       appSpecification = serviceHelper.ensureObject(appSpecification);
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
