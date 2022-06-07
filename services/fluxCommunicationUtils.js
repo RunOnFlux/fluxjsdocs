@@ -3,10 +3,11 @@ const LRU = require('lru-cache');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
-const daemonServiceZelnodeRpcs = require('./daemonService/daemonServiceZelnodeRpcs');
+const daemonService = require('./daemonService');
+
 // default cache
 const LRUoptions = {
-  max: 12000, // currently 12000 nodes
+  max: 2000, // currently 750 nodes lets put a value expecting increase in the numbers.
   maxAge: 1000 * 150, // 150 seconds slightly over average blocktime. Allowing 1 block expired too.
 };
 
@@ -14,11 +15,8 @@ const myCache = new LRU(LRUoptions);
 
 let addingNodesToCache = false;
 
-/**
- * To get deterministc Flux list from cache.
- * @param {string} filter Filter. Can only be a publicKey.
- * @returns {(*|*)} Value of any type or an empty array of any type.
- */
+// get deterministc Flux list from cache
+// filter can only be a publicKey!
 async function deterministicFluxList(filter) {
   try {
     while (addingNodesToCache) {
@@ -40,7 +38,7 @@ async function deterministicFluxList(filter) {
           params: {},
           query: {},
         };
-        const daemonFluxNodesList = await daemonServiceZelnodeRpcs.viewDeterministicZelNodeList(request);
+        const daemonFluxNodesList = await daemonService.viewDeterministicZelNodeList(request);
         if (daemonFluxNodesList.status === 'success') {
           generalFluxList = daemonFluxNodesList.data || [];
           myCache.set('fluxList', generalFluxList);
@@ -67,13 +65,7 @@ async function deterministicFluxList(filter) {
   }
 }
 
-/**
- * To verify Flux broadcast.
- * @param {object} data Data containing public key, timestamp, signature and version.
- * @param {object[]} obtainedFluxNodesList List of FluxNodes.
- * @param {number} currentTimeStamp Current timestamp.
- * @returns {boolean} False unless message is successfully verified.
- */
+// return boolean
 async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp) {
   const dataObj = serviceHelper.ensureObject(data);
   const { pubKey } = dataObj;
@@ -116,12 +108,6 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
   return false;
 }
 
-/**
- * To verify timestamp in Flux broadcast.
- * @param {object} data Data.
- * @param {number} currentTimeStamp Current timestamp.
- * @returns {boolean} False unless current timestamp is within 5 minutes of the data object's timestamp.
- */
 async function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
   // eslint-disable-next-line no-param-reassign
   const dataObj = serviceHelper.ensureObject(data);
@@ -134,13 +120,7 @@ async function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
   return false;
 }
 
-/**
- * To verify original Flux broadcast. Extends verifyFluxBroadcast by not allowing request older than 5 mins.
- * @param {object} data Data.
- * @param {object[]} obtainedFluxNodeList List of FluxNodes.
- * @param {number} currentTimeStamp Current timestamp.
- * @returns {boolean} False unless message is successfully verified.
- */
+// extends verifyFluxBroadcast by not allowing request older than 5 mins.
 async function verifyOriginalFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp) {
   if (await verifyTimestampInFluxBroadcast(data, currentTimeStamp)) {
     return verifyFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp);

@@ -5,7 +5,7 @@ const WebSocket = require('ws');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
+const daemonService = require('./daemonService');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
@@ -17,7 +17,7 @@ const {
 let response = messageHelper.createErrorMessage();
 // default cache
 const LRUoptions = {
-  max: 12000, // currently 12000 nodes
+  max: 2000, // currently 750 nodes lets put a value expecting increase in the numbers.
   maxAge: 1000 * 150, // 150 seconds slightly over average blocktime. Allowing 1 block expired too.
 };
 
@@ -453,7 +453,7 @@ async function addPeer(req, res) {
  */
 async function fluxDiscovery() {
   try {
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const syncStatus = daemonService.isDaemonSynced();
     if (!syncStatus.data.synced) {
       throw new Error('Daemon not yet synced. Flux discovery is awaiting.');
     }
