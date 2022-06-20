@@ -17,13 +17,12 @@ const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const daemonServiceBenchmarkRpcs = require('./daemonService/daemonServiceBenchmarkRpcs');
+const daemonService = require('./daemonService');
 const benchmarkService = require('./benchmarkService');
 const dockerService = require('./dockerService');
 const generalService = require('./generalService');
 const upnpService = require('./upnpService');
-const geolocationService = require('./geolocationService');
+const fluxService = require('./fluxService');
 const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
@@ -871,7 +870,7 @@ async function fluxUsage(req, res) {
     if (result) {
       explorerHeight = serviceHelper.ensureNumber(result.generalScannedHeight) || 999999999;
     }
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const syncStatus = daemonService.isDaemonSynced();
     const daemonHeight = syncStatus.data.height;
     let cpuCores = 0;
     const cpus = os.cpus();
@@ -1018,7 +1017,7 @@ async function getNodeSpecs() {
     }
     if (nodeSpecs.ssdStorage === 0) {
       // get my external IP and check that it is longer than 5 in length.
-      const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+      const benchmarkResponse = await daemonService.getBenchmarks();
       if (benchmarkResponse.status === 'success') {
         const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
         log.info(`Gathered ssdstorage ${benchmarkResponseData.ssd}`);
@@ -2023,22 +2022,22 @@ function totalAppHWRequirements(appSpecifications, myNodeTier) {
 function checkAppGeolocationRequirements(appSpecs) {
   // check geolocation
   if (appSpecs.version >= 5) {
-    const nodeGeo = geolocationService.getNodeGeolocation();
+    const nodeGeo = fluxService.getNodeGeolocation();
     if (!nodeGeo) {
       throw new Error('Node Geolocation not set. Aborting.');
     }
     if (appSpecs.geolocation && appSpecs.geolocation.length > 0) {
       const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
-      const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
       if (appContinent) {
         if (appContinent.slice(1) !== nodeGeo.continentCode) {
           throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
         }
-      }
 
-      if (appCountry) {
-        if (appCountry.slice(1) !== nodeGeo.countryCode) {
-          throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
+        const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
+        if (appCountry) {
+          if (appCountry.slice(1) !== nodeGeo.countryCode) {
+            throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
+          }
         }
       }
     }
@@ -3578,6 +3577,28 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
     if (appSpecifications.containerPort < 0 || appSpecifications.containerPort > 65535) {
       throw new Error(`Container Port ${appSpecifications.containerPort} is not within system limits 0-65535`);
     }
+    if (appSpecifications.repotag.length > 100) {
+      throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
+    }
+    if (appSpecifications.containerData.length > 100) {
+      throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
+    }
+    if (appSpecifications.enviromentParameters.length > 10) {
+      throw new Error(`App ${appSpecifications.name} environment invalid. Maximum of 10 environment variables allowed.`);
+    }
+    appSpecifications.enviromentParameters.forEach((env) => {
+      if (env.length > 50) {
+        throw new Error(`App ${appSpecifications.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
+      }
+    });
+    if (appSpecifications.commands.length > 10) {
+      throw new Error(`App ${appSpecifications.name} commands invalid. Maximum of 10 commands allowed.`);
+    }
+    appSpecifications.commands.forEach((com) => {
+      if (com.length > 50) {
+        throw new Error(`App ${appSpecifications.name} command ${com} is too long. Maximum of 50 characters is allowed`);
+      }
+    });
   } else if (appSpecifications.version <= 3) {
     // check port is within range
     appSpecifications.ports.forEach((port) => {
@@ -3600,9 +3621,31 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
     if (appSpecifications.ports.length > 5) {
       throw new Error('Too many ports defined. Maximum of 5 allowed.');
     }
+    if (appSpecifications.repotag.length > 100) {
+      throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
+    }
+    if (appSpecifications.containerData.length > 100) {
+      throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
+    }
+    if (appSpecifications.enviromentParameters.length > 10) {
+      throw new Error(`App ${appSpecifications.name} environment invalid. Maximum of 10 environment variables allowed.`);
+    }
+    appSpecifications.enviromentParameters.forEach((env) => {
+      if (env.length > 50) {
+        throw new Error(`App ${appSpecifications.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
+      }
+    });
+    if (appSpecifications.commands.length > 10) {
+      throw new Error(`App ${appSpecifications.name} commands invalid. Maximum of 10 commands allowed.`);
+    }
+    appSpecifications.commands.forEach((com) => {
+      if (com.length > 50) {
+        throw new Error(`App ${appSpecifications.name} command ${com} is too long. Maximum of 50 characters is allowed`);
+      }
+    });
     appSpecifications.domains.forEach((dom) => {
-      if (dom.length > 253) {
-        throw new Error(`App ${appSpecifications.name} domain ${dom} is too long. Maximum of 253 characters is allowed`);
+      if (dom.length > 50) {
+        throw new Error(`App ${appSpecifications.name} domain ${dom} is too long. Maximum of 50 characters is allowed`);
       }
     });
   }
@@ -3612,29 +3655,13 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
     if (appSpecifications.containerData.length < 2) {
       throw new Error('Flux App container data folder not specified. If no data folder is whished, use /tmp');
     }
-    if (appSpecifications.containerData.length > 200) {
-      throw new Error('Flux App Container Data is too long. Maximum of 200 characters is allowed');
-    }
-    if (appSpecifications.repotag.length > 200) {
-      throw new Error('Flux App Repository is too long. Maximum of 200 characters is allowed.');
-    }
-    if (appSpecifications.enviromentParameters.length > 20) {
-      throw new Error(`App ${appSpecifications.name} environment invalid. Maximum of 20 environment variables allowed.`);
-    }
-    appSpecifications.enviromentParameters.forEach((env) => {
-      if (env.length > 400) {
-        throw new Error(`App ${appSpecifications.name} environment ${env} is too long. Maximum of 400 characters is allowed`);
-      }
-    });
-    if (appSpecifications.commands.length > 20) {
-      throw new Error(`App ${appSpecifications.name} commands invalid. Maximum of 20 commands allowed.`);
-    }
-    appSpecifications.commands.forEach((com) => {
-      if (com.length > 400) {
-        throw new Error(`App ${appSpecifications.name} command ${com} is too long. Maximum of 400 characters is allowed`);
-      }
-    });
   } else {
+    if (appSpecifications.instances < config.fluxapps.minimumInstances) {
+      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
+    }
+    if (appSpecifications.instances > config.fluxapps.maximumInstances) {
+      throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
+    }
     if (appSpecifications.compose.length < 1) {
       throw new Error('Flux App does not contain any composition');
     }
@@ -3676,31 +3703,31 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
           throw new Error(`Assigned port ${port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
         }
       });
-      if (appComponent.repotag.length > 200) {
-        throw new Error('Flux App Repository is too long. Maximum of 200 characters is allowed.');
+      if (appComponent.repotag.length > 100) {
+        throw new Error('Flux App Repository is too long. Maximum of 100 characters is allowed.');
       }
-      if (appComponent.containerData.length > 200) {
-        throw new Error('Flux App Container Data is too long. Maximum of 200 characters is allowed');
+      if (appComponent.containerData.length > 100) {
+        throw new Error('Flux App Container Data is too long. Maximum of 100 characters is allowed');
       }
-      if (appComponent.environmentParameters.length > 20) {
-        throw new Error(`App component ${appComponent.name} environment invalid. Maximum of 20 environment variables allowed.`);
+      if (appComponent.environmentParameters.length > 10) {
+        throw new Error(`App component ${appComponent.name} environment invalid. Maximum of 10 environment variables allowed.`);
       }
       appComponent.environmentParameters.forEach((env) => {
-        if (env.length > 400) {
-          throw new Error(`App component ${appComponent.name} environment ${env} is too long. Maximum of 400 characters is allowed`);
+        if (env.length > 50) {
+          throw new Error(`App component ${appComponent.name} environment ${env} is too long. Maximum of 50 characters is allowed`);
         }
       });
-      if (appComponent.commands.length > 20) {
-        throw new Error(`App component ${appComponent.name} commands invalid. Maximum of 20 commands allowed.`);
+      if (appComponent.commands.length > 10) {
+        throw new Error(`App component ${appComponent.name} commands invalid. Maximum of 10 commands allowed.`);
       }
       appComponent.commands.forEach((com) => {
-        if (com.length > 400) {
-          throw new Error(`App component ${appComponent.name} command ${com} is too long. Maximum of 400 characters is allowed`);
+        if (com.length > 50) {
+          throw new Error(`App component ${appComponent.name} command ${com} is too long. Maximum of 50 characters is allowed`);
         }
       });
       appComponent.domains.forEach((dom) => {
-        if (dom.length > 253) {
-          throw new Error(`App component ${appComponent.name} domain ${dom} is too long. Maximum of 253 characters is allowed`);
+        if (dom.length > 50) {
+          throw new Error(`App component ${appComponent.name} domain ${dom} is too long. Maximum of 50 characters is allowed`);
         }
       });
       // check if containerPort makes sense
@@ -3722,15 +3749,6 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications) {
       if (appComponent.containerData.length < 2) {
         throw new Error(`Flux App container data folder not specified in in ${appComponent.name}. If no data folder is whished, use /tmp`);
       }
-    }
-  }
-
-  if (appSpecifications.version >= 3) {
-    if (appSpecifications.instances < config.fluxapps.minimumInstances) {
-      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
-    }
-    if (appSpecifications.instances > config.fluxapps.maximumInstances) {
-      throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
     }
   }
 
@@ -4555,14 +4573,14 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
   // this takes roughly at least 1 second
   if (furtherVerification) {
     if (message.type === 'zelappregister' || message.type === 'fluxappregister') {
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       await verifyAppSpecifications(specifications, daemonHeight);
       await verifyAppHash(message);
       await checkApplicationRegistrationNameConflicts(specifications);
       await verifyAppMessageSignature(message.type, message.version, specifications, message.timestamp, message.signature);
     } else if (message.type === 'zelappupdate' || message.type === 'fluxappupdate') {
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       // stadard verifications
       await verifyAppSpecifications(specifications, daemonHeight);
@@ -5065,7 +5083,7 @@ async function registerAppGlobalyApi(req, res) {
 
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -5182,7 +5200,7 @@ async function updateAppGlobalyApi(req, res) {
 
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -6043,7 +6061,7 @@ async function getAppHashes(req, res) {
     };
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     const resultsResponse = messageHelper.createDataMessage(results);
-    return res ? res.json(resultsResponse) : resultsResponse;
+    res.json(resultsResponse);
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(
@@ -6051,7 +6069,7 @@ async function getAppHashes(req, res) {
       error.name,
       error.code,
     );
-    return res ? res.json(errorResponse) : errorResponse;
+    res.json(errorResponse);
   }
 }
 
@@ -6398,8 +6416,6 @@ async function trySpawningGlobalApplication() {
       log.info(`App ${randomApp} was already evaluated in the last 30m.`);
       if (numberOfGlobalApps < 20) {
         await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
-      } else {
-        await serviceHelper.delay(config.fluxapps.installation.delay * 1000 * 0.1);
       }
       trySpawningGlobalApplication();
       return;
@@ -6414,7 +6430,7 @@ async function trySpawningGlobalApplication() {
     const adjustedDelay = delay / probLn;
 
     // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    const benchmarkResponse = await daemonService.getBenchmarks();
     let myIP = null;
     if (benchmarkResponse.status === 'success') {
       const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -6599,7 +6615,7 @@ async function trySpawningGlobalApplication() {
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    const benchmarkResponse = await daemonService.getBenchmarks();
     let myIP = null;
     if (benchmarkResponse.status === 'success') {
       const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -7154,7 +7170,7 @@ async function getAppPrice(req, res) {
           _id: 0,
         },
       };
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -7262,7 +7278,7 @@ async function verifyAppRegistrationParameters(req, res) {
       appSpecification = serviceHelper.ensureObject(appSpecification);
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }
@@ -7309,7 +7325,7 @@ async function verifyAppUpdateParameters(req, res) {
       appSpecification = serviceHelper.ensureObject(appSpecification);
       const appSpecFormatted = specificationFormatter(appSpecification);
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const syncStatus = daemonService.isDaemonSynced();
       if (!syncStatus.data.synced) {
         throw new Error('Daemon not yet synced.');
       }

@@ -6,9 +6,8 @@ const explorerService = require('./explorerService');
 const fluxCommunication = require('./fluxCommunication');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const appsService = require('./appsService');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
+const daemonService = require('./daemonService');
 const fluxService = require('./fluxService');
-const geolocationService = require('./geolocationService');
 const upnpService = require('./upnpService');
 const userconfig = require('../../../config/userconfig');
 
@@ -75,9 +74,9 @@ async function startFluxFunctions() {
     log.info('Firewalls checked');
     fluxCommunication.keepConnectionsAlive();
     log.info('Connections polling prepared');
-    daemonServiceMiscRpcs.daemonBlockchainInfoService();
+    daemonService.daemonBlockchainInfoService();
     log.info('Flux Daemon Info Service Started');
-    fluxService.installFluxWatchTower();
+    fluxService.InstallFluxWatchTower();
     fluxNetworkHelper.checkDeterministicNodesCollisions();
     log.info('Flux checks operational');
     fluxCommunication.fluxDiscovery();
@@ -94,7 +93,7 @@ async function startFluxFunctions() {
     }, 1 * 60 * 1000);
     setTimeout(() => {
       log.info('Starting setting Node Geolocation');
-      geolocationService.setNodeGeolocation();
+      fluxService.setNodeGeolocation();
     }, 90 * 1000);
     setTimeout(() => { // wait as of restarts due to ui building
       explorerService.initiateBlockProcessor(true, true);

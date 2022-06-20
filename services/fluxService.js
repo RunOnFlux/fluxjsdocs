@@ -12,18 +12,15 @@ const packageJson = require('../../../package.json');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const daemonServiceZelnodeRpcs = require('./daemonService/daemonServiceZelnodeRpcs');
-const daemonServiceBenchmarkRpcs = require('./daemonService/daemonServiceBenchmarkRpcs');
-const daemonServiceControlRpcs = require('./daemonService/daemonServiceControlRpcs');
+const daemonService = require('./daemonService');
 const benchmarkService = require('./benchmarkService');
 const appsService = require('./appsService');
 const generalService = require('./generalService');
-const explorerService = require('./explorerService');
-const fluxCommunication = require('./fluxCommunication');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
-const geolocationService = require('./geolocationService');
 const userconfig = require('../../../config/userconfig');
+
+let storedGeolocation = null;
+let storedIp = null;
 
 /**
  * To show the directory on the node machine where FluxOS files are stored.
@@ -377,7 +374,7 @@ function getFluxVersion(req, res) {
  * @returns {object} Message.
  */
 async function getFluxIP(req, res) {
-  const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+  const benchmarkResponse = await daemonService.getBenchmarks();
   let myIP = null;
   if (benchmarkResponse.status === 'success') {
     const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
@@ -439,7 +436,7 @@ async function daemonDebug(req, res) {
   }
   // check daemon datadir
   const defaultDir = new fullnode.Config().defaultFolder();
-  const datadir = daemonServiceMiscRpcs.getConfigValue('datadir') || defaultDir;
+  const datadir = daemonService.getConfigValue('datadir') || defaultDir;
   const filepath = `${datadir}/debug.log`;
 
   return res.download(filepath, 'debug.log');
@@ -477,7 +474,7 @@ async function tailDaemonDebug(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
   if (authorized === true) {
     const defaultDir = new fullnode.Config().defaultFolder();
-    const datadir = daemonServiceMiscRpcs.getConfigValue('datadir') || defaultDir;
+    const datadir = daemonService.getConfigValue('datadir') || defaultDir;
     const filepath = `${datadir}/debug.log`;
     const exec = `tail -n 100 ${filepath}`;
     nodecmd.get(exec, (err, data) => {
@@ -754,7 +751,7 @@ async function getFluxInfo(req, res) {
       benchmark: {},
       flux: {},
       apps: {},
-      geolocation: geolocationService.getNodeGeolocation(),
+      geolocation: storedGeolocation,
     };
     const versionRes = await getFluxVersion();
     if (versionRes.status === 'error') {
@@ -787,13 +784,13 @@ async function getFluxInfo(req, res) {
     }
     info.flux.dos = dosResult.data;
 
-    const daemonInfoRes = await daemonServiceControlRpcs.getInfo();
+    const daemonInfoRes = await daemonService.getInfo();
     if (daemonInfoRes.status === 'error') {
       throw daemonInfoRes.data;
     }
     info.daemon.info = daemonInfoRes.data;
 
-    const daemonNodeStatusRes = await daemonServiceZelnodeRpcs.getZelNodeStatus();
+    const daemonNodeStatusRes = await daemonService.getZelNodeStatus();
     if (daemonNodeStatusRes.status === 'error') {
       throw daemonNodeStatusRes.data;
     }
@@ -830,29 +827,6 @@ async function getFluxInfo(req, res) {
       throw appsResources.data;
     }
     info.apps.resources = appsResources.data;
-    const appHashes = await appsService.getAppHashes();
-    if (appHashes.status === 'error') {
-      throw appHashes.data;
-    }
-    const hashesOk = appHashes.data.filter((data) => data.height >= 694000);
-    info.appsHashesTotal = hashesOk.length;
-    const mesOK = hashesOk.filter((mes) => mes.message === true);
-    info.hashesPresent = mesOK.length;
-    const explorerScannedHeight = await explorerService.getScannedHeight();
-    if (explorerScannedHeight.status === 'error') {
-      throw explorerScannedHeight.data;
-    }
-    info.flux.explorerScannedHeigth = explorerScannedHeight.data;
-    const connectionsOut = fluxCommunication.connectedPeersInfo();
-    if (connectionsOut.status === 'error') {
-      throw connectionsOut.data;
-    }
-    info.flux.numberOfConnectionsOut = connectionsOut.data.length;
-    const connectionsIn = fluxNetworkHelper.getIncomingConnectionsInfo();
-    if (connectionsIn.status === 'error') {
-      throw connectionsIn.data;
-    }
-    info.flux.numberOfConnectionsIn = connectionsIn.data.length;
 
     const response = messageHelper.createDataMessage(info);
     return res ? res.json(response) : response;
@@ -1000,7 +974,7 @@ async function getNodeTier(req, res) {
 /**
  * To install Flux Watch Tower (executes the command `bash fluxwatchtower.sh` in the relevent directory on the node machine).
  */
-async function installFluxWatchTower() {
+async function InstallFluxWatchTower() {
   try {
     const nodedpath = path.join(__dirname, '../../../helpers');
     const exec = `cd ${nodedpath} && bash fluxwatchtower.sh`;
@@ -1010,6 +984,57 @@ async function installFluxWatchTower() {
   } catch (error) {
     log.error(error);
   }
+}
+
+/**
+ * Method responsable for setting node geolocation information
+ */
+async function setNodeGeolocation() {
+  try {
+    const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+    if (!myIP) {
+      throw new Error('Flux IP not detected. Flux geolocation service is awaiting');
+    }
+    if (!storedGeolocation || myIP !== storedIp) {
+      log.info(`Checking geolocation of ${myIP}`);
+      storedIp = myIP;
+      // consider another service failover or stats db
+      const ipApiUrl = `http://ip-api.com/json/${myIP.split(':')[0]}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org`;
+      const ipRes = await serviceHelper.axiosGet(ipApiUrl);
+      if (ipRes.data.status !== 'success') {
+        throw new Error(`Geolocation of IP ${myIP} is unavailable`);
+      }
+      storedGeolocation = {
+        ip: ipRes.data.query,
+        continent: ipRes.data.continent,
+        continentCode: ipRes.data.continentCode,
+        country: ipRes.data.country,
+        countryCode: ipRes.data.countryCode,
+        region: ipRes.data.region,
+        regionName: ipRes.data.regionName,
+        lat: ipRes.data.lat,
+        lon: ipRes.data.lon,
+        org: ipRes.data.org,
+      };
+    }
+    log.info(`Geolocation of ${myIP} is ${JSON.stringify(storedGeolocation)}`);
+    setTimeout(() => { // executes again in 12h
+      setNodeGeolocation();
+    }, 12 * 60 * 60 * 1000);
+  } catch (error) {
+    log.error(`Failed to get Geolocation with ${error}`);
+    log.error(error);
+    setTimeout(() => {
+      setNodeGeolocation();
+    }, 5 * 60 * 1000);
+  }
+}
+
+/**
+ * Method responsable for getting stored node geolocation information
+ */
+function getNodeGeolocation() {
+  return storedGeolocation;
 }
 
 module.exports = {
@@ -1048,5 +1073,7 @@ module.exports = {
   adjustKadenaAccount,
   fluxBackendFolder,
   getNodeTier,
-  installFluxWatchTower,
+  InstallFluxWatchTower,
+  setNodeGeolocation,
+  getNodeGeolocation,
 };
