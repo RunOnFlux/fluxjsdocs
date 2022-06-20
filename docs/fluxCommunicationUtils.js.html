@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>JSDoc: Source: serviceHelper.js</title>
+    <title>JSDoc: Source: fluxCommunicationUtils.js</title>
 
     <script src="scripts/prettify/prettify.js"> </script>
     <script src="scripts/prettify/lang-css.js"> </script>
@@ -17,7 +17,7 @@
 
 <div id="main">
 
-    <h1 class="page-title">Source: serviceHelper.js</h1>
+    <h1 class="page-title">Source: fluxCommunicationUtils.js</h1>
 
     
 
@@ -26,161 +26,161 @@
     
     <section>
         <article>
-            <pre class="prettyprint source linenums"><code>const axios = require('axios');
-const config = require('config');
-const qs = require('qs');
-
-const dbHelper = require('./dbHelper');
+            <pre class="prettyprint source linenums"><code>/* eslint-disable no-underscore-dangle */
+const LRU = require('lru-cache');
 const log = require('../lib/log');
-
-/**
- * To delay by a number of milliseconds.
- * @param {number} ms Number of milliseconds.
- * @returns {Promise} Promise object.
- */
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * To convert a parameter to a boolean.
- * @param {(string|number|boolean)} parameter True, false, 1 or 0 in either string, number or boolean form.
- * @returns {boolean} True or false.
- */
-function ensureBoolean(parameter) {
-  let param;
-  if (parameter === 'false' || parameter === 0 || parameter === '0' || parameter === false) {
-    param = false;
-  }
-  if (parameter === 'true' || parameter === 1 || parameter === '1' || parameter === true) {
-    param = true;
-  }
-  return param;
-}
-
-/**
- * To convert a parameter to a number.
- * @param {*} parameter Parameter of any type.
- * @returns {number} Parameter converted to number type.
- */
-function ensureNumber(parameter) {
-  return typeof parameter === 'number' ? parameter : Number(parameter);
-}
-
-/**
- * To check if a parameter is an object and if not, return an empty object.
- * @param {*} parameter Parameter of any type.
- * @returns {object} Returns the original parameter if it is an object or returns an empty object.
- */
-function ensureObject(parameter) {
-  if (typeof parameter === 'object') {
-    return parameter;
-  }
-  if (!parameter) {
-    return {};
-  }
-  let param;
-  try {
-    param = JSON.parse(parameter);
-  } catch (e) {
-    param = qs.parse(parameter);
-  }
-  if (typeof param !== 'object') {
-    return {};
-  }
-  return param;
-}
-
-/**
- * To convert a parameter to a string.
- * @param {*} parameter Parameter of any type.
- * @returns {string} Parameter converted to string type.
- */
-function ensureString(parameter) {
-  return typeof parameter === 'string' ? parameter : JSON.stringify(parameter);
-}
-
-/**
- * To return the owner of a FluxOS application.
- * @param {string} appName Name of app.
- * @returns {number} Owner.
- */
-// helper owner flux app function
-async function getApplicationOwner(appName) {
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-
-  const query = { name: new RegExp(`^${appName}$`, 'i') };
-  const projection = {
-    projection: {
-      _id: 0,
-      owner: 1,
-    },
-  };
-  const globalAppsInformation = config.database.appsglobal.collections.appsInformation;
-  const appSpecs = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-  if (appSpecs) {
-    return appSpecs.owner;
-  }
-  // eslint-disable-next-line global-require
-  const appsService = require('./appsService');
-  const allApps = await appsService.availableApps();
-  const appInfo = allApps.find((app) => app.name.toLowerCase() === appName.toLowerCase());
-  if (appInfo) {
-    return appInfo.owner;
-  }
-  return null;
-}
-
-/**
- * To delete login phrase.
- * @param {string} phrase Login phrase.
- */
-async function deleteLoginPhrase(phrase) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.local.database);
-    const collection = config.database.local.collections.activeLoginPhrases;
-    const query = { loginPhrase: phrase };
-    const projection = {};
-    await dbHelper.findOneAndDeleteInDatabase(database, collection, query, projection);
-  } catch (error) {
-    log.error(error);
-  }
-}
-
-/**
- * To handle timeouts on axios connection.
- * @param {string} url URL.
- * @param {object} options Options object.
- * @returns {object} Response.
- */
-// helper function for timeout on axios connection
-const axiosGet = (url, options = {
-  timeout: 20000,
-}) => {
-  const abort = axios.CancelToken.source();
-  const id = setTimeout(
-    () => abort.cancel(`Timeout of ${options.timeout}ms.`),
-    options.timeout,
-  );
-  return axios
-    .get(url, { cancelToken: abort.token, ...options })
-    .then((res) => {
-      clearTimeout(id);
-      return res;
-    });
+const serviceHelper = require('./serviceHelper');
+const verificationHelper = require('./verificationHelper');
+const daemonServiceZelnodeRpcs = require('./daemonService/daemonServiceZelnodeRpcs');
+// default cache
+const LRUoptions = {
+  max: 12000, // currently 12000 nodes
+  maxAge: 1000 * 150, // 150 seconds slightly over average blocktime. Allowing 1 block expired too.
 };
 
+const myCache = new LRU(LRUoptions);
+
+let addingNodesToCache = false;
+
+/**
+ * To get deterministc Flux list from cache.
+ * @param {string} filter Filter. Can only be a publicKey.
+ * @returns {(*|*)} Value of any type or an empty array of any type.
+ */
+async function deterministicFluxList(filter) {
+  try {
+    while (addingNodesToCache) {
+      // prevent several instances filling the cache at the same time.
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(100);
+    }
+    let fluxList;
+    if (filter) {
+      fluxList = myCache.get(`fluxList${serviceHelper.ensureString(filter)}`);
+    } else {
+      fluxList = myCache.get('fluxList');
+    }
+    if (!fluxList) {
+      let generalFluxList = myCache.get('fluxList');
+      addingNodesToCache = true;
+      if (!generalFluxList) {
+        const request = {
+          params: {},
+          query: {},
+        };
+        const daemonFluxNodesList = await daemonServiceZelnodeRpcs.viewDeterministicZelNodeList(request);
+        if (daemonFluxNodesList.status === 'success') {
+          generalFluxList = daemonFluxNodesList.data || [];
+          myCache.set('fluxList', generalFluxList);
+          if (filter) {
+            const filterFluxList = generalFluxList.filter((node) => node.pubkey === filter);
+            myCache.set(`fluxList${serviceHelper.ensureString(filter)}`, filterFluxList);
+          }
+        }
+      } else { // surely in filtered branch too
+        const filterFluxList = generalFluxList.filter((node) => node.pubkey === filter);
+        myCache.set(`fluxList${serviceHelper.ensureString(filter)}`, filterFluxList);
+      }
+      addingNodesToCache = false;
+      if (filter) {
+        fluxList = myCache.get(`fluxList${serviceHelper.ensureString(filter)}`);
+      } else {
+        fluxList = myCache.get('fluxList');
+      }
+    }
+    return fluxList || [];
+  } catch (error) {
+    log.error(error);
+    return [];
+  }
+}
+
+/**
+ * To verify Flux broadcast.
+ * @param {object} data Data containing public key, timestamp, signature and version.
+ * @param {object[]} obtainedFluxNodesList List of FluxNodes.
+ * @param {number} currentTimeStamp Current timestamp.
+ * @returns {boolean} False unless message is successfully verified.
+ */
+async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp) {
+  const dataObj = serviceHelper.ensureObject(data);
+  const { pubKey } = dataObj;
+  const { timestamp } = dataObj; // ms
+  const { signature } = dataObj;
+  const { version } = dataObj;
+  // only version 1 is active
+  if (version !== 1) {
+    return false;
+  }
+  const message = serviceHelper.ensureString(dataObj.data);
+  // is timestamp valid ?
+  // eslint-disable-next-line no-param-reassign
+  currentTimeStamp = currentTimeStamp || Date.now(); // ms
+  if (currentTimeStamp &lt; (timestamp - 120000)) { // message was broadcasted in the future. Allow 120 sec clock sync
+    return false;
+  }
+
+  let node = null;
+  if (obtainedFluxNodesList) { // for test purposes.
+    node = obtainedFluxNodesList.find((key) => key.pubkey === pubKey);
+    if (!node) {
+      return false;
+    }
+  }
+  if (!node) {
+    // node that broadcasted the message has to be on list
+    // pubkey of the broadcast has to be on the list
+    const zl = await deterministicFluxList(pubKey); // this itself is sufficient.
+    node = zl.find((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
+  }
+  if (!node) {
+    return false;
+  }
+  const messageToVerify = version + message + timestamp;
+  const verified = await verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
+  if (verified === true) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * To verify timestamp in Flux broadcast.
+ * @param {object} data Data.
+ * @param {number} currentTimeStamp Current timestamp.
+ * @returns {boolean} False unless current timestamp is within 5 minutes of the data object's timestamp.
+ */
+async function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
+  // eslint-disable-next-line no-param-reassign
+  const dataObj = serviceHelper.ensureObject(data);
+  const { timestamp } = dataObj; // ms
+  // eslint-disable-next-line no-param-reassign
+  currentTimeStamp = currentTimeStamp || Date.now(); // ms
+  if (currentTimeStamp &lt; (timestamp + 300000)) { // bigger than 5 mins
+    return true;
+  }
+  return false;
+}
+
+/**
+ * To verify original Flux broadcast. Extends verifyFluxBroadcast by not allowing request older than 5 mins.
+ * @param {object} data Data.
+ * @param {object[]} obtainedFluxNodeList List of FluxNodes.
+ * @param {number} currentTimeStamp Current timestamp.
+ * @returns {boolean} False unless message is successfully verified.
+ */
+async function verifyOriginalFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp) {
+  if (await verifyTimestampInFluxBroadcast(data, currentTimeStamp)) {
+    return verifyFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp);
+  }
+  return false;
+}
+
 module.exports = {
-  ensureBoolean,
-  ensureNumber,
-  ensureObject,
-  ensureString,
-  axiosGet,
-  delay,
-  getApplicationOwner,
-  deleteLoginPhrase,
+  verifyTimestampInFluxBroadcast,
+  verifyOriginalFluxBroadcast,
+  deterministicFluxList,
+  verifyFluxBroadcast,
 };
 </code></pre>
         </article>
