@@ -24,6 +24,7 @@ jobs:
       uses: andstor/jsdoc-action@v1
       with:
         source_dir: ./services # The folder holding the source files imported from RunOnFlux/flux.
+        recurse: true # Recurse into subdirectories (now that daemon service files are separate) when scanning for source files.
         output_dir: ./JSDocsBuild # The temp folder the action should build files in.
     - name: Deploy 🚀
       uses: JamesIves/github-pages-deploy-action@4.0.0
