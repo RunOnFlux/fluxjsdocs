@@ -282,6 +282,21 @@ async function removeIncomingPeer(req, res, expressWS) {
 }
 
 /**
+ * To check if sufficient communication is established. Minimum number of outgoing and incoming peers must be met.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ */
+function isCommunicationEstablished(req, res) {
+  let message;
+  if (outgoingPeers.length < config.fluxapps.minOutgoing || incomingPeers.length < config.fluxapps.minIncoming) {
+    message = messageHelper.createErrorMessage('Not enough connections established to Flux network');
+  } else {
+    message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
+  }
+  res.json(message);
+}
+
+/**
  * To initiate and handle a connection. Opens a web socket and handles various events during connection.
  * @param {string} connection IP address (and port if applicable).
  */
@@ -519,6 +534,7 @@ module.exports = {
   removePeer,
   removeIncomingPeer,
   connectedPeersInfo,
+  isCommunicationEstablished,
   keepConnectionsAlive,
   fluxDiscovery,
   handleAppMessages,
