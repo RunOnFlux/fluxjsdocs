@@ -403,42 +403,6 @@ async function checkFluxbenchVersionAllowed() {
 }
 
 /**
- * To get node uptime in seconds
- * @param {object} req Request.
- * @param {object} res Response.
- */
-function fluxUptime(req, res) {
-  let message;
-  try {
-    const ut = process.uptime();
-    const measureUptime = Math.floor(ut);
-    message = messageHelper.createDataMessage(measureUptime);
-    return res ? res.json(message) : message;
-  } catch (error) {
-    log.error(error);
-    message = messageHelper.createErrorMessage('Error obtaining uptime');
-    return res ? res.json(message) : message;
-  }
-}
-
-/**
- * To check if sufficient communication is established. Minimum number of outgoing and incoming peers must be met.
- * @param {object} req Request.
- * @param {object} res Response.
- */
-function isCommunicationEstablished(req, res) {
-  let message;
-  if (outgoingPeers.length < config.fluxapps.minOutgoing) { // easier to establish
-    message = messageHelper.createErrorMessage('Not enough connections established to Flux network');
-  } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node
-    message = messageHelper.createErrorMessage('Not enough connections established to Flux network');
-  } else {
-    message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
-  }
-  return res ? res.json(message) : message;
-}
-
-/**
  * To check user's FluxNode availability.
  * @param {number} retryNumber Number of retries.
  * @returns {boolean} True if all checks passed.
@@ -528,25 +492,6 @@ async function checkMyFluxAvailability(retryNumber = 0) {
     }
     return false;
   }
-  const measuredUptime = fluxUptime();
-  if (measuredUptime.status === 'success' && measuredUptime.data > config.minUpTime) { // node has been running for 1 hour. Upon starting a node, there can be dos that needs resetting
-    const nodeList = await fluxCommunicationUtils.deterministicFluxList();
-    if (nodeList.length > config.fluxapps.minIncoming + config.fluxapps.minOutgoing) {
-      // check sufficient connections
-      const connectionInfo = isCommunicationEstablished();
-      if (connectionInfo.status === 'error') {
-        dosState += 0.015; // slow increment, DOS after ~13 hours. 0.015 per minute. This check depends on other nodes being able to connect to my node
-        if (dosState > 10) {
-          setDosMessage(dosMessage || 'Flux does not have sufficient peers');
-          log.error(dosMessage);
-          return false;
-        }
-        return true; // availability ok
-      }
-    }
-  } else if (measuredUptime.status === 'error') {
-    log.error('Flux uptime is not available'); // introduce dos increment
-  }
   dosState = 0;
   setDosMessage(null);
   return true;
@@ -635,26 +580,9 @@ async function checkDeterministicNodesCollisions() {
           }
         }
       }
-      // early stages of the network or testnet
-      if (nodeList.length > config.fluxapps.minIncoming + config.fluxapps.minOutgoing) {
-        const availabilityOk = await checkMyFluxAvailability();
-        if (availabilityOk) {
-          adjustExternalIP(myIP.split(':')[0]);
-        }
-      } else { // sufficient amount of nodes has to appear on the network within 12 hours
-        const measuredUptime = fluxUptime();
-        if (measuredUptime.status === 'success' && measuredUptime.data > (config.minUpTime * 12)) {
-          const availabilityOk = await checkMyFluxAvailability();
-          if (availabilityOk) {
-            adjustExternalIP(myIP.split(':')[0]);
-          }
-        } else if (measuredUptime.status === 'error') {
-          log.error('Flux uptime unavailable');
-          const availabilityOk = await checkMyFluxAvailability();
-          if (availabilityOk) {
-            adjustExternalIP(myIP.split(':')[0]);
-          }
-        }
+      const availabilityOk = await checkMyFluxAvailability();
+      if (availabilityOk) {
+        adjustExternalIP(myIP.split(':')[0]);
       }
     } else {
       dosState += 1;
@@ -859,6 +787,4 @@ module.exports = {
   setDosMessage,
   setDosStateValue,
   getDosStateValue,
-  fluxUptime,
-  isCommunicationEstablished,
 };
