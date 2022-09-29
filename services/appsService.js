@@ -871,6 +871,24 @@ async function appMonitorStream(req, res) {
 }
 
 /**
+ * Returns folder size in byes of application component
+ * @param {object} appName monitored component name
+ */
+async function getAppFolderSize(appName) {
+  try {
+    const dirpath = path.join(__dirname, '../../../');
+    const directoryPath = `${dirpath}ZelApps/${appName}`;
+    const exec = `sudo du -s --block-size=1 ${directoryPath}`;
+    const cmdres = await cmdAsync(exec);
+    const size = serviceHelper.ensureString(cmdres).split('\t')[0] || 0;
+    return size;
+  } catch (error) {
+    log.error(error);
+    return 0;
+  }
+}
+
+/**
  * Starts app monitoring for a single app and saves monitoring data in-memory to the appsMonitored object.
  * @param {object} appName monitored component name
  */
@@ -888,8 +906,15 @@ function startAppMonitoring(appName) {
     appsMonitored[appName].oneMinuteInterval = setInterval(async () => {
       try {
         const statsNow = await dockerService.dockerContainerStats(appName);
+        const appFolderName = dockerService.getAppDockerNameIdentifier(appName).substring(1);
+        const folderSize = await getAppFolderSize(appFolderName);
+        statsNow.disk_stats = {
+          used: folderSize,
+        };
         appsMonitored[appName].oneMinuteStatsStore.unshift({ timestamp: new Date().getTime(), data: statsNow }); // Most recent stats object is at position 0 in the array
-        appsMonitored[appName].oneMinuteStatsStore.length = 60; // Store stats every 1 min for the last hour only
+        if (appsMonitored[appName].oneMinuteStatsStore.length > 60) {
+          appsMonitored[appName].oneMinuteStatsStore.length = 60; // Store stats every 1 min for the last hour only
+        }
       } catch (error) {
         log.error(error);
       }
@@ -898,7 +923,9 @@ function startAppMonitoring(appName) {
       try {
         const statsNow = await dockerService.dockerContainerStats(appName);
         appsMonitored[appName].fifteenMinStatsStore.unshift({ timestamp: new Date().getTime(), data: statsNow }); // Most recent stats object is at position 0 in the array
-        appsMonitored[appName].fifteenMinStatsStore.length = 96; // Store stats every 15 mins for the last day only
+        if (appsMonitored[appName].oneMinuteStatsStore.length > 96) {
+          appsMonitored[appName].fifteenMinStatsStore.length = 96; // Store stats every 15 mins for the last day only
+        }
       } catch (error) {
         log.error(error);
       }
@@ -2444,7 +2471,6 @@ function checkAppGeolocationRequirements(appSpecs) {
       throw new Error('Node Geolocation not set. Aborting.');
     }
     if (appSpecs.geolocation && appSpecs.geolocation.length > 0) {
-      // previous geolocation specification version (a, b) [aEU, bFR]
       const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
       const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
       if (appContinent) {
@@ -2452,31 +2478,15 @@ function checkAppGeolocationRequirements(appSpecs) {
           throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
         }
       }
+
       if (appCountry) {
         if (appCountry.slice(1) !== nodeGeo.countryCode) {
           throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
         }
       }
-
-      // current geolocation style [acEU], [acEU_CZ], [acEU_CZ_PRG], [a!cEU], [a!cEU_CZ], [a!cEU_CZ_PRG]
-      const geoC = appSpecs.geolocation.filter((x) => x.startsWith('ac')); // this ensures that new specs can only run on updated nodes.
-      const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
-      const myNodeLocationContinent = nodeGeo.continentCode;
-      const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
-      const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionCode}`;
-      geoCForbidden.forEach((locationNotAllowed) => {
-        if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
-          throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
-        }
-      });
-      if (geoC.length) {
-        const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull);
-        if (!nodeLocationOK) {
-          throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
-        }
-      }
     }
   }
+
   return true;
 }
 
