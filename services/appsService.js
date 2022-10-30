@@ -2485,9 +2485,6 @@ function checkAppGeolocationRequirements(appSpecs) {
       const myNodeLocationContinent = nodeGeo.continentCode;
       const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
       const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
-      const myNodeLocationContinentALL = 'ALL';
-      const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
-      const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
 
       if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
         if (appContinent.slice(1) !== nodeGeo.continentCode) {
@@ -2506,8 +2503,7 @@ function checkAppGeolocationRequirements(appSpecs) {
         }
       });
       if (geoC.length) {
-        const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
-          || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL);
+        const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull);
         if (!nodeLocationOK) {
           throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
         }
@@ -3784,9 +3780,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
   if (typeof version !== 'number') {
     throw new Error('Invalid Flux App version');
   }
-  if (!serviceHelper.isDecimalLimit(version)) {
-    throw new Error('Invalid Flux App version decimals');
-  }
 
   if (typeof name !== 'string') {
     throw new Error('Invalid Flux App name');
@@ -3819,9 +3812,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       ports.forEach((parameter) => {
         if (typeof parameter !== 'string') {
           throw new Error('Ports for Flux App are invalid');
-        }
-        if (!serviceHelper.isDecimalLimit(parameter, 0)) {
-          throw new Error('Ports for Flux App are invalid decimals');
         }
       });
     } else {
@@ -3859,9 +3849,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         if (typeof parameter !== 'string') {
           throw new Error('Container Ports for Flux App are invalid');
         }
-        if (!serviceHelper.isDecimalLimit(parameter, 0)) {
-          throw new Error('Container Ports for Flux App are invalid decimals');
-        }
       });
     } else {
       throw new Error('Container Ports for Flux App are invalid');
@@ -3871,9 +3858,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
     if (typeof cpu !== 'number' || typeof hdd !== 'number' || typeof ram !== 'number') {
       throw new Error('Invalid HW specifications');
-    }
-    if (!serviceHelper.isDecimalLimit(cpu) || !serviceHelper.isDecimalLimit(hdd) || !serviceHelper.isDecimalLimit(ram)) {
-      throw new Error('Invalid HW specifications decimal limits');
     }
 
     if (tiered) {
@@ -3889,11 +3873,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       if (typeof cpubasic !== 'number' || typeof cpusuper !== 'number' || typeof cpubamf !== 'number'
         || typeof rambasic !== 'number' || typeof ramsuper !== 'number' || typeof rambamf !== 'number'
         || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
-        throw new Error('Invalid tiered HW specifications');
-      }
-      if (!serviceHelper.isDecimalLimit(cpubasic) || !serviceHelper.isDecimalLimit(cpusuper) || !serviceHelper.isDecimalLimit(cpubamf)
-        || !serviceHelper.isDecimalLimit(rambasic) || !serviceHelper.isDecimalLimit(ramsuper) || !serviceHelper.isDecimalLimit(rambamf)
-        || !serviceHelper.isDecimalLimit(hddbasic) || !serviceHelper.isDecimalLimit(hddsuper) || !serviceHelper.isDecimalLimit(hddbamf)) {
         throw new Error('Invalid tiered HW specifications');
       }
     }
@@ -3927,9 +3906,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         appComponent.ports.forEach((parameter) => {
           if (typeof parameter !== 'number') {
             throw new Error(`Ports for Flux App component ${appComponent.name} are invalid`);
-          }
-          if (!serviceHelper.isDecimalLimit(parameter, 0)) {
-            throw new Error(`Ports for Flux App component ${appComponent.name} are invalid decimals`);
           }
         });
       } else {
@@ -3967,9 +3943,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
           if (typeof parameter !== 'number') {
             throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid`);
           }
-          if (!serviceHelper.isDecimalLimit(parameter, 0)) {
-            throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid decimals`);
-          }
         });
       } else {
         throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid`);
@@ -3982,9 +3955,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       const hddB = appComponent.hdd;
       if (typeof cpuB !== 'number' || typeof ramB !== 'number' || typeof hddB !== 'number') {
         throw new Error('Invalid HW specifications');
-      }
-      if (!serviceHelper.isDecimalLimit(cpuB) || !serviceHelper.isDecimalLimit(ramB) || !serviceHelper.isDecimalLimit(hddB)) {
-        throw new Error('Invalid HW specifications decimal limits');
       }
       if (appComponent.tiered) {
         const { cpubasic } = appComponent;
@@ -4001,11 +3971,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
           || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
           throw new Error('Invalid tiered HW specifications');
         }
-        if (!serviceHelper.isDecimalLimit(cpubasic) || !serviceHelper.isDecimalLimit(cpusuper) || !serviceHelper.isDecimalLimit(cpubamf)
-          || !serviceHelper.isDecimalLimit(rambasic) || !serviceHelper.isDecimalLimit(ramsuper) || !serviceHelper.isDecimalLimit(rambamf)
-          || !serviceHelper.isDecimalLimit(hddbasic) || !serviceHelper.isDecimalLimit(hddsuper) || !serviceHelper.isDecimalLimit(hddbamf)) {
-          throw new Error('Invalid tiered HW specifications');
-        }
       }
     });
   }
@@ -4018,9 +3983,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       throw new Error('Invalid instances specification');
     }
     if (Number.isInteger(instances) !== true) {
-      throw new Error('Invalid instances specified');
-    }
-    if (!serviceHelper.isDecimalLimit(instances, 0)) {
       throw new Error('Invalid instances specified');
     }
   }
@@ -5048,10 +5010,6 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
   console.log(serviceHelper.ensureString(message));
   myCache.set(serviceHelper.ensureString(message), message);
   const specifications = message.appSpecifications || message.zelAppSpecifications;
-  // eslint-disable-next-line no-use-before-define
-  const appSpecFormatted = specificationFormatter(specifications);
-  const messageTimestamp = serviceHelper.ensureNumber(message.timestamp);
-  const messageVersion = serviceHelper.ensureNumber(message.version);
 
   // check permanent app message storage
   const appMessage = await checkAppMessageExistence(message.hash);
@@ -5072,23 +5030,23 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
     if (message.type === 'zelappregister' || message.type === 'fluxappregister') {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
-      await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+      await verifyAppSpecifications(specifications, daemonHeight);
       await verifyAppHash(message);
-      await checkApplicationRegistrationNameConflicts(appSpecFormatted);
-      await verifyAppMessageSignature(message.type, messageVersion, appSpecFormatted, messageTimestamp, message.signature);
+      await checkApplicationRegistrationNameConflicts(specifications);
+      await verifyAppMessageSignature(message.type, message.version, specifications, message.timestamp, message.signature);
     } else if (message.type === 'zelappupdate' || message.type === 'fluxappupdate') {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       // stadard verifications
-      await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+      await verifyAppSpecifications(specifications, daemonHeight);
       await verifyAppHash(message);
       // verify that app exists, does not change repotag (for v1-v3), does not change name and does not change component names
-      await checkApplicationUpdateNameRepositoryConflicts(appSpecFormatted, messageTimestamp);
+      await checkApplicationUpdateNameRepositoryConflicts(specifications, message.timestamp);
       // get previousAppSpecifications as we need previous owner
-      const previousAppSpecs = await getPreviousAppSpecifications(appSpecFormatted, message);
+      const previousAppSpecs = await getPreviousAppSpecifications(specifications, message);
       const { owner } = previousAppSpecs;
       // here signature is checked against PREVIOUS app owner
-      await verifyAppMessageUpdateSignature(message.type, messageVersion, appSpecFormatted, messageTimestamp, message.signature, owner);
+      await verifyAppMessageUpdateSignature(message.type, message.version, specifications, message.timestamp, message.signature, owner);
     } else {
       throw new Error('Invalid Flux App message received');
     }
@@ -5098,11 +5056,11 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
   const validTill = receivedAt + (60 * 60 * 1000); // 60 minutes
 
   const newMessage = {
-    appSpecifications: appSpecFormatted,
+    appSpecifications: specifications,
     type: message.type, // shall be fluxappregister, fluxappupdate
-    version: messageVersion,
+    version: message.version,
     hash: message.hash,
-    timestamp: messageTimestamp,
+    timestamp: message.timestamp,
     signature: message.signature,
     receivedAt: new Date(receivedAt),
     expireAt: new Date(validTill),
