@@ -6982,8 +6982,7 @@ async function trySpawningGlobalApplication() {
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
       return;
-    }
-    if (benchmarkBenchRes.data.thunder) {
+    } else if (benchmarkBenchRes.data.thunder) {
       log.info('Flux Node is a Thunder Storage Node. Global applications will not be installed');
       await serviceHelper.delay(24 * 3600 * 1000); // check again in one day as changing from and to only requires the restart of flux daemon
       trySpawningGlobalApplication();
