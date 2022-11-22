@@ -53,7 +53,6 @@ const dockerService = require('./dockerService');
 const generalService = require('./generalService');
 const upnpService = require('./upnpService');
 const geolocationService = require('./geolocationService');
-const syncthingService = require('./syncthingService');
 const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
@@ -1212,7 +1211,7 @@ async function stopAppMonitoringAPI(req, res) {
       }
       const monitoringResponse = messageHelper.createSuccessMessage(successMessage);
       res.json(monitoringResponse);
-      // 2. Stop a specific app
+    // 2. Stop a specific app
     } else {
       const mainAppName = appname.split('_')[1] || appname;
       const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
@@ -1815,9 +1814,9 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     if (useThisVolume.mount === '/') {
       execRemoveAlloc = `sudo rm -rf ${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
     }
-    await cmdAsync(execRemoveAlloc).catch((e) => log.error(e));
-    const execFinal = `sudo rm -rf ${appsFolder + appId}`;
-    await cmdAsync(execFinal).catch((e) => log.error(e));
+    await cmdAsync(execRemoveAlloc);
+    const execFinal = `sudo rm -rf ${appsFolder + appId}/${appId}VERTEMP`;
+    await cmdAsync(execFinal);
     const aloocationRemoval2 = {
       status: 'Pre-removal cleaning completed. Forcing removal.',
     };
@@ -1867,9 +1866,6 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus2));
   }
-
-  // eslint-disable-next-line no-use-before-define
-  await stopSyncthingApp(monitoredName, res);
 
   const removeStatus = {
     status: isComponent ? `Removing Flux App component ${appSpecifications.name} container...` : `Removing Flux App ${appName} container...`,
@@ -2315,9 +2311,6 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus2));
   }
-
-  // eslint-disable-next-line no-use-before-define
-  await stopSyncthingApp(monitoredName, res);
 
   const removeStatus = {
     status: isComponent ? `Removing Flux App component ${appSpecifications.name} container...` : `Removing Flux App ${appName} container...`,
@@ -7017,8 +7010,7 @@ async function trySpawningGlobalApplication() {
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
       return;
-    }
-    if (benchmarkBenchRes.data.thunder) {
+    } else if (benchmarkBenchRes.data.thunder) {
       log.info('Flux Node is a Thunder Storage Node. Global applications will not be installed');
       await serviceHelper.delay(24 * 3600 * 1000); // check again in one day as changing from and to only requires the restart of flux daemon
       trySpawningGlobalApplication();
@@ -8185,93 +8177,6 @@ async function forceAppRemovals() {
   }
 }
 
-async function stopSyncthingApp(appComponentName, res) {
-  try {
-    const identifier = appComponentName;
-    const appId = dockerService.getAppIdentifier(identifier);
-    const folder = `${appsFolder + appId}`;
-    const allSyncthingFolders = await syncthingService.getConfigFolders();
-    if (allSyncthingFolders.status === 'error') {
-      return;
-    }
-    let folderId = null;
-    allSyncthingFolders.data.forEach((syncthingFolder) => {
-      if (syncthingFolder.path === folder) {
-        folderId = syncthingFolder.id;
-      }
-    });
-    if (!folderId) {
-      return;
-    }
-    const adjustSyncthingA = {
-      status: 'Adjusting Syncthing...',
-    };
-    // remove folder from syncthing
-    await syncthingService.adjustConfigFolders('delete', undefined, folderId);
-    const restartRequired = await syncthingService.getConfigRestartRequired();
-    if (restartRequired.status === 'success' &amp;&amp; restartRequired.data.requiresRestart === true) {
-      await syncthingService.systemRestart();
-    }
-    const adjustSyncthingB = {
-      status: 'Syncthing adjusted',
-    };
-    log.info(adjustSyncthingA);
-    if (res) {
-      res.write(serviceHelper.ensureString(adjustSyncthingA));
-    }
-    if (res) {
-      res.write(serviceHelper.ensureString(adjustSyncthingB));
-    }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
-// update syncthing configuration for locally installed apps
-async function syncthingApps() {
-  try {
-    // do not run if installationInProgress or removalInProgress
-    if (installationInProgress || removalInProgress) {
-      return;
-    }
-    // get list of all installed apps
-    const appsInstalled = await installedApps();
-    if (appsInstalled.status === 'error') {
-      return;
-    }
-    // go through every containerData of all components of every app
-    // const devicesToKeep = [];
-    // const foldersToKeep = [];
-    // eslint-disable-next-line no-restricted-syntax
-    for (const installedApp of appsInstalled.data) {
-      if (installedApp.version &lt;= 3) {
-        const containerDataFlags = installedApp.containerData.split(':')[1] ? installedApp.containerData.split(':')[0] : '';
-        if (containerDataFlags.includes('s')) {
-          // TODO do magic, this is syncthing
-          // get list of app running locations
-          // ask those app locations for syncthing device id
-          // add those devices to our devices list
-          // adjust activated folders
-        }
-      } else {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const installedComponent of installedApp) {
-          const containerDataFlags = installedComponent.containerData.split(':')[1] ? installedComponent.containerData.split(':')[0] : '';
-          if (containerDataFlags.includes('s')) {
-            // TODO do magic, this is syncthing
-          }
-        }
-      }
-    }
-    const restartRequired = await syncthingService.getConfigRestartRequired();
-    if (restartRequired.status === 'success' &amp;&amp; restartRequired.data.requiresRestart === true) {
-      await syncthingService.systemRestart();
-    }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -8360,7 +8265,6 @@ module.exports = {
   forceAppRemovals,
   getAllGlobalApplicationsNames,
   getAllGlobalApplicationsNamesWithLocation,
-  syncthingApps,
 };
 </code></pre>
         </article>
@@ -8379,7 +8283,7 @@ To verify privilege use verifyPrivilege from verificationHelper module.</a></li>
 <br class="clear">
 
 <footer>
-    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Mon Nov 21 2022 07:33:36 GMT+0000 (Coordinated Universal Time)
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Tue Nov 22 2022 15:49:54 GMT+0000 (Coordinated Universal Time)
 </footer>
 
 <script> prettyPrint(); </script>
