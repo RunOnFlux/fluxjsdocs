@@ -1,0 +1,2124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: syncthingService.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: syncthingService.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>const config = require('config');
+const nodecmd = require('node-cmd');
+const axios = require('axios');
+const { XMLParser } = require('fast-xml-parser');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const util = require('util');
+const qs = require('qs');
+const verificationHelper = require('./verificationHelper');
+// eslint-disable-next-line import/no-extraneous-dependencies
+
+const cmdAsync = util.promisify(nodecmd.get);
+const fsPromises = fs.promises;
+
+const messageHelper = require('./messageHelper');
+const serviceHelper = require('./serviceHelper');
+const log = require('../lib/log');
+const userconfig = require('../../../config/userconfig');
+
+const syncthingURL = `http://${config.syncthing.ip}:${config.syncthing.port}`;
+
+let syncthingApiKey = '';
+
+const parserOptions = {
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  allowBooleanAttributes: true,
+};
+const parser = new XMLParser(parserOptions);
+
+/**
+ * To get syncthing config xml file
+ * @returns {string} config gile (XML).
+ */
+async function getConfigFile() {
+  try {
+    const homedir = os.homedir();
+    const result = await fsPromises.readFile(`${homedir}/.config/syncthing/config.xml`, 'utf8');
+    return result;
+  } catch (error) {
+    log.error(error);
+    return null;
+  }
+}
+
+/**
+ * To get syncthing Api key
+ * @returns {string} Api key.
+ */
+async function getSyncthingApiKey() { // can throw
+  const fileRead = await getConfigFile();
+  if (!fileRead) {
+    throw new Error('No Syncthing configuration found');
+  }
+  const jsonConfig = parser.parse(fileRead);
+  const apiKey = jsonConfig.configuration.gui.apikey;
+  return apiKey;
+}
+
+/**
+ * To perform http request
+ * @param {string} method Method.
+ * @param {string} urlpath URL to be called.
+ * @param {object} data Request data.
+ * @returns {object} Message.
+ */
+async function performRequest(method = 'get', urlpath = '', data) {
+  try {
+    if (!syncthingApiKey) {
+      const apiKey = await getSyncthingApiKey();
+      syncthingApiKey = apiKey;
+    }
+    const instance = axios.create({
+      baseURL: syncthingURL,
+      timeout: 5000,
+      headers: {
+        'X-API-Key': syncthingApiKey,
+      },
+    });
+    const response = await instance[method](urlpath, data);
+    const successResponse = messageHelper.createDataMessage(response.data);
+    return successResponse;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return errorResponse;
+  }
+}
+/**
+ * To get meta
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function getMeta(req, res) {
+  // does not require authentication
+  const response = await performRequest('get', '/meta.js');
+  // "var metadata = {\"deviceID\":\"K6VOO4G-5RLTF3B-JTUFMHH-JWITKGM-63DTTMT-I6BMON6-7E3LVFW-V5WAIAO\"};\n"
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get Syhcthing health
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} System health, {"status": "OK"}.
+ */
+async function getHealth(req, res) {
+  const response = await performRequest('get', '/rest/noauth/health');
+  return res ? res.json(response) : response;
+}
+
+// === STATISTICS ENDPOINTS ===
+
+/**
+ * To get device statistics
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} General statistics about devices.
+ */
+async function statsDevice(req, res) {
+  const response = await performRequest('get', '/rest/stats/device');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get folder statistics
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} General statistics about folders.
+ */
+async function statsFolder(req, res) {
+  const response = await performRequest('get', '/rest/stats/folder');
+  return res ? res.json(response) : response;
+}
+
+// === SYSTEM ENDPOINTS ===
+
+/**
+ * To get list of directories matching the path given by the optional parameter current
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of directories in json array format.
+ */
+async function systemBrowse(req, res) {
+  let { current } = req.params;
+  current = current || req.query.current;
+  let apiPath = 'rest/system/browse';
+  if (current) {
+    apiPath += `?current=${current}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the list of configured devices and some metadata associated with them. The list also contains the local device itself as not connected.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of configured devices and some metadata in json format.
+ */
+async function systemConnections(req, res) {
+  const response = await performRequest('get', '/rest/system/connections');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the set of debug facilities and which of them are currently enabled.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of debug facilities and which of them are currently enabled.
+ */
+async function systemDebug(req, res) {
+  let method = 'get';
+  let { disable } = req.params;
+  disable = disable || req.query.disable;
+  let { enable } = req.params;
+  enable = enable || req.query.enable;
+  let apiPath = 'rest/system/debug';
+  if (enable || disable) {
+    method = 'post';
+  }
+  if (enable &amp;&amp; disable) {
+    apiPath += `?enable=${enable}&amp;disable=${disable}`;
+  } else if (enable) {
+    apiPath += `?enable=${enable}`;
+  } else if (disable) {
+    apiPath += `?disable=${disable}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the contents of the local discovery cache
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Contents of the local discovery cache
+ */
+async function systemDiscovery(req, res) {
+  let method = 'get';
+  let { device } = req.params;
+  device = device || req.query.device;
+  let { addr } = req.params;
+  addr = addr || req.query.addr;
+  let apiPath = 'rest/system/discovery';
+  if (device || addr) {
+    method = 'post';
+  }
+  if (device &amp;&amp; addr) { // both must be defined otherwise get
+    method = 'post';
+    apiPath += `?device=${device}&amp;addr=${addr}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Post with empty body to remove all recent errors.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemErrorClear(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/error/clear');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the list of recent errors. Post with an error message in the body (plain text) to register a new error.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemError(req, res) {
+  let method = 'get';
+  let { message } = req.params;
+  message = message || req.query.message;
+  const apiPath = 'rest/system/error';
+  if (message) {
+    method = 'post';
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath, message);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Post with an error message in the body (plain text) to register a new error.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postSystemError(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    const message = serviceHelper.ensureObject(body);
+    try {
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest('post', '/rest/system/error', message);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To get the list of recent log entries. The optional {since} parameter limits the results to message newer than the given timestamp in RFC 3339 format.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemLog(req, res) {
+  let { since } = req.params;
+  since = since || req.query.since;
+  let apiPath = 'rest/system/log';
+  if (since) {
+    apiPath += `?since=${since}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the list of recent log entries formatted as a text log instead of a JSON object. The optional {since} parameter limits the results to message newer than the given timestamp in RFC 3339 format.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemLogTxt(req, res) {
+  let { since } = req.params;
+  since = since || req.query.since;
+  let apiPath = 'rest/system/log.txt';
+  if (since) {
+    apiPath += `?since=${since}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the path locations used internally for storing configuration, database, and others.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemPaths(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/system/paths');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To pause the given device or all devices. Takes the optional parameter {device} (device ID). When omitted, pauses all devices.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemPause(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
+  let apiPath = 'rest/system/pause';
+  if (device) {
+    apiPath += `?device=${device}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns a {"ping": "pong"} object.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemPing(req, res) {
+  const response = await performRequest('get', '/rest/system/ping'); // can also be 'post', same
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To erase the current index database and restart Syncthing. With no query parameters, the entire database is erased from disk. By specifying the {folder} parameter with a valid folder ID, only information for that folder will be erased.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemReset(req, res) {
+  // note: scary call
+  let { folder } = req.params;
+  folder = folder || req.query.folder;
+  let apiPath = 'rest/system/reset';
+  if (folder) {
+    apiPath += `?folder=${folder}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To immediately restart Syncthing
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemRestart(req, res) {
+  log.info('Restarting Syncthing...');
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/restart');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  log.info('Syncthing restarted');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To resume the given device or all devices. Takes the optional parameter {device} (device ID). When omitted, resumes all devices
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemResume(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
+  let apiPath = 'rest/system/pause';
+  if (device) {
+    apiPath += `?device=${device}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To cause Syncthing to exit and not restart.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemShutdown(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/shutdown');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns information about current system status and resource usage.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemStatus(req, res) {
+  const response = await performRequest('get', '/rest/system/status');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Check for a possible upgrade, returns an object describing the newest version and upgrade possibility.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemUpgrade(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/system/upgrade');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To perform an upgrade to the newest released version and restart.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postSystemUpgrade(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/upgrade');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the current Syncthing version information.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemVersion(req, res) {
+  const response = await performRequest('get', '/rest/system/version');
+  return res ? res.json(response) : response;
+}
+
+// === CONFIG ENDPOINTS ===
+
+/**
+ * Returns the entire config.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfig(req, res) {
+  const response = await performRequest('get', '/rest/config');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Replaces the entire config.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfig(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest('put', '/rest/config', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Returns whether a restart of Syncthing is required for the current config to take effect.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigRestartRequired(req, res) {
+  const response = await performRequest('get', '/rest/config/restart-required');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the folder for the given ID.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigFolders(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
+  }
+  let { id } = req.params;
+  id = id || req.query.id;
+  let apiPath = '/rest/config/folders';
+  if (id) {
+    apiPath += `/${id}`;
+  }
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the device for the given ID.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDevices(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
+  }
+  let { id } = req.params;
+  id = id || req.query.id;
+  let apiPath = '/rest/config/devices';
+  if (id) {
+    apiPath += `/${id}`;
+  }
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To modify config for folders. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the folder
+ * @param {string} method Request method.
+ * @param {string} newConfig new config to be replaced.
+ * @param {string} id folder ID.
+ * @returns {object} Message
+ */
+async function adjustConfigFolders(method, newConfig, id) {
+  let apiPath = '/rest/config/folders';
+  if (id) {
+    apiPath += `/${id}`;
+  }
+  const response = await performRequest(method, apiPath, newConfig);
+  return response;
+}
+
+/**
+ * To modify config for folders. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the folder
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigFolders(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { id } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigFolders(method, newConfig, id);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify config for devices. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the device
+ * @param {string} method Request method.
+ * @param {string} newConfig new config.
+ * @param {string} id device ID.
+ * @returns {object} Message
+ */
+async function adjustConfigDevices(method, newConfig, id) {
+  let apiPath = '/rest/config/devices';
+  if (id) {
+    apiPath += `/${id}`;
+  }
+  const response = await performRequest(method, apiPath, newConfig);
+  return response;
+}
+
+/**
+ * To modify config for devices. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the devices
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDevices(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { id } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigDevices(method, newConfig, id);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Returns a template folder configuration object with all default values, which only needs a unique ID to be applied
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDefaultsFolder(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/folder');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns a template device configuration object with all default values, which only needs a unique ID to be applied
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDefaultsDevice(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/device');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To modify config for defult values for folders, PUT replaces the default config (omitted values are reset to the hard-coded defaults), PATCH replaces only the given child objects.
+ * @param {string} method Request method.
+ * @param {object} newConfig new config.
+ * @returns {object} Message
+ */
+async function adjustConfigDefaultsFolder(method, newConfig) {
+  log.info('Patching Syncthing defaults for folder configuration...');
+  const response = await performRequest(method, '/rest/config/defaults/folder', newConfig);
+  log.info('Syncthing defaults for folder configuration patched...');
+  return response;
+}
+
+/**
+ * To modify config for defult values for folders, PUT replaces the default config (omitted values are reset to the hard-coded defaults), PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsFolder(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigDefaultsFolder(method, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify config for defult values for devices, PUT replaces the default config (omitted values are reset to the hard-coded defaults), PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsDevice(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/defaults/device', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * returns an object listing ignore patterns to be used by default on folders, as an array of single-line strings
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDefaultsIgnores(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/ignores');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To replace the default ignore patterns from an object of the same format
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsIgnores(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = 'put';
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/defaults/ignores', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Returns the options object
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigOptions(req, res) {
+  const response = await performRequest('get', '/rest/config/options');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the gui object
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigGui(req, res) {
+  const response = await performRequest('get', '/rest/config/gui');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the ldap object
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigLdap(req, res) {
+  const response = await performRequest('get', '/rest/config/ldap');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To modify options object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {string} method Request.
+ * @param {object} newConfig Response.
+ * @returns {object} Message
+ */
+async function adjustConfigOptions(method, newConfig) {
+  log.info('Patching Syncthing configuration...');
+  const response = await performRequest(method, '/rest/config/options', newConfig);
+  log.info('Syncthing configuration patched...');
+  return response;
+}
+
+/**
+ * To modify options object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigOptions(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigOptions(method, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify gui object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigGui(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/gui', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify ldap object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigLdap(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/ldap', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+// === CLUSTER ENDPOINTS ===
+
+/**
+ * Lists remote devices which have tried to connect, but are not yet configured in the instance.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getClusterPendigDevices(req, res) {
+  const response = await performRequest('get', '/rest/cluster/pending/devices');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To remove records about a pending remote device which tried to connect.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postClusterPendigDevices(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { device } = processedBody;
+      const method = (processedBody.method || 'delete').toLowerCase();
+      let apiPath = '/rest/cluster/pending/devices';
+      if (device) {
+        apiPath += `?device=${device}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Lists folders which remote devices have offered to us, but are not yet shared from our instance to them. Takes the optional {device} parameter to only return folders offered by a specific remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getClusterPendigFolders(req, res) {
+  const response = await performRequest('get', '/rest/cluster/pending/folders');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To remove records about a pending folder announced from a remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postClusterPendigFolders(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'delete').toLowerCase();
+      let apiPath = '/rest/cluster/pending/folders';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+// === FOLDER ENDPOINTS ===
+
+/**
+ * Returns the list of errors encountered during scanning or pulling. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getFolderErrors(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/folder/errors';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of archived files that could be recovered. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getFolderVersions(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/folder/versions';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * To restore archived versions of a given set of files. Expects an object with attributes named after the relative file paths, with timestamps as values matching valid versionTime entries in the corresponding getFolderVersions() response object. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postFolderVersions(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/folder/versions';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+// === DATABASE ENDPOINTS ===
+
+/**
+ * Returns the directory tree of the global model. takes one mandatory {folder} parameter and two optional parameters {levels} and {prefix}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbBrowse(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { levels } = req.params;
+    levels = levels || req.query.levels;
+    let { prefix } = req.params;
+    prefix = prefix || req.query.prefix;
+    let apiPath = '/rest/db/browse';
+    if (!folder) {
+      throw new Error('folder parameter is mandatory');
+    }
+    const qq = {
+      folder,
+      levels,
+      prefix,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `?${qqStr};`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the completion percentage (0 to 100) and byte / item counts. Takes optional {device} and {folder} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbCompletion(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { device } = req.params;
+    device = device || req.query.device;
+    let apiPath = '/rest/db/completion';
+    if (folder || device) apiPath += '?';
+    const qq = {
+      folder,
+      device,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr};`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns most data available about a given file, including version and availability. Takes {folder} and {file} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbFile(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { file } = req.params;
+    file = file || req.query.file;
+    let apiPath = '/rest/db/file';
+    if (folder || file) apiPath += '?';
+    const qq = {
+      folder,
+      file,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr};`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the content of the .stignore as the ignore field. Takes one parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbIgnores(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/ignores';
+    if (folder) apiPath += `?folder=${folder}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of files which were changed locally in a receive-only folder. Takes one mandatory parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbLocalchanged(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/localchanged';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns lists of files which are needed by this device in order for it to become in sync. Takes one mandatory parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbNeed(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/need';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of files which are needed by that remote device in order for it to become in sync with the shared folder. Takes the mandatory parameters {folder} and {device}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbRemoteNeed(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { device } = req.params;
+    device = device || req.query.device;
+    let apiPath = '/rest/db/remoteneed';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    if (device) {
+      apiPath += `&amp;device=${device}`;
+    } else {
+      throw new Error('device parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns information about the current status of a folder. Takes the mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbStatus(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/status';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Updates the content of the .stignore echoing it back as a response. Takes one parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbIgnores(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/ignores';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Request override of a send only folder. Override means to make the local version latest, overriding changes made on other devices. This API call does nothing if the folder is not a send only folder. Takes the mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbOverride(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/override';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Moves the file to the top of the download queue.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbPrio(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const { file } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/prio';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      if (file) {
+        apiPath += `&amp;file=${file}`;
+      } else {
+        throw new Error('file parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To request revert of a receive only folder. Reverting a folder means to undo all local changes. This API call does nothing if the folder is not a receive only folder. Takes the mandatory parameter {folder}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbRevert(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/revert';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To request immediate scan. Takes the optional parameters {folder} (folder ID), {sub} (path relative to the folder root) and {next} (time in seconds)
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbScan(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const { sub } = processedBody;
+      const { next } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/scan';
+      if (folder || sub || next) apiPath += '?';
+      const qq = {
+        folder,
+        sub,
+        next,
+      };
+      const qqStr = qs.stringify(qq);
+      apiPath += `${qqStr};`;
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+// === DEBUG ===
+
+/**
+ * Summarizes the completion precentage for each remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugPeerCompletion(req, res) {
+  const response = await performRequest('get', '/rest/debug/peerCompletion');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns statistics about each served REST API endpoint, to diagnose how much time was spent generating the responses.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugHttpmetrics(req, res) {
+  const response = await performRequest('get', '/rest/debug/httpmetrics');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To capture a profile of what Syncthing is doing on the CPU
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugCpuprof(req, res) {
+  const response = await performRequest('get', '/rest/debug/cpuprof');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To capture a profile of what Syncthing is doing with the heap memory.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugHeapprof(req, res) {
+  const response = await performRequest('get', '/rest/debug/heapprof');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Collect information about the running instance for troubleshooting purposes.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugSupport(req, res) {
+  const response = await performRequest('get', '/rest/debug/support');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Show diagnostics about a certain file in a shared folder. Takes the {folder} and {file} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugFile(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { file } = req.params;
+    file = file || req.query.file;
+    let apiPath = '/rest/debug/file';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    if (file) {
+      apiPath += `&amp;file=${file}`;
+    } else {
+      throw new Error('file parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+// === EVENT ENDPOINTS ===
+
+/**
+ * To receive Syncthing events. takes {events}, {since}, {limit} and {timeout} parameters to filter the result.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getEvents(req, res) {
+  try {
+    let { events } = req.params;
+    events = events || req.query.events;
+    let { since } = req.params;
+    since = since || req.query.since;
+    let { limit } = req.params;
+    limit = limit || req.query.limit;
+    let { timeout } = req.params;
+    timeout = timeout || req.query.timeout;
+    let apiPath = '/rest/events';
+    if (events || since || limit || timeout) apiPath += '?';
+    const qq = {
+      events,
+      since,
+      limit,
+      timeout,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr};`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * To receive LocalChangeDetected and RemoteChangeDetected event types. takes {since}, {limit} and {timeout} parameters to filter the result.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getEventsDisk(req, res) {
+  try {
+    let { since } = req.params;
+    since = since || req.query.since;
+    let { limit } = req.params;
+    limit = limit || req.query.limit;
+    let { timeout } = req.params;
+    timeout = timeout || req.query.timeout;
+    let apiPath = '/rest/events/disk';
+    if (since || limit || timeout) apiPath += '?';
+    const qq = {
+      since,
+      limit,
+      timeout,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr};`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+// === MISC SERVICES ENDPOINTS ===
+
+/**
+ * Verifies and formats a device ID. Takes one parameter, {id}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcDeviceID(req, res) {
+  try {
+    let { id } = req.params;
+    id = id || req.query.id;
+    let apiPath = '/rest/svc/deviceid';
+    if (id) {
+      apiPath += `?id=${id}`;
+    } else {
+      throw new Error('id parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns a strong random generated string (alphanumeric) of the specified length. Takes the {length} parameter.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcRandomString(req, res) {
+  let { length } = req.params;
+  length = length || req.query.length;
+  let apiPath = '/rest/svc/random/string';
+  try {
+    if (length) {
+      apiPath += `?length=${length}`;
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the data sent in the anonymous usage report.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcReport(req, res) {
+  try {
+    const response = await performRequest('get', '/rest/svc/report');
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+// === CUSTOM ===
+
+/**
+ * Returns device id, also checks that syncthing is installed and running and we have the api key.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDeviceID(req, res) {
+  try {
+    const meta = await getMeta();
+    const healthy = await getHealth(); // check that syncthing instance is healthy
+    const pingResponse = await systemPing(); // check that flux has proper api key
+    if (meta.status === 'success' &amp;&amp; pingResponse.data.ping === 'pong' &amp;&amp; healthy.data.status === 'OK') {
+      const adjustedString = meta.data.slice(15).slice(0, -2);
+      const deviceObject = JSON.parse(adjustedString);
+      const { deviceID } = deviceObject;
+      const successResponse = messageHelper.createDataMessage(deviceID);
+      return res ? res.json(successResponse) : successResponse;
+    }
+    throw new Error('Syncthing is not running properly');
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * To install Syncthing
+ */
+async function installSyncthing() { // can throw
+  const nodedpath = path.join(__dirname, '../../../helpers');
+  const exec = `cd ${nodedpath} &amp;&amp; bash installSyncthing.sh`;
+  await cmdAsync(exec);
+  log.info('Syncthing installed');
+}
+
+/**
+ * To Start Syncthing
+ */
+async function startSyncthing() {
+  try {
+    // check wether syncthing is running or not
+    const myDevice = await getDeviceID();
+    if (myDevice.status === 'error') {
+      const exec = 'syncthing --allow-newer-config --no-browser';
+      log.info('Spawning Syncthing instance...');
+      let errored = false;
+      nodecmd.get(exec, async (err) => {
+        if (err) {
+          errored = true;
+          log.error(err);
+          log.info('Syncthing is not installed, proceeding with installation');
+        }
+      });
+      await serviceHelper.delay(30 * 1000);
+      if (errored) {
+        await installSyncthing();
+        await serviceHelper.delay(60 * 1000);
+      }
+      startSyncthing();
+    } else {
+      const currentConfigOptions = await getConfigOptions();
+      const currentDefaultsFolderOptions = await getConfigDefaultsFolder();
+      const apiPort = userconfig.initial.apiport || config.server.apiport;
+      const myPort = +apiPort + 2; // end with 9 eg 16139
+      // adjust configuration
+      const newConfig = {
+        globalAnnounceEnabled: false,
+        localAnnounceEnabled: false,
+        listenAddresses: [`tcp://:${myPort}`, `quic://:${myPort}`],
+      };
+      const newConfigDefaultFolders = {
+        syncOwnership: true,
+        sendOwnership: true,
+        syncXattrs: true,
+        sendXattrs: true,
+      };
+      if (currentConfigOptions.status === 'success') {
+        if (currentConfigOptions.data.globalAnnounceEnabled !== newConfig.globalAnnounceEnabled
+          || currentConfigOptions.data.localAnnounceEnabled !== newConfig.localAnnounceEnabled
+          || serviceHelper.ensureString(currentConfigOptions.data.listenAddresses) !== serviceHelper.ensureString(newConfig.listenAddresse)) {
+          // patch our config
+          await adjustConfigOptions('patch', newConfig);
+        }
+      }
+      if (currentDefaultsFolderOptions.status === 'success') {
+        if (currentDefaultsFolderOptions.data.syncOwnership !== newConfigDefaultFolders.syncOwnership
+          || currentDefaultsFolderOptions.data.sendOwnership !== newConfigDefaultFolders.sendOwnership
+          || currentDefaultsFolderOptions.data.syncXattrs !== newConfigDefaultFolders.syncXattrs
+          || currentDefaultsFolderOptions.data.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
+          // patch our defaults folder config
+          await adjustConfigDefaultsFolder('patch', newConfigDefaultFolders);
+        }
+      }
+      // remove default folder
+      const allFolders = await getConfigFolders();
+      if (allFolders.status === 'success') {
+        const defaultFolderExists = allFolders.data.find((syncthingFolder) => syncthingFolder.id === 'default');
+        if (defaultFolderExists) {
+          await adjustConfigFolders('delete', undefined, 'default');
+        }
+      }
+      const restartRequired = await getConfigRestartRequired();
+      if (restartRequired.status === 'success' &amp;&amp; restartRequired.data.requiresRestart === true) {
+        await systemRestart();
+      }
+      await serviceHelper.delay(8 * 60 * 1000);
+      startSyncthing();
+    }
+  } catch (error) {
+    log.error(error);
+    await serviceHelper.delay(2 * 60 * 1000);
+    startSyncthing();
+  }
+}
+
+module.exports = {
+  startSyncthing,
+  getDeviceID,
+  getMeta,
+  getHealth,
+  statsDevice,
+  statsFolder,
+  systemBrowse,
+  systemConnections,
+  systemDiscovery,
+  systemDebug,
+  systemErrorClear,
+  systemError,
+  postSystemError,
+  systemLog,
+  systemLogTxt,
+  systemPaths,
+  systemPause,
+  systemReset,
+  systemRestart,
+  systemResume,
+  systemShutdown,
+  systemStatus,
+  systemUpgrade,
+  postSystemUpgrade,
+  systemVersion,
+  systemPing,
+  // CONFIG
+  getConfig,
+  postConfig,
+  getConfigRestartRequired,
+  getConfigFolders,
+  getConfigDevices,
+  postConfigFolders,
+  postConfigDevices,
+  getConfigDefaultsFolder,
+  getConfigDefaultsDevice,
+  postConfigDefaultsFolder,
+  postConfigDefaultsDevice,
+  getConfigDefaultsIgnores,
+  postConfigDefaultsIgnores,
+  getConfigOptions,
+  getConfigGui,
+  getConfigLdap,
+  postConfigOptions,
+  postConfigGui,
+  postConfigLdap,
+  // Cluster
+  getClusterPendigDevices,
+  postClusterPendigDevices,
+  getClusterPendigFolders,
+  postClusterPendigFolders,
+  // Folder
+  getFolderErrors,
+  getFolderVersions,
+  postFolderVersions,
+  // DATABASE ENDPOINTS
+  getDbBrowse,
+  getDbCompletion,
+  getDbFile,
+  getDbIgnores,
+  getDbLocalchanged,
+  getDbNeed,
+  getDbRemoteNeed,
+  getDbStatus,
+  postDbIgnores,
+  postDbOverride,
+  postDbPrio,
+  postDbRevert,
+  postDbScan,
+  // EVENTS
+  getEvents,
+  getEventsDisk,
+  // MISC
+  getSvcDeviceID,
+  getSvcRandomString,
+  getSvcReport,
+  // DEBUG
+  debugCpuprof,
+  debugFile,
+  debugHttpmetrics,
+  debugHeapprof,
+  debugPeerCompletion,
+  debugSupport,
+  // helpers
+  adjustConfigFolders,
+  adjustConfigDevices,
+};
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Modules</h3><ul><li><a href="Contains%2520utility%2520functions%2520to%2520be%2520used%2520only%2520by%2520verificationHelper.%250ATo%2520verify%2520privilege%2520use%2520verifyPrivilege%2520from%2520verificationHelper%2520module.module_.html">Contains utility functions to be used only by verificationHelper.
+To verify privilege use verifyPrivilege from verificationHelper module.</a></li><li><a href="module-Helper%2520module%2520used%2520for%2520all%2520interactions%2520with%2520database.html">Helper module used for all interactions with database</a></li></ul><h3>Global</h3><ul><li><a href="global.html#activeLoginPhrases">activeLoginPhrases</a></li><li><a href="global.html#addMultiSigAddress">addMultiSigAddress</a></li><li><a href="global.html#addMultiSigAddressPost">addMultiSigAddressPost</a></li><li><a href="global.html#addNode">addNode</a></li><li><a href="global.html#addPeer">addPeer</a></li><li><a href="global.html#adjustConfigDefaultsFolder">adjustConfigDefaultsFolder</a></li><li><a href="global.html#adjustConfigDevices">adjustConfigDevices</a></li><li><a href="global.html#adjustConfigFolders">adjustConfigFolders</a></li><li><a href="global.html#adjustConfigOptions">adjustConfigOptions</a></li><li><a href="global.html#adjustCruxID">adjustCruxID</a></li><li><a href="global.html#adjustExternalIP">adjustExternalIP</a></li><li><a href="global.html#adjustFirewall">adjustFirewall</a></li><li><a href="global.html#adjustKadenaAccount">adjustKadenaAccount</a></li><li><a href="global.html#allowPort">allowPort</a></li><li><a href="global.html#allowPortApi">allowPortApi</a></li><li><a href="global.html#appChanges">appChanges</a></li><li><a href="global.html#appDockerCreate">appDockerCreate</a></li><li><a href="global.html#appDockerImageRemove">appDockerImageRemove</a></li><li><a href="global.html#appDockerKill">appDockerKill</a></li><li><a href="global.html#appDockerPause">appDockerPause</a></li><li><a href="global.html#appDockerRemove">appDockerRemove</a></li><li><a href="global.html#appDockerRestart">appDockerRestart</a></li><li><a href="global.html#appDockerStart">appDockerStart</a></li><li><a href="global.html#appDockerStop">appDockerStop</a></li><li><a href="global.html#appDockerTop">appDockerTop</a></li><li><a href="global.html#appDockerUnpause">appDockerUnpause</a></li><li><a href="global.html#appExec">appExec</a></li><li><a href="global.html#appHashHasMessage">appHashHasMessage</a></li><li><a href="global.html#appInspect">appInspect</a></li><li><a href="global.html#appKill">appKill</a></li><li><a href="global.html#appLocation">appLocation</a></li><li><a href="global.html#appLog">appLog</a></li><li><a href="global.html#appLogStream">appLogStream</a></li><li><a href="global.html#appMonitor">appMonitor</a></li><li><a href="global.html#appMonitorStream">appMonitorStream</a></li><li><a href="global.html#appPause">appPause</a></li><li><a href="global.html#appPortsUnique">appPortsUnique</a></li><li><a href="global.html#appPricePerMonth">appPricePerMonth</a></li><li><a href="global.html#appRestart">appRestart</a></li><li><a href="global.html#appsResources">appsResources</a></li><li><a href="global.html#appStart">appStart</a></li><li><a href="global.html#appStats">appStats</a></li><li><a href="global.html#appStop">appStop</a></li><li><a href="global.html#appTop">appTop</a></li><li><a href="global.html#appUninstallHard">appUninstallHard</a></li><li><a href="global.html#appUninstallSoft">appUninstallSoft</a></li><li><a href="global.html#appUnpause">appUnpause</a></li><li><a href="global.html#assignedPortsGlobalApps">assignedPortsGlobalApps</a></li><li><a href="global.html#assignedPortsInstalledApps">assignedPortsInstalledApps</a></li><li><a href="global.html#availableApps">availableApps</a></li><li><a href="global.html#axiosGet">axiosGet</a></li><li><a href="global.html#backupWallet">backupWallet</a></li><li><a href="global.html#benchmarkDebug">benchmarkDebug</a></li><li><a href="global.html#broadcastMessageFromUser">broadcastMessageFromUser</a></li><li><a href="global.html#broadcastMessageFromUserPost">broadcastMessageFromUserPost</a></li><li><a href="global.html#broadcastMessageToIncoming">broadcastMessageToIncoming</a></li><li><a href="global.html#broadcastMessageToIncomingFromUser">broadcastMessageToIncomingFromUser</a></li><li><a href="global.html#broadcastMessageToIncomingFromUserPost">broadcastMessageToIncomingFromUserPost</a></li><li><a href="global.html#broadcastMessageToOutgoing">broadcastMessageToOutgoing</a></li><li><a href="global.html#broadcastMessageToOutgoingFromUser">broadcastMessageToOutgoingFromUser</a></li><li><a href="global.html#broadcastMessageToOutgoingFromUserPost">broadcastMessageToOutgoingFromUserPost</a></li><li><a href="global.html#broadcastTemporaryAppMessage">broadcastTemporaryAppMessage</a></li><li><a href="global.html#checkAndNotifyPeersOfRunningApps">checkAndNotifyPeersOfRunningApps</a></li><li><a href="global.html#checkAndRemoveApplicationInstance">checkAndRemoveApplicationInstance</a></li><li><a href="global.html#checkAndRequestApp">checkAndRequestApp</a></li><li><a href="global.html#checkAppGeolocationRequirements">checkAppGeolocationRequirements</a></li><li><a href="global.html#checkAppHWRequirements">checkAppHWRequirements</a></li><li><a href="global.html#checkApplicationImagesComplience">checkApplicationImagesComplience</a></li><li><a href="global.html#checkApplicationRegistrationNameConflicts">checkApplicationRegistrationNameConflicts</a></li><li><a href="global.html#checkApplicationUpdateNameRepositoryConflicts">checkApplicationUpdateNameRepositoryConflicts</a></li><li><a href="global.html#checkAppMessageExistence">checkAppMessageExistence</a></li><li><a href="global.html#checkAppRequirements">checkAppRequirements</a></li><li><a href="global.html#checkAppTemporaryMessageExistence">checkAppTemporaryMessageExistence</a></li><li><a href="global.html#checkBlockProcessingStopped">checkBlockProcessingStopped</a></li><li><a href="global.html#checkComposeHWParameters">checkComposeHWParameters</a></li><li><a href="global.html#checkDeterministicNodesCollisions">checkDeterministicNodesCollisions</a></li><li><a href="global.html#checkDockerAccessibility">checkDockerAccessibility</a></li><li><a href="global.html#checkFluxAvailability">checkFluxAvailability</a></li><li><a href="global.html#checkFluxbenchVersionAllowed">checkFluxbenchVersionAllowed</a></li><li><a href="global.html#checkHWParameters">checkHWParameters</a></li><li><a href="global.html#checkLoggedUser">checkLoggedUser</a></li><li><a href="global.html#checkMyFluxAvailability">checkMyFluxAvailability</a></li><li><a href="global.html#checkRateLimit">checkRateLimit</a></li><li><a href="global.html#checkSynced">checkSynced</a></li><li><a href="global.html#checkWhitelistedRepository">checkWhitelistedRepository</a></li><li><a href="global.html#clearBanned">clearBanned</a></li><li><a href="global.html#closeConnection">closeConnection</a></li><li><a href="global.html#closeIncomingConnection">closeIncomingConnection</a></li><li><a href="global.html#confirmNodeTierHardware">confirmNodeTierHardware</a></li><li><a href="global.html#connectedPeers">connectedPeers</a></li><li><a href="global.html#connectedPeersInfo">connectedPeersInfo</a></li><li><a href="global.html#continuousFluxAppHashesCheck">continuousFluxAppHashesCheck</a></li><li><a href="global.html#createAppVolume">createAppVolume</a></li><li><a href="global.html#createConfirmationTransaction">createConfirmationTransaction</a></li><li><a href="global.html#createDataMessage">createDataMessage</a></li><li><a href="global.html#createErrorMessage">createErrorMessage</a></li><li><a href="global.html#createFluxDockerNetwork">createFluxDockerNetwork</a></li><li><a href="global.html#createFluxNetworkAPI">createFluxNetworkAPI</a></li><li><a href="global.html#createMultiSig">createMultiSig</a></li><li><a href="global.html#createMultiSigPost">createMultiSigPost</a></li><li><a href="global.html#createRawTransaction">createRawTransaction</a></li><li><a href="global.html#createRawTransactionPost">createRawTransactionPost</a></li><li><a href="global.html#createSuccessMessage">createSuccessMessage</a></li><li><a href="global.html#createWarningMessage">createWarningMessage</a></li><li><a href="global.html#createZelNodeBroadcast">createZelNodeBroadcast</a></li><li><a href="global.html#createZelNodeKey">createZelNodeKey</a></li><li><a href="global.html#daemonBlockchainInfoService">daemonBlockchainInfoService</a></li><li><a href="global.html#daemonDebug">daemonDebug</a></li><li><a href="global.html#debugCpuprof">debugCpuprof</a></li><li><a href="global.html#debugFile">debugFile</a></li><li><a href="global.html#debugHeapprof">debugHeapprof</a></li><li><a href="global.html#debugHttpmetrics">debugHttpmetrics</a></li><li><a href="global.html#debugPeerCompletion">debugPeerCompletion</a></li><li><a href="global.html#debugSupport">debugSupport</a></li><li><a href="global.html#decodeMessage">decodeMessage</a></li><li><a href="global.html#decodeRawTransaction">decodeRawTransaction</a></li><li><a href="global.html#decodeRawTransactionPost">decodeRawTransactionPost</a></li><li><a href="global.html#decodeScript">decodeScript</a></li><li><a href="global.html#decodeScriptPost">decodeScriptPost</a></li><li><a href="global.html#decodeZelNodeBroadcast">decodeZelNodeBroadcast</a></li><li><a href="global.html#delay">delay</a></li><li><a href="global.html#deleteLoginPhrase">deleteLoginPhrase</a></li><li><a href="global.html#denyPort">denyPort</a></li><li><a href="global.html#deploymentInformation">deploymentInformation</a></li><li><a href="global.html#deterministicFluxList">deterministicFluxList</a></li><li><a href="global.html#disconnectNode">disconnectNode</a></li><li><a href="global.html#dockerContainerChanges">dockerContainerChanges</a></li><li><a href="global.html#dockerContainerExec">dockerContainerExec</a></li><li><a href="global.html#dockerContainerInspect">dockerContainerInspect</a></li><li><a href="global.html#dockerContainerLogs">dockerContainerLogs</a></li><li><a href="global.html#dockerContainerLogsStream">dockerContainerLogsStream</a></li><li><a href="global.html#dockerContainerStats">dockerContainerStats</a></li><li><a href="global.html#dockerContainerStatsStream">dockerContainerStatsStream</a></li><li><a href="global.html#dockerCreateNetwork">dockerCreateNetwork</a></li><li><a href="global.html#dockerListContainers">dockerListContainers</a></li><li><a href="global.html#dockerListImages">dockerListImages</a></li><li><a href="global.html#dockerNetworkInspect">dockerNetworkInspect</a></li><li><a href="global.html#dockerPullStream">dockerPullStream</a></li><li><a href="global.html#dockerRemoveNetwork">dockerRemoveNetwork</a></li><li><a href="global.html#dumpPrivKey">dumpPrivKey</a></li><li><a href="global.html#emergencyPhrase">emergencyPhrase</a></li><li><a href="global.html#ensureApplicationImagesExistsForPlatform">ensureApplicationImagesExistsForPlatform</a></li><li><a href="global.html#ensureApplicationPortsNotUsed">ensureApplicationPortsNotUsed</a></li><li><a href="global.html#ensureAppUniquePorts">ensureAppUniquePorts</a></li><li><a href="global.html#ensureBoolean">ensureBoolean</a></li><li><a href="global.html#ensureNumber">ensureNumber</a></li><li><a href="global.html#ensureObject">ensureObject</a></li><li><a href="global.html#ensureString">ensureString</a></li><li><a href="global.html#errUnauthorizedMessage">errUnauthorizedMessage</a></li><li><a href="global.html#estimateFee">estimateFee</a></li><li><a href="global.html#estimatePriority">estimatePriority</a></li><li><a href="global.html#executeAppGlobalCommand">executeAppGlobalCommand</a></li><li><a href="global.html#executeCall">executeCall</a></li><li><a href="global.html#expireGlobalApplications">expireGlobalApplications</a></li><li><a href="global.html#fluxBackendFolder">fluxBackendFolder</a></li><li><a href="global.html#fluxDaemonBlockchainInfo">fluxDaemonBlockchainInfo</a></li><li><a href="global.html#fluxDebugLog">fluxDebugLog</a></li><li><a href="global.html#fluxDiscovery">fluxDiscovery</a></li><li><a href="global.html#fluxErrorLog">fluxErrorLog</a></li><li><a href="global.html#fluxInfoLog">fluxInfoLog</a></li><li><a href="global.html#fluxLog">fluxLog</a></li><li><a href="global.html#fluxShareCreateFolder">fluxShareCreateFolder</a></li><li><a href="global.html#fluxShareDatabaseFileDelete">fluxShareDatabaseFileDelete</a></li><li><a href="global.html#fluxShareDatabaseFileDeleteMultiple">fluxShareDatabaseFileDeleteMultiple</a></li><li><a href="global.html#fluxShareDatabaseShareFile">fluxShareDatabaseShareFile</a></li><li><a href="global.html#fluxShareDownloadFile">fluxShareDownloadFile</a></li><li><a href="global.html#fluxShareDownloadFolder">fluxShareDownloadFolder</a></li><li><a href="global.html#fluxShareFileExists">fluxShareFileExists</a></li><li><a href="global.html#fluxShareGetFolder">fluxShareGetFolder</a></li><li><a href="global.html#fluxShareGetSharedFiles">fluxShareGetSharedFiles</a></li><li><a href="global.html#fluxShareRemoveFile">fluxShareRemoveFile</a></li><li><a href="global.html#fluxShareRemoveFolder">fluxShareRemoveFolder</a></li><li><a href="global.html#fluxShareRename">fluxShareRename</a></li><li><a href="global.html#fluxShareSharedFiles">fluxShareSharedFiles</a></li><li><a href="global.html#fluxShareShareFile">fluxShareShareFile</a></li><li><a href="global.html#fluxShareStorageStats">fluxShareStorageStats</a></li><li><a href="global.html#fluxShareUnshareFile">fluxShareUnshareFile</a></li><li><a href="global.html#fluxShareUpload">fluxShareUpload</a></li><li><a href="global.html#fluxUptime">fluxUptime</a></li><li><a href="global.html#fluxUsage">fluxUsage</a></li><li><a href="global.html#fluxWarnLog">fluxWarnLog</a></li><li><a href="global.html#fundRawTransaction">fundRawTransaction</a></li><li><a href="global.html#fundRawTransactionPost">fundRawTransactionPost</a></li><li><a href="global.html#getAddedNodeInfo">getAddedNodeInfo</a></li><li><a href="global.html#getAddressBalance">getAddressBalance</a></li><li><a href="global.html#getAddressDeltas">getAddressDeltas</a></li><li><a href="global.html#getAddressFusionCoinbase">getAddressFusionCoinbase</a></li><li><a href="global.html#getAddressMempool">getAddressMempool</a></li><li><a href="global.html#getAddressTransactions">getAddressTransactions</a></li><li><a href="global.html#getAddressTxids">getAddressTxids</a></li><li><a href="global.html#getAddressUtxos">getAddressUtxos</a></li><li><a href="global.html#getAllAddresses">getAllAddresses</a></li><li><a href="global.html#getAllAddressesWithTransactions">getAllAddressesWithTransactions</a></li><li><a href="global.html#getAllFiles">getAllFiles</a></li><li><a href="global.html#getAllFluxTransactions">getAllFluxTransactions</a></li><li><a href="global.html#getAllFusionCoinbase">getAllFusionCoinbase</a></li><li><a href="global.html#getAllGlobalApplicationsNames">getAllGlobalApplicationsNames</a></li><li><a href="global.html#getAllGlobalApplicationsNamesWithLocation">getAllGlobalApplicationsNamesWithLocation</a></li><li><a href="global.html#getAllUtxos">getAllUtxos</a></li><li><a href="global.html#getAppDockerNameIdentifier">getAppDockerNameIdentifier</a></li><li><a href="global.html#getAppFolderSize">getAppFolderSize</a></li><li><a href="global.html#getAppHashes">getAppHashes</a></li><li><a href="global.html#getAppIdentifier">getAppIdentifier</a></li><li><a href="global.html#getApplicationGlobalSpecifications">getApplicationGlobalSpecifications</a></li><li><a href="global.html#getApplicationLocalSpecifications">getApplicationLocalSpecifications</a></li><li><a href="global.html#getApplicationOwner">getApplicationOwner</a></li><li><a href="global.html#getApplicationOwnerAPI">getApplicationOwnerAPI</a></li><li><a href="global.html#getApplicationSpecificationAPI">getApplicationSpecificationAPI</a></li><li><a href="global.html#getApplicationSpecifications">getApplicationSpecifications</a></li><li><a href="global.html#getAppPrice">getAppPrice</a></li><li><a href="global.html#getAppsLocation">getAppsLocation</a></li><li><a href="global.html#getAppsLocations">getAppsLocations</a></li><li><a href="global.html#getAppsPermanentMessages">getAppsPermanentMessages</a></li><li><a href="global.html#getAppsTemporaryMessages">getAppsTemporaryMessages</a></li><li><a href="global.html#getBalance">getBalance</a></li><li><a href="global.html#getBenchmarks">getBenchmarks</a></li><li><a href="global.html#getBenchStatus">getBenchStatus</a></li><li><a href="global.html#getBestBlockHash">getBestBlockHash</a></li><li><a href="global.html#getBlock">getBlock</a></li><li><a href="global.html#getBlockCache">getBlockCache</a></li><li><a href="global.html#getBlockchainInfo">getBlockchainInfo</a></li><li><a href="global.html#getBlockCount">getBlockCount</a></li><li><a href="global.html#getBlockDeltas">getBlockDeltas</a></li><li><a href="global.html#getBlockHash">getBlockHash</a></li><li><a href="global.html#getBlockHashes">getBlockHashes</a></li><li><a href="global.html#getBlockHashesPost">getBlockHashesPost</a></li><li><a href="global.html#getBlockHeader">getBlockHeader</a></li><li><a href="global.html#getBlockSubsidy">getBlockSubsidy</a></li><li><a href="global.html#getBlockTemplate">getBlockTemplate</a></li><li><a href="global.html#getChainTips">getChainTips</a></li><li><a href="global.html#getClusterPendigDevices">getClusterPendigDevices</a></li><li><a href="global.html#getClusterPendigFolders">getClusterPendigFolders</a></li><li><a href="global.html#getCollateralInfo">getCollateralInfo</a></li><li><a href="global.html#getConfig">getConfig</a></li><li><a href="global.html#getConfigDefaultsDevice">getConfigDefaultsDevice</a></li><li><a href="global.html#getConfigDefaultsFolder">getConfigDefaultsFolder</a></li><li><a href="global.html#getConfigDefaultsIgnores">getConfigDefaultsIgnores</a></li><li><a href="global.html#getConfigDevices">getConfigDevices</a></li><li><a href="global.html#getConfigFile">getConfigFile</a></li><li><a href="global.html#getConfigFolders">getConfigFolders</a></li><li><a href="global.html#getConfigGui">getConfigGui</a></li><li><a href="global.html#getConfigLdap">getConfigLdap</a></li><li><a href="global.html#getConfigOptions">getConfigOptions</a></li><li><a href="global.html#getConfigRestartRequired">getConfigRestartRequired</a></li><li><a href="global.html#getConfigValue">getConfigValue</a></li><li><a href="global.html#getConnectionCount">getConnectionCount</a></li><li><a href="global.html#getDbBrowse">getDbBrowse</a></li><li><a href="global.html#getDbCompletion">getDbCompletion</a></li><li><a href="global.html#getDbFile">getDbFile</a></li><li><a href="global.html#getDbIgnores">getDbIgnores</a></li><li><a href="global.html#getDbLocalchanged">getDbLocalchanged</a></li><li><a href="global.html#getDbNeed">getDbNeed</a></li><li><a href="global.html#getDbRemoteNeed">getDbRemoteNeed</a></li><li><a href="global.html#getDbStatus">getDbStatus</a></li><li><a href="global.html#getDeprecationInfo">getDeprecationInfo</a></li><li><a href="global.html#getDeviceID">getDeviceID</a></li><li><a href="global.html#getDifficulty">getDifficulty</a></li><li><a href="global.html#getDockerContainer">getDockerContainer</a></li><li><a href="global.html#getDockerContainerByIdOrName">getDockerContainerByIdOrName</a></li><li><a href="global.html#getDOSList">getDOSList</a></li><li><a href="global.html#getDosMessage">getDosMessage</a></li><li><a href="global.html#getDOSState">getDOSState</a></li><li><a href="global.html#getDosStateValue">getDosStateValue</a></li><li><a href="global.html#getEvents">getEvents</a></li><li><a href="global.html#getEventsDisk">getEventsDisk</a></li><li><a href="global.html#getFilteredFluxTxs">getFilteredFluxTxs</a></li><li><a href="global.html#getFluxCruxID">getFluxCruxID</a></li><li><a href="global.html#getFluxInfo">getFluxInfo</a></li><li><a href="global.html#getFluxIP">getFluxIP</a></li><li><a href="global.html#getFluxKadena">getFluxKadena</a></li><li><a href="global.html#getFluxMessageSignature">getFluxMessageSignature</a></li><li><a href="global.html#getFluxNodePrivateKey">getFluxNodePrivateKey</a></li><li><a href="global.html#getFluxNodePublicKey">getFluxNodePublicKey</a></li><li><a href="global.html#getFluxShareSize">getFluxShareSize</a></li><li><a href="global.html#getFluxShareSpecificFolderSize">getFluxShareSpecificFolderSize</a></li><li><a href="global.html#getFluxTimezone">getFluxTimezone</a></li><li><a href="global.html#getFluxVersion">getFluxVersion</a></li><li><a href="global.html#getFluxZelID">getFluxZelID</a></li><li><a href="global.html#getFolderErrors">getFolderErrors</a></li><li><a href="global.html#getFolderVersions">getFolderVersions</a></li><li><a href="global.html#getGatewayApi">getGatewayApi</a></li><li><a href="global.html#getGlobalAppsSpecifications">getGlobalAppsSpecifications</a></li><li><a href="global.html#getHealth">getHealth</a></li><li><a href="global.html#getIncomingConnections">getIncomingConnections</a></li><li><a href="global.html#getIncomingConnectionsInfo">getIncomingConnectionsInfo</a></li><li><a href="global.html#getInfo">getInfo</a></li><li><a href="global.html#getIpApi">getIpApi</a></li><li><a href="global.html#getLocalSolPs">getLocalSolPs</a></li><li><a href="global.html#getMapApi">getMapApi</a></li><li><a href="global.html#getMempoolInfo">getMempoolInfo</a></li><li><a href="global.html#getMeta">getMeta</a></li><li><a href="global.html#getMiningInfo">getMiningInfo</a></li><li><a href="global.html#getMyFluxIPandPort">getMyFluxIPandPort</a></li><li><a href="global.html#getNetTotals">getNetTotals</a></li><li><a href="global.html#getNetworkHashPs">getNetworkHashPs</a></li><li><a href="global.html#getNetworkInfo">getNetworkInfo</a></li><li><a href="global.html#getNetworkSolPs">getNetworkSolPs</a></li><li><a href="global.html#getNewAddress">getNewAddress</a></li><li><a href="global.html#getNewNodeTier">getNewNodeTier</a></li><li><a href="global.html#getNodeGeolocation">getNodeGeolocation</a></li><li><a href="global.html#getNodeSpecs">getNodeSpecs</a></li><li><a href="global.html#getNodeTier">getNodeTier</a></li><li><a href="global.html#getPeerInfo">getPeerInfo</a></li><li><a href="global.html#getPreviousAppSpecifications">getPreviousAppSpecifications</a></li><li><a href="global.html#getPublicIp">getPublicIp</a></li><li><a href="global.html#getRandomConnection">getRandomConnection</a></li><li><a href="global.html#getRawChangeAddress">getRawChangeAddress</a></li><li><a href="global.html#getRawMemPool">getRawMemPool</a></li><li><a href="global.html#getRawTransaction">getRawTransaction</a></li><li><a href="global.html#getRawTxCacheCache">getRawTxCacheCache</a></li><li><a href="global.html#getReceivedByAddress">getReceivedByAddress</a></li><li><a href="global.html#getRunningAppIpList">getRunningAppIpList</a></li><li><a href="global.html#getRunningAppList">getRunningAppList</a></li><li><a href="global.html#getScannedHeight">getScannedHeight</a></li><li><a href="global.html#getSender">getSender</a></li><li><a href="global.html#getSenderForFluxTx">getSenderForFluxTx</a></li><li><a href="global.html#getSenderForFluxTxInsight">getSenderForFluxTxInsight</a></li><li><a href="global.html#getSenderTransactionFromDaemon">getSenderTransactionFromDaemon</a></li><li><a href="global.html#getSingleAddressBalance">getSingleAddressBalance</a></li><li><a href="global.html#getSingleAddressDeltas">getSingleAddressDeltas</a></li><li><a href="global.html#getSingleAddressMempool">getSingleAddressMempool</a></li><li><a href="global.html#getSingleAddresssTxids">getSingleAddresssTxids</a></li><li><a href="global.html#getSingleAddressUtxos">getSingleAddressUtxos</a></li><li><a href="global.html#getSpaceAvailableForFluxShare">getSpaceAvailableForFluxShare</a></li><li><a href="global.html#getSpentInfo">getSpentInfo</a></li><li><a href="global.html#getSpentInfoPost">getSpentInfoPost</a></li><li><a href="global.html#getStandardCache">getStandardCache</a></li><li><a href="global.html#getStartList">getStartList</a></li><li><a href="global.html#getStatus">getStatus</a></li><li><a href="global.html#getStoredCollateral">getStoredCollateral</a></li><li><a href="global.html#getStoredFluxBenchAllowed">getStoredFluxBenchAllowed</a></li><li><a href="global.html#getStoredTier">getStoredTier</a></li><li><a href="global.html#getStrictApplicationSpecifications">getStrictApplicationSpecifications</a></li><li><a href="global.html#getSvcDeviceID">getSvcDeviceID</a></li><li><a href="global.html#getSvcRandomString">getSvcRandomString</a></li><li><a href="global.html#getSvcReport">getSvcReport</a></li><li><a href="global.html#getSyncthingApiKey">getSyncthingApiKey</a></li><li><a href="global.html#getTransaction">getTransaction</a></li><li><a href="global.html#getTxOut">getTxOut</a></li><li><a href="global.html#getTxOutProof">getTxOutProof</a></li><li><a href="global.html#getTxOutSetInfo">getTxOutSetInfo</a></li><li><a href="global.html#getUnconfirmedBalance">getUnconfirmedBalance</a></li><li><a href="global.html#getVerboseBlock">getVerboseBlock</a></li><li><a href="global.html#getWalletInfo">getWalletInfo</a></li><li><a href="global.html#getZelNodeCount">getZelNodeCount</a></li><li><a href="global.html#getZelNodeOutputs">getZelNodeOutputs</a></li><li><a href="global.html#getZelNodeScores">getZelNodeScores</a></li><li><a href="global.html#getZelNodeStatus">getZelNodeStatus</a></li><li><a href="global.html#getZelNodeWinners">getZelNodeWinners</a></li><li><a href="global.html#handleAppMessages">handleAppMessages</a></li><li><a href="global.html#handleAppRunningMessage">handleAppRunningMessage</a></li><li><a href="global.html#handleIncomingConnection">handleIncomingConnection</a></li><li><a href="global.html#hardRedeploy">hardRedeploy</a></li><li><a href="global.html#hardUpdateFlux">hardUpdateFlux</a></li><li><a href="global.html#help">help</a></li><li><a href="global.html#importAddress">importAddress</a></li><li><a href="global.html#importPrivKey">importPrivKey</a></li><li><a href="global.html#importWallet">importWallet</a></li><li><a href="global.html#initiateAndHandleConnection">initiateAndHandleConnection</a></li><li><a href="global.html#initiateBlockProcessor">initiateBlockProcessor</a></li><li><a href="global.html#installApplicationHard">installApplicationHard</a></li><li><a href="global.html#installApplicationSoft">installApplicationSoft</a></li><li><a href="global.html#installedApps">installedApps</a></li><li><a href="global.html#installFluxWatchTower">installFluxWatchTower</a></li><li><a href="global.html#installSyncthing">installSyncthing</a></li><li><a href="global.html#installTemporaryLocalApplication">installTemporaryLocalApplication</a></li><li><a href="global.html#isCommunicationEstablished">isCommunicationEstablished</a></li><li><a href="global.html#isDaemonSynced">isDaemonSynced</a></li><li><a href="global.html#isDecimalLimit">isDecimalLimit</a></li><li><a href="global.html#isFirewallActive">isFirewallActive</a></li><li><a href="global.html#isFluxAvailable">isFluxAvailable</a></li><li><a href="global.html#isInsightExplorer">isInsightExplorer</a></li><li><a href="global.html#isNodeStatusConfirmed">isNodeStatusConfirmed</a></li><li><a href="global.html#isUPNP">isUPNP</a></li><li><a href="global.html#keepConnectionsAlive">keepConnectionsAlive</a></li><li><a href="global.html#keyPoolRefill">keyPoolRefill</a></li><li><a href="global.html#listAddressGroupings">listAddressGroupings</a></li><li><a href="global.html#listAllApps">listAllApps</a></li><li><a href="global.html#listAppsImages">listAppsImages</a></li><li><a href="global.html#listBanned">listBanned</a></li><li><a href="global.html#listLockUnspent">listLockUnspent</a></li><li><a href="global.html#listReceivedByAddress">listReceivedByAddress</a></li><li><a href="global.html#listRunningApps">listRunningApps</a></li><li><a href="global.html#listSinceBlock">listSinceBlock</a></li><li><a href="global.html#listTransactions">listTransactions</a></li><li><a href="global.html#listUnspent">listUnspent</a></li><li><a href="global.html#listZelNodeConf">listZelNodeConf</a></li><li><a href="global.html#listZelNodes">listZelNodes</a></li><li><a href="global.html#lockUnspent">lockUnspent</a></li><li><a href="global.html#loggedSessions">loggedSessions</a></li><li><a href="global.html#loggedUsers">loggedUsers</a></li><li><a href="global.html#loginPhrase">loginPhrase</a></li><li><a href="global.html#logoutAllSessions">logoutAllSessions</a></li><li><a href="global.html#logoutAllUsers">logoutAllUsers</a></li><li><a href="global.html#logoutCurrentSession">logoutCurrentSession</a></li><li><a href="global.html#logoutSpecificSession">logoutSpecificSession</a></li><li><a href="global.html#mapPortApi">mapPortApi</a></li><li><a href="global.html#mapUpnpPort">mapUpnpPort</a></li><li><a href="global.html#messageHash">messageHash</a></li><li><a href="global.html#minVersionSatisfy">minVersionSatisfy</a></li><li><a href="global.html#nodeCollateral">nodeCollateral</a></li><li><a href="global.html#nodeTier">nodeTier</a></li><li><a href="global.html#performRequest">performRequest</a></li><li><a href="global.html#ping">ping</a></li><li><a href="global.html#postClusterPendigDevices">postClusterPendigDevices</a></li><li><a href="global.html#postClusterPendigFolders">postClusterPendigFolders</a></li><li><a href="global.html#postConfig">postConfig</a></li><li><a href="global.html#postConfigDefaultsDevice">postConfigDefaultsDevice</a></li><li><a href="global.html#postConfigDefaultsFolder">postConfigDefaultsFolder</a></li><li><a href="global.html#postConfigDefaultsIgnores">postConfigDefaultsIgnores</a></li><li><a href="global.html#postConfigDevices">postConfigDevices</a></li><li><a href="global.html#postConfigFolders">postConfigFolders</a></li><li><a href="global.html#postConfigGui">postConfigGui</a></li><li><a href="global.html#postConfigLdap">postConfigLdap</a></li><li><a href="global.html#postConfigOptions">postConfigOptions</a></li><li><a href="global.html#postDbIgnores">postDbIgnores</a></li><li><a href="global.html#postDbOverride">postDbOverride</a></li><li><a href="global.html#postDbPrio">postDbPrio</a></li><li><a href="global.html#postDbRevert">postDbRevert</a></li><li><a href="global.html#postDbScan">postDbScan</a></li><li><a href="global.html#postFolderVersions">postFolderVersions</a></li><li><a href="global.html#postSystemError">postSystemError</a></li><li><a href="global.html#postSystemUpgrade">postSystemUpgrade</a></li><li><a href="global.html#prioritiseTransaction">prioritiseTransaction</a></li><li><a href="global.html#processBlock">processBlock</a></li><li><a href="global.html#processBlockTransactions">processBlockTransactions</a></li><li><a href="global.html#processInsight">processInsight</a></li><li><a href="global.html#processStandard">processStandard</a></li><li><a href="global.html#processTransaction">processTransaction</a></li><li><a href="global.html#provideSign">provideSign</a></li><li><a href="global.html#rebuildHome">rebuildHome</a></li><li><a href="global.html#reconstructAppMessagesHashCollection">reconstructAppMessagesHashCollection</a></li><li><a href="global.html#reconstructAppMessagesHashCollectionAPI">reconstructAppMessagesHashCollectionAPI</a></li><li><a href="global.html#redeployAPI">redeployAPI</a></li><li><a href="global.html#registerAppGlobalyApi">registerAppGlobalyApi</a></li><li><a href="global.html#registerAppLocally">registerAppLocally</a></li><li><a href="global.html#registrationInformation">registrationInformation</a></li><li><a href="global.html#reindexDaemon">reindexDaemon</a></li><li><a href="global.html#reindexExplorer">reindexExplorer</a></li><li><a href="global.html#reindexGlobalAppsInformation">reindexGlobalAppsInformation</a></li><li><a href="global.html#reindexGlobalAppsInformationAPI">reindexGlobalAppsInformationAPI</a></li><li><a href="global.html#reindexGlobalAppsLocation">reindexGlobalAppsLocation</a></li><li><a href="global.html#reindexGlobalAppsLocationAPI">reindexGlobalAppsLocationAPI</a></li><li><a href="global.html#reinstallOldApplications">reinstallOldApplications</a></li><li><a href="global.html#relayZelNodeBroadcast">relayZelNodeBroadcast</a></li><li><a href="global.html#removeAppLocally">removeAppLocally</a></li><li><a href="global.html#removeAppLocallyApi">removeAppLocallyApi</a></li><li><a href="global.html#removeIncomingPeer">removeIncomingPeer</a></li><li><a href="global.html#removeMapPortApi">removeMapPortApi</a></li><li><a href="global.html#removeMapUpnpPort">removeMapUpnpPort</a></li><li><a href="global.html#removePeer">removePeer</a></li><li><a href="global.html#repositoryArchitectures">repositoryArchitectures</a></li><li><a href="global.html#requestAppMessage">requestAppMessage</a></li><li><a href="global.html#rescanBlockchain">rescanBlockchain</a></li><li><a href="global.html#rescanExplorer">rescanExplorer</a></li><li><a href="global.html#rescanGlobalAppsInformation">rescanGlobalAppsInformation</a></li><li><a href="global.html#rescanGlobalAppsInformationAPI">rescanGlobalAppsInformationAPI</a></li><li><a href="global.html#respondWithAppMessage">respondWithAppMessage</a></li><li><a href="global.html#restartBenchmark">restartBenchmark</a></li><li><a href="global.html#restartBlockProcessing">restartBlockProcessing</a></li><li><a href="global.html#restartDaemon">restartDaemon</a></li><li><a href="global.html#restartNodeBenchmarks">restartNodeBenchmarks</a></li><li><a href="global.html#restoreAppsPortsSupport">restoreAppsPortsSupport</a></li><li><a href="global.html#restoreDatabaseToBlockheightState">restoreDatabaseToBlockheightState</a></li><li><a href="global.html#restoreFluxPortsSupport">restoreFluxPortsSupport</a></li><li><a href="global.html#restorePortsSupport">restorePortsSupport</a></li><li><a href="global.html#sendFrom">sendFrom</a></li><li><a href="global.html#sendFromPost">sendFromPost</a></li><li><a href="global.html#sendMany">sendMany</a></li><li><a href="global.html#sendManyPost">sendManyPost</a></li><li><a href="global.html#sendMessageToWS">sendMessageToWS</a></li><li><a href="global.html#sendRawTransaction">sendRawTransaction</a></li><li><a href="global.html#sendRawTransactionPost">sendRawTransactionPost</a></li><li><a href="global.html#sendToAddress">sendToAddress</a></li><li><a href="global.html#sendToAddressPost">sendToAddressPost</a></li><li><a href="global.html#sendToAllIncomingConnections">sendToAllIncomingConnections</a></li><li><a href="global.html#sendToAllPeers">sendToAllPeers</a></li><li><a href="global.html#serialiseAndSignFluxBroadcast">serialiseAndSignFluxBroadcast</a></li><li><a href="global.html#setBan">setBan</a></li><li><a href="global.html#setBlockCache">setBlockCache</a></li><li><a href="global.html#setDosMessage">setDosMessage</a></li><li><a href="global.html#setDosStateValue">setDosStateValue</a></li><li><a href="global.html#setMyFluxIp">setMyFluxIp</a></li><li><a href="global.html#setNodeGeolocation">setNodeGeolocation</a></li><li><a href="global.html#setRawTxCache">setRawTxCache</a></li><li><a href="global.html#setStandardCache">setStandardCache</a></li><li><a href="global.html#setStoredCollateral">setStoredCollateral</a></li><li><a href="global.html#setStoredFluxBenchAllowed">setStoredFluxBenchAllowed</a></li><li><a href="global.html#setStoredTier">setStoredTier</a></li><li><a href="global.html#setTxFee">setTxFee</a></li><li><a href="global.html#setupUPNP">setupUPNP</a></li><li><a href="global.html#signFluxTransaction">signFluxTransaction</a></li><li><a href="global.html#signFluxTransactionPost">signFluxTransactionPost</a></li><li><a href="global.html#signMessage">signMessage</a></li><li><a href="global.html#signMessagePost">signMessagePost</a></li><li><a href="global.html#signRawTransaction">signRawTransaction</a></li><li><a href="global.html#signRawTransactionPost">signRawTransactionPost</a></li><li><a href="global.html#softRedeploy">softRedeploy</a></li><li><a href="global.html#softRegisterAppLocally">softRegisterAppLocally</a></li><li><a href="global.html#softRemoveAppLocally">softRemoveAppLocally</a></li><li><a href="global.html#softUpdateFlux">softUpdateFlux</a></li><li><a href="global.html#softUpdateFluxInstall">softUpdateFluxInstall</a></li><li><a href="global.html#specificationFormatter">specificationFormatter</a></li><li><a href="global.html#spork">spork</a></li><li><a href="global.html#startAppMonitoring">startAppMonitoring</a></li><li><a href="global.html#startAppMonitoringAPI">startAppMonitoringAPI</a></li><li><a href="global.html#startBenchmark">startBenchmark</a></li><li><a href="global.html#startBenchmarkD">startBenchmarkD</a></li><li><a href="global.html#startDaemon">startDaemon</a></li><li><a href="global.html#startDeterministicZelNode">startDeterministicZelNode</a></li><li><a href="global.html#startFluxFunctions">startFluxFunctions</a></li><li><a href="global.html#startMonitoringOfApps">startMonitoringOfApps</a></li><li><a href="global.html#startSyncthing">startSyncthing</a></li><li><a href="global.html#startZelNode">startZelNode</a></li><li><a href="global.html#statsDevice">statsDevice</a></li><li><a href="global.html#statsFolder">statsFolder</a></li><li><a href="global.html#stop">stop</a></li><li><a href="global.html#stopAllNonFluxRunningApps">stopAllNonFluxRunningApps</a></li><li><a href="global.html#stopAppMonitoring">stopAppMonitoring</a></li><li><a href="global.html#stopAppMonitoringAPI">stopAppMonitoringAPI</a></li><li><a href="global.html#stopBenchmarkD">stopBenchmarkD</a></li><li><a href="global.html#stopBlockProcessing">stopBlockProcessing</a></li><li><a href="global.html#stopMonitoringOfApps">stopMonitoringOfApps</a></li><li><a href="global.html#storeAppPermanentMessage">storeAppPermanentMessage</a></li><li><a href="global.html#storeAppRunningMessage">storeAppRunningMessage</a></li><li><a href="global.html#storeAppTemporaryMessage">storeAppTemporaryMessage</a></li><li><a href="global.html#submitBlock">submitBlock</a></li><li><a href="global.html#submitBlockPost">submitBlockPost</a></li><li><a href="global.html#systemArchitecture">systemArchitecture</a></li><li><a href="global.html#systemBrowse">systemBrowse</a></li><li><a href="global.html#systemConnections">systemConnections</a></li><li><a href="global.html#systemDebug">systemDebug</a></li><li><a href="global.html#systemDiscovery">systemDiscovery</a></li><li><a href="global.html#systemError">systemError</a></li><li><a href="global.html#systemErrorClear">systemErrorClear</a></li><li><a href="global.html#systemLog">systemLog</a></li><li><a href="global.html#systemLogTxt">systemLogTxt</a></li><li><a href="global.html#systemPaths">systemPaths</a></li><li><a href="global.html#systemPause">systemPause</a></li><li><a href="global.html#systemPing">systemPing</a></li><li><a href="global.html#systemReset">systemReset</a></li><li><a href="global.html#systemRestart">systemRestart</a></li><li><a href="global.html#systemResume">systemResume</a></li><li><a href="global.html#systemShutdown">systemShutdown</a></li><li><a href="global.html#systemStatus">systemStatus</a></li><li><a href="global.html#systemUpgrade">systemUpgrade</a></li><li><a href="global.html#systemVersion">systemVersion</a></li><li><a href="global.html#tailBenchmarkDebug">tailBenchmarkDebug</a></li><li><a href="global.html#tailDaemonDebug">tailDaemonDebug</a></li><li><a href="global.html#tailFluxDebugLog">tailFluxDebugLog</a></li><li><a href="global.html#tailFluxErrorLog">tailFluxErrorLog</a></li><li><a href="global.html#tailFluxInfoLog">tailFluxInfoLog</a></li><li><a href="global.html#tailFluxLog">tailFluxLog</a></li><li><a href="global.html#tailFluxWarnLog">tailFluxWarnLog</a></li><li><a href="global.html#totalAppHWRequirements">totalAppHWRequirements</a></li><li><a href="global.html#trySpawningGlobalApplication">trySpawningGlobalApplication</a></li><li><a href="global.html#updateAppGlobalyApi">updateAppGlobalyApi</a></li><li><a href="global.html#updateAppSpecifications">updateAppSpecifications</a></li><li><a href="global.html#updateAppSpecsForRescanReindex">updateAppSpecsForRescanReindex</a></li><li><a href="global.html#updateBenchmark">updateBenchmark</a></li><li><a href="global.html#updateDaemon">updateDaemon</a></li><li><a href="global.html#updateFlux">updateFlux</a></li><li><a href="global.html#validateAddress">validateAddress</a></li><li><a href="global.html#verifyAppHash">verifyAppHash</a></li><li><a href="global.html#verifyAppMessageSignature">verifyAppMessageSignature</a></li><li><a href="global.html#verifyAppMessageUpdateSignature">verifyAppMessageUpdateSignature</a></li><li><a href="global.html#verifyAppRegistrationParameters">verifyAppRegistrationParameters</a></li><li><a href="global.html#verifyAppSpecifications">verifyAppSpecifications</a></li><li><a href="global.html#verifyAppUpdateParameters">verifyAppUpdateParameters</a></li><li><a href="global.html#verifyChain">verifyChain</a></li><li><a href="global.html#verifyFluxBroadcast">verifyFluxBroadcast</a></li><li><a href="global.html#verifyLogin">verifyLogin</a></li><li><a href="global.html#verifyMessage">verifyMessage</a></li><li><a href="global.html#verifyMessagePost">verifyMessagePost</a></li><li><a href="global.html#verifyObjectKeysCorrectnessOfApp">verifyObjectKeysCorrectnessOfApp</a></li><li><a href="global.html#verifyOriginalFluxBroadcast">verifyOriginalFluxBroadcast</a></li><li><a href="global.html#verifyPrivilege">verifyPrivilege</a></li><li><a href="global.html#verifyRepository">verifyRepository</a></li><li><a href="global.html#verifyRestrictionCorrectnessOfApp">verifyRestrictionCorrectnessOfApp</a></li><li><a href="global.html#verifyTimestampInFluxBroadcast">verifyTimestampInFluxBroadcast</a></li><li><a href="global.html#verifyTxOutProof">verifyTxOutProof</a></li><li><a href="global.html#verifyTypeCorrectnessOfApp">verifyTypeCorrectnessOfApp</a></li><li><a href="global.html#verifyUPNPsupport">verifyUPNPsupport</a></li><li><a href="global.html#verifyZelID">verifyZelID</a></li><li><a href="global.html#viewDeterministicZelNodeList">viewDeterministicZelNodeList</a></li><li><a href="global.html#whitelistedRepositories">whitelistedRepositories</a></li><li><a href="global.html#wsRespondLoginPhrase">wsRespondLoginPhrase</a></li><li><a href="global.html#wsRespondSignature">wsRespondSignature</a></li><li><a href="global.html#zcBenchmark">zcBenchmark</a></li><li><a href="global.html#zcRawJoinSplit">zcRawJoinSplit</a></li><li><a href="global.html#zcRawJoinSplitPost">zcRawJoinSplitPost</a></li><li><a href="global.html#zcRawKeygen">zcRawKeygen</a></li><li><a href="global.html#zcRawReceive">zcRawReceive</a></li><li><a href="global.html#zcRawReceivePost">zcRawReceivePost</a></li><li><a href="global.html#zcSampleJoinSplit">zcSampleJoinSplit</a></li><li><a href="global.html#zelNodeCurrentWinner">zelNodeCurrentWinner</a></li><li><a href="global.html#zelNodeDebug">zelNodeDebug</a></li><li><a href="global.html#zExportKey">zExportKey</a></li><li><a href="global.html#zExportViewingKey">zExportViewingKey</a></li><li><a href="global.html#zGetBalance">zGetBalance</a></li><li><a href="global.html#zGetMigrationStatus">zGetMigrationStatus</a></li><li><a href="global.html#zGetNewAddress">zGetNewAddress</a></li><li><a href="global.html#zGetOperationResult">zGetOperationResult</a></li><li><a href="global.html#zGetOperationStatus">zGetOperationStatus</a></li><li><a href="global.html#zGetTotalBalance">zGetTotalBalance</a></li><li><a href="global.html#zImportKey">zImportKey</a></li><li><a href="global.html#zImportViewingKey">zImportViewingKey</a></li><li><a href="global.html#zImportWallet">zImportWallet</a></li><li><a href="global.html#zListAddresses">zListAddresses</a></li><li><a href="global.html#zListOperationIds">zListOperationIds</a></li><li><a href="global.html#zListReceivedByAddress">zListReceivedByAddress</a></li><li><a href="global.html#zListUnspent">zListUnspent</a></li><li><a href="global.html#zMergeToAddress">zMergeToAddress</a></li><li><a href="global.html#znsync">znsync</a></li><li><a href="global.html#zSendMany">zSendMany</a></li><li><a href="global.html#zSendManyPost">zSendManyPost</a></li><li><a href="global.html#zSetMigration">zSetMigration</a></li><li><a href="global.html#zShieldCoinBase">zShieldCoinBase</a></li><li><a href="global.html#zValidateAddress">zValidateAddress</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 3.6.7</a> on Mon Nov 28 2022 18:46:05 GMT+0000 (Coordinated Universal Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
