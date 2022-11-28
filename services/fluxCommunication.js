@@ -17,7 +17,7 @@ const {
 let response = messageHelper.createErrorMessage();
 // default cache
 const LRUoptions = {
-  max: 20000, // currently 20000 nodes
+  max: 12000, // currently 12000 nodes
   maxAge: 1000 * 150, // 150 seconds slightly over average blocktime. Allowing 1 block expired too.
 };
 
@@ -513,13 +513,6 @@ async function fluxDiscovery() {
   }
 }
 
-/**
- * Return the number of peers this node is connected to
- */
-function getNumberOfPeers(){
-  return incomingConnections.length + outgoingConnections.length;
-}
-
 module.exports = {
   handleIncomingConnection,
   connectedPeers,
@@ -532,5 +525,4 @@ module.exports = {
   addPeer,
   handleAppRunningMessage,
   initiateAndHandleConnection,
-  getNumberOfPeers,
 };
