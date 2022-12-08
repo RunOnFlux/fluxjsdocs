@@ -9,7 +9,6 @@ const LRU = require('lru-cache');
 const systemcrontab = require('crontab');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const util = require('util');
-const fluxCommunication = require('./fluxCommunication');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const {
@@ -62,8 +61,6 @@ const trySpawningGlobalAppCache = new LRU(GlobalAppsSpawnLRUoptions);
 let removalInProgress = false;
 let installationInProgress = false;
 let reinstallationOfOldAppsInProgress = false;
-
-const hashesNumberOfSearchs = new Map();
 
 const nodeSpecs = {
   cpuCores: 0,
@@ -3636,6 +3633,47 @@ async function availableApps(req, res) {
       hash: 'localappinstancehashABCDEF', // hash of app message
       height: 0, // height of tx on which it was
     },
+    {
+      version: 2,
+      name: 'KadenaChainWebNode', // corresponds to docker name and this name is stored in apps mongo database
+      description: 'Kadena is a fast, secure, and scalable blockchain using the Chainweb consensus protocol. '
+        + 'Chainweb is a braided, parallelized Proof Of Work consensus mechanism that improves throughput and scalability in executing transactions on the blockchain while maintaining the security and integrity found in Bitcoin. '
+        + 'The healthy information tells you if your node is running and synced. If you just installed the docker it can say unhealthy for long time because on first run a bootstrap is downloaded and extracted to make your node sync faster before the node is started. '
+        + 'Do not stop or restart the docker in the first hour after installation. You can also check if your kadena node is synced, by going to running apps and press visit button on kadena and compare your node height with Kadena explorer. Thank you.',
+      repotag: 'runonflux/kadena-chainweb-node:2.13.0',
+      owner: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
+      ports: [30004, 30005],
+      containerPorts: [30004, 30005],
+      domains: ['', ''],
+      tiered: false,
+      cpu: 2.5, // true resource registered for app. If not tiered only this is available
+      ram: 4000, // true resource registered for app
+      hdd: 120, // true resource registered for app
+      enviromentParameters: ['CHAINWEB_P2P_PORT=30004', 'CHAINWEB_SERVICE_PORT=30005', 'LOGLEVEL=warn'],
+      commands: ['/bin/bash', '-c', '(test -d /data/chainweb-db/0 && ./run-chainweb-node.sh) || (/chainweb/initialize-db.sh && ./run-chainweb-node.sh)'],
+      containerData: '/data', // cannot be root todo in verification
+      hash: 'localSpecificationsVersion17', // hash of app message
+      height: 680000, // height of tx on which it was
+    },
+    {
+      version: 2,
+      name: 'KadenaChainWebData', // corresponds to docker name and this name is stored in apps mongo database
+      description: 'Kadena Chainweb Data is extension to Chainweb Node offering additional data about Kadena blockchain. Chainweb Data offers statistics, coins circulation and mainly transaction history and custom searching through transactions',
+      repotag: 'runonflux/kadena-chainweb-data:v1.1.0',
+      owner: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
+      ports: [30006],
+      containerPorts: [8888],
+      domains: [''],
+      tiered: false,
+      cpu: 3, // true resource registered for app. If not tiered only this is available
+      ram: 6000, // true resource registered for app
+      hdd: 60, // true resource registered for app
+      enviromentParameters: [],
+      commands: [],
+      containerData: '/var/lib/postgresql/data', // cannot be root todo in verification
+      hash: 'chainwebDataLocalSpecificationsVersion3', // hash of app message
+      height: 900000, // height of tx on which it was
+    },
     { // app specifications
       version: 2,
       name: 'FoldingAtHomeArm64',
@@ -3663,6 +3701,108 @@ async function availableApps(req, res) {
       containerData: '/config',
       hash: 'localSpecificationsFoldingVersion1', // hash of app message
       height: 0, // height of tx on which it was
+    },
+    {
+      name: 'websiteSync',
+      commands: [],
+      containerData: 's:/website',
+      containerPorts: [
+        '80',
+      ],
+      cpu: 0.2,
+      description: 'Global Deployment of the RunOnFlux.io website',
+      domains: [
+        'runonflux.io',
+      ],
+      enviromentParameters: [],
+      hash: 'afdfdsfdsafdfds',
+      hdd: 1,
+      height: 12419384,
+      owner: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
+      ports: [
+        '31001',
+      ],
+      ram: 200,
+      repotag: 'runonflux/website:latest',
+      tiered: false,
+      version: 3,
+      instances: 5,
+    },
+    {
+      name: 'websiteSync2',
+      compose: [
+        {
+          name: 'comp1',
+          commands: [],
+          containerData: 's:/website',
+          containerPorts: [
+            '80',
+          ],
+          cpu: 0.2,
+          description: 'TEST',
+          domains: [
+            '',
+          ],
+          environmentParameters: [],
+          hdd: 1,
+          ports: [
+            '31002',
+          ],
+          ram: 200,
+          repotag: 'runonflux/website:latest',
+          tiered: false,
+        },
+        {
+          name: 'comp2',
+          commands: [],
+          containerData: '/website',
+          containerPorts: [
+            '80',
+          ],
+          cpu: 0.2,
+          description: 'Global Deployment of the RunOnFlux.io website',
+          domains: [
+            '',
+          ],
+          environmentParameters: [],
+          hdd: 1,
+          ports: [
+            '31003',
+          ],
+          ram: 200,
+          repotag: 'runonflux/website:latest',
+          tiered: false,
+        },
+        {
+          name: 'comp3',
+          commands: [],
+          containerData: 's:/website',
+          containerPorts: [
+            '80',
+          ],
+          cpu: 0.2,
+          description: 'Global Deployment of the RunOnFlux.io website',
+          domains: [
+            '',
+          ],
+          environmentParameters: [],
+          hdd: 1,
+          ports: [
+            '31004',
+          ],
+          ram: 200,
+          repotag: 'runonflux/website:latest',
+          tiered: false,
+        },
+      ],
+      contacts: [],
+      description: 'TEST',
+      geolocation: [],
+      hash: 'asdasdasd',
+      height: 12391464,
+      instances: 5,
+      owner: '1hjy4bCYBJr4mny4zCE85J94RXa8W6q37',
+      version: 5,
     },
   ];
 
@@ -3801,31 +3941,23 @@ async function checkApplicationImagesComplience(appSpecs) {
 
   const repos = resBlockedRepo.data;
 
-  const pureImagesOrOrganisationsRepos = [];
+  const pureImagesRepos = [];
   repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
+    pureImagesRepos.push(repo.split(':')[0]);
   });
 
   const images = [];
-  const organisations = [];
   if (appSpecs.version <= 3) {
     images.push(appSpecs.repotag.split(':')[0]);
-    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
   } else {
     appSpecs.compose.forEach((component) => {
       images.push(component.repotag.split(':')[0]);
-      organisations.push(component.repotag.split(':')[0].split('/')[0]);
     });
   }
 
   images.forEach((image) => {
-    if (pureImagesOrOrganisationsRepos.includes(image)) {
+    if (pureImagesRepos.includes(image)) {
       throw new Error(`Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`);
-    }
-  });
-  organisations.forEach((org) => {
-    if (pureImagesOrOrganisationsRepos.includes(org)) {
-      throw new Error(`Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`);
     }
   });
 
@@ -4259,7 +4391,7 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
       }
       // furthermore name cannot contain any special character
       if (!appComponent.name.match(/^[a-zA-Z0-9]+$/)) {
-        throw new Error('Flux App component name contains special characters. Only a-z, A-Z and 0-9 are allowed');
+        throw new Error('Flux App name contains special characters. Only a-z, A-Z and 0-9 are allowed');
       }
       if (usedNames.includes(appComponent.name)) {
         throw new Error(`Flux App component ${appComponent.name} already assigned. Use different name.`);
@@ -4586,8 +4718,8 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
  */
 async function assignedPortsInstalledApps() {
   // construct object ob app name and ports array
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appslocal.database);
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appslocal.database);
   const query = {};
   const projection = { projection: { _id: 0 } };
   const results = await dbHelper.findInDatabase(database, localAppsInformation, query, projection);
@@ -5869,13 +6001,11 @@ async function updateAppGlobalyApi(req, res) {
 }
 
 /**
- * To install any app locally Checks that the app is installable on the machine (i.e. the machine has a suitable space. Only accessible by admins and Flux team members.
- * Possible to install any locally present app and currently present global app
- * This has intentionally less check then automated global installation. Node op should know what is doing, great for testing.
+ * To install temporary local app. Checks that the app is installable on the machine (i.e. the machine has a suitable node tier status and any required dependency apps are installed). Only accessible by admins and Flux team members.
  * @param {object} req Request.
  * @param {object} res Response.
  */
-async function installAppLocally(req, res) {
+async function installTemporaryLocalApplication(req, res) {
   try {
     let { appname } = req.params;
     appname = appname || req.query.appname;
@@ -5886,46 +6016,27 @@ async function installAppLocally(req, res) {
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       const allApps = await availableApps();
-      let appSpecifications = allApps.find((app) => app.name === appname);
+      const appSpecifications = allApps.find((app) => app.name === appname);
       if (!appSpecifications) {
-        // eslint-disable-next-line no-use-before-define
-        appSpecifications = await getApplicationGlobalSpecifications(appname);
-        if (!appSpecifications) {
-          throw new Error(`Application Specifications of ${appname} not found`);
-        }
+        throw new Error('Application Specifications not found');
       }
-      // get current height
-      const dbopen = dbHelper.databaseConnection();
-      if (!appSpecifications.height && appSpecifications.height !== 0) {
-        // precaution for old temporary apps. Set up for custom test specifications.
-        const database = dbopen.db(config.database.daemon.database);
-        const query = { generalScannedHeight: { $gte: 0 } };
-        const projection = {
-          projection: {
-            _id: 0,
-            generalScannedHeight: 1,
-          },
-        };
-        const result = await dbHelper.findOneInDatabase(database, scannedHeightCollection, query, projection);
-        if (!result) {
-          throw new Error('Scanning not initiated');
+      const tier = await generalService.nodeTier();
+      if (appname === 'KadenaChainWebNode' && tier === 'basic') {
+        throw new Error('KadenaChainWebNode can only be installed on NIMBUS and STRATUS');
+      } else if (appname === 'KadenaChainWebData' && (tier === 'basic' || tier === 'super')) {
+        throw new Error('KadenaChainWebData can only be installed on STRATUS');
+      } else if (appname === 'KadenaChainWebData') {
+        // this app can only be installed if KadenaChainWebNode is installed
+        // check if they are running?
+        const installedAppsRes = await installedApps();
+        if (installedAppsRes.status !== 'success') {
+          throw new Error('Failed to get installed Apps');
         }
-        const explorerHeight = serviceHelper.ensureNumber(result.generalScannedHeight);
-        appSpecifications.height = explorerHeight - config.fluxapps.blocksLasting + (10 * config.fluxapps.expireFluxAppsPeriod); // allow running for 1000 blocks
-      }
-
-      const appsDatabase = dbopen.db(config.database.appslocal.database);
-      const appsQuery = {}; // all
-      const appsProjection = {
-        projection: {
-          _id: 0,
-          name: 1,
-        },
-      };
-      const apps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
-      const appExists = apps.find((app) => app.name === appSpecifications.name);
-      if (appExists) { // double checked in installation process.
-        throw new Error(`Application ${appname} is already installed`);
+        const appsInstalled = installedAppsRes.data;
+        const chainwebNode = appsInstalled.find((app) => app.name === 'KadenaChainWebNode');
+        if (!chainwebNode) {
+          throw new Error('KadenaChainWebNode must be installed first');
+        }
       }
 
       await checkAppRequirements(appSpecifications); // entire app
@@ -6144,21 +6255,6 @@ async function appHashHasMessage(hash) {
   const database = db.db(config.database.daemon.database);
   const query = { hash };
   const update = { $set: { message: true } };
-  const options = {};
-  await dbHelper.updateOneInDatabase(database, appsHashesCollection, query, update, options);
-  return true;
-}
-
-/**
- * To update the database that an app hash has a message not found on network.
- * @param {object} hash Hash object containing app information.
- * @returns {boolean} True.
- */
-async function appHashHasMessageNotFound(hash) {
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.daemon.database);
-  const query = { hash };
-  const update = { $set: { messageNotFound: true } };
   const options = {};
   await dbHelper.updateOneInDatabase(database, appsHashesCollection, query, update, options);
   return true;
@@ -6588,13 +6684,8 @@ async function rescanGlobalAppsInformationAPI(req, res) {
  */
 async function continuousFluxAppHashesCheck() {
   try {
+    const knownWrongTxids = ['e56e08a8dbe9523ad10ca328fca84ee1da775ea5f466abed06ec357daa192940'];
     log.info('Requesting missing Flux App messages');
-
-    const numberOfPeers = fluxCommunication.getNumberOfPeers();
-    if (numberOfPeers < 10) {
-      log.info('Not enough connected peers to request missing Flux App messages');
-      return;
-    }
     // get flux app hashes that do not have a message;
     const dbopen = dbHelper.databaseConnection();
     const database = dbopen.db(config.database.daemon.database);
@@ -6607,26 +6698,15 @@ async function continuousFluxAppHashesCheck() {
         height: 1,
         value: 1,
         message: 1,
-        messageNotFound: 1,
       },
     };
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // eslint-disable-next-line no-restricted-syntax
     for (const result of results) {
-      if (!result.messageNotFound) { // wrong data, can be later removed
-        let numberOfSearches = 1;
-        if (hashesNumberOfSearchs.has(result.hash)) {
-          numberOfSearches = hashesNumberOfSearchs.get(result.hash) + 1;
-        }
-        hashesNumberOfSearchs.set(result.hash, numberOfSearches);
-        if (numberOfSearches < 4) {
-          checkAndRequestApp(result.hash, result.txid, result.height, result.value);
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(1234);
-        } else {
-          // eslint-disable-next-line no-await-in-loop
-          await appHashHasMessageNotFound(result.hash);
-        }
+      if (!knownWrongTxids.includes(result.txid)) { // wrong data, can be later removed
+        checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(1234);
       }
     }
   } catch (error) {
@@ -7421,7 +7501,7 @@ async function expireGlobalApplications() {
     // find applications that have specifications height lower than expirationHeight
     const databaseApps = dbopen.db(config.database.appsglobal.database);
     const queryApps = { height: { $lt: expirationHeight } };
-    const projectionApps = { projection: { _id: 0, name: 1, hash: 1 } };
+    const projectionApps = { projection: { _id: 0, name: 1, hash: 1 } }; // todo look into correction for checking hash of app
     const results = await dbHelper.findInDatabase(databaseApps, globalAppsInformation, queryApps, projectionApps);
     const appNamesToExpire = results.map((res) => res.name);
     // remove appNamesToExpire apps from global database
@@ -7438,8 +7518,7 @@ async function expireGlobalApplications() {
       throw new Error('Failed to get installed Apps');
     }
     const appsInstalled = installedAppsRes.data;
-    // remove any installed app which height is lower (or not present) but is not infinite app
-    const appsToRemove = appsInstalled.filter((app) => appNamesToExpire.includes(app.name) || (app.height !== 0 && (app.height < expirationHeight || !app.height)));
+    const appsToRemove = appsInstalled.filter((app) => appNamesToExpire.includes(app.name));
     const appsToRemoveNames = appsToRemove.map((app) => app.name);
     // remove appsToRemoveNames apps from locally running
     // eslint-disable-next-line no-restricted-syntax
@@ -8453,7 +8532,7 @@ module.exports = {
   reindexGlobalAppsInformationAPI,
   reindexGlobalAppsLocationAPI,
   expireGlobalApplications,
-  installAppLocally,
+  installTemporaryLocalApplication,
   updateAppGlobalyApi,
   getAppPrice,
   reinstallOldApplications,
