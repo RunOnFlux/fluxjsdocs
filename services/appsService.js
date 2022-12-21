@@ -1688,7 +1688,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     if (res) {
       res.write(serviceHelper.ensureString(makeDirectory));
     }
-    const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata`;
+    const execDIR = `sudo mkdir -p ${appsFolder + appId}`;
     await cmdAsync(execDIR);
     const makeDirectory2 = {
       status: 'Directory made',
@@ -1733,27 +1733,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(permissionsDirectory2);
     if (res) {
       res.write(serviceHelper.ensureString(permissionsDirectory2));
-    }
-
-    // if s flag create .stfolder
-    const containerDataFlags = appSpecifications.containerData.split(':')[1] ? appSpecifications.containerData.split(':')[0] : '';
-    if (containerDataFlags.includes('s')) {
-      const stFolderCreation = {
-        status: 'Creating .stfolder for syncthing...',
-      };
-      log.info(stFolderCreation);
-      if (res) {
-        res.write(serviceHelper.ensureString(stFolderCreation));
-      }
-      const execDIRst = `sudo mkdir -p ${appsFolder + appId}/.stfolder`;
-      await cmdAsync(execDIRst);
-      const stFolderCreation2 = {
-        status: '.stfolder created',
-      };
-      log.info(stFolderCreation2);
-      if (res) {
-        res.write(serviceHelper.ensureString(stFolderCreation2));
-      }
     }
 
     const cronStatus = {
@@ -8372,6 +8351,7 @@ async function syncthingApps() {
         }
       }
     }
+    log.info(`devicesConfiguration is: ${JSON.stringify(devicesConfiguration)}`);
     // now we have new accurate devicesConfiguration and foldersConfiguration
     // add more of current devices
     // excludes our current deviceID adjustment
