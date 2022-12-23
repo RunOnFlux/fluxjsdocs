@@ -56,8 +56,12 @@ const LRUoptions = {
 const GlobalAppsSpawnLRUoptions = {
   maxAge: 1000 * 60 * 30, // 30 minutes
 };
+const longCache = {
+  maxAge: 1000 * 60 * 60 * 8, // 8 hours
+};
 const myCache = new LRU(LRUoptions);
 const trySpawningGlobalAppCache = new LRU(GlobalAppsSpawnLRUoptions);
+const myLongCache = new LRU(longCache);
 
 let removalInProgress = false;
 let installationInProgress = false;
@@ -3808,19 +3812,35 @@ async function verifyRepository(repotag) {
   return true;
 }
 
+async function getBlockedRepositores() {
+  try {
+    const cachedResponse = myLongCache.get('blockedRepositories');
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+    const resBlockedRepo = await serviceHelper.axiosGet('https://raw.githubusercontent.com/runonflux/flux/master/helpers/blockedrepositories.json');
+    if (resBlockedRepo.data) {
+      myLongCache.set('blockedRepositories', resBlockedRepo.data);
+      return resBlockedRepo.data;
+    }
+    return null;
+  } catch (error) {
+    log.error(error);
+    return null;
+  }
+}
+
 /**
  * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub repositories.
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if no errors are thrown.
  */
 async function checkApplicationImagesComplience(appSpecs) {
-  const resBlockedRepo = await serviceHelper.axiosGet('https://raw.githubusercontent.com/runonflux/flux/master/helpers/blockedrepositories.json');
+  const repos = await getBlockedRepositores();
 
-  if (!resBlockedRepo) {
+  if (!repos) {
     throw new Error('Unable to communicate with Flux Services! Try again later.');
   }
-
-  const repos = resBlockedRepo.data;
 
   const pureImagesOrOrganisationsRepos = [];
   repos.forEach((repo) => {
@@ -3851,6 +3871,51 @@ async function checkApplicationImagesComplience(appSpecs) {
   });
 
   return true;
+}
+
+/**
+ * To check if application image is part of blocked repositories
+ * @param {object} appSpecs App specifications.
+ * @returns {boolean} True if no errors are thrown.
+ */
+async function checkApplicationImagesBlocked(appSpecs) {
+  const repos = await getBlockedRepositores();
+
+  let isBlocked = false;
+
+  if (!repos) {
+    return isBlocked;
+  }
+
+  const pureImagesOrOrganisationsRepos = [];
+  repos.forEach((repo) => {
+    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
+  });
+
+  const images = [];
+  const organisations = [];
+  if (appSpecs.version <= 3) {
+    images.push(appSpecs.repotag.split(':')[0]);
+    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
+  } else {
+    appSpecs.compose.forEach((component) => {
+      images.push(component.repotag.split(':')[0]);
+      organisations.push(component.repotag.split(':')[0].split('/')[0]);
+    });
+  }
+
+  images.forEach((image) => {
+    if (pureImagesOrOrganisationsRepos.includes(image)) {
+      isBlocked = `Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`;
+    }
+  });
+  organisations.forEach((org) => {
+    if (pureImagesOrOrganisationsRepos.includes(org)) {
+      isBlocked = `Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`;
+    }
+  });
+
+  return isBlocked;
 }
 
 /**
@@ -4018,12 +4083,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
     if (!Array.isArray(compose)) {
       throw new Error('Invalid Flux App Specifications');
-    }
-    if (compose.length < 1) {
-      throw new Error('Flux App does not contain any components');
-    }
-    if (compose.length > 5) {
-      throw new Error('Flux App has too many components');
     }
     compose.forEach((appComponent) => {
       if (Array.isArray(appComponent)) {
@@ -4256,7 +4315,11 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
     if (appSpecifications.compose.length < 1) {
       throw new Error('Flux App does not contain any composition');
     }
-    if (appSpecifications.compose.length > 5) {
+    let maxComponents = 10;
+    if (height < config.fluxapps.appSpecsEnforcementHeights[6]) {
+      maxComponents = 5;
+    }
+    if (appSpecifications.compose.length > maxComponents) {
       throw new Error('Flux App has too many components');
     }
     // check port is within range
@@ -4365,11 +4428,7 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
       throw new Error('Invalid geolocation submited.'); // for now we are only accepting continent and country.
     }
     appSpecifications.geolocation.forEach((geo) => {
-      let maxGeoLength = 5;
-      if (height > 1230000) { // once all nodes update, we can remove this
-        // ac geolocation
-        maxGeoLength = 50; // should be way more than sufficient
-      }
+      const maxGeoLength = 50;
       if (geo.length > maxGeoLength) { // for now we only treat aXX and bXX as continent and country specs.
         throw new Error(`Geolocation ${geo} is not valid.`); // firt letter for what represents and next two for the code
       }
@@ -5477,11 +5536,8 @@ function specificationFormatter(appSpecification) {
       throw new Error('Missing Flux App specification parameter');
     }
     compose = serviceHelper.ensureObject(compose);
-    if (compose.length < 1) {
-      throw new Error('Flux App does not contain any components');
-    }
-    if (compose.length > 5) {
-      throw new Error('Flux App has too many components');
+    if (!Array.isArray(compose)) {
+      throw new Error('Flux App compose parameter is not valid');
     }
     compose.forEach((appComponent) => {
       const appComponentCorrect = {};
@@ -5905,23 +5961,37 @@ async function installAppLocally(req, res) {
     if (!appname) {
       throw new Error('No Flux App specified');
     }
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    let blockAllowance = config.fluxapps.ownerAppAllowance;
+    // needs to be logged in
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized) {
-      const allApps = await availableApps();
-      let appSpecifications = allApps.find((app) => app.name === appname);
+      let appSpecifications;
+      // anyone can deploy temporary app
+      // favor temporary to launch test temporary apps
+      const tempMessage = await checkAppTemporaryMessageExistence(appname);
+      if (tempMessage) {
+      // eslint-disable-next-line prefer-destructuring
+        appSpecifications = tempMessage.appSpecifications;
+        blockAllowance = config.fluxapps.temporaryAppAllowance;
+      }
+      if (!appSpecifications) {
+        // only owner can deploy permanent message or existing app
+        const ownerAuthorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+        if (!ownerAuthorized) {
+          const errMessage = messageHelper.errUnauthorizedMessage();
+          res.json(errMessage);
+          return;
+        }
+      }
+      if (!appSpecifications) {
+        const allApps = await availableApps();
+        appSpecifications = allApps.find((app) => app.name === appname);
+      }
       if (!appSpecifications) {
         // eslint-disable-next-line no-use-before-define
         appSpecifications = await getApplicationGlobalSpecifications(appname);
       }
-      // search in temporary messages for the specific apphash to launch
-      // favor temporary to launch test temporary apps
-      if (!appSpecifications) {
-        const tempMessage = await checkAppTemporaryMessageExistence(appname);
-        if (tempMessage) {
-        // eslint-disable-next-line prefer-destructuring
-          appSpecifications = tempMessage.appSpecifications;
-        }
-      }
+      // search in permanent messages for the specific apphash to launch
       if (!appSpecifications) {
         const permMessage = await checkAppMessageExistence(appname);
         if (permMessage) {
@@ -5949,7 +6019,7 @@ async function installAppLocally(req, res) {
           throw new Error('Scanning not initiated');
         }
         const explorerHeight = serviceHelper.ensureNumber(result.generalScannedHeight);
-        appSpecifications.height = explorerHeight - config.fluxapps.blocksLasting + (10 * config.fluxapps.expireFluxAppsPeriod); // allow running for 1000 blocks
+        appSpecifications.height = explorerHeight - config.fluxapps.blocksLasting + blockAllowance; // allow running for this amount of blocks
       }
 
       const appsDatabase = dbopen.db(config.database.appslocal.database);
@@ -7479,6 +7549,19 @@ async function expireGlobalApplications() {
     // remove any installed app which height is lower (or not present) but is not infinite app
     const appsToRemove = appsInstalled.filter((app) => appNamesToExpire.includes(app.name) || (app.height !== 0 && (app.height < expirationHeight || !app.height)));
     const appsToRemoveNames = appsToRemove.map((app) => app.name);
+    if (appsInstalled.length > appsToRemoveNames.length) {
+      // only ask for blocked repositories if some apps installed are not getting removed
+      // eslint-disable-next-line no-restricted-syntax
+      for (const app of appsInstalled) {
+        // eslint-disable-next-line no-await-in-loop
+        const isAppBlocked = await checkApplicationImagesBlocked(app);
+        if (isAppBlocked) {
+          if (!appsToRemoveNames.includes(app.name)) {
+            appsToRemoveNames.push(app.name);
+          }
+        }
+      }
+    }
     // remove appsToRemoveNames apps from locally running
     // eslint-disable-next-line no-restricted-syntax
     for (const appName of appsToRemoveNames) {
@@ -8059,10 +8142,16 @@ async function verifyAppUpdateParameters(req, res) {
 async function deploymentInformation(req, res) {
   try {
     // respond with information needed for application deployment regarding specification limitation and prices
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height;
+    let deployAddr = config.fluxapps.address;
+    if (daemonHeight >= config.fluxapps.appSpecsEnforcementHeights[6]) {
+      deployAddr = config.fluxapps.addressB;
+    }
     const information = {
       price: config.fluxapps.price,
       appSpecsEnforcementHeights: config.fluxapps.appSpecsEnforcementHeights,
-      address: config.fluxapps.address,
+      address: deployAddr,
       portMin: config.fluxapps.portMin,
       portMax: config.fluxapps.portMax,
       maxImageSize: config.fluxapps.maxImageSize,
@@ -8274,7 +8363,7 @@ async function getDeviceID(fluxIP) {
     if (response.data.status === 'success') {
       return response.data.data;
     }
-    throw new Error(`Unable to get deviceid from ${fluxIP}`);
+    throw new Error(response.data.data);
   } catch (error) {
     log.error(error);
     return null;
