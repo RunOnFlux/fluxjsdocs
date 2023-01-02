@@ -460,8 +460,8 @@ function isCommunicationEstablished(req, res) {
   let message;
   if (outgoingPeers.length < config.fluxapps.minOutgoing) { // easier to establish
     message = messageHelper.createErrorMessage('Not enough connections established to Flux network');
-  // } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
-  //   message = messageHelper.createErrorMessage('Not enough incoming connections from Flux network');
+  } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
+    message = messageHelper.createErrorMessage('Not enough incoming connections from Flux network');
   } else {
     message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
   }
@@ -729,7 +729,6 @@ async function allowPort(port) {
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
-  console.log(cmdres);
   const cmdStat = {
     status: false,
     message: null,
@@ -753,7 +752,6 @@ async function denyPort(port) {
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
-  console.log(cmdres);
   const cmdStat = {
     status: false,
     message: null,
