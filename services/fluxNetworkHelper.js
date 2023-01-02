@@ -460,8 +460,8 @@ function isCommunicationEstablished(req, res) {
   let message;
   if (outgoingPeers.length < config.fluxapps.minOutgoing) { // easier to establish
     message = messageHelper.createErrorMessage('Not enough connections established to Flux network');
-  // } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
-  //   message = messageHelper.createErrorMessage('Not enough incoming connections from Flux network');
+  } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
+    message = messageHelper.createErrorMessage('Not enough incoming connections from Flux network');
   } else {
     message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
   }
@@ -649,9 +649,12 @@ async function checkDeterministicNodesCollisions() {
             const filterEarlierSame = result.filter((node) => (node.readded_confirmed_height || node.confirmed_height) <= myBlockHeight);
             // keep running only older collaterals
             if (filterEarlierSame.length >= 1) {
-              log.error('Flux earlier collision detection');
+              log.error(`Flux earlier collision detection on ip:${myIP}`);
               dosState = 100;
-              setDosMessage('Flux earlier collision detection');
+              setDosMessage(`Flux earlier collision detection on ip:${myIP}`);
+              setTimeout(() => {
+                checkDeterministicNodesCollisions();
+              }, 60 * 1000);
               return;
             }
           }
@@ -661,6 +664,9 @@ async function checkDeterministicNodesCollisions() {
             log.error('Flux collision detection');
             dosState = 100;
             setDosMessage('Flux collision detection');
+            setTimeout(() => {
+              checkDeterministicNodesCollisions();
+            }, 60 * 1000);
             return;
           }
         }
@@ -729,7 +735,6 @@ async function allowPort(port) {
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
-  console.log(cmdres);
   const cmdStat = {
     status: false,
     message: null,
@@ -753,7 +758,6 @@ async function denyPort(port) {
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
-  console.log(cmdres);
   const cmdStat = {
     status: false,
     message: null,
