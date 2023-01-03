@@ -55,7 +55,7 @@ async function updateFlux(req, res) {
   const exec = `cd ${nodedpath} && npm run updateflux`;
   nodecmd.get(exec, (err) => {
     if (err) {
-      log.error(err);
+      console.log(err);
       const errMessage = messageHelper.createErrorMessage(`Error updating Flux: ${err.message}`, err.name, err.code);
       return res.json(errMessage);
     }
@@ -233,7 +233,6 @@ async function startBenchmark(req, res) {
   }
   nodecmd.get(exec, (err, data) => {
     if (err) {
-      log.error(err);
       const errMessage = messageHelper.createErrorMessage(`Error starting Benchmark: ${err.message}`, err.name, err.code);
       return res.json(errMessage);
     }
@@ -254,6 +253,7 @@ async function restartBenchmark(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
+    console.log(errMessage);
     return res.json(errMessage);
   }
   const nodedpath = path.join(__dirname, '../../../helpers');
@@ -287,7 +287,6 @@ async function startDaemon(req, res) {
   }
   nodecmd.get(exec, (err, data) => {
     if (err) {
-      log.error(err);
       const errMessage = messageHelper.createErrorMessage(`Error starting Daemon: ${err.message}`, err.name, err.code);
       return res.json(errMessage);
     }
@@ -308,6 +307,7 @@ async function restartDaemon(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
+    console.log(errMessage);
     return res.json(errMessage);
   }
   const nodedpath = path.join(__dirname, '../../../helpers');
