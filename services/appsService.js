@@ -2196,10 +2196,9 @@ async function removeAppLocally(app, res, force = false, endResponse = true) {
     // we want to remove the image as well (repotag) what if other container uses the same image -> then it shall result in an error so ok anyway
     if (!force) {
       if (removalInProgress) {
-        const warnResponse = messageHelper.createWarningMessage('Another application is undergoing removal. Removal not possible.');
-        log.warn(warnResponse);
+        log.warn('Another application is undergoing removal');
         if (res) {
-          res.write(serviceHelper.ensureString(warnResponse));
+          res.write(serviceHelper.ensureString('Another application is undergoing removal'));
           if (endResponse) {
             res.end();
           }
@@ -2207,10 +2206,9 @@ async function removeAppLocally(app, res, force = false, endResponse = true) {
         return;
       }
       if (installationInProgress) {
-        const warnResponse = messageHelper.createWarningMessage('Another application is undergoing installation. Removal not possible.');
-        log.warn(warnResponse);
+        log.warn('Another application is undergoing installation');
         if (res) {
-          res.write(serviceHelper.ensureString(warnResponse));
+          res.write(serviceHelper.ensureString('Another application is undergoing installation'));
           if (endResponse) {
             res.end();
           }
@@ -2945,7 +2943,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
   // register and launch according to specifications in message
   try {
     if (removalInProgress) {
-      const rStatus = messageHelper.createWarningMessage('Another application is undergoing removal. Installation not possible.');
+      const rStatus = messageHelper.createErrorMessage('Another application is undergoing removal');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
@@ -2954,7 +2952,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
       return;
     }
     if (installationInProgress) {
-      const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation not possible');
+      const rStatus = messageHelper.createErrorMessage('Another application is undergoing installation');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
@@ -3372,7 +3370,9 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       }
       const fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
       if (!fluxNet) {
-        throw new Error(`Flux App network of ${appName} failed to initiate`);
+        if (!fluxNet) {
+          throw new Error(`Flux App network of ${appName} failed to initiate`);
+        }
       }
       log.info(serviceHelper.ensureString(fluxNet));
       const fluxNetResponse = {
@@ -8164,6 +8164,7 @@ async function reinstallOldApplications() {
               await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, appSpecifications);
               log.warn(`Composed application ${appSpecifications.name} updated.`);
             } catch (error) {
+              removalInProgress = false;
               log.error(error);
               removeAppLocally(appSpecifications.name, null, true); // remove entire app
             }
