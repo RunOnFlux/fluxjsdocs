@@ -2196,9 +2196,10 @@ async function removeAppLocally(app, res, force = false, endResponse = true) {
     // we want to remove the image as well (repotag) what if other container uses the same image -> then it shall result in an error so ok anyway
     if (!force) {
       if (removalInProgress) {
-        log.warn('Another application is undergoing removal');
+        const warnResponse = messageHelper.createWarningMessage('Another application is undergoing removal. Removal not possible.');
+        log.warn(warnResponse);
         if (res) {
-          res.write(serviceHelper.ensureString('Another application is undergoing removal'));
+          res.write(serviceHelper.ensureString(warnResponse));
           if (endResponse) {
             res.end();
           }
@@ -2206,9 +2207,10 @@ async function removeAppLocally(app, res, force = false, endResponse = true) {
         return;
       }
       if (installationInProgress) {
-        log.warn('Another application is undergoing installation');
+        const warnResponse = messageHelper.createWarningMessage('Another application is undergoing installation. Removal not possible.');
+        log.warn(warnResponse);
         if (res) {
-          res.write(serviceHelper.ensureString('Another application is undergoing installation'));
+          res.write(serviceHelper.ensureString(warnResponse));
           if (endResponse) {
             res.end();
           }
@@ -2943,7 +2945,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
   // register and launch according to specifications in message
   try {
     if (removalInProgress) {
-      const rStatus = messageHelper.createErrorMessage('Another application is undergoing removal');
+      const rStatus = messageHelper.createWarningMessage('Another application is undergoing removal. Installation not possible.');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
@@ -2952,7 +2954,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
       return;
     }
     if (installationInProgress) {
-      const rStatus = messageHelper.createErrorMessage('Another application is undergoing installation');
+      const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation not possible');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
@@ -3370,9 +3372,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       }
       const fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
       if (!fluxNet) {
-        if (!fluxNet) {
-          throw new Error(`Flux App network of ${appName} failed to initiate`);
-        }
+        throw new Error(`Flux App network of ${appName} failed to initiate`);
       }
       log.info(serviceHelper.ensureString(fluxNet));
       const fluxNetResponse = {
@@ -4964,14 +4964,16 @@ async function restoreFluxPortsSupport() {
 
     const apiPort = userconfig.initial.apiport || config.server.apiport;
     const homePort = +apiPort - 1;
+    const syncthingPort = +apiPort + 2;
 
     // setup UFW if active
     await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(apiPort));
     await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(homePort));
+    await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(syncthingPort));
 
     // UPNP
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
-      // map our Flux API and UI port
+      // map our Flux API, UI and SYNCTHING port
       await upnpService.setupUPNP(apiPort);
     }
   } catch (error) {
@@ -8164,7 +8166,6 @@ async function reinstallOldApplications() {
               await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, appSpecifications);
               log.warn(`Composed application ${appSpecifications.name} updated.`);
             } catch (error) {
-              removalInProgress = false;
               log.error(error);
               removeAppLocally(appSpecifications.name, null, true); // remove entire app
             }
