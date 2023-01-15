@@ -116,14 +116,7 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
 
     const fluxVersion = fluxResponse.data.data;
     const versionMinOK = minVersionSatisfy(fluxVersion, config.minimumFluxOSAllowedVersion);
-    if (!versionMinOK) return false;
-
-    const homePort = +port - 1;
-    const fluxResponseUI = await serviceHelper.axiosGet(`http://${ip}:${homePort}`, axiosConfig);
-    const UIok = fluxResponseUI.data.includes('<title>');
-    if (!UIok) return false;
-
-    return true;
+    return versionMinOK;
   } catch (e) {
     return false;
   }
@@ -428,7 +421,7 @@ async function checkFluxbenchVersionAllowed() {
       return false;
     }
     dosState += 2;
-    setDosMessage('Fluxbench Version Error. Error obtaining FluxBench Version.');
+    setDosMessage('Fluxbench Version Error. Error obtaining Flux Version.');
     log.error(dosMessage);
     return false;
   } catch (err) {
