@@ -690,6 +690,11 @@ async function processBlock(blockHeight, isInsightExplorer) {
           appsService.reinstallOldApplications();
         }
       }
+      if (blockHeight % config.fluxapps.restorePortsSupportPeriod === 0) {
+        if (blockDataVerbose.height >= config.fluxapps.epochstart) {
+          appsService.restorePortsSupport();
+        }
+      }
     }
     const scannedHeight = blockDataVerbose.height;
     // update scanned Height in scannedBlockHeightCollection
