@@ -8284,15 +8284,12 @@ async function getAppPrice(req, res) {
       actualPriceToPay = Math.ceil(actualPriceToPay * 100) / 100;
       if (appInfo) {
         let previousSpecsPrice = await appPricePerMonth(appInfo, daemonHeight, appPrices); // calculate previous based on CURRENT height, with current interval of prices!
-        let previousExpireIn = previousSpecsPrice.expire || defaultExpire; // bad typo bug line. Leave it like it is, this bug is a feature now.
-        if (daemonHeight > 1315000) {
-          previousExpireIn = appInfo.expire || defaultExpire;
-        }
+        const previousExpireIn = previousSpecsPrice.expire || defaultExpire;
         const multiplierPrevious = previousExpireIn / defaultExpire;
         previousSpecsPrice *= multiplierPrevious;
         previousSpecsPrice = Math.ceil(previousSpecsPrice * 100) / 100;
         // what is the height difference
-        const heightDifference = daemonHeight - appInfo.height;
+        const heightDifference = daemonHeight - appInfo.height; // has to be lower than 22000
         const perc = (previousExpireIn - heightDifference) / previousExpireIn;
         if (perc > 0) {
           actualPriceToPay -= (perc * previousSpecsPrice);
@@ -8909,7 +8906,7 @@ async function checkMyAppsAvailability() {
         });
       } else {
         app.compose.forEach((component) => {
-          component.ports.forEach((port) => {
+          component.ports((port) => {
             appPorts.push(port);
           });
         });
