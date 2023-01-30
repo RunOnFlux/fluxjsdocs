@@ -561,9 +561,9 @@ function fluxUptime(req, res) {
 function isCommunicationEstablished(req, res) {
   let message;
   if (outgoingPeers.length < config.fluxapps.minOutgoing) { // easier to establish
-    message = messageHelper.createErrorMessage(`Not enough outgoing connections established to Flux network. Minimum required ${config.fluxapps.minOutgoing} found ${outgoingPeers.length}`);
+    message = messageHelper.createErrorMessage('Not enough outgoing connections established to Flux network');
   } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
-    message = messageHelper.createErrorMessage(`Not enough incoming connections from Flux network. Minimum required ${config.fluxapps.minIncoming} found ${incomingPeers.length}`);
+    message = messageHelper.createErrorMessage('Not enough incoming connections from Flux network');
   } else {
     message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
   }
@@ -663,19 +663,13 @@ async function checkMyFluxAvailability(retryNumber = 0) {
   const measuredUptime = fluxUptime();
   if (measuredUptime.status === 'success' && measuredUptime.data > config.fluxapps.minUpTime) { // node has been running for 30 minutes. Upon starting a node, there can be dos that needs resetting
     const nodeList = await fluxCommunicationUtils.deterministicFluxList();
-    // nodeList must include our fluxnode ip myIP
-    let myCorrectIp = `${myIP}:${apiPort}`;
-    if (apiPort === 16127 || apiPort === '16127') {
-      myCorrectIp = myCorrectIp.split(':')[0];
-    }
-    const myNodeExists = nodeList.find((node) => node.ip === myCorrectIp);
-    if (nodeList.length > config.fluxapps.minIncoming + config.fluxapps.minOutgoing && myNodeExists) { // our node MUST be in confirmed list in order to have some peers
+    if (nodeList.length > config.fluxapps.minIncoming + config.fluxapps.minOutgoing) {
       // check sufficient connections
       const connectionInfo = isCommunicationEstablished();
       if (connectionInfo.status === 'error') {
         dosState += 0.13; // slow increment, DOS after ~75 minutes. 0.13 per minute. This check depends on other nodes being able to connect to my node
         if (dosState > 10) {
-          setDosMessage(connectionInfo.data.message || 'Flux does not have sufficient peers');
+          setDosMessage(dosMessage || 'Flux does not have sufficient peers');
           log.error(dosMessage);
           return false;
         }
