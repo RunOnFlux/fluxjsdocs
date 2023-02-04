@@ -109,7 +109,7 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
     return false;
   }
   const messageToVerify = version + message + timestamp;
-  const verified = verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
+  const verified = await verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
   if (verified === true) {
     return true;
   }
