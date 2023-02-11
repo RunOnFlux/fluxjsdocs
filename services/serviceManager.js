@@ -131,9 +131,6 @@ async function startFluxFunctions() {
       log.info('Starting to spawn applications');
       appsService.trySpawningGlobalApplication();
     }, 90 * 60 * 1000);
-    setInterval(() => {
-      appsService.checkApplicationsCompliance();
-    }, 60 * 60 * 1000); //  every hour
     setTimeout(() => {
       appsService.forceAppRemovals(); // force cleanup of apps every day
       setInterval(() => {
