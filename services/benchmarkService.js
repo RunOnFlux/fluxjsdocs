@@ -5,9 +5,6 @@ const fs = require('fs');
 const serviceHelper = require('./serviceHelper');
 const messageHelper = require('./messageHelper');
 const verificationHelper = require('./verificationHelper');
-const generalService = require('./generalService');
-const upnpService = require('./upnpService');
-const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
 const isTestnet = userconfig.initial.testnet;
@@ -236,23 +233,6 @@ async function startMultiPortBench(req, res) {
   return res ? res.json(response) : response;
 }
 
-/**
- * Execute benchmark on all upnp nodes at the same time
- */
-async function executeUpnpBench() {
-  // check if we are synced
-  const synced = await generalService.checkSynced();
-  if (synced !== true) {
-    log.info('executeUpnpBench - Flux not yet synced');
-    return;
-  }
-  const isUPNP = upnpService.isUPNP();
-  if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
-    log.info('Calling FluxBench startMultiPortBench');
-    startMultiPortBench();
-  }
-}
-
 module.exports = {
   // == Export for testing purposes ==
   executeCall,
@@ -271,7 +251,4 @@ module.exports = {
   getBenchmarks,
   getInfo,
   getPublicIp,
-
-  // == UPNP FluxBecnh ==
-  executeUpnpBench,
 };

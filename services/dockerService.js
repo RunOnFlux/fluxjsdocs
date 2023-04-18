@@ -365,7 +365,7 @@ async function dockerContainerLogs(idOrName, lines) {
   return logs.toString();
 }
 
-async function obtainPayloadFromStorage(url, appName) {
+async function obtainPayloadFromStorage(url) {
   try {
     // do a signed request in headers
     // we want to be able to fetch even from unsecure storages that may not have all the auths
@@ -380,7 +380,6 @@ async function obtainPayloadFromStorage(url, appName) {
       headers: {
         'flux-message': message,
         'flux-signature': signature,
-        'flux-app': appName,
       },
       timeout: 20000,
     };
@@ -527,7 +526,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     const fluxStorageEnv = options.Env.find((env) => env.startsWith(('F_S_ENV=')));
     if (fluxStorageEnv) {
       const url = fluxStorageEnv.split('F_S_ENV=')[1];
-      const envVars = await obtainPayloadFromStorage(url, appName);
+      const envVars = await obtainPayloadFromStorage(url);
       if (Array.isArray(envVars) && envVars.length < 200) {
         envVars.forEach((parameter) => {
           if (typeof parameter !== 'string' || parameter.length > 5000000) {
@@ -546,7 +545,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     const fluxStorageCmd = options.Cmd.find((cmd) => cmd.startsWith(('F_S_CMD=')));
     if (fluxStorageCmd) {
       const url = fluxStorageCmd.split('F_S_CMD=')[1];
-      const envVars = await obtainPayloadFromStorage(url, appName);
+      const envVars = await obtainPayloadFromStorage(url);
       if (Array.isArray(envVars) && envVars.length < 200) {
         envVars.forEach((parameter) => {
           if (typeof parameter !== 'string' || parameter.length > 5000000) {
