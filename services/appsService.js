@@ -3997,31 +3997,25 @@ async function verifyAppMessageUpdateSignature(type, version, appSpec, timestamp
  * @returns {boolean} True if no errors are thrown.
  */
 async function verifyRepository(repotag) {
-  const splittedRepo = generalService.splitRepoTag(repotag);
-  let {
-    provider,
-    service,
-    authentication,
-  } = splittedRepo;
-  const {
-    providerName,
-    namespace,
-    repository,
-    tag,
-    port,
-  } = splittedRepo;
-  if (port) {
-    provider = `${provider}:${port}`;
-    service = `${service}:${port}`;
-    authentication = `${authentication}:${port}`;
+  if (typeof repotag !== 'string') {
+    throw new Error('Invalid repotag');
   }
-  const image = repository;
-  if (providerName === 'Docker Hub') { // favor docker hub api
-    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`).catch(() => {
-      throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
+
+  if (/\s/.test(repotag)) {
+    throw new Error(`Repository "${repotag}" should not contain space characters.`);
+  }
+
+  const splittedRepo = repotag.split(':');
+  if (splittedRepo[0] && splittedRepo[1] && !splittedRepo[2]) {
+    let repoToFetch = splittedRepo[0];
+    if (!repoToFetch.includes('/')) {
+      repoToFetch = `library/${splittedRepo[0]}`;
+    }
+    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${repoToFetch}/tags/${splittedRepo[1]}`).catch(() => {
+      throw new Error(`Repository ${repotag} is not found on docker hub in expected format`);
     });
     if (!resDocker) {
-      throw new Error(`Unable to communicate with ${providerName}! Try again later.`);
+      throw new Error('Unable to communicate with Docker Hub! Try again later.');
     }
     if (resDocker.data.errinfo) {
       throw new Error('Docker image not found');
@@ -4033,81 +4027,16 @@ async function verifyRepository(repotag) {
       throw new Error('Docker image not found3');
     }
     // eslint-disable-next-line no-restricted-syntax
-    for (const img of resDocker.data.images) {
-      if (img.size > config.fluxapps.maxImageSize) {
-        throw new Error(`Docker image ${repotag} of architecture ${img.architecture} size is over Flux limit`);
+    for (const image of resDocker.data.images) {
+      if (image.size > config.fluxapps.maxImageSize) {
+        throw new Error(`Docker image ${repotag} of architecture ${image.architecture} size is over Flux limit`);
       }
     }
     if (resDocker.data.full_size > config.fluxapps.maxImageSize) {
       throw new Error(`Docker image ${repotag} size is over Flux limit`);
     }
-  } else { // use docker v2 api, general for any public docker repositories
-    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch(() => {
-      throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
-    });
-    if (!authTokenRes) {
-      throw new Error(`Unable to communicate with authentication token provider ${provider}! Try again later.`);
-    }
-    const authToken = authTokenRes.data.token;
-    const axiosOptionsManifestList = {
-      timeout: 20000,
-      headers: {
-        // eslint-disable-next-line max-len
-        Authorization: `Bearer ${authToken}`,
-        Accept: 'application/vnd.docker.distribution.manifest.list.v2+json',
-      },
-    };
-    const axiosOptionsManifest = {
-      timeout: 20000,
-      headers: {
-        // eslint-disable-next-line max-len
-        Authorization: `Bearer ${authToken}`,
-        Accept: 'application/vnd.docker.distribution.manifest.v2+json',
-      },
-    };
-    const manifestsListResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${tag}`, axiosOptionsManifestList).catch(() => {
-      throw new Error(`Manifests List from ${provider} for ${namespace}/${image}:${tag} not available`);
-    });
-
-    if (!manifestsListResp) {
-      throw new Error(`Unable to communicate with manifest list provider ${provider}! Try again later.`);
-    }
-    if (manifestsListResp.data.schemaVersion !== 2) {
-      throw new Error(`Unsupported manifest list version from ${provider} for ${namespace}/${image}:${tag}.`);
-    }
-    const manifests = manifestsListResp.data.manifests || [];
-
-    if (manifestsListResp.data.mediaType === 'application/vnd.docker.distribution.manifest.v2+json') { // returned not a list like we wanted
-      manifests.push(manifestsListResp.data); // single platform amd64
-    } else if (manifestsListResp.data.mediaType !== 'application/vnd.docker.distribution.manifest.list.v2+json') { // we only want v2 or list
-      throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifestsListResp.data.mediaType}`);
-    }
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const mnfst of manifests) {
-      const { digest } = mnfst;
-      // eslint-disable-next-line no-await-in-loop
-      const manifestResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${digest}`, axiosOptionsManifest).catch(() => {
-        throw new Error(`Manifest from ${provider} for ${namespace}/${image}:${digest} not available`);
-      });
-      if (!manifestResp) {
-        throw new Error(`Unable to communicate with manifest provider ${provider}! Try again later.`);
-      }
-      const manifest = manifestResp.data;
-      if (manifest.schemaVersion !== 2) {
-        throw new Error(`Unsupported manifest version from ${provider} for ${namespace}/${image}:${digest}.`);
-      }
-      if (manifest.mediaType === 'application/vnd.docker.distribution.manifest.v2+json') {
-        throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifest.mediaType}`);
-      }
-      let size = 0;
-      manifest.layers.forEach((layer) => {
-        size += layer.size;
-      });
-      if (size > config.fluxapps.maxImageSize) {
-        throw new Error(`Docker image ${repotag} size is over Flux limit`);
-      }
-    }
+  } else {
+    throw new Error(`Repository ${repotag} is not in valid format namespace/repository:tag`);
   }
   return true;
 }
@@ -4131,7 +4060,7 @@ async function getBlockedRepositores() {
 }
 
 /**
- * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub/Github/Google repositories.
+ * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub repositories.
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if no errors are thrown.
  */
@@ -4144,7 +4073,7 @@ async function checkApplicationImagesComplience(appSpecs) {
 
   const pureImagesOrOrganisationsRepos = [];
   repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':')));
+    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
   });
 
   // blacklist works also for zelid and app hash
@@ -4158,16 +4087,12 @@ async function checkApplicationImagesComplience(appSpecs) {
   const images = [];
   const organisations = [];
   if (appSpecs.version <= 3) {
-    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':'));
-    images.push(repository);
-    const pureNamespace = repository.substring(0, repository.lastIndexOf('/'));
-    organisations.push(pureNamespace);
+    images.push(appSpecs.repotag.split(':')[0]);
+    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
   } else {
     appSpecs.compose.forEach((component) => {
-      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':'));
-      images.push(repository);
-      const pureNamespace = repository.substring(0, repository.lastIndexOf('/'));
-      organisations.push(pureNamespace);
+      images.push(component.repotag.split(':')[0]);
+      organisations.push(component.repotag.split(':')[0].split('/')[0]);
     });
   }
 
@@ -4201,7 +4126,7 @@ async function checkApplicationImagesBlocked(appSpecs) {
 
   const pureImagesOrOrganisationsRepos = [];
   repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':')));
+    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
   });
 
   // blacklist works also for zelid and app hash
@@ -4215,16 +4140,12 @@ async function checkApplicationImagesBlocked(appSpecs) {
   const images = [];
   const organisations = [];
   if (appSpecs.version <= 3) {
-    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':'));
-    images.push(repository);
-    const pureNamespace = repository.substring(0, repository.lastIndexOf('/'));
-    organisations.push(pureNamespace);
+    images.push(appSpecs.repotag.split(':')[0]);
+    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
   } else {
     appSpecs.compose.forEach((component) => {
-      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':'));
-      images.push(repository);
-      const pureNamespace = repository.substring(0, repository.lastIndexOf('/'));
-      organisations.push(pureNamespace);
+      images.push(component.repotag.split(':')[0]);
+      organisations.push(component.repotag.split(':')[0].split('/')[0]);
     });
   }
 
@@ -5253,32 +5174,20 @@ async function ensureApplicationPortsNotUsed(appSpecFormatted, globalCheckedApps
  * @returns {string[]} List of Docker image architectures.
  */
 async function repositoryArchitectures(repotag) {
-  const splittedRepo = generalService.splitRepoTag(repotag);
-  let {
-    provider,
-    service,
-    authentication,
-  } = splittedRepo;
-  const {
-    providerName,
-    namespace,
-    repository,
-    tag,
-    port,
-  } = splittedRepo;
-  if (port) {
-    provider = `${provider}:${port}`;
-    service = `${service}:${port}`;
-    authentication = `${authentication}:${port}`;
+  if (typeof repotag !== 'string') {
+    throw new Error('Invalid repotag');
   }
-  const image = repository;
-  const architectures = [];
-  if (providerName === 'Docker Hub') { // favor docker hub api
-    const resDocker = await serviceHelper.axiosGet(`https://${provider}/v2/repositories/${namespace}/${image}/tags/${tag}`).catch(() => {
-      throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
+  const splittedRepo = repotag.split(':');
+  if (splittedRepo[0] && splittedRepo[1] && !splittedRepo[2]) {
+    let repoToFetch = splittedRepo[0];
+    if (!repoToFetch.includes('/')) {
+      repoToFetch = `library/${splittedRepo[0]}`;
+    }
+    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${repoToFetch}/tags/${splittedRepo[1]}`).catch(() => {
+      throw new Error(`Repository ${repotag} is not found on docker hub in expected format`);
     });
     if (!resDocker) {
-      throw new Error(`Unable to communicate with ${providerName}! Try again later.`);
+      throw new Error('Unable to communicate with Docker Hub! Try again later.');
     }
     if (resDocker.data.errinfo) {
       throw new Error('Docker image not found');
@@ -5289,51 +5198,14 @@ async function repositoryArchitectures(repotag) {
     if (!resDocker.data.images[0]) {
       throw new Error('Docker image not found3');
     }
+    const architectures = [];
     // eslint-disable-next-line no-restricted-syntax
-    for (const img of resDocker.data.images) {
-      architectures.push(img.architecture);
+    for (const image of resDocker.data.images) {
+      architectures.push(image.architecture);
     }
-  } else { // use docker v2 api, general for any public docker repositories
-    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch(() => {
-      throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
-    });
-    if (!authTokenRes) {
-      throw new Error(`Unable to communicate with authentication token provider ${provider}! Try again later.`);
-    }
-    const authToken = authTokenRes.data.token;
-    const axiosOptionsManifestList = {
-      timeout: 20000,
-      headers: {
-        // eslint-disable-next-line max-len
-        Authorization: `Bearer ${authToken}`,
-        Accept: 'application/vnd.docker.distribution.manifest.list.v2+json',
-      },
-    };
-    const manifestsListResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${tag}`, axiosOptionsManifestList).catch(() => {
-      throw new Error(`Manifests List from ${provider} for ${namespace}/${image}:${tag} not available`);
-    });
-
-    if (!manifestsListResp) {
-      throw new Error(`Unable to communicate with manifest list provider ${provider}! Try again later.`);
-    }
-    if (manifestsListResp.data.schemaVersion !== 2) {
-      throw new Error(`Unsupported manifest list version from ${provider} for ${namespace}/${image}:${tag}.`);
-    }
-    const manifests = manifestsListResp.data.manifests || [];
-
-    if (manifestsListResp.data.mediaType === 'application/vnd.docker.distribution.manifest.v2+json') { // returned not a list like we wanted
-      // handle as single platform amd64.
-      architectures.push('amd64');
-    } else if (manifestsListResp.data.mediaType !== 'application/vnd.docker.distribution.manifest.list.v2+json') { // we only want v2 or list
-      throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifestsListResp.data.mediaType}`);
-    }
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const mnfst of manifests) {
-      architectures.push(mnfst.platform.architecture);
-    }
+    return architectures;
   }
-  return architectures;
+  throw new Error(`Repository ${repotag} is not in valid format namespace/repository:tag`);
 }
 
 /**
