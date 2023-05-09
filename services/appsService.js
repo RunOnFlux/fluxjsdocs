@@ -2049,7 +2049,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
       // eslint-disable-next-line no-restricted-syntax
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
-        await fluxNetworkHelper.denyPort(serviceHelper.ensureNumber(port));
+        await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(port));
       }
     }
     const isUPNP = upnpService.isUPNP();
@@ -2064,7 +2064,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   } else if (appSpecifications.port) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      await fluxNetworkHelper.denyPort(serviceHelper.ensureNumber(appSpecifications.port));
+      await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(appSpecifications.port));
     }
     const isUPNP = upnpService.isUPNP();
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
@@ -2506,7 +2506,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
       // eslint-disable-next-line no-restricted-syntax
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
-        await fluxNetworkHelper.denyPort(serviceHelper.ensureNumber(port));
+        await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(port));
       }
     }
     const isUPNP = upnpService.isUPNP();
@@ -2521,7 +2521,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   } else if (appSpecifications.port) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      await fluxNetworkHelper.denyPort(serviceHelper.ensureNumber(appSpecifications.port));
+      await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(appSpecifications.port));
     }
     const isUPNP = upnpService.isUPNP();
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
@@ -3997,25 +3997,32 @@ async function verifyAppMessageUpdateSignature(type, version, appSpec, timestamp
  * @returns {boolean} True if no errors are thrown.
  */
 async function verifyRepository(repotag) {
-  if (typeof repotag !== 'string') {
-    throw new Error('Invalid repotag');
+  const splittedRepo = generalService.splitRepoTag(repotag);
+  let {
+    provider,
+    service,
+    authentication,
+  } = splittedRepo;
+  const {
+    providerName,
+    namespace,
+    repository,
+    tag,
+    port,
+  } = splittedRepo;
+  if (port) {
+    provider = `${provider}:${port}`;
+    service = `${service}:${port}`;
+    authentication = `${authentication}:${port}`;
   }
-
-  if (/\s/.test(repotag)) {
-    throw new Error(`Repository "${repotag}" should not contain space characters.`);
-  }
-
-  const splittedRepo = repotag.split(':');
-  if (splittedRepo[0] && splittedRepo[1] && !splittedRepo[2]) {
-    let repoToFetch = splittedRepo[0];
-    if (!repoToFetch.includes('/')) {
-      repoToFetch = `library/${splittedRepo[0]}`;
-    }
-    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${repoToFetch}/tags/${splittedRepo[1]}`).catch(() => {
-      throw new Error(`Repository ${repotag} is not found on docker hub in expected format`);
+  const image = repository;
+  if (providerName === 'Docker Hub') { // favor docker hub api
+    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`).catch((error) => {
+      log.warn(error);
+      throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
     });
     if (!resDocker) {
-      throw new Error('Unable to communicate with Docker Hub! Try again later.');
+      throw new Error(`Unable to communicate with ${providerName}! Try again later.`);
     }
     if (resDocker.data.errinfo) {
       throw new Error('Docker image not found');
@@ -4027,16 +4034,95 @@ async function verifyRepository(repotag) {
       throw new Error('Docker image not found3');
     }
     // eslint-disable-next-line no-restricted-syntax
-    for (const image of resDocker.data.images) {
-      if (image.size > config.fluxapps.maxImageSize) {
-        throw new Error(`Docker image ${repotag} of architecture ${image.architecture} size is over Flux limit`);
+    for (const img of resDocker.data.images) {
+      if (img.size > config.fluxapps.maxImageSize) {
+        throw new Error(`Docker image ${repotag} of architecture ${img.architecture} size is over Flux limit`);
       }
     }
     if (resDocker.data.full_size > config.fluxapps.maxImageSize) {
       throw new Error(`Docker image ${repotag} size is over Flux limit`);
     }
-  } else {
-    throw new Error(`Repository ${repotag} is not in valid format namespace/repository:tag`);
+  } else { // use docker v2 api, general for any public docker repositories
+    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch((error) => {
+      log.warn(error);
+      throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
+    });
+    if (!authTokenRes) {
+      throw new Error(`Unable to communicate with authentication token provider ${provider}! Try again later.`);
+    }
+    const authToken = authTokenRes.data.token;
+    const axiosOptionsManifestList = {
+      timeout: 20000,
+      headers: {
+        // eslint-disable-next-line max-len
+        Authorization: `Bearer ${authToken}`,
+        Accept: 'application/vnd.docker.distribution.manifest.list.v2+json',
+      },
+    };
+    const axiosOptionsManifest = {
+      timeout: 20000,
+      headers: {
+        // eslint-disable-next-line max-len
+        Authorization: `Bearer ${authToken}`,
+        Accept: 'application/vnd.docker.distribution.manifest.v2+json',
+      },
+    };
+    const manifestsListResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${tag}`, axiosOptionsManifestList).catch((error) => {
+      log.warn(error);
+      throw new Error(`Manifests List from ${provider} for ${namespace}/${image}:${tag} not available`);
+    });
+
+    if (!manifestsListResp) {
+      throw new Error(`Unable to communicate with manifest list provider ${provider}! Try again later.`);
+    }
+    if (manifestsListResp.data.schemaVersion !== 2) {
+      throw new Error(`Unsupported manifest list version from ${provider} for ${namespace}/${image}:${tag}.`);
+    }
+    const manifests = manifestsListResp.data.manifests || [];
+
+    if (manifestsListResp.data.mediaType === 'application/vnd.docker.distribution.manifest.v2+json') {
+      // returned not a list like we wanted
+      // treat as single platform amd64
+      let size = 0;
+      manifestsListResp.data.layers.forEach((layer) => {
+        size += layer.size;
+      });
+      if (size > config.fluxapps.maxImageSize) {
+        throw new Error(`Docker image ${repotag} size is over Flux limit`);
+      }
+    } else if (manifestsListResp.data.mediaType !== 'application/vnd.docker.distribution.manifest.list.v2+json') { // we only want v2 or list
+      throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifestsListResp.data.mediaType}`);
+    }
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const mnfst of manifests) {
+      // rate limit precaution
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(1000); // catch for potential rate limit
+      const { digest } = mnfst;
+      // eslint-disable-next-line no-await-in-loop
+      const manifestResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${digest}`, axiosOptionsManifest).catch((error) => {
+        log.warn(error);
+        throw new Error(`Manifest from ${provider} for ${namespace}/${image}:${digest} not available`);
+      });
+      if (!manifestResp) {
+        throw new Error(`Unable to communicate with manifest provider ${provider}! Try again later.`);
+      }
+      const manifest = manifestResp.data;
+      if (manifest.schemaVersion !== 2) {
+        throw new Error(`Unsupported manifest version from ${provider} for ${namespace}/${image}:${digest}.`);
+      }
+      if (manifest.mediaType !== 'application/vnd.docker.distribution.manifest.v2+json') {
+        throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifest.mediaType}`);
+      }
+      let size = 0;
+      manifest.layers.forEach((layer) => {
+        size += layer.size;
+      });
+      if (size > config.fluxapps.maxImageSize) {
+        throw new Error(`Docker image ${repotag} size is over Flux limit`);
+      }
+    }
   }
   return true;
 }
@@ -4060,7 +4146,7 @@ async function getBlockedRepositores() {
 }
 
 /**
- * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub repositories.
+ * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub/Github/Google repositories.
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if no errors are thrown.
  */
@@ -4073,7 +4159,7 @@ async function checkApplicationImagesComplience(appSpecs) {
 
   const pureImagesOrOrganisationsRepos = [];
   repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
+    pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':') > -1 ? repo.lastIndexOf(':') : repo.length));
   });
 
   // blacklist works also for zelid and app hash
@@ -4087,12 +4173,16 @@ async function checkApplicationImagesComplience(appSpecs) {
   const images = [];
   const organisations = [];
   if (appSpecs.version <= 3) {
-    images.push(appSpecs.repotag.split(':')[0]);
-    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
+    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
+    images.push(repository);
+    const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+    organisations.push(pureNamespace);
   } else {
     appSpecs.compose.forEach((component) => {
-      images.push(component.repotag.split(':')[0]);
-      organisations.push(component.repotag.split(':')[0].split('/')[0]);
+      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
+      images.push(repository);
+      const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+      organisations.push(pureNamespace);
     });
   }
 
@@ -4126,7 +4216,7 @@ async function checkApplicationImagesBlocked(appSpecs) {
 
   const pureImagesOrOrganisationsRepos = [];
   repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.split(':')[0]);
+    pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':') > -1 ? repo.lastIndexOf(':') : repo.length));
   });
 
   // blacklist works also for zelid and app hash
@@ -4140,12 +4230,16 @@ async function checkApplicationImagesBlocked(appSpecs) {
   const images = [];
   const organisations = [];
   if (appSpecs.version <= 3) {
-    images.push(appSpecs.repotag.split(':')[0]);
-    organisations.push(appSpecs.repotag.split(':')[0].split('/')[0]);
+    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
+    images.push(repository);
+    const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+    organisations.push(pureNamespace);
   } else {
     appSpecs.compose.forEach((component) => {
-      images.push(component.repotag.split(':')[0]);
-      organisations.push(component.repotag.split(':')[0].split('/')[0]);
+      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
+      images.push(repository);
+      const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+      organisations.push(pureNamespace);
     });
   }
 
@@ -5066,10 +5160,13 @@ async function restoreFluxPortsSupport() {
     const homePort = +apiPort - 1;
     const syncthingPort = +apiPort + 2;
 
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
+    if (firewallActive) {
     // setup UFW if active
-    await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(apiPort));
-    await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(homePort));
-    await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(syncthingPort));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(apiPort));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(homePort));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(syncthingPort));
+    }
 
     // UPNP
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
@@ -5089,13 +5186,16 @@ async function restoreAppsPortsSupport() {
     const currentAppsPorts = await assignedPortsInstalledApps();
     const isUPNP = upnpService.isUPNP();
 
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
     // setup UFW for apps
+    if (firewallActive) {
     // eslint-disable-next-line no-restricted-syntax
-    for (const application of currentAppsPorts) {
+      for (const application of currentAppsPorts) {
       // eslint-disable-next-line no-restricted-syntax
-      for (const port of application.ports) {
+        for (const port of application.ports) {
         // eslint-disable-next-line no-await-in-loop
-        await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
+          await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
+        }
       }
     }
 
@@ -5107,7 +5207,14 @@ async function restoreAppsPortsSupport() {
         // eslint-disable-next-line no-restricted-syntax
         for (const port of application.ports) {
           // eslint-disable-next-line no-await-in-loop
-          await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
+          const upnpOk = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
+          if (!upnpOk) {
+            // eslint-disable-next-line no-await-in-loop
+            await removeAppLocally(application, null, true).catch((error) => log.error(error)); // remove entire app
+            // eslint-disable-next-line no-await-in-loop
+            await serviceHelper.delay(3 * 60 * 1000); // 3 mins
+            break;
+          }
         }
       }
     }
@@ -5174,20 +5281,33 @@ async function ensureApplicationPortsNotUsed(appSpecFormatted, globalCheckedApps
  * @returns {string[]} List of Docker image architectures.
  */
 async function repositoryArchitectures(repotag) {
-  if (typeof repotag !== 'string') {
-    throw new Error('Invalid repotag');
+  const splittedRepo = generalService.splitRepoTag(repotag);
+  let {
+    provider,
+    service,
+    authentication,
+  } = splittedRepo;
+  const {
+    providerName,
+    namespace,
+    repository,
+    tag,
+    port,
+  } = splittedRepo;
+  if (port) {
+    provider = `${provider}:${port}`;
+    service = `${service}:${port}`;
+    authentication = `${authentication}:${port}`;
   }
-  const splittedRepo = repotag.split(':');
-  if (splittedRepo[0] && splittedRepo[1] && !splittedRepo[2]) {
-    let repoToFetch = splittedRepo[0];
-    if (!repoToFetch.includes('/')) {
-      repoToFetch = `library/${splittedRepo[0]}`;
-    }
-    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${repoToFetch}/tags/${splittedRepo[1]}`).catch(() => {
-      throw new Error(`Repository ${repotag} is not found on docker hub in expected format`);
+  const image = repository;
+  const architectures = [];
+  if (providerName === 'Docker Hub') { // favor docker hub api
+    const resDocker = await serviceHelper.axiosGet(`https://${provider}/v2/repositories/${namespace}/${image}/tags/${tag}`).catch((error) => {
+      log.warn(error);
+      throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
     });
     if (!resDocker) {
-      throw new Error('Unable to communicate with Docker Hub! Try again later.');
+      throw new Error(`Unable to communicate with ${providerName}! Try again later.`);
     }
     if (resDocker.data.errinfo) {
       throw new Error('Docker image not found');
@@ -5198,14 +5318,53 @@ async function repositoryArchitectures(repotag) {
     if (!resDocker.data.images[0]) {
       throw new Error('Docker image not found3');
     }
-    const architectures = [];
     // eslint-disable-next-line no-restricted-syntax
-    for (const image of resDocker.data.images) {
-      architectures.push(image.architecture);
+    for (const img of resDocker.data.images) {
+      architectures.push(img.architecture);
     }
-    return architectures;
+  } else { // use docker v2 api, general for any public docker repositories
+    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch((error) => {
+      log.warn(error);
+      throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
+    });
+    if (!authTokenRes) {
+      throw new Error(`Unable to communicate with authentication token provider ${provider}! Try again later.`);
+    }
+    const authToken = authTokenRes.data.token;
+    const axiosOptionsManifestList = {
+      timeout: 20000,
+      headers: {
+        // eslint-disable-next-line max-len
+        Authorization: `Bearer ${authToken}`,
+        Accept: 'application/vnd.docker.distribution.manifest.list.v2+json',
+      },
+    };
+    const manifestsListResp = await serviceHelper.axiosGet(`https://${provider}/v2/${namespace}/${image}/manifests/${tag}`, axiosOptionsManifestList).catch((error) => {
+      log.warn(error);
+      throw new Error(`Manifests List from ${provider} for ${namespace}/${image}:${tag} not available`);
+    });
+
+    if (!manifestsListResp) {
+      throw new Error(`Unable to communicate with manifest list provider ${provider}! Try again later.`);
+    }
+    if (manifestsListResp.data.schemaVersion !== 2) {
+      throw new Error(`Unsupported manifest list version from ${provider} for ${namespace}/${image}:${tag}.`);
+    }
+    const manifests = manifestsListResp.data.manifests || [];
+
+    if (manifestsListResp.data.mediaType === 'application/vnd.docker.distribution.manifest.v2+json') { // returned not a list like we wanted
+      // handle as single platform amd64.
+      architectures.push('amd64');
+    } else if (manifestsListResp.data.mediaType !== 'application/vnd.docker.distribution.manifest.list.v2+json') { // we only want v2 or list
+      throw new Error(`Unsupported manifest from ${provider} for ${namespace}/${image}:${tag} media type ${manifestsListResp.data.mediaType}`);
+    }
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const mnfst of manifests) {
+      architectures.push(mnfst.platform.architecture);
+    }
   }
-  throw new Error(`Repository ${repotag} is not in valid format namespace/repository:tag`);
+  return architectures;
 }
 
 /**
@@ -8742,10 +8901,17 @@ async function forceAppRemovals() {
         if (appDetails) {
           // it is global app
           // do removal
-          log.warn(`${dApp} does not exist in installed apps, forcing removal`);
-          removeAppLocally(dApp, null, true); // remove entire app
+          log.warn(`${dApp} does not exist in installed app. Forcing removal.`);
           // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(10 * 60 * 1000); // 10 mins
+          await removeAppLocally(dApp, null, true).catch((error) => log.error(error)); // remove entire app
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay(3 * 60 * 1000); // 3 mins
+        } else {
+          log.warn(`${dApp} does not exist in installed apps and global application specifications are missing. Forcing removal.`);
+          // eslint-disable-next-line no-await-in-loop
+          await removeAppLocally(dApp, null, true).catch((error) => log.error(error)); // remove entire app, as of missing specs will be done based on latest app specs message
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay(3 * 60 * 1000); // 3 mins
         }
       }
     }
@@ -9042,7 +9208,10 @@ async function checkMyAppsAvailability() {
       return;
     }
     // now open this port properly and launch listening on it
-    await fluxNetworkHelper.allowPort(testingPort);
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
+    if (firewallActive) {
+      await fluxNetworkHelper.allowPort(testingPort);
+    }
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.mapUpnpPort(testingPort, 'Flux_Test_App');
     }
@@ -9094,7 +9263,9 @@ async function checkMyAppsAvailability() {
       dosMessage = 'Applications port range is not reachable from outside!';
     }
     // stop listening on the port, close the port
-    await fluxNetworkHelper.deleteAllowPortRule(testingPort);
+    if (firewallActive) {
+      await fluxNetworkHelper.deleteAllowPortRule(testingPort);
+    }
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.removeMapUpnpPort(testingPort, 'Flux_Test_App');
     }
@@ -9108,8 +9279,12 @@ async function checkMyAppsAvailability() {
     }
     checkMyAppsAvailability();
   } catch (error) {
+    let firewallActive = true;
+    firewallActive = await fluxNetworkHelper.isFirewallActive().catch((e) => log.error(e));
     // stop listening on the testing port, close the port
-    await fluxNetworkHelper.deleteAllowPortRule(testingPort).catch((e) => log.error(e));
+    if (firewallActive) {
+      await fluxNetworkHelper.deleteAllowPortRule(testingPort).catch((e) => log.error(e));
+    }
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.removeMapUpnpPort(testingPort, 'Flux_Test_App').catch((e) => log.error(e));
     }
