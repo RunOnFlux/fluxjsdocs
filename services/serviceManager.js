@@ -87,10 +87,6 @@ async function startFluxFunctions() {
     syncthingService.startSyncthing();
     log.info('Syncthing service started');
     setTimeout(() => {
-      log.info('Recheking firewall app rules');
-      fluxNetworkHelper.purgeUFW();
-    }, 30 * 1000);
-    setTimeout(() => {
       appsService.stopAllNonFluxRunningApps();
       appsService.startMonitoringOfApps();
       appsService.restoreAppsPortsSupport();
