@@ -11,7 +11,6 @@ const fluxService = require('./fluxService');
 const geolocationService = require('./geolocationService');
 const upnpService = require('./upnpService');
 const syncthingService = require('./syncthingService');
-const pgpService = require('./pgpService');
 const userconfig = require('../../../config/userconfig');
 
 const apiPort = userconfig.initial.apiport || config.server.apiport;
@@ -87,8 +86,6 @@ async function startFluxFunctions() {
     log.info('Flux Discovery started');
     syncthingService.startSyncthing();
     log.info('Syncthing service started');
-    pgpService.generateIdentity();
-    log.info('PGP service initiated');
     setTimeout(() => {
       log.info('Rechecking firewall app rules');
       fluxNetworkHelper.purgeUFW();
