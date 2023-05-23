@@ -140,6 +140,7 @@ async function getChainParamsPriceUpdates() {
           minPrice: +splittedMess[4],
           port: +splittedMess[5] || 2,
           scope: +splittedMess[6] || 6,
+          staticip: +splittedMess[7] || 3,
         };
         priceForks.push(dataPoint);
       }
@@ -2741,53 +2742,67 @@ function nodeFullGeolocation() {
 }
 
 /**
+ * To check app requirements of staticip restrictions for a node
+ * @param {object} appSpecs App specifications.
+ * @returns {boolean} True if all checks passed.
+ */
+function checkAppStaticIpRequirements(appSpecs) {
+  // check geolocation
+  if (appSpecs.version >= 7 && appSpecs.staticip) {
+    const isMyNodeStaticIP = geolocationService.isStaticIP();
+    if (isMyNodeStaticIP !== appSpecs.staticip) {
+      throw new Error(`Application ${appSpecs.name} requires static IP address to run. Aborting.`);
+    }
+  }
+  return true;
+}
+
+/**
  * To check app requirements of geolocation restrictions for a node
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
  */
 function checkAppGeolocationRequirements(appSpecs) {
   // check geolocation
-  if (appSpecs.version >= 5) {
+  if (appSpecs.version >= 5 && appSpecs.geolocation && appSpecs.geolocation.length > 0) {
     const nodeGeo = geolocationService.getNodeGeolocation();
     if (!nodeGeo) {
       throw new Error('Node Geolocation not set. Aborting.');
     }
-    if (appSpecs.geolocation && appSpecs.geolocation.length > 0) {
-      // previous geolocation specification version (a, b) [aEU, bFR]
-      // current geolocation style [acEU], [acEU_CZ], [acEU_CZ_PRG], [a!cEU], [a!cEU_CZ], [a!cEU_CZ_PRG]
-      const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
-      const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
-      const geoC = appSpecs.geolocation.filter((x) => x.startsWith('ac')); // this ensures that new specs can only run on updated nodes.
-      const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
-      const myNodeLocationContinent = nodeGeo.continentCode;
-      const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
-      const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
-      const myNodeLocationContinentALL = 'ALL';
-      const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
-      const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
+    // previous geolocation specification version (a, b) [aEU, bFR]
+    // current geolocation style [acEU], [acEU_CZ], [acEU_CZ_PRG], [a!cEU], [a!cEU_CZ], [a!cEU_CZ_PRG]
+    const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
+    const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
+    const geoC = appSpecs.geolocation.filter((x) => x.startsWith('ac')); // this ensures that new specs can only run on updated nodes.
+    const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
+    const myNodeLocationContinent = nodeGeo.continentCode;
+    const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
+    const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
+    const myNodeLocationContinentALL = 'ALL';
+    const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
+    const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
 
-      if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
-        if (appContinent.slice(1) !== nodeGeo.continentCode) {
-          throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
-        }
+    if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
+      if (appContinent.slice(1) !== nodeGeo.continentCode) {
+        throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
       }
-      if (appCountry) {
-        if (appCountry.slice(1) !== nodeGeo.countryCode) {
-          throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
-        }
+    }
+    if (appCountry) {
+      if (appCountry.slice(1) !== nodeGeo.countryCode) {
+        throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
       }
+    }
 
-      geoCForbidden.forEach((locationNotAllowed) => {
-        if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
-          throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
-        }
-      });
-      if (geoC.length) {
-        const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
+    geoCForbidden.forEach((locationNotAllowed) => {
+      if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
+        throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
+      }
+    });
+    if (geoC.length) {
+      const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
           || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL);
-        if (!nodeLocationOK) {
-          throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
-        }
+      if (!nodeLocationOK) {
+        throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
       }
     }
   }
@@ -2850,6 +2865,8 @@ async function checkAppRequirements(appSpecs) {
   // appSpecs has hdd, cpu and ram assigned to correct tier
   await checkAppHWRequirements(appSpecs);
   // check geolocation
+
+  checkAppStaticIpRequirements(appSpecs);
 
   checkAppGeolocationRequirements(appSpecs);
 
@@ -3682,6 +3699,9 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
   if (dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) { // v7+ enterprise app scoped to nodes
     totalPrice += priceSpecifications.scope;
   }
+  if (dataForAppRegistration.staticip) { // v7+ staticip option
+    totalPrice += priceSpecifications.staticip;
+  }
   totalPrice += enterprisePorts.length * priceSpecifications.port; // enterprise ports
   let appPrice = Number(Math.ceil(totalPrice * 100) / 100);
   if (instancesAdditional > 0) {
@@ -4369,29 +4389,32 @@ async function checkApplicationImagesBlocked(appSpecs) {
  * @returns {boolean} True if no errors are thrown.
  */
 function verifyTypeCorrectnessOfApp(appSpecification) {
-  const { version } = appSpecification;
-  const { name } = appSpecification;
-  const { description } = appSpecification;
-  const { owner } = appSpecification;
-  const { port } = appSpecification;
-  const { containerPort } = appSpecification;
-  const { compose } = appSpecification;
-  const { repotag } = appSpecification;
-  const { ports } = appSpecification;
-  const { domains } = appSpecification;
-  const { enviromentParameters } = appSpecification;
-  const { commands } = appSpecification;
-  const { containerPorts } = appSpecification;
-  const { containerData } = appSpecification;
-  const { instances } = appSpecification;
-  const { cpu } = appSpecification;
-  const { ram } = appSpecification;
-  const { hdd } = appSpecification;
-  const { tiered } = appSpecification;
-  const { contacts } = appSpecification;
-  const { geolocation } = appSpecification;
-  const { expire } = appSpecification;
-  const { nodes } = appSpecification;
+  const {
+    version,
+    name,
+    description,
+    owner,
+    port,
+    containerPort,
+    compose,
+    repotag,
+    ports,
+    domains,
+    enviromentParameters,
+    commands,
+    containerPorts,
+    containerData,
+    instances,
+    cpu,
+    ram,
+    hdd,
+    tiered,
+    contacts,
+    geolocation,
+    expire,
+    nodes,
+    staticip,
+  } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -4501,15 +4524,17 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
 
     if (tiered) {
-      const { cpubasic } = appSpecification;
-      const { cpusuper } = appSpecification;
-      const { cpubamf } = appSpecification;
-      const { rambasic } = appSpecification;
-      const { ramsuper } = appSpecification;
-      const { rambamf } = appSpecification;
-      const { hddbasic } = appSpecification;
-      const { hddsuper } = appSpecification;
-      const { hddbamf } = appSpecification;
+      const {
+        cpubasic,
+        cpusuper,
+        cpubamf,
+        rambasic,
+        ramsuper,
+        rambamf,
+        hddbasic,
+        hddsuper,
+        hddbamf,
+      } = appSpecification;
       if (typeof cpubasic !== 'number' || typeof cpusuper !== 'number' || typeof cpubamf !== 'number'
         || typeof rambasic !== 'number' || typeof ramsuper !== 'number' || typeof rambamf !== 'number'
         || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
@@ -4605,15 +4630,17 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         throw new Error('Invalid HW specifications decimal limits');
       }
       if (appComponent.tiered) {
-        const { cpubasic } = appComponent;
-        const { cpusuper } = appComponent;
-        const { cpubamf } = appComponent;
-        const { rambasic } = appComponent;
-        const { ramsuper } = appComponent;
-        const { rambamf } = appComponent;
-        const { hddbasic } = appComponent;
-        const { hddsuper } = appComponent;
-        const { hddbamf } = appComponent;
+        const {
+          cpubasic,
+          cpusuper,
+          cpubamf,
+          rambasic,
+          ramsuper,
+          rambamf,
+          hddbasic,
+          hddsuper,
+          hddbamf,
+        } = appComponent;
         if (typeof cpubasic !== 'number' || typeof cpusuper !== 'number' || typeof cpubamf !== 'number'
           || typeof rambasic !== 'number' || typeof ramsuper !== 'number' || typeof rambamf !== 'number'
           || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
@@ -4632,7 +4659,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         }
 
         if (typeof appComponent.repoauth !== 'string') {
-          throw new Error(`Secrets for Flux App component ${appComponent.name} are invalid`);
+          throw new Error(`Repository Authentication for Flux App component ${appComponent.name} are invalid`);
         }
       }
     });
@@ -4701,6 +4728,10 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       });
     } else {
       throw new Error('Nodes for Flux App are invalid');
+    }
+
+    if (typeof staticip !== 'boolean') {
+      throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
     }
   }
 
@@ -5113,7 +5144,7 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
     });
   } else if (appSpecifications.version === 7) {
     const specifications = [
-      'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts', 'geolocation', 'expire', 'nodes',
+      'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts', 'geolocation', 'expire', 'nodes', 'staticip',
     ];
     const componentSpecifications = [
       'name', 'description', 'repotag', 'ports', 'containerPorts', 'environmentParameters', 'commands', 'containerData', 'domains', 'secrets', 'repoauth',
@@ -6070,27 +6101,32 @@ async function requestAppMessage(hash) {
  * @returns {object} Returns formatted app specification to be stored in global database. Otherwise throws error.
  */
 function specificationFormatter(appSpecification) {
-  let { version } = appSpecification;
-  let { name } = appSpecification;
-  let { description } = appSpecification;
-  let { owner } = appSpecification;
-  let { compose } = appSpecification;
-  let { repotag } = appSpecification;
-  let { ports } = appSpecification;
-  let { domains } = appSpecification;
-  let { enviromentParameters } = appSpecification;
-  let { commands } = appSpecification;
-  let { containerPorts } = appSpecification;
-  let { containerData } = appSpecification;
-  let { instances } = appSpecification;
-  let { cpu } = appSpecification;
-  let { ram } = appSpecification;
-  let { hdd } = appSpecification;
-  const { tiered } = appSpecification;
-  let { contacts } = appSpecification;
-  let { geolocation } = appSpecification;
-  let { expire } = appSpecification;
-  let { nodes } = appSpecification;
+  let {
+    version,
+    name,
+    description,
+    owner,
+    // port, version 1 deprecated
+    // containerPort, version 1 deprecated
+    compose,
+    repotag,
+    ports,
+    domains,
+    enviromentParameters,
+    commands,
+    containerPorts,
+    containerData,
+    instances,
+    cpu,
+    ram,
+    hdd,
+    tiered,
+    contacts,
+    geolocation,
+    expire,
+    nodes,
+    staticip,
+  } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -6178,6 +6214,7 @@ function specificationFormatter(appSpecification) {
     cpu = serviceHelper.ensureNumber(cpu);
     ram = serviceHelper.ensureNumber(ram);
     hdd = serviceHelper.ensureNumber(hdd);
+    tiered = serviceHelper.ensureBoolean(tiered);
     if (typeof tiered !== 'boolean') {
       throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
     }
@@ -6196,15 +6233,17 @@ function specificationFormatter(appSpecification) {
     appSpecFormatted.tiered = tiered; // boolean
 
     if (tiered) {
-      let { cpubasic } = appSpecification;
-      let { cpusuper } = appSpecification;
-      let { cpubamf } = appSpecification;
-      let { rambasic } = appSpecification;
-      let { ramsuper } = appSpecification;
-      let { rambamf } = appSpecification;
-      let { hddbasic } = appSpecification;
-      let { hddsuper } = appSpecification;
-      let { hddbamf } = appSpecification;
+      let {
+        cpubasic,
+        cpusuper,
+        cpubamf,
+        rambasic,
+        ramsuper,
+        rambamf,
+        hddbasic,
+        hddsuper,
+        hddbamf,
+      } = appSpecification;
       if (!cpubasic || !cpusuper || !cpubamf || !rambasic || !ramsuper || !rambamf || !hddbasic || !hddsuper || !hddbamf) {
         throw new Error('Flux App was requested as tiered setup but specifications are missing');
       }
@@ -6304,15 +6343,17 @@ function specificationFormatter(appSpecification) {
         throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
       }
       if (appComponentCorrect.tiered) {
-        let { cpubasic } = appComponent;
-        let { cpusuper } = appComponent;
-        let { cpubamf } = appComponent;
-        let { rambasic } = appComponent;
-        let { ramsuper } = appComponent;
-        let { rambamf } = appComponent;
-        let { hddbasic } = appComponent;
-        let { hddsuper } = appComponent;
-        let { hddbamf } = appComponent;
+        let {
+          cpubasic,
+          cpusuper,
+          cpubamf,
+          rambasic,
+          ramsuper,
+          rambamf,
+          hddbasic,
+          hddsuper,
+          hddbamf,
+        } = appComponent;
         if (!cpubasic || !cpusuper || !cpubamf || !rambasic || !ramsuper || !rambamf || !hddbasic || !hddsuper || !hddbamf) {
           throw new Error(`Flux App component ${appComponent.name} was requested as tiered setup but specifications are missing`);
         }
@@ -6432,6 +6473,12 @@ function specificationFormatter(appSpecification) {
       throw new Error('Nodes for Flux App are invalid');
     }
     appSpecFormatted.nodes = nodesCorrect;
+
+    staticip = serviceHelper.ensureBoolean(staticip);
+    if (typeof staticip !== 'boolean') {
+      throw new Error('Invalid staticip specification. Only boolean as true or false allowed.');
+    }
+    appSpecFormatted.staticip = staticip;
   }
 
   return appSpecFormatted;
@@ -6467,9 +6514,7 @@ async function registerAppGlobalyApi(req, res) {
       // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
       // name and port HAVE to be unique for application. Check if they don't exist in global database
       // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification } = processedBody;
-      let { timestamp } = processedBody;
-      let { signature } = processedBody;
+      let { appSpecification, timestamp, signature } = processedBody;
       let messageType = processedBody.type; // determines how data is treated in the future
       let typeVersion = processedBody.version; // further determines how data is treated in the future
       if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
@@ -6584,9 +6629,7 @@ async function updateAppGlobalyApi(req, res) {
       // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
       // name and ports HAVE to be unique for application. Check if they don't exist in global database
       // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification } = processedBody;
-      let { timestamp } = processedBody;
-      let { signature } = processedBody;
+      let { appSpecification, timestamp, signature } = processedBody;
       let messageType = processedBody.type; // determines how data is treated in the future
       let typeVersion = processedBody.version; // further determines how data is treated in the future
       if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
