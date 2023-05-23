@@ -29,6 +29,7 @@ const generalService = require('./generalService');
 const upnpService = require('./upnpService');
 const geolocationService = require('./geolocationService');
 const syncthingService = require('./syncthingService');
+const pgpSrevice = require('./pgpService');
 const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
@@ -65,7 +66,7 @@ const LRUoptionsTemp = { // cache for temporary messages
 };
 const GlobalAppsSpawnLRUoptions = {
   max: 1000,
-  maxAge: 1000 * 60 * 30, // 30 minutes
+  maxAge: 1000 * 60 * 60 * 2, // 2 hours
 };
 const longCache = {
   max: 500,
@@ -137,6 +138,9 @@ async function getChainParamsPriceUpdates() {
           ram: +splittedMess[2],
           hdd: +splittedMess[3],
           minPrice: +splittedMess[4],
+          port: +splittedMess[5] || 2,
+          scope: +splittedMess[6] || 6,
+          staticip: +splittedMess[7] || 3,
         };
         priceForks.push(dataPoint);
       }
@@ -2738,53 +2742,67 @@ function nodeFullGeolocation() {
 }
 
 /**
+ * To check app requirements of staticip restrictions for a node
+ * @param {object} appSpecs App specifications.
+ * @returns {boolean} True if all checks passed.
+ */
+function checkAppStaticIpRequirements(appSpecs) {
+  // check geolocation
+  if (appSpecs.version >= 7 && appSpecs.staticip) {
+    const isMyNodeStaticIP = geolocationService.isStaticIP();
+    if (isMyNodeStaticIP !== appSpecs.staticip) {
+      throw new Error(`Application ${appSpecs.name} requires static IP address to run. Aborting.`);
+    }
+  }
+  return true;
+}
+
+/**
  * To check app requirements of geolocation restrictions for a node
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
  */
 function checkAppGeolocationRequirements(appSpecs) {
   // check geolocation
-  if (appSpecs.version >= 5) {
+  if (appSpecs.version >= 5 && appSpecs.geolocation && appSpecs.geolocation.length > 0) {
     const nodeGeo = geolocationService.getNodeGeolocation();
     if (!nodeGeo) {
       throw new Error('Node Geolocation not set. Aborting.');
     }
-    if (appSpecs.geolocation && appSpecs.geolocation.length > 0) {
-      // previous geolocation specification version (a, b) [aEU, bFR]
-      // current geolocation style [acEU], [acEU_CZ], [acEU_CZ_PRG], [a!cEU], [a!cEU_CZ], [a!cEU_CZ_PRG]
-      const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
-      const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
-      const geoC = appSpecs.geolocation.filter((x) => x.startsWith('ac')); // this ensures that new specs can only run on updated nodes.
-      const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
-      const myNodeLocationContinent = nodeGeo.continentCode;
-      const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
-      const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
-      const myNodeLocationContinentALL = 'ALL';
-      const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
-      const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
+    // previous geolocation specification version (a, b) [aEU, bFR]
+    // current geolocation style [acEU], [acEU_CZ], [acEU_CZ_PRG], [a!cEU], [a!cEU_CZ], [a!cEU_CZ_PRG]
+    const appContinent = appSpecs.geolocation.find((x) => x.startsWith('a'));
+    const appCountry = appSpecs.geolocation.find((x) => x.startsWith('b'));
+    const geoC = appSpecs.geolocation.filter((x) => x.startsWith('ac')); // this ensures that new specs can only run on updated nodes.
+    const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
+    const myNodeLocationContinent = nodeGeo.continentCode;
+    const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
+    const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
+    const myNodeLocationContinentALL = 'ALL';
+    const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
+    const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
 
-      if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
-        if (appContinent.slice(1) !== nodeGeo.continentCode) {
-          throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
-        }
+    if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
+      if (appContinent.slice(1) !== nodeGeo.continentCode) {
+        throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
       }
-      if (appCountry) {
-        if (appCountry.slice(1) !== nodeGeo.countryCode) {
-          throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
-        }
+    }
+    if (appCountry) {
+      if (appCountry.slice(1) !== nodeGeo.countryCode) {
+        throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
       }
+    }
 
-      geoCForbidden.forEach((locationNotAllowed) => {
-        if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
-          throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
-        }
-      });
-      if (geoC.length) {
-        const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
+    geoCForbidden.forEach((locationNotAllowed) => {
+      if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
+        throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
+      }
+    });
+    if (geoC.length) {
+      const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
           || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL);
-        if (!nodeLocationOK) {
-          throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
-        }
+      if (!nodeLocationOK) {
+        throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
       }
     }
   }
@@ -2848,6 +2866,8 @@ async function checkAppRequirements(appSpecs) {
   await checkAppHWRequirements(appSpecs);
   // check geolocation
 
+  checkAppStaticIpRequirements(appSpecs);
+
   checkAppGeolocationRequirements(appSpecs);
 
   return true;
@@ -2869,7 +2889,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
     throw new Error(`Invalid architecture ${architecture} detected.`);
   }
   // eslint-disable-next-line no-use-before-define
-  const repoArchitectures = await repositoryArchitectures(appSpecifications.repotag);
+  const repoArchitectures = await repositoryArchitectures(appSpecifications.repotag, appSpecifications.repoauth);
   if (!repoArchitectures.includes(architecture)) { // if my system architecture is not in the image
     throw new Error(`Architecture ${architecture} not supported by ${appSpecifications.repotag}`);
   }
@@ -2878,13 +2898,22 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
 
   // check repotag if available for download
   // eslint-disable-next-line no-use-before-define
-  await verifyRepository(appSpecifications.repotag);
+  await verifyRepository(appSpecifications.repotag, appSpecifications.repoauth);
   // check blacklist
   // eslint-disable-next-line no-use-before-define
   await checkApplicationImagesComplience(fullAppSpecs);
   // pull image
+  const pullConfig = { repoTag: appSpecifications.repotag };
+  // decode repoauth if exists
+  if (appSpecifications.repoauth) {
+    const authToken = await pgpSrevice.decryptMessage(appSpecifications.repoauth);
+    if (!authToken) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+    pullConfig.authToken = authToken;
+  }
   // eslint-disable-next-line no-unused-vars
-  await dockerPullStreamPromise(appSpecifications.repotag, res);
+  await dockerPullStreamPromise(pullConfig, res);
   const pullStatus = {
     status: isComponent ? `Pulling component ${appSpecifications.name} of Flux App ${appName}` : `Pulling global Flux App ${appName} was successful`,
   };
@@ -3220,7 +3249,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
     throw new Error(`Invalid architecture ${architecture} detected.`);
   }
   // eslint-disable-next-line no-use-before-define
-  const repoArchitectures = await repositoryArchitectures(appSpecifications.repotag);
+  const repoArchitectures = await repositoryArchitectures(appSpecifications.repotag, appSpecifications.repoauth);
   if (!repoArchitectures.includes(architecture)) { // if my system architecture is not in the image
     throw new Error(`Architecture ${architecture} not supported by ${appSpecifications.repotag}`);
   }
@@ -3229,13 +3258,22 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
 
   // check repotag if available for download
   // eslint-disable-next-line no-use-before-define
-  await verifyRepository(appSpecifications.repotag);
+  await verifyRepository(appSpecifications.repotag, appSpecifications.repoauth);
   // check blacklist
   // eslint-disable-next-line no-use-before-define
   await checkApplicationImagesComplience(fullAppSpecs);
   // pull image
+  const pullConfig = { repoTag: appSpecifications.repotag };
+  // decode repoauth if exists
+  if (appSpecifications.repoauth) {
+    const authToken = await pgpSrevice.decryptMessage(appSpecifications.repoauth);
+    if (!authToken) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+    pullConfig.authToken = authToken;
+  }
   // eslint-disable-next-line no-unused-vars
-  await dockerPullStreamPromise(appSpecifications.repotag, res);
+  await dockerPullStreamPromise(pullConfig, res);
   const pullStatus = {
     status: isComponent ? `Pulling global Flux App ${appSpecifications.name} was successful` : `Pulling global Flux App ${appName} was successful`,
   };
@@ -3582,7 +3620,20 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
       const hddTotalCount = dataForAppRegistration.hddbasic + dataForAppRegistration.hddsuper + dataForAppRegistration.hddbamf;
       const hddPrice = hddTotalCount * priceSpecifications.hdd;
       const hddTotal = hddPrice / 3;
-      const totalPrice = cpuTotal + ramTotal + hddTotal;
+      let totalPrice = cpuTotal + ramTotal + hddTotal;
+      if (dataForAppRegistration.port) {
+        if (fluxNetworkHelper.isPortEnterprise(dataForAppRegistration.port)) {
+          totalPrice += priceSpecifications.port;
+        }
+      } else if (dataForAppRegistration.ports) {
+        const enterprisePorts = [];
+        dataForAppRegistration.ports.forEach((port) => {
+          if (fluxNetworkHelper.isPortEnterprise(port)) {
+            enterprisePorts.push(port);
+          }
+        });
+        totalPrice += enterprisePorts.length * priceSpecifications.port; // enterprise ports
+      }
       let appPrice = Number(Math.ceil(totalPrice * 100) / 100);
       if (instancesAdditional > 0) {
         const additionalPrice = (appPrice * instancesAdditional) / 3;
@@ -3596,7 +3647,20 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
     const cpuTotal = dataForAppRegistration.cpu * priceSpecifications.cpu * 10;
     const ramTotal = (dataForAppRegistration.ram * priceSpecifications.ram) / 100;
     const hddTotal = dataForAppRegistration.hdd * priceSpecifications.hdd;
-    const totalPrice = cpuTotal + ramTotal + hddTotal;
+    let totalPrice = cpuTotal + ramTotal + hddTotal;
+    if (dataForAppRegistration.port) {
+      if (fluxNetworkHelper.isPortEnterprise(dataForAppRegistration.port)) {
+        totalPrice += priceSpecifications.port;
+      }
+    } else if (dataForAppRegistration.ports) {
+      const enterprisePorts = [];
+      dataForAppRegistration.ports.forEach((port) => {
+        if (fluxNetworkHelper.isPortEnterprise(port)) {
+          enterprisePorts.push(port);
+        }
+      });
+      totalPrice += enterprisePorts.length * priceSpecifications.port; // enterprise ports
+    }
     let appPrice = Number(Math.ceil(totalPrice * 100) / 100);
     if (instancesAdditional > 0) {
       const additionalPrice = (appPrice * instancesAdditional) / 3;
@@ -3611,6 +3675,7 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
   let cpuTotalCount = 0;
   let ramTotalCount = 0;
   let hddTotalCount = 0;
+  const enterprisePorts = [];
   dataForAppRegistration.compose.forEach((appComponent) => {
     if (appComponent.tiered) {
       cpuTotalCount += ((appComponent.cpubasic + appComponent.cpusuper + appComponent.cpubamf) / 3);
@@ -3621,11 +3686,23 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
       ramTotalCount += appComponent.ram;
       hddTotalCount += appComponent.hdd;
     }
+    appComponent.ports.forEach((port) => {
+      if (fluxNetworkHelper.isPortEnterprise(port)) {
+        enterprisePorts.push(port);
+      }
+    });
   });
   const cpuPrice = cpuTotalCount * priceSpecifications.cpu * 10;
   const ramPrice = (ramTotalCount * priceSpecifications.ram) / 100;
   const hddPrice = hddTotalCount * priceSpecifications.hdd;
-  const totalPrice = cpuPrice + ramPrice + hddPrice;
+  let totalPrice = cpuPrice + ramPrice + hddPrice;
+  if (dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) { // v7+ enterprise app scoped to nodes
+    totalPrice += priceSpecifications.scope;
+  }
+  if (dataForAppRegistration.staticip) { // v7+ staticip option
+    totalPrice += priceSpecifications.staticip;
+  }
+  totalPrice += enterprisePorts.length * priceSpecifications.port; // enterprise ports
   let appPrice = Number(Math.ceil(totalPrice * 100) / 100);
   if (instancesAdditional > 0) {
     const additionalPrice = (appPrice * instancesAdditional) / 3;
@@ -3996,7 +4073,7 @@ async function verifyAppMessageUpdateSignature(type, version, appSpec, timestamp
  * @param {string} repotag Docker Hub repository tag.
  * @returns {boolean} True if no errors are thrown.
  */
-async function verifyRepository(repotag) {
+async function verifyRepository(repotag, repoauth, skipVerification = false) {
   const splittedRepo = generalService.splitRepoTag(repotag);
   let {
     provider,
@@ -4016,8 +4093,41 @@ async function verifyRepository(repotag) {
     authentication = `${authentication}:${port}`;
   }
   const image = repository;
+  if (repoauth && skipVerification) {
+    return true;
+  }
+  let decryptedRepoAuth;
+  if (repoauth) {
+    decryptedRepoAuth = pgpSrevice.decryptMessage(repoauth);
+    if (!decryptedRepoAuth) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+  }
   if (providerName === 'Docker Hub') { // favor docker hub api
-    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`).catch((error) => {
+    // if we are using private image, we need to authenticate first
+    let axiosConfig = {};
+    if (decryptedRepoAuth) {
+      let loginData = {};
+      if (decryptedRepoAuth.includes(':')) { // specified by username:token
+        loginData = {
+          username: decryptedRepoAuth.split(':')[0],
+          password: decryptedRepoAuth.split(':')[1],
+        };
+      } else {
+        throw new Error('Invalid login credentials for docker provided');
+      }
+      const loginResp = await axios.post('https://hub.docker.com/v2/users/login', loginData).catch((error) => {
+        console.log(error);
+      });
+      console.log(loginResp);
+      const { token } = loginResp.data;
+      axiosConfig = {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      };
+    }
+    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`, axiosConfig).catch((error) => {
       log.warn(error);
       throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
     });
@@ -4043,7 +4153,23 @@ async function verifyRepository(repotag) {
       throw new Error(`Docker image ${repotag} size is over Flux limit`);
     }
   } else { // use docker v2 api, general for any public docker repositories
-    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch((error) => {
+    // if we are using private image, we need to authenticate first
+    let axiosConfig = {};
+    if (decryptedRepoAuth) {
+      let loginData = {};
+      if (decryptedRepoAuth.includes(':')) { // specified by username:token
+        loginData = {
+          username: decryptedRepoAuth.split(':')[0],
+          password: decryptedRepoAuth.split(':')[1],
+        };
+      } else {
+        throw new Error('Invalid login credentials for docker provided');
+      }
+      axiosConfig = {
+        auth: loginData,
+      };
+    }
+    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`, axiosConfig).catch((error) => {
       log.warn(error);
       throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
     });
@@ -4263,28 +4389,32 @@ async function checkApplicationImagesBlocked(appSpecs) {
  * @returns {boolean} True if no errors are thrown.
  */
 function verifyTypeCorrectnessOfApp(appSpecification) {
-  const { version } = appSpecification;
-  const { name } = appSpecification;
-  const { description } = appSpecification;
-  const { owner } = appSpecification;
-  const { port } = appSpecification;
-  const { containerPort } = appSpecification;
-  const { compose } = appSpecification;
-  const { repotag } = appSpecification;
-  const { ports } = appSpecification;
-  const { domains } = appSpecification;
-  const { enviromentParameters } = appSpecification;
-  const { commands } = appSpecification;
-  const { containerPorts } = appSpecification;
-  const { containerData } = appSpecification;
-  const { instances } = appSpecification;
-  const { cpu } = appSpecification;
-  const { ram } = appSpecification;
-  const { hdd } = appSpecification;
-  const { tiered } = appSpecification;
-  const { contacts } = appSpecification;
-  const { geolocation } = appSpecification;
-  const { expire } = appSpecification;
+  const {
+    version,
+    name,
+    description,
+    owner,
+    port,
+    containerPort,
+    compose,
+    repotag,
+    ports,
+    domains,
+    enviromentParameters,
+    commands,
+    containerPorts,
+    containerData,
+    instances,
+    cpu,
+    ram,
+    hdd,
+    tiered,
+    contacts,
+    geolocation,
+    expire,
+    nodes,
+    staticip,
+  } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -4394,15 +4524,17 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
 
     if (tiered) {
-      const { cpubasic } = appSpecification;
-      const { cpusuper } = appSpecification;
-      const { cpubamf } = appSpecification;
-      const { rambasic } = appSpecification;
-      const { ramsuper } = appSpecification;
-      const { rambamf } = appSpecification;
-      const { hddbasic } = appSpecification;
-      const { hddsuper } = appSpecification;
-      const { hddbamf } = appSpecification;
+      const {
+        cpubasic,
+        cpusuper,
+        cpubamf,
+        rambasic,
+        ramsuper,
+        rambamf,
+        hddbasic,
+        hddsuper,
+        hddbamf,
+      } = appSpecification;
       if (typeof cpubasic !== 'number' || typeof cpusuper !== 'number' || typeof cpubamf !== 'number'
         || typeof rambasic !== 'number' || typeof ramsuper !== 'number' || typeof rambamf !== 'number'
         || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
@@ -4498,15 +4630,17 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         throw new Error('Invalid HW specifications decimal limits');
       }
       if (appComponent.tiered) {
-        const { cpubasic } = appComponent;
-        const { cpusuper } = appComponent;
-        const { cpubamf } = appComponent;
-        const { rambasic } = appComponent;
-        const { ramsuper } = appComponent;
-        const { rambamf } = appComponent;
-        const { hddbasic } = appComponent;
-        const { hddsuper } = appComponent;
-        const { hddbamf } = appComponent;
+        const {
+          cpubasic,
+          cpusuper,
+          cpubamf,
+          rambasic,
+          ramsuper,
+          rambamf,
+          hddbasic,
+          hddsuper,
+          hddbamf,
+        } = appComponent;
         if (typeof cpubasic !== 'number' || typeof cpusuper !== 'number' || typeof cpubamf !== 'number'
           || typeof rambasic !== 'number' || typeof ramsuper !== 'number' || typeof rambamf !== 'number'
           || typeof hddbasic !== 'number' || typeof hddsuper !== 'number' || typeof hddbamf !== 'number') {
@@ -4516,6 +4650,16 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
           || !serviceHelper.isDecimalLimit(rambasic) || !serviceHelper.isDecimalLimit(ramsuper) || !serviceHelper.isDecimalLimit(rambamf)
           || !serviceHelper.isDecimalLimit(hddbasic) || !serviceHelper.isDecimalLimit(hddsuper) || !serviceHelper.isDecimalLimit(hddbamf)) {
           throw new Error('Invalid tiered HW specifications');
+        }
+      }
+
+      if (version >= 7) {
+        if (typeof appComponent.secrets !== 'string') {
+          throw new Error(`Secrets for Flux App component ${appComponent.name} are invalid`);
+        }
+
+        if (typeof appComponent.repoauth !== 'string') {
+          throw new Error(`Repository Authentication for Flux App component ${appComponent.name} are invalid`);
         }
       }
     });
@@ -4572,6 +4716,25 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
   }
 
+  if (version >= 7) {
+    if (!nodes) {
+      throw new Error('Missing Flux App specification parameter');
+    }
+    if (Array.isArray(nodes)) {
+      nodes.forEach((parameter) => {
+        if (typeof parameter !== 'string') {
+          throw new Error('Nodes for Flux App are invalid');
+        }
+      });
+    } else {
+      throw new Error('Nodes for Flux App are invalid');
+    }
+
+    if (typeof staticip !== 'boolean') {
+      throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
+    }
+  }
+
   return true;
 }
 
@@ -4581,7 +4744,9 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
  * @returns {boolean} True if no errors are thrown.
  */
 function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
-  if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6) {
+  const minPort = height >= config.fluxapps.portBockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
+  const maxPort = height >= config.fluxapps.portBockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
+  if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6 && appSpecifications.version !== 7) {
     throw new Error('Flux App message version specification is invalid');
   }
   if (appSpecifications.name.length > 32) {
@@ -4603,8 +4768,12 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
 
   if (appSpecifications.version === 1) {
     // check port is within range
-    if (appSpecifications.port < config.fluxapps.portMin || appSpecifications.port > config.fluxapps.portMax) {
-      throw new Error(`Assigned port ${appSpecifications.port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
+    if (appSpecifications.port < minPort || appSpecifications.port > maxPort) {
+      throw new Error(`Assigned port ${appSpecifications.port} is not within Flux Apps range ${minPort}-${maxPort}`);
+    }
+    const iBP = fluxNetworkHelper.isPortBanned(appSpecifications.port);
+    if (iBP) {
+      throw new Error(`Assigned port ${appSpecifications.port} is not allowed for Flux Apps`);
     }
     // check if containerPort makes sense
     if (appSpecifications.containerPort < 0 || appSpecifications.containerPort > 65535) {
@@ -4613,8 +4782,12 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   } else if (appSpecifications.version <= 3) {
     // check port is within range
     appSpecifications.ports.forEach((port) => {
-      if (port < config.fluxapps.portMin || port > config.fluxapps.portMax) {
-        throw new Error(`Assigned port ${port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
+      if (port < minPort || port > maxPort) {
+        throw new Error(`Assigned port ${port} is not within Flux Apps range ${minPort}-${maxPort}`);
+      }
+      const iBP = fluxNetworkHelper.isPortBanned(port);
+      if (iBP) {
+        throw new Error(`Assigned port ${port} is not allowed for Flux Apps`);
       }
     });
     // check if containerPort makes sense
@@ -4708,8 +4881,12 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
         throw new Error('Description is too long. Maximum of 256 characters is allowed.');
       }
       appComponent.ports.forEach((port) => {
-        if (port < config.fluxapps.portMin || port > config.fluxapps.portMax) {
-          throw new Error(`Assigned port ${port} is not within Flux Apps range ${config.fluxapps.portMin}-${config.fluxapps.portMax}`);
+        if (port < minPort || port > maxPort) {
+          throw new Error(`Assigned port ${port} is not within Flux Apps range ${minPort}-${maxPort}`);
+        }
+        const iBP = fluxNetworkHelper.isPortBanned(port);
+        if (iBP) {
+          throw new Error(`Assigned port ${port} is not allowed for Flux Apps`);
         }
       });
       if (appComponent.repotag.length > 200) {
@@ -4758,6 +4935,24 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
       if (appComponent.containerData.length < 2) {
         throw new Error(`Flux App container data folder not specified in in ${appComponent.name}. If no data folder is whished, use /tmp`);
       }
+
+      if (appSpecifications.version >= 7) {
+        if (!appSpecifications.nodes.length) { // this is NOT an enterprise app, no nodes scoping
+          if (appComponent.secrets.length) { // pgp encrypted message. Every signature encryption of node is about 100 characters. For 100 selected nodes, this gives ~5k chars limit
+            throw new Error('Secrets can not be defined for non Enterprise Applications');
+          }
+          if (appComponent.repoauth.length) { // pgp encrypted message.
+            throw new Error('Private repositories are only allowed for Enteprise Applications');
+          }
+        } else {
+          if (appComponent.secrets.length > 15000) { // pgp encrypted message. Every signature encryption of node is about 100 characters. For 100 selected nodes, this gives ~5k chars limit
+            throw new Error('Maximum length of secrets is 15000. Consider uploading to Flux Storage for bigger payload.');
+          }
+          if (appComponent.repoauth.length > 15000) { // pgp encrypted message.
+            throw new Error('Maximum length of repoauth is 15000.');
+          }
+        }
+      }
     }
   }
 
@@ -4800,6 +4995,17 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
     if (appSpecifications.expire % config.fluxapps.blocksAllowanceInterval !== 0) {
       throw new Error(`Expiration of application has to be a multiple of ${config.fluxapps.blocksAllowanceInterval} blocks ~ 1 day`);
     }
+  }
+
+  if (appSpecifications.version >= 7) {
+    if (appSpecifications.nodes.length > 110) {
+      throw new Error('Maximum number of selecteed nodes is 110');
+    }
+    appSpecifications.nodes.forEach((node) => {
+      if (node.length > 70) { // 64 for txhash, : separator, max 5 for outidx
+        throw new Error('Invalid node length');
+      }
+    });
   }
 }
 
@@ -4925,14 +5131,36 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
     const specsKeys = Object.keys(appSpecifications);
     specsKeys.forEach((sKey) => {
       if (!specifications.includes((sKey))) {
-        throw new Error('Unsupported parameter for v5 app specifications');
+        throw new Error('Unsupported parameter for v6 app specifications');
       }
     });
     appSpecifications.compose.forEach((appComponent) => {
       const specsKeysComponent = Object.keys(appComponent);
       specsKeysComponent.forEach((sKey) => {
         if (!componentSpecifications.includes((sKey))) {
-          throw new Error('Unsupported parameter for v5 app specifications');
+          throw new Error('Unsupported parameter for v6 app specifications');
+        }
+      });
+    });
+  } else if (appSpecifications.version === 7) {
+    const specifications = [
+      'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts', 'geolocation', 'expire', 'nodes', 'staticip',
+    ];
+    const componentSpecifications = [
+      'name', 'description', 'repotag', 'ports', 'containerPorts', 'environmentParameters', 'commands', 'containerData', 'domains', 'secrets', 'repoauth',
+      'cpu', 'ram', 'hdd', 'tiered', 'cpubasic', 'rambasic', 'hddbasic', 'cpusuper', 'ramsuper', 'hddsuper', 'cpubamf', 'rambamf', 'hddbamf',
+    ];
+    const specsKeys = Object.keys(appSpecifications);
+    specsKeys.forEach((sKey) => {
+      if (!specifications.includes((sKey))) {
+        throw new Error('Unsupported parameter for v7 app specifications');
+      }
+    });
+    appSpecifications.compose.forEach((appComponent) => {
+      const specsKeysComponent = Object.keys(appComponent);
+      specsKeysComponent.forEach((sKey) => {
+        if (!componentSpecifications.includes((sKey))) {
+          throw new Error('Unsupported parameter for v7 app specifications');
         }
       });
     });
@@ -5033,7 +5261,7 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
       await generalService.checkWhitelistedRepository(appSpecifications.repotag);
 
       // check repotag if available for download
-      await verifyRepository(appSpecifications.repotag);
+      await verifyRepository(appSpecifications.repotag, appSpecifications.repoauth, true);
     } else {
       // eslint-disable-next-line no-restricted-syntax
       for (const appComponent of appSpecifications.compose) {
@@ -5043,7 +5271,7 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
 
         // check repotag if available for download
         // eslint-disable-next-line no-await-in-loop
-        await verifyRepository(appComponent.repotag);
+        await verifyRepository(appComponent.repotag, appComponent.repoauth, true);
       }
     }
     // check blacklist
@@ -5210,7 +5438,7 @@ async function restoreAppsPortsSupport() {
           const upnpOk = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
           if (!upnpOk) {
             // eslint-disable-next-line no-await-in-loop
-            await removeAppLocally(application, null, true).catch((error) => log.error(error)); // remove entire app
+            await removeAppLocally(application.name, null, true).catch((error) => log.error(error)); // remove entire app
             // eslint-disable-next-line no-await-in-loop
             await serviceHelper.delay(3 * 60 * 1000); // 3 mins
             break;
@@ -5280,7 +5508,7 @@ async function ensureApplicationPortsNotUsed(appSpecFormatted, globalCheckedApps
  * @param {string} repotag Docker Hub repository tag.
  * @returns {string[]} List of Docker image architectures.
  */
-async function repositoryArchitectures(repotag) {
+async function repositoryArchitectures(repotag, repoauth) {
   const splittedRepo = generalService.splitRepoTag(repotag);
   let {
     provider,
@@ -5301,8 +5529,38 @@ async function repositoryArchitectures(repotag) {
   }
   const image = repository;
   const architectures = [];
+  let decryptedRepoAuth;
+  if (repoauth) {
+    decryptedRepoAuth = pgpSrevice.decryptMessage(repoauth);
+    if (!decryptedRepoAuth) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+  }
   if (providerName === 'Docker Hub') { // favor docker hub api
-    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`).catch((error) => {
+    // if we are using private image, we need to authenticate first
+    let axiosConfig = {};
+    if (decryptedRepoAuth) {
+      let loginData = {};
+      if (decryptedRepoAuth.includes(':')) { // specified by username:token
+        loginData = {
+          username: decryptedRepoAuth.split(':')[0],
+          password: decryptedRepoAuth.split(':')[1],
+        };
+      } else {
+        throw new Error('Invalid login credentials for docker provided');
+      }
+      const loginResp = await axios.post('https://hub.docker.com/v2/users/login', loginData).catch((error) => {
+        console.log(error);
+      });
+      console.log(loginResp);
+      const { token } = loginResp.data;
+      axiosConfig = {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      };
+    }
+    const resDocker = await serviceHelper.axiosGet(`https://hub.docker.com/v2/repositories/${namespace}/${image}/tags/${tag}`, axiosConfig).catch((error) => {
       log.warn(error);
       throw new Error(`Repository ${repotag} is not found on ${providerName} in expected format`);
     });
@@ -5323,7 +5581,23 @@ async function repositoryArchitectures(repotag) {
       architectures.push(img.architecture);
     }
   } else { // use docker v2 api, general for any public docker repositories
-    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`).catch((error) => {
+    // if we are using private image, we need to authenticate first
+    let axiosConfig = {};
+    if (decryptedRepoAuth) {
+      let loginData = {};
+      if (decryptedRepoAuth.includes(':')) { // specified by username:token
+        loginData = {
+          username: decryptedRepoAuth.split(':')[0],
+          password: decryptedRepoAuth.split(':')[1],
+        };
+      } else {
+        throw new Error('Invalid login credentials for docker provided');
+      }
+      axiosConfig = {
+        auth: loginData,
+      };
+    }
+    const authTokenRes = await serviceHelper.axiosGet(`https://${authentication}/token?service=${service}&scope=repository:${namespace}/${image}:pull`, axiosConfig).catch((error) => {
       log.warn(error);
       throw new Error(`Authentication token from ${provider} for ${namespace}/${image} not available`);
     });
@@ -5390,25 +5664,22 @@ async function ensureApplicationImagesExistsForPlatform(appSpecFormatted) {
   if (architecture !== 'arm64' && architecture !== 'amd64') {
     throw new Error(`Invalid architecture ${architecture} detected.`);
   }
-  // get all images in apps specifications
-  const appRepos = [];
   if (appSpecFormatted.version <= 3) {
-    appRepos.push(appSpecFormatted.repotag);
-  } else {
-    // eslint-disable-next-line no-restricted-syntax
-    for (const appComponent of appSpecFormatted.compose) {
-      appRepos.push(appComponent.repotag);
-    }
-  }
-  // eslint-disable-next-line no-restricted-syntax
-  for (const appRepo of appRepos) {
-    // eslint-disable-next-line no-await-in-loop
-    const repoArchitectures = await repositoryArchitectures(appRepo);
+    const repoArchitectures = await repositoryArchitectures(appSpecFormatted.repotag, appSpecFormatted.repoauth); // repoauth is undefined
     if (!repoArchitectures.includes(architecture)) { // if my system architecture is not in the image
       return false;
     }
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.delay(500); // catch for potential rate limit
+  } else {
+    // eslint-disable-next-line no-restricted-syntax
+    for (const appComponent of appSpecFormatted.compose) {
+      // eslint-disable-next-line no-await-in-loop
+      const repoArchitectures = await repositoryArchitectures(appComponent.repotag, appComponent.repoauth);
+      if (!repoArchitectures.includes(architecture)) { // if my system architecture is not in the image
+        return false;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(500); // catch for potential rate limit
+    }
   }
   return true; // all images have my system architecture
 }
@@ -5830,26 +6101,32 @@ async function requestAppMessage(hash) {
  * @returns {object} Returns formatted app specification to be stored in global database. Otherwise throws error.
  */
 function specificationFormatter(appSpecification) {
-  let { version } = appSpecification;
-  let { name } = appSpecification;
-  let { description } = appSpecification;
-  let { owner } = appSpecification;
-  let { compose } = appSpecification;
-  let { repotag } = appSpecification;
-  let { ports } = appSpecification;
-  let { domains } = appSpecification;
-  let { enviromentParameters } = appSpecification;
-  let { commands } = appSpecification;
-  let { containerPorts } = appSpecification;
-  let { containerData } = appSpecification;
-  let { instances } = appSpecification;
-  let { cpu } = appSpecification;
-  let { ram } = appSpecification;
-  let { hdd } = appSpecification;
-  const { tiered } = appSpecification;
-  let { contacts } = appSpecification;
-  let { geolocation } = appSpecification;
-  let { expire } = appSpecification;
+  let {
+    version,
+    name,
+    description,
+    owner,
+    // port, version 1 deprecated
+    // containerPort, version 1 deprecated
+    compose,
+    repotag,
+    ports,
+    domains,
+    enviromentParameters,
+    commands,
+    containerPorts,
+    containerData,
+    instances,
+    cpu,
+    ram,
+    hdd,
+    tiered,
+    contacts,
+    geolocation,
+    expire,
+    nodes,
+    staticip,
+  } = appSpecification;
 
   if (!version) {
     throw new Error('Missing Flux App specification parameter');
@@ -5937,6 +6214,7 @@ function specificationFormatter(appSpecification) {
     cpu = serviceHelper.ensureNumber(cpu);
     ram = serviceHelper.ensureNumber(ram);
     hdd = serviceHelper.ensureNumber(hdd);
+    tiered = serviceHelper.ensureBoolean(tiered);
     if (typeof tiered !== 'boolean') {
       throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
     }
@@ -5955,15 +6233,17 @@ function specificationFormatter(appSpecification) {
     appSpecFormatted.tiered = tiered; // boolean
 
     if (tiered) {
-      let { cpubasic } = appSpecification;
-      let { cpusuper } = appSpecification;
-      let { cpubamf } = appSpecification;
-      let { rambasic } = appSpecification;
-      let { ramsuper } = appSpecification;
-      let { rambamf } = appSpecification;
-      let { hddbasic } = appSpecification;
-      let { hddsuper } = appSpecification;
-      let { hddbamf } = appSpecification;
+      let {
+        cpubasic,
+        cpusuper,
+        cpubamf,
+        rambasic,
+        ramsuper,
+        rambamf,
+        hddbasic,
+        hddsuper,
+        hddbamf,
+      } = appSpecification;
       if (!cpubasic || !cpusuper || !cpubamf || !rambasic || !ramsuper || !rambamf || !hddbasic || !hddsuper || !hddbamf) {
         throw new Error('Flux App was requested as tiered setup but specifications are missing');
       }
@@ -6063,15 +6343,17 @@ function specificationFormatter(appSpecification) {
         throw new Error('Invalid tiered value obtained. Only boolean as true or false allowed.');
       }
       if (appComponentCorrect.tiered) {
-        let { cpubasic } = appComponent;
-        let { cpusuper } = appComponent;
-        let { cpubamf } = appComponent;
-        let { rambasic } = appComponent;
-        let { ramsuper } = appComponent;
-        let { rambamf } = appComponent;
-        let { hddbasic } = appComponent;
-        let { hddsuper } = appComponent;
-        let { hddbamf } = appComponent;
+        let {
+          cpubasic,
+          cpusuper,
+          cpubamf,
+          rambasic,
+          ramsuper,
+          rambamf,
+          hddbasic,
+          hddsuper,
+          hddbamf,
+        } = appComponent;
         if (!cpubasic || !cpusuper || !cpubamf || !rambasic || !ramsuper || !rambamf || !hddbasic || !hddsuper || !hddbamf) {
           throw new Error(`Flux App component ${appComponent.name} was requested as tiered setup but specifications are missing`);
         }
@@ -6094,6 +6376,10 @@ function specificationFormatter(appSpecification) {
         appComponentCorrect.hddbasic = hddbasic;
         appComponentCorrect.hddsuper = hddsuper;
         appComponentCorrect.hddbamf = hddbamf;
+        if (version >= 7) {
+          appComponentCorrect.secrets = serviceHelper.ensureString(appComponent.secrets);
+          appComponentCorrect.repoauth = serviceHelper.ensureString(appComponent.repoauth);
+        }
       }
       correctCompose.push(appComponentCorrect);
     });
@@ -6172,6 +6458,29 @@ function specificationFormatter(appSpecification) {
     appSpecFormatted.expire = expire;
   }
 
+  if (version >= 7) {
+    if (!nodes) { // can be empty array for no nodes set
+      throw new Error('Missing Flux App specification parameter');
+    }
+    nodes = serviceHelper.ensureObject(nodes);
+    const nodesCorrect = [];
+    if (Array.isArray(nodes)) {
+      nodes.forEach((parameter) => {
+        const param = serviceHelper.ensureString(parameter); // string
+        nodesCorrect.push(param);
+      });
+    } else {
+      throw new Error('Nodes for Flux App are invalid');
+    }
+    appSpecFormatted.nodes = nodesCorrect;
+
+    staticip = serviceHelper.ensureBoolean(staticip);
+    if (typeof staticip !== 'boolean') {
+      throw new Error('Invalid staticip specification. Only boolean as true or false allowed.');
+    }
+    appSpecFormatted.staticip = staticip;
+  }
+
   return appSpecFormatted;
 }
 
@@ -6205,9 +6514,7 @@ async function registerAppGlobalyApi(req, res) {
       // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
       // name and port HAVE to be unique for application. Check if they don't exist in global database
       // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification } = processedBody;
-      let { timestamp } = processedBody;
-      let { signature } = processedBody;
+      let { appSpecification, timestamp, signature } = processedBody;
       let messageType = processedBody.type; // determines how data is treated in the future
       let typeVersion = processedBody.version; // further determines how data is treated in the future
       if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
@@ -6322,9 +6629,7 @@ async function updateAppGlobalyApi(req, res) {
       // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
       // name and ports HAVE to be unique for application. Check if they don't exist in global database
       // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification } = processedBody;
-      let { timestamp } = processedBody;
-      let { signature } = processedBody;
+      let { appSpecification, timestamp, signature } = processedBody;
       let messageType = processedBody.type; // determines how data is treated in the future
       let typeVersion = processedBody.version; // further determines how data is treated in the future
       if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
@@ -7649,7 +7954,7 @@ async function trySpawningGlobalApplication() {
       return;
     }
     if (benchmarkResponse.data.thunder) {
-      log.info('Flux Node is a Thunder Storage Node. Global applications will not be installed');
+      log.info('Flux Node is a Fractus Storage Node. Global applications will not be installed');
       await serviceHelper.delay(24 * 3600 * 1000); // check again in one day as changing from and to only requires the restart of flux daemon
       trySpawningGlobalApplication();
       return;
@@ -7665,53 +7970,63 @@ async function trySpawningGlobalApplication() {
     }
 
     // get all the applications list names
-    const globalAppNamesLocation = await getAllGlobalApplications(['name', 'geolocation']);
-    // pick a random one
+    const globalAppNamesLocation = await getAllGlobalApplications(['name', 'geolocation', 'nodes']);
     const numberOfGlobalApps = globalAppNamesLocation.length;
-    const randomAppnumber = Math.floor((Math.random() * numberOfGlobalApps));
-    if (!globalAppNamesLocation[randomAppnumber] || !globalAppNamesLocation[randomAppnumber].name) {
-      log.info('No application specifications found');
+    if (!numberOfGlobalApps) {
+      log.info('No installable application found');
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
       return;
     }
-    let randomApp = globalAppNamesLocation[randomAppnumber].name;
 
-    // force switch to run a geo restricted app
-    if (randomAppnumber % 5 === 0) { // every 5th run we are forcing application instalation that is in the nodes geolocation, esnuring highly geolocated apps spawn fast enough
-      // get this node location
-      const myNodeLocation = nodeFullGeolocation();
-      const appsInMyLocation = globalAppNamesLocation.filter((apps) => apps.geolocation && apps.geolocation.find((loc) => `ac${myNodeLocation}`.startsWith(loc)));
-      if (appsInMyLocation.length) {
-        const numberOfMyNodeGeoApps = appsInMyLocation.length;
-        const randomGeoAppNumber = Math.floor((Math.random() * numberOfMyNodeGeoApps));
-        if (!appsInMyLocation[randomGeoAppNumber] || !appsInMyLocation[randomGeoAppNumber].name) {
-          log.info('No application specifications found');
-          await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
-          trySpawningGlobalApplication();
-          return;
+    let appToRun;
+    // highly favor application that is targetting our node
+    // get my collateral
+    const myCollateral = await generalService.obtainNodeCollateralInformation();
+    // get my ip address
+    // filter apps only those that include my ip or my collateral
+    const scopedApps = globalAppNamesLocation.filter((app) => app.nodes && app.nodes.forEach((node) => node === myIP || node === `${myCollateral.txhash}:${myCollateral.txindex}`));
+    const scopedAppsNotRun = scopedApps.filter((app) => trySpawningGlobalAppCache.has(app.name));
+    // check if this app was already evaluated
+    const numberOfScopedAppsNotRun = scopedAppsNotRun.length;
+    if (numberOfScopedAppsNotRun) { // some app should be prioritized on our node
+      const appToRunNumber = Math.floor((Math.random() * numberOfScopedAppsNotRun));
+      appToRun = scopedAppsNotRun[appToRunNumber].name;
+    }
+
+    // no scoped applicaiton, run some global app
+    if (!appToRun) {
+      // pick a random one
+      const appToRunNumber = Math.floor((Math.random() * numberOfGlobalApps));
+      appToRun = globalAppNamesLocation[appToRunNumber].name;
+
+      // force switch to run a geo restricted app
+      if (appToRunNumber % 5 === 0) { // every 5th run we are forcing application instalation that is in the nodes geolocation, esnuring highly geolocated apps spawn fast enough
+        // get this node location
+        const myNodeLocation = nodeFullGeolocation();
+        const appsInMyLocation = globalAppNamesLocation.filter((apps) => apps.geolocation && apps.geolocation.find((loc) => `ac${myNodeLocation}`.startsWith(loc)));
+        if (appsInMyLocation.length) {
+          const numberOfMyNodeGeoApps = appsInMyLocation.length;
+          const randomGeoAppNumber = Math.floor((Math.random() * numberOfMyNodeGeoApps));
+          // install geo location restricted app instead
+          appToRun = appsInMyLocation[randomGeoAppNumber].name;
         }
-        // install geo location restricted app instead
-        randomApp = appsInMyLocation[randomGeoAppNumber].name;
       }
     }
 
-    // Check if App was checked in the last 30m.
+    trySpawningGlobalAppCache.set(appToRun, appToRun);
+
+    // Check if App was checked in the last 2 hours.
     // This is a small help because random can be getting the same app over and over
-    if (trySpawningGlobalAppCache.has(randomApp)) {
-      log.info(`App ${randomApp} was already evaluated in the last 30m.`);
-      if (numberOfGlobalApps < 20) {
-        await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
-      } else {
-        await serviceHelper.delay(config.fluxapps.installation.delay * 1000 * 0.1);
-      }
+    if (trySpawningGlobalAppCache.has(appToRun)) {
+      log.info(`App ${appToRun} was already evaluated in the last 2 hours.`);
+      const delay = numberOfGlobalApps < 20 ? config.fluxapps.installation.delay * 1000 : config.fluxapps.installation.delay * 1000 * 0.1;
+      await serviceHelper.delay(delay);
       trySpawningGlobalApplication();
       return;
     }
 
-    // check if there is < 5 instances of nodes running the app
-    // TODO evaluate if its not better to check locally running applications!
-    const runningAppList = await getRunningAppList(randomApp);
+    const runningAppList = await getRunningAppList(appToRun);
 
     const delay = config.fluxapps.installation.delay * 1000;
     const probLn = Math.log(2 + numberOfGlobalApps); // from ln(2) -> ln(2 + x)
@@ -7720,9 +8035,8 @@ async function trySpawningGlobalApplication() {
     const adjustedIP = myIP.split(':')[0]; // just IP address
     // check if app not running on this device
     if (runningAppList.find((document) => document.ip.includes(adjustedIP))) {
-      log.info(`Application ${randomApp} is reported as already running on this Flux IP`);
+      log.info(`Application ${appToRun} is reported as already running on this Flux IP`);
       await serviceHelper.delay(adjustedDelay);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
       trySpawningGlobalApplication();
       return;
     }
@@ -7731,27 +8045,24 @@ async function trySpawningGlobalApplication() {
     if (runningApps.status !== 'success') {
       throw new Error('Unable to check running apps on this Flux');
     }
-    if (runningApps.data.find((app) => app.Names[0].slice(5) === randomApp)) {
-      log.info(`${randomApp} application is already running on this Flux`);
+    if (runningApps.data.find((app) => app.Names[0].slice(5) === appToRun)) {
+      log.info(`${appToRun} application is already running on this Flux`);
       await serviceHelper.delay(adjustedDelay);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
       trySpawningGlobalApplication();
       return;
     }
 
     // get app specifications
-    const appSpecifications = await getApplicationGlobalSpecifications(randomApp);
+    const appSpecifications = await getApplicationGlobalSpecifications(appToRun);
     if (!appSpecifications) {
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
-      throw new Error(`Specifications for application ${randomApp} were not found!`);
+      throw new Error(`Specifications for application ${appToRun} were not found!`);
     }
 
     // check if app is installed on the number of instances requested
     const minInstances = appSpecifications.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
     if (runningAppList.length >= minInstances) {
-      log.info(`Application ${randomApp} is already spawned on ${runningAppList.length} instances`);
+      log.info(`Application ${appToRun} is already spawned on ${runningAppList.length} instances`);
       await serviceHelper.delay(adjustedDelay);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
       trySpawningGlobalApplication();
       return;
     }
@@ -7774,7 +8085,6 @@ async function trySpawningGlobalApplication() {
     if (appExists) { // double checked in installation process.
       log.info(`Application ${appSpecifications.name} is already installed`);
       await serviceHelper.delay(adjustedDelay);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
       trySpawningGlobalApplication();
       return;
     }
@@ -7791,7 +8101,6 @@ async function trySpawningGlobalApplication() {
             log.info(`${componentToInstall.repotag} Image is already running on this Flux`);
             // eslint-disable-next-line no-await-in-loop
             await serviceHelper.delay(adjustedDelay);
-            trySpawningGlobalAppCache.set(randomApp, randomApp);
             trySpawningGlobalApplication();
             return;
           }
@@ -7803,22 +8112,14 @@ async function trySpawningGlobalApplication() {
 
       // check repotag if available for download
       // eslint-disable-next-line no-await-in-loop
-      await verifyRepository(componentToInstall.repotag);
+      await verifyRepository(componentToInstall.repotag, componentToInstall.repoauth);
     }
 
     // verify app compliance
-    await checkApplicationImagesComplience(appSpecifications).catch((error) => {
-      log.error(error);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
-      throw error;
-    });
+    await checkApplicationImagesComplience(appSpecifications);
 
     // verify requirements
-    await checkAppRequirements(appSpecifications).catch((error) => { // catch it so we can add it to prevention of spawning
-      log.error(error);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
-      throw error; // throw it again so we begin new cycle
-    });
+    await checkAppRequirements(appSpecifications);
 
     // ensure ports unused
     // appNames on Ip
@@ -7827,21 +8128,13 @@ async function trySpawningGlobalApplication() {
     runningAppsIp.forEach((app) => {
       runningAppsNames.push(app.name);
     });
-    await ensureApplicationPortsNotUsed(appSpecifications, runningAppsNames).catch((error) => {
-      log.error(error);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
-      throw error;
-    });
+    await ensureApplicationPortsNotUsed(appSpecifications, runningAppsNames);
 
     // ensure images exists for platform
-    const imagesArchitectureMatches = await ensureApplicationImagesExistsForPlatform(appSpecifications).catch((error) => {
-      log.error(error);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
-      throw error;
-    });
+    const imagesArchitectureMatches = await ensureApplicationImagesExistsForPlatform(appSpecifications);
+
     if (imagesArchitectureMatches !== true) {
-      log.info(`Application ${randomApp} does not support our node architecture, installation aborted.`);
-      trySpawningGlobalAppCache.set(randomApp, randomApp);
+      log.info(`Application ${appToRun} does not support our node architecture, installation aborted.`);
       await serviceHelper.delay(adjustedDelay);
       trySpawningGlobalApplication();
       return;
@@ -8746,12 +9039,16 @@ async function deploymentInformation(req, res) {
     }
     // search in chainparams db for chainmessages of p version
     const appPrices = await getChainParamsPriceUpdates();
+    const minPort = daemonHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
+    const maxPort = daemonHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
     const information = {
       price: appPrices,
       appSpecsEnforcementHeights: config.fluxapps.appSpecsEnforcementHeights,
       address: deployAddr,
-      portMin: config.fluxapps.portMin,
-      portMax: config.fluxapps.portMax,
+      portMin: minPort,
+      portMax: maxPort,
+      enterprisePorts: config.fluxapps.enterprisePorts,
+      bannedPorts: config.fluxapps.bannedPorts,
       maxImageSize: config.fluxapps.maxImageSize,
       minimumInstances: config.fluxapps.minimumInstances,
       maximumInstances: config.fluxapps.maximumInstances,
@@ -9219,10 +9516,19 @@ async function checkMyAppsAvailability() {
         });
       }
     }
+    const minPort = currentHeight.generalScannedHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin - 1000;
+    const maxPort = currentHeight.generalScannedHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
     // choose random port
-    const min = config.fluxapps.portMin - 1000;
-    const max = config.fluxapps.portMax;
+    const min = minPort;
+    const max = maxPort;
     testingPort = failedPort || Math.floor(Math.random() * (max - min) + min);
+    const iBP = fluxNetworkHelper.isPortBanned(testingPort);
+    if (iBP) {
+      // skip this check, port is not possible to run on flux
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
     if (appPorts.includes(testingPort)) {
       log.warn(`Skipped checking ${testingPort} - in use.`);
       failedPort = null;
