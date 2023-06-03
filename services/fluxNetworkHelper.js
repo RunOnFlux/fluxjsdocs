@@ -106,50 +106,6 @@ function minVersionSatisfy(version, minimumVersion) {
 }
 
 /**
- * To get if port belongs to enterprise range
- * @returns {boolean} Returns true if enterprise
- */
-function isPortEnterprise(port) {
-  const { enterprisePorts } = config.fluxapps;
-  let portEnterprise = false;
-  enterprisePorts.forEach((portOrInterval) => {
-    if (typeof portOrInterval === 'string') { // '0-10'
-      const minPort = Number(portOrInterval.split('-')[0]);
-      const maxPort = Number(portOrInterval.split('-')[1]);
-      if (+port >= minPort && +port <= maxPort) {
-        portEnterprise = true;
-      }
-    } else if (portOrInterval === +port) {
-      portEnterprise = true;
-    }
-  });
-  console.log(port);
-  return portEnterprise;
-}
-
-/**
- * To get if port belongs to banned range
- * @returns {boolean} Returns true if port is banned
- */
-function isPortBanned(port) {
-  const { bannedPorts } = config.fluxapps;
-  let portBanned = false;
-  bannedPorts.forEach((portOrInterval) => {
-    if (typeof portOrInterval === 'string') { // '0-10'
-      const minPort = Number(portOrInterval.split('-')[0]);
-      const maxPort = Number(portOrInterval.split('-')[1]);
-      if (+port >= minPort && +port <= maxPort) {
-        portBanned = true;
-      }
-    } else if (portOrInterval === +port) {
-      portBanned = true;
-    }
-  });
-  console.log(port);
-  return portBanned;
-}
-
-/**
  * To perform a basic check if port on an ip is opened
  * This requires our port to be also open on out
  * @param {string} ip IP address.
@@ -162,19 +118,13 @@ async function isPortOpen(ip, port, app, timeout = 5000) {
   let resp;
   try {
     let portResponse = true;
-    // eslint-disable-next-line no-use-before-define
-    const firewallActive = await isFirewallActive();
     // open port first
-    if (firewallActive) {
     // eslint-disable-next-line no-use-before-define
-      resp = await allowOutPort(port).catch((error) => { // requires allow out for apps checking, for our ports both
-        log.error(error);
-      });
-      if (!resp) {
-        resp = {};
-      }
-    } else {
-      resp.message = 'existing';
+    resp = await allowOutPort(port).catch((error) => { // requires allow out for apps checking, for our ports both
+      log.error(error);
+    });
+    if (!resp) {
+      resp = {};
     }
 
     const promise = new Promise(((resolve, reject) => {
@@ -218,7 +168,7 @@ async function isPortOpen(ip, port, app, timeout = 5000) {
     setTimeout(() => { // timeout ensure return first
       if (app) {
         // delete the rule
-        if (resp.message !== 'existing') { // new or updated rule or firewall not active from above
+        if (resp.message !== 'existing') { // new or updated rule
           // eslint-disable-next-line no-use-before-define
           deleteAllowOutPortRule(port); // no need waiting for response. Delete if was not present before to not create huge firewall list
         }
@@ -229,7 +179,7 @@ async function isPortOpen(ip, port, app, timeout = 5000) {
     setTimeout(() => { // timeout ensure return first
       if (app) {
         // delete the rule
-        if (resp.message !== 'existing') { // new or updated rule or firewall not active from above
+        if (resp.message !== 'existing') { // new or updated rule
           // eslint-disable-next-line no-use-before-define
           deleteAllowOutPortRule(port); // no need waiting for response. Delete if was not present before to not create huge firewall list
         }
@@ -267,7 +217,6 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
     if (!UIok) return false;
 
     const syncthingPort = +port + 2;
-    // eslint-disable-next-line no-use-before-define
     const syncthingOpen = await isPortOpen(ip, syncthingPort);
     if (!syncthingOpen) return false;
 
@@ -335,20 +284,15 @@ async function checkAppAvailability(req, res) {
       delete dataToVerify.signature;
       const messageToVerify = JSON.stringify(dataToVerify);
       const verified = verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
-      if ((verified !== true || !node) && authorized !== true) { // TODO
+      if ((verified !== true || !node) && authorized !== true) {
         log.error('Unable to verify request authenticity');
         // throw new Error('Unable to verify request authenticity');
       }
 
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-      const daemonHeight = syncStatus.data.height;
-      const minPort = daemonHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin - 1000;
-      const maxPort = daemonHeight >= config.fluxapps.portBockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
       const portsListening = [];
       // eslint-disable-next-line no-restricted-syntax
       for (const port of ports) {
-        const iBP = isPortBanned(+port);
-        if (+port >= minPort && +port <= maxPort && !iBP) {
+        if (+port >= (config.fluxapps.portMin - 1000) && +port <= config.fluxapps.portMax) {
         // eslint-disable-next-line no-await-in-loop
           const isOpen = await isPortOpen(ip, port, appname, 30000);
           if (!isOpen) {
@@ -848,8 +792,7 @@ async function adjustExternalIP(ip) {
     testnet: ${userconfig.initial.testnet || false},
     development: ${userconfig.initial.development || false},
     apiport: ${Number(userconfig.initial.apiport || config.apiport)},
-    pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
-    pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+    decryptionkey: '${userconfig.initial.decryptionkey || ''}',
   }
 }`;
 
@@ -903,9 +846,9 @@ async function checkDeterministicNodesCollisions() {
           // prevent new activation
         } else if (result.length === 1) {
           if (!myNode) {
-            log.error('Flux collision detection. Another ip:port is confirmed on flux network with the same collateral transaction information.');
+            log.error('Flux collision detection');
             dosState = 100;
-            setDosMessage('Flux collision detection. Another ip:port is confirmed on flux network with the same collateral transaction information.');
+            setDosMessage('Flux collision detection');
             setTimeout(() => {
               checkDeterministicNodesCollisions();
             }, 60 * 1000);
@@ -1029,8 +972,7 @@ async function denyPort(port) {
     status: false,
     message: null,
   };
-  const portBanned = isPortBanned(+port);
-  if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
+  if (+port < (config.fluxapps.portMin - 1000) || +port > config.fluxapps.portMax) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
@@ -1060,40 +1002,11 @@ async function deleteAllowPortRule(port) {
     status: false,
     message: null,
   };
-  const portBanned = isPortBanned(+port);
-  if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
+  if (+port < (config.fluxapps.portMin - 1000) || +port > config.fluxapps.portMax) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
   const exec = `sudo ufw delete allow ${port} && sudo ufw delete allow out ${port}`;
-  const cmdAsync = util.promisify(nodecmd.get);
-
-  const cmdres = await cmdAsync(exec);
-  cmdStat.message = cmdres;
-  if (serviceHelper.ensureString(cmdres).includes('delete')) { // Rule deleted or Could not delete non-existent rule both ok
-    cmdStat.status = true;
-  } else {
-    cmdStat.status = false;
-  }
-  return cmdStat;
-}
-
-/**
- * To delete a ufw deny rule on port.
- * @param {string} port Port.
- * @returns {object} Command status.
- */
-async function deleteDenyPortRule(port) {
-  const cmdStat = {
-    status: false,
-    message: null,
-  };
-  const portBanned = isPortBanned(+port);
-  if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
-    cmdStat.message = 'Port out of deletable app ports range';
-    return cmdStat;
-  }
-  const exec = `sudo ufw delete deny ${port} && sudo ufw delete deny out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
@@ -1116,8 +1029,7 @@ async function deleteAllowOutPortRule(port) {
     status: false,
     message: null,
   };
-  const portBanned = isPortBanned(+port);
-  if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
+  if (+port < (config.fluxapps.portMin - 1000) || +port > config.fluxapps.portMax) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
@@ -1227,41 +1139,6 @@ async function adjustFirewall() {
   }
 }
 
-async function purgeUFW() {
-  try {
-    const cmdAsync = util.promisify(nodecmd.get);
-    const firewallActive = await isFirewallActive();
-    if (firewallActive) {
-      const execB = 'sudo ufw status | grep \'DENY\' | grep -E \'(3[0-9]{4})\''; // 30000 - 39999
-      const cmdresB = await cmdAsync(execB).catch(() => {}) || ''; // fail silently,
-      if (serviceHelper.ensureString(cmdresB).includes('DENY')) {
-        const deniedPorts = cmdresB.split('\n'); // split by new line
-        const portsToDelete = [];
-        deniedPorts.forEach((port) => {
-          const adjPort = port.substring(0, port.indexOf(' '));
-          if (adjPort) { // last line is empty
-            if (!portsToDelete.includes(adjPort)) {
-              portsToDelete.push(adjPort);
-            }
-          }
-        });
-        // eslint-disable-next-line no-restricted-syntax
-        for (const port of portsToDelete) {
-          // eslint-disable-next-line no-await-in-loop
-          await deleteDenyPortRule(port);
-        }
-        log.info('UFW app deny rules purged');
-      } else {
-        log.info('No UFW deny rules found');
-      }
-    } else {
-      log.info('Firewall is not active. Purging UFW not necessary');
-    }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
 const lruRateOptions = {
   max: 500,
   maxAge: 1000 * 15, // 15 seconds
@@ -1334,7 +1211,6 @@ module.exports = {
   deleteAllowOutPortRule,
   allowPortApi,
   adjustFirewall,
-  purgeUFW,
   checkRateLimit,
   closeConnection,
   closeIncomingConnection,
@@ -1357,6 +1233,4 @@ module.exports = {
   lruRateLimit,
   isPortOpen,
   checkAppAvailability,
-  isPortEnterprise,
-  isPortBanned,
 };

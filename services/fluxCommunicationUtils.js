@@ -102,12 +102,8 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
   if (!node) {
     // node that broadcasted the message has to be on list
     // pubkey of the broadcast has to be on the list
-    const zl = await deterministicFluxList(pubKey);
-    if (dataObj.data && dataObj.data.type === 'fluxapprunning') {
-      node = zl.find((key) => key.pubkey === pubKey && dataObj.data.ip && dataObj.data.ip === key.ip); // check ip is on the network and belongs to broadcasted public key
-    } else {
-      node = zl.find((key) => key.pubkey === pubKey);
-    }
+    const zl = await deterministicFluxList(pubKey); // this itself is sufficient.
+    node = zl.find((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
   }
   if (!node) {
     return false;
@@ -126,7 +122,7 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
  * @param {number} currentTimeStamp Current timestamp.
  * @returns {boolean} False unless current timestamp is within 5 minutes of the data object's timestamp.
  */
-function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
+async function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
   // eslint-disable-next-line no-param-reassign
   const dataObj = serviceHelper.ensureObject(data);
   const { timestamp } = dataObj; // ms
@@ -146,10 +142,8 @@ function verifyTimestampInFluxBroadcast(data, currentTimeStamp) {
  * @returns {boolean} False unless message is successfully verified.
  */
 async function verifyOriginalFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp) {
-  const timeStampOK = verifyTimestampInFluxBroadcast(data, currentTimeStamp);
-  if (timeStampOK) {
-    const broadcastOK = await verifyFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp);
-    return broadcastOK;
+  if (await verifyTimestampInFluxBroadcast(data, currentTimeStamp)) {
+    return verifyFluxBroadcast(data, obtainedFluxNodeList, currentTimeStamp);
   }
   return false;
 }

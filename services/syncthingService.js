@@ -1923,9 +1923,6 @@ async function getDeviceID(req, res) {
       const successResponse = messageHelper.createDataMessage(deviceID);
       return res ? res.json(successResponse) : successResponse;
     }
-    log.error(meta);
-    log.error(healthy);
-    log.error(pingResponse);
     throw new Error('Syncthing is not running properly');
   } catch (error) {
     log.error(error);
@@ -1947,21 +1944,11 @@ async function installSyncthing() { // can throw
 /**
  * To Start Syncthing
  */
-let previousSyncthingErrored = false;
 async function startSyncthing() {
   try {
     // check wether syncthing is running or not
     const myDevice = await getDeviceID();
     if (myDevice.status === 'error') {
-      // retry before killing and restarting
-      if (previousSyncthingErrored === false) {
-        previousSyncthingErrored = true;
-        await serviceHelper.delay(60 * 1000);
-        startSyncthing();
-      }
-      previousSyncthingErrored = false;
-      log.error('Syncthing Error');
-      log.error(myDevice);
       const execDIRcr = 'mkdir -p $HOME/.config'; // create .config folder first for it to have standard user ownership. With -p no error will be thrown in case of exists
       await cmdAsync(execDIRcr).catch((error) => log.error(error));
       const execDIRown = 'sudo chown $USER:$USER $HOME/.config'; // adjust .config folder for ownership of running user
@@ -1974,7 +1961,7 @@ async function startSyncthing() {
       await serviceHelper.delay(10 * 1000);
       await cmdAsync(execKill).catch((error) => log.error(error));
       await cmdAsync(execKillB).catch((error) => log.error(error));
-      const exec = 'sudo syncthing --allow-newer-config --no-browser --home=$HOME/.config/syncthing & nohup';
+      const exec = 'sudo syncthing --allow-newer-config --no-browser --home=$HOME/.config/syncthing';
       log.info('Spawning Syncthing instance...');
       let errored = false;
       nodecmd.get(exec, async (err) => {
@@ -2039,7 +2026,7 @@ async function startSyncthing() {
       if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
         await systemRestart();
       }
-      await serviceHelper.delay(0.5 * 60 * 1000);
+      await serviceHelper.delay(8 * 60 * 1000);
       startSyncthing();
     }
   } catch (error) {
