@@ -135,7 +135,7 @@ async function loginPhrase(req, res) {
       // nodeHardwareSpecsGood is not part of response yet
       if (dosState.data.dosState > 10 || dosState.data.dosMessage !== null || dosState.data.nodeHardwareSpecsGood === false) {
         let errMessage = messageHelper.createErrorMessage(dosState.data.dosMessage, 'DOS', dosState.data.dosState);
-        if (dosState.data.dosMessage !== 'Flux IP detection failed' && dosState.data.dosMessage !== 'Flux collision detection') {
+        if (dosState.data.dosMessage !== 'Flux IP detection failed' && dosState.data.dosMessage !== 'Flux collision detection. Another ip:port is confirmed on flux network with the same collateral transaction information.') {
           errMessage = messageHelper.createErrorMessage(dosState.data.dosMessage, 'CONNERROR', dosState.data.dosState);
         }
         if (dosState.data.nodeHardwareSpecsGood === false) {
@@ -150,7 +150,7 @@ async function loginPhrase(req, res) {
     const dosAppsState = appsService.getAppsDOSState();
     if (dosAppsState.status === 'success') {
       // nodeHardwareSpecsGood is not part of response yet
-      if (dosAppsState.data.dosState > 10 || dosAppsState.data.dosMessage !== null) {
+      if (dosAppsState.data.dosState > 10) {
         const errMessage = messageHelper.createErrorMessage(dosAppsState.data.dosMessage, 'DOS', dosAppsState.data.dosState);
         log.error(errMessage);
         res.json(errMessage);

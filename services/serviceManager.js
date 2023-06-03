@@ -11,6 +11,7 @@ const fluxService = require('./fluxService');
 const geolocationService = require('./geolocationService');
 const upnpService = require('./upnpService');
 const syncthingService = require('./syncthingService');
+const pgpService = require('./pgpService');
 const userconfig = require('../../../config/userconfig');
 
 const apiPort = userconfig.initial.apiport || config.server.apiport;
@@ -86,6 +87,13 @@ async function startFluxFunctions() {
     log.info('Flux Discovery started');
     syncthingService.startSyncthing();
     log.info('Syncthing service started');
+    await pgpService.generateIdentity();
+    log.info('PGP service initiated');
+    setTimeout(() => {
+      log.info('Rechecking firewall app rules');
+      fluxNetworkHelper.purgeUFW();
+      appsService.testAppMount(); // test if our node can mount a volume
+    }, 30 * 1000);
     setTimeout(() => {
       appsService.stopAllNonFluxRunningApps();
       appsService.startMonitoringOfApps();
@@ -103,6 +111,7 @@ async function startFluxFunctions() {
       log.info('Flux Block Processing Service started');
     }, 2 * 60 * 1000);
     setTimeout(() => {
+      appsService.checkForNonAllowedAppsOnLocalNetwork();
       appsService.checkMyAppsAvailability(); // periodically checks
     }, 3 * 60 * 1000);
     setTimeout(() => {
@@ -139,10 +148,10 @@ async function startFluxFunctions() {
         await fluxService.enterDevelopment().catch((error) => log.error(error));
         if (development === true || development === 'true' || development === 1 || development === '1') { // in other cases pause git pull
           setTimeout(async () => {
-            await fluxService.softUpdateFlux().catch((error) => log.error(error));
+            await fluxService.softUpdateFluxInstall().catch((error) => log.error(error));
           }, 15 * 1000);
         }
-      }, 5 * 60 * 1000); // every 5 mins
+      }, 60 * 60 * 1000); // every 1 hour
     }
   } catch (e) {
     log.error(e);
