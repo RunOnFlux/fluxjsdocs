@@ -4,9 +4,6 @@ const serviceHelper = require('./serviceHelper');
 
 let storedGeolocation = null;
 let storedIp = null;
-let staticIp = false;
-let execution = 1;
-const staticIpOrgs = ['hetzner', 'ovh', 'netcup', 'hostnodes', 'contabo'];
 
 /**
  * Method responsable for setting node geolocation information
@@ -17,11 +14,11 @@ async function setNodeGeolocation() {
     if (!myIP) {
       throw new Error('Flux IP not detected. Flux geolocation service is awaiting');
     }
-    if (!storedGeolocation || myIP !== storedIp || execution % 4 === 0) {
+    if (!storedGeolocation || myIP !== storedIp) {
       log.info(`Checking geolocation of ${myIP}`);
       storedIp = myIP;
       // consider another service failover or stats db
-      const ipApiUrl = `http://ip-api.com/json/${myIP.split(':')[0]}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org,isp`;
+      const ipApiUrl = `http://ip-api.com/json/${myIP.split(':')[0]}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org`;
       const ipRes = await serviceHelper.axiosGet(ipApiUrl);
       if (ipRes.data.status !== 'success') {
         throw new Error(`Geolocation of IP ${myIP} is unavailable`);
@@ -36,18 +33,10 @@ async function setNodeGeolocation() {
         regionName: ipRes.data.regionName,
         lat: ipRes.data.lat,
         lon: ipRes.data.lon,
-        org: ipRes.data.org || ipRes.data.isp,
+        org: ipRes.data.org,
       };
     }
     log.info(`Geolocation of ${myIP} is ${JSON.stringify(storedGeolocation)}`);
-    for (let i = 0; i < staticIpOrgs.length; i += 1) {
-      const org = staticIpOrgs[i];
-      if (storedGeolocation.org.toLowerCase().includes(org)) {
-        staticIp = true;
-        break;
-      }
-    }
-    execution += 1;
     setTimeout(() => { // executes again in 12h
       setNodeGeolocation();
     }, 12 * 60 * 60 * 1000);
@@ -67,15 +56,7 @@ function getNodeGeolocation() {
   return storedGeolocation;
 }
 
-/**
- * Method responsible for returning if node ip is static based on IP org.
- */
-function isStaticIP() {
-  return staticIp;
-}
-
 module.exports = {
   setNodeGeolocation,
   getNodeGeolocation,
-  isStaticIP,
 };

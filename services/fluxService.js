@@ -449,30 +449,6 @@ function getFluxZelID(req, res) {
 }
 
 /**
- * To show the if FluxNode is running under a known static ip ISP/Org.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-function isStaticIPapi(req, res) {
-  const staticIp = geolocationService.isStaticIP();
-  const message = messageHelper.createDataMessage(staticIp);
-  return res ? res.json(message) : message;
-}
-
-/**
- * To show the node pgp public key
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-function getFluxPGPidentity(req, res) {
-  const pgp = userconfig.initial.pgpPublicKey;
-  const message = messageHelper.createDataMessage(pgp);
-  return res ? res.json(message) : message;
-}
-
-/**
  * To show the current CruxID that is being used with FluxOS.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -837,17 +813,11 @@ async function getFluxInfo(req, res) {
       throw ipRes.data;
     }
     info.flux.ip = ipRes.data;
-    info.flux.staticIp = geolocationService.isStaticIP();
     const zelidRes = await getFluxZelID();
     if (zelidRes.status === 'error') {
       throw zelidRes.data;
     }
     info.flux.zelid = zelidRes.data;
-    const pgp = await getFluxPGPidentity();
-    if (pgp.status === 'error') {
-      throw pgp.data;
-    }
-    info.flux.pgp = pgp.data;
     const cruxidRes = await getFluxCruxID();
     if (cruxidRes.status === 'error') {
       throw cruxidRes.data;
@@ -869,7 +839,7 @@ async function getFluxInfo(req, res) {
       throw dosAppsResult.data;
     }
     info.flux.appsDos = dosAppsResult.data;
-    info.flux.development = userconfig.initial.development || false;
+    info.flux.development = `${userconfig.initial.development || false}`;
 
     const daemonInfoRes = await daemonServiceControlRpcs.getInfo();
     if (daemonInfoRes.status === 'error') {
@@ -980,8 +950,7 @@ async function adjustCruxID(req, res) {
           testnet: ${userconfig.initial.testnet || false},
           development: ${userconfig.initial.development || false},
           apiport: ${Number(userconfig.initial.apiport || config.apiport)},
-          pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
-          pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+          decryptionkey: '${userconfig.initial.decryptionkey || ''}',
         }
       }`;
 
@@ -1033,8 +1002,7 @@ async function adjustKadenaAccount(req, res) {
     testnet: ${userconfig.initial.testnet || false},
     development: ${userconfig.initial.development || false},
     apiport: ${Number(userconfig.initial.apiport || config.apiport)},
-    pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
-    pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+    decryptionkey: '${userconfig.initial.decryptionkey || ''}',
   }
 }`;
 
@@ -1116,7 +1084,6 @@ module.exports = {
   getFluxVersion,
   getFluxIP,
   getFluxZelID,
-  getFluxPGPidentity,
   getFluxCruxID,
   getFluxKadena,
   daemonDebug,
@@ -1142,7 +1109,6 @@ module.exports = {
   installFluxWatchTower,
   enterDevelopment,
   enterMaster,
-  isStaticIPapi,
 
   // Exports for testing purposes
   fluxLog,
