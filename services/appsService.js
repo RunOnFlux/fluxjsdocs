@@ -8015,12 +8015,12 @@ async function trySpawningGlobalApplication() {
     // get my ip address
     // filter apps only those that include my ip or my collateral
     const scopedApps = globalAppNamesLocation.filter((app) => app.nodes && app.nodes.includes((node) => node === myIP || node === `${myCollateral.txhash}:${myCollateral.txindex}`));
-    const scopedAppsNotRun = scopedApps.filter((app) => trySpawningGlobalAppCache.has(app.name));
+    const scopedAppsToRun = scopedApps.filter((app) => !trySpawningGlobalAppCache.has(app.name));
     // check if this app was already evaluated
-    const numberOfScopedAppsNotRun = scopedAppsNotRun.length;
-    if (numberOfScopedAppsNotRun) { // some app should be prioritized on our node
-      const appToRunNumber = Math.floor((Math.random() * numberOfScopedAppsNotRun));
-      appToRun = scopedAppsNotRun[appToRunNumber].name;
+    const numberOfScopedAppsToRun = scopedAppsToRun.length;
+    if (numberOfScopedAppsToRun) { // some app should be prioritized on our node
+      const appToRunNumber = Math.floor((Math.random() * numberOfScopedAppsToRun));
+      appToRun = scopedAppsToRun[appToRunNumber].name;
     }
 
     if (appToRun) { // ensure higher rate spawning for scoped apps
@@ -9949,7 +9949,10 @@ async function checkForNonAllowedAppsOnLocalNetwork() {
     // eslint-disable-next-line no-restricted-syntax
     for (const app of appsInstalled) {
       if (app.name.toLowerCase().startsWith('presearchnode')) {
-        const containerName = `${app.compose[0].name}${app.name}`;
+        let containerName = app.name;
+        if (app.version >= 4) {
+          containerName = `${app.compose[0].name}_${app.name}`;
+        }
         // eslint-disable-next-line no-await-in-loop
         const logs = await dockerService.dockerContainerLogs(containerName, 5);
         if (logs.toLowerCase().includes('duplicate ip: this ip address is already running another node')) {
