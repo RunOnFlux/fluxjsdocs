@@ -1943,28 +1943,12 @@ async function getDeviceID(req, res) {
 }
 
 /**
- * Check if Synchtng is installed and if not install it
+ * To install Syncthing
  */
-let syncthingInstalled = false;
 async function installSyncthing() { // can throw
-  // check if syncthing is installed or not
-  log.info('Checking if Syncthing is installed...');
-  const execIsInstalled = 'syncthing --version';
-  let isInstalled = true;
-  await cmdAsync(execIsInstalled).catch((error) => {
-    if (error) {
-      log.error(error);
-      log.info('Syncthing not installed....');
-      isInstalled = false;
-    }
-  });
-  if (!isInstalled) {
-    log.info('Installing Syncthing...');
-    const nodedpath = path.join(__dirname, '../../../helpers');
-    const exec = `cd ${nodedpath} && bash installSyncthing.sh`;
-    await cmdAsync(exec);
-  }
-  syncthingInstalled = true;
+  const nodedpath = path.join(__dirname, '../../../helpers');
+  const exec = `cd ${nodedpath} && bash installSyncthing.sh`;
+  await cmdAsync(exec);
   log.info('Syncthing installed');
 }
 
@@ -1974,11 +1958,6 @@ async function installSyncthing() { // can throw
 let previousSyncthingErrored = false;
 async function startSyncthing() {
   try {
-    if (!syncthingInstalled) {
-      await installSyncthing();
-      await serviceHelper.delay(10 * 1000);
-      startSyncthing();
-    }
     // check wether syncthing is running or not
     const myDevice = await getDeviceID();
     if (myDevice.status === 'error') {
@@ -2004,15 +1983,21 @@ async function startSyncthing() {
       await serviceHelper.delay(10 * 1000);
       await cmdAsync(execKill).catch((error) => log.error(error));
       await cmdAsync(execKillB).catch((error) => log.error(error));
-      const exec = 'sudo nohup syncthing -logfile $HOME/.config/syncthing/syncthing.log --allow-newer-config --no-browser --home=$HOME/.config/syncthing &';
+      const exec = 'sudo nohup syncthing --allow-newer-config --no-browser --home=$HOME/.config/syncthing &';
       log.info('Spawning Syncthing instance...');
+      let errored = false;
       nodecmd.get(exec, async (err) => {
         if (err) {
+          errored = true;
           log.error(err);
-          log.info('Error starting synchting.');
+          log.info('Syncthing is not installed, proceeding with installation');
         }
       });
-      await serviceHelper.delay(60 * 1000);
+      await serviceHelper.delay(30 * 1000);
+      if (errored) {
+        await installSyncthing();
+        await serviceHelper.delay(60 * 1000);
+      }
       startSyncthing();
     } else {
       const currentConfigOptions = await getConfigOptions();
