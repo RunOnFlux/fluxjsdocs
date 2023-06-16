@@ -105,11 +105,9 @@ async function loginPhrase(req, res) {
     await dbHelper.findOneInDatabase(database, collection, query, projection); // fast find call for db test
 
     // check synthing availability
-    const syncthingDeviceID = await syncthingService.getDeviceID();
-    if (syncthingDeviceID.status === 'error') {
+    if (!syncthingService.isRunning()) {
       if (syncthingWorking) {
         syncthingWorking = false;
-        syncthingService.systemRestart();
       } else {
         throw new Error('Syncthing is not running properly');
       }
