@@ -30,7 +30,6 @@ const upnpService = require('./upnpService');
 const geolocationService = require('./geolocationService');
 const syncthingService = require('./syncthingService');
 const pgpService = require('./pgpService');
-const signatureVerifier = require('./signatureVerifier');
 const log = require('../lib/log');
 const userconfig = require('../../../config/userconfig');
 
@@ -2451,6 +2450,9 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
     res.write(serviceHelper.ensureString(stopStatus2));
   }
 
+  // eslint-disable-next-line no-use-before-define
+  await stopSyncthingApp(monitoredName, res);
+
   const removeStatus = {
     status: isComponent ? `Removing Flux App component ${appSpecifications.name} container...` : `Removing Flux App ${appName} container...`,
   };
@@ -3025,6 +3027,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   }
   const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
   const app = await dockerService.appDockerStart(identifier);
+  installationInProgress = false;
   if (!app) {
     return;
   }
@@ -3205,7 +3208,6 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
       res.write(serviceHelper.ensureString(successStatus));
       res.end();
     }
-    installationInProgress = false;
   } catch (error) {
     installationInProgress = false;
     const errorResponse = messageHelper.createErrorMessage(
@@ -3222,6 +3224,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
     if (res) {
       res.write(serviceHelper.ensureString(removeStatus));
     }
+    installationInProgress = false;
     removeAppLocally(appSpecs.name, res, true);
     return false;
   }
@@ -3380,6 +3383,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   }
   const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
   const app = await dockerService.appDockerStart(identifier);
+  installationInProgress = false;
   if (!app) {
     return;
   }
@@ -3560,7 +3564,6 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       res.write(serviceHelper.ensureString(successStatus));
       res.end();
     }
-    installationInProgress = false;
   } catch (error) {
     installationInProgress = false;
     const errorResponse = messageHelper.createErrorMessage(
@@ -3577,6 +3580,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     if (res) {
       res.write(serviceHelper.ensureString(removeStatus));
     }
+    installationInProgress = false;
     removeAppLocally(appSpecs.name, res, true);
   }
 }
@@ -4029,10 +4033,7 @@ async function verifyAppMessageSignature(type, version, appSpec, timestamp, sign
     throw new Error('Invalid Flux App message specifications');
   }
   const messageToVerify = type + version + JSON.stringify(appSpec) + timestamp;
-  let isValidSignature = verificationHelper.verifyMessage(messageToVerify, appSpec.owner, signature); // only btc
-  if (timestamp > 1688947200000) { // remove after this time passed
-    isValidSignature = signatureVerifier.verifySignature(messageToVerify, appSpec.owner, signature); // btc, eth
-  }
+  const isValidSignature = verificationHelper.verifyMessage(messageToVerify, appSpec.owner, signature);
   if (isValidSignature !== true) {
     const errorMessage = isValidSignature === false ? 'Received signature is invalid or Flux App specifications are not properly formatted' : isValidSignature;
     throw new Error(errorMessage);
@@ -4055,10 +4056,7 @@ async function verifyAppMessageUpdateSignature(type, version, appSpec, timestamp
     throw new Error('Invalid Flux App message specifications');
   }
   const messageToVerify = type + version + JSON.stringify(appSpec) + timestamp;
-  let isValidSignature = verificationHelper.verifyMessage(messageToVerify, appOwner, signature); // only btc
-  if (timestamp > 1688947200000) { // remove after this time passed
-    isValidSignature = signatureVerifier.verifySignature(messageToVerify, appOwner, signature); // btc, eth
-  }
+  const isValidSignature = verificationHelper.verifyMessage(messageToVerify, appOwner, signature);
   if (isValidSignature !== true) {
     const errorMessage = isValidSignature === false ? 'Received signature does not correspond with Flux App owner or Flux App specifications are not properly formatted' : isValidSignature;
     throw new Error(errorMessage);
@@ -4758,9 +4756,6 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   }
   if (appSpecifications.name.startsWith('zel')) {
     throw new Error('Flux App name can not start with zel');
-  }
-  if (appSpecifications.name.toLowerCase() === 'watchtower') {
-    throw new Error('Flux App name is conflicting with another application');
   }
   if (appSpecifications.name.startsWith('flux')) {
     throw new Error('Flux App name can not start with flux');
@@ -9326,15 +9321,13 @@ async function getDeviceID(fluxIP) {
   }
 }
 
-let updateSyncthingRunning = false;
 // update syncthing configuration for locally installed apps
 async function syncthingApps() {
   try {
     // do not run if installationInProgress or removalInProgress
-    if (installationInProgress || removalInProgress || updateSyncthingRunning) {
+    if (installationInProgress || removalInProgress) {
       return;
     }
-    updateSyncthingRunning = true;
     // get list of all installed apps
     const appsInstalled = await installedApps();
     if (appsInstalled.status === 'error') {
@@ -9371,12 +9364,7 @@ async function syncthingApps() {
             // eslint-disable-next-line no-await-in-loop
             const deviceID = await getDeviceID(name);
             if (deviceID) {
-              if (deviceID !== myDeviceID.data) { // skip my id, already present
-                const folderDeviceExists = devices.find((device) => device.deviceID === deviceID);
-                if (!folderDeviceExists) { // double check if not multiple the same ids
-                  devices.push({ deviceID });
-                }
-              }
+              devices.push({ deviceID });
               const deviceExists = devicesConfiguration.find((device) => device.name === name);
               if (!deviceExists) {
                 const newDevice = {
@@ -9421,12 +9409,7 @@ async function syncthingApps() {
               // eslint-disable-next-line no-await-in-loop
               const deviceID = await getDeviceID(name);
               if (deviceID) {
-                if (deviceID !== myDeviceID.data) { // skip my id, already present
-                  const folderDeviceExists = devices.find((device) => device.deviceID === deviceID);
-                  if (!folderDeviceExists) { // double check if not multiple the same ids
-                    devices.push({ deviceID });
-                  }
-                }
+                devices.push({ deviceID });
                 const deviceExists = devicesConfiguration.find((device) => device.name === name);
                 if (!deviceExists) {
                   const newDevice = {
@@ -9452,12 +9435,17 @@ async function syncthingApps() {
         }
       }
     }
+    // now we have new accurate devicesConfiguration and foldersConfiguration
+    // add more of current devices
+    // excludes our current deviceID adjustment
+    await syncthingService.adjustConfigDevices('put', devicesConfiguration);
+    // add more of current folders
+    await syncthingService.adjustConfigFolders('put', foldersConfiguration);
     // remove folders that should not be synced anymore (this shall actually not trigger)
     const allFoldersResp = await syncthingService.getConfigFolders();
     const nonUsedFolders = allFoldersResp.data.filter((syncthingFolder) => !folderIds.includes(syncthingFolder.id));
     // eslint-disable-next-line no-restricted-syntax
     for (const nonUsedFolder of nonUsedFolders) {
-      log.info(`Removing unused Syncthing of folder ${nonUsedFolder.id}`);
       // eslint-disable-next-line no-await-in-loop
       await syncthingService.adjustConfigFolders('delete', undefined, nonUsedFolder.id);
     }
@@ -9468,31 +9456,18 @@ async function syncthingApps() {
     for (const nonUsedDevice of nonUsedDevices) {
       // exclude our deviceID
       if (nonUsedDevice.deviceID !== myDeviceID.data) {
-        log.info(`Removing unused Syncthing device ${nonUsedDevice.deviceID}`);
         // eslint-disable-next-line no-await-in-loop
         await syncthingService.adjustConfigDevices('delete', undefined, nonUsedDevice.deviceID);
       }
     }
-    // finally apply all new configuration
-    // now we have new accurate devicesConfiguration and foldersConfiguration
-    // add more of current devices
-    // excludes our current deviceID adjustment
-    await syncthingService.adjustConfigDevices('put', devicesConfiguration);
-    // add more of current folders
-    await syncthingService.adjustConfigFolders('put', foldersConfiguration);
     // all configuration changes applied
     // check if restart is needed
     const restartRequired = await syncthingService.getConfigRestartRequired();
     if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-      log.info('New configuration applied. Syncthing restart required, restarting...');
       await syncthingService.systemRestart();
     }
   } catch (error) {
     log.error(error);
-  } finally {
-    updateSyncthingRunning = false;
-    await serviceHelper.delay(2 * 60 * 1000);
-    syncthingApps();
   }
 }
 
