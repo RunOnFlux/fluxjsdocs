@@ -105,13 +105,13 @@ async function estimatePriority(req, res) {
  * @returns {object} Message.
  */
 async function validateAddress(req, res) {
-  let { fluxaddress } = req.params;
-  fluxaddress = fluxaddress || req.query.fluxaddress;
+  let { zelcashaddress } = req.params;
+  zelcashaddress = zelcashaddress || req.query.zelcashaddress;
 
   const rpccall = 'validateAddress';
   let rpcparameters = [];
-  if (fluxaddress) {
-    rpcparameters = [fluxaddress];
+  if (zelcashaddress) {
+    rpcparameters = [zelcashaddress];
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
@@ -138,15 +138,15 @@ async function validateAddress(req, res) {
  * @returns {object} Message.
  */
 async function verifyMessage(req, res) {
-  let { fluxaddress, signature, message } = req.params;
-  fluxaddress = fluxaddress || req.query.fluxaddress;
+  let { zelcashaddress, signature, message } = req.params;
+  zelcashaddress = zelcashaddress || req.query.zelcashaddress;
   signature = signature || req.query.signature;
   message = message || req.query.message;
 
   const rpccall = 'verifyMessage';
   let rpcparameters = [];
-  if (fluxaddress && signature && message) {
-    rpcparameters = [fluxaddress, signature, message];
+  if (zelcashaddress && signature && message) {
+    rpcparameters = [zelcashaddress, signature, message];
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
@@ -166,12 +166,12 @@ async function verifyMessagePost(req, res) {
   });
   req.on('end', async () => {
     const processedBody = serviceHelper.ensureObject(body);
-    const { fluxaddress, signature, message } = processedBody;
+    const { zelcashaddress, signature, message } = processedBody;
 
     const rpccall = 'verifyMessage';
     let rpcparameters = [];
-    if (fluxaddress && signature && message) {
-      rpcparameters = [fluxaddress, signature, message];
+    if (zelcashaddress && signature && message) {
+      rpcparameters = [zelcashaddress, signature, message];
     }
     response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
