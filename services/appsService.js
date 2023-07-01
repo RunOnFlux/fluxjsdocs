@@ -7955,7 +7955,6 @@ function getAppPorts(appSpecs) {
  * Checks if app already has the required number of instances deployed. Checks that application image is not blacklisted. Checks that ports not already in use.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
-let firstExecutionAfterItsSynced = true;
 async function trySpawningGlobalApplication() {
   try {
     // how do we continue with this function?
@@ -7968,13 +7967,6 @@ async function trySpawningGlobalApplication() {
       trySpawningGlobalApplication();
       return;
     }
-    if (firstExecutionAfterItsSynced === true) {
-      log.info('Explorer Synced, checking for expired apps');
-      // eslint-disable-next-line no-use-before-define
-      await expireGlobalApplications();
-      firstExecutionAfterItsSynced = false;
-    }
-
     const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
     if (!isNodeConfirmed) {
       log.info('Flux Node not Confirmed. Global applications will not be installed');
@@ -8347,25 +8339,13 @@ async function checkAndNotifyPeersOfRunningApps() {
         installedAndRunning.push(app);
       }
     });
-
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-
-    if (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1) {
-      // eslint-disable-next-line no-restricted-syntax
-      const broadcastedAt = new Date().getTime();
-      const newAppRunningMessageV2 = {
-        type: 'fluxapprunning',
-        version: 2,
-        ip: myIP,
-        broadcastedAt,
-      };
-      const apps = [];
-      // eslint-disable-next-line no-restricted-syntax
-      for (const application of installedAndRunning) {
-        log.info(`${application.name} is running properly. Broadcasting status.`);
+    // eslint-disable-next-line no-restricted-syntax
+    for (const application of installedAndRunning) {
+      log.info(`${application.name} is running properly. Broadcasting status.`);
+      try {
         // eslint-disable-next-line no-await-in-loop
         // we can distinguish pure local apps from global with hash and height
+        const broadcastedAt = new Date().getTime();
         const newAppRunningMessage = {
           type: 'fluxapprunning',
           version: 1,
@@ -8374,57 +8354,22 @@ async function checkAndNotifyPeersOfRunningApps() {
           ip: myIP,
           broadcastedAt,
         };
-        const app = {
-          name: application.name,
-          hash: application.hash, // hash of application specifics that are running
-        };
-        apps.push(app);
+
         // store it in local database first
         // eslint-disable-next-line no-await-in-loop
         await storeAppRunningMessage(newAppRunningMessage);
-      }
-      newAppRunningMessageV2.apps = apps;
-      // eslint-disable-next-line no-await-in-loop
-      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessageV2);
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(500);
-      // eslint-disable-next-line no-await-in-loop
-      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
-      // broadcast messages about running apps to all peers
-    } else {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const application of installedAndRunning) {
-        log.info(`${application.name} is running properly. Broadcasting status.`);
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          // we can distinguish pure local apps from global with hash and height
-          const broadcastedAt = new Date().getTime();
-          const newAppRunningMessage = {
-            type: 'fluxapprunning',
-            version: 1,
-            name: application.name,
-            hash: application.hash, // hash of application specifics that are running
-            ip: myIP,
-            broadcastedAt,
-          };
-
-          // store it in local database first
-          // eslint-disable-next-line no-await-in-loop
-          await storeAppRunningMessage(newAppRunningMessage);
-          // eslint-disable-next-line no-await-in-loop
-          await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(500);
-          // eslint-disable-next-line no-await-in-loop
-          await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-          // broadcast messages about running apps to all peers
-        } catch (err) {
-          log.error(err);
-          // removeAppLocally(stoppedApp);
-        }
+        // eslint-disable-next-line no-await-in-loop
+        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(500);
+        // eslint-disable-next-line no-await-in-loop
+        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
+        // broadcast messages about running apps to all peers
+      } catch (err) {
+        log.error(err);
+        // removeAppLocally(stoppedApp);
       }
     }
-
     log.info('Running Apps broadcasted');
   } catch (error) {
     log.error(error);
