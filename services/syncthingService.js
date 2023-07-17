@@ -934,13 +934,7 @@ async function getConfigOptions(req, res) {
  * @returns {object} Message
  */
 async function getConfigGui(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/config/gui');
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
+  const response = await performRequest('get', '/rest/config/gui');
   return res ? res.json(response) : response;
 }
 
