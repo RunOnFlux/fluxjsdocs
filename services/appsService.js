@@ -9246,8 +9246,7 @@ async function forceAppRemovals() {
     });
 
     // array of unique main app names
-    let dockerAppsTrueNameB = [...new Set(dockerAppsTrueNames)];
-    dockerAppsTrueNameB = dockerAppsTrueNameB.filter((appName) => appName !== 'watchtower');
+    const dockerAppsTrueNameB = [...new Set(dockerAppsTrueNames)];
     // eslint-disable-next-line no-restricted-syntax
     for (const dApp of dockerAppsTrueNameB) {
       // check if app is in installedApps
