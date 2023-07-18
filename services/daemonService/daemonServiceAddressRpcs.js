@@ -21,14 +21,9 @@ async function getAddressTxids(req, res) {
 
     const options = {
       addresses,
+      start,
+      end,
     };
-
-    if (start) {
-      options.start = serviceHelper.ensureNumber(start);
-    }
-    if (end) {
-      options.end = serviceHelper.ensureNumber(end);
-    }
 
     const rpccall = 'getaddresstxids';
     const rpcparameters = [options];
@@ -55,14 +50,9 @@ async function getSingleAddresssTxids(req, res) {
 
   const options = {
     addresses: [address],
+    start,
+    end,
   };
-
-  if (start) {
-    options.start = serviceHelper.ensureNumber(start);
-  }
-  if (end) {
-    options.end = serviceHelper.ensureNumber(end);
-  }
 
   const rpccall = 'getaddresstxids';
   const rpcparameters = [options];
@@ -136,23 +126,15 @@ async function getAddressDeltas(req, res) {
   req.on('end', async () => {
     const processedBody = serviceHelper.ensureObject(body);
     const {
-      addresses, start, end, chaininfo,
+      addresses, start, end, chainInfo,
     } = processedBody;
 
     const options = {
       addresses,
+      start,
+      end,
+      chainInfo,
     };
-
-    if (start) {
-      options.start = serviceHelper.ensureNumber(start);
-    }
-    if (end) {
-      options.end = serviceHelper.ensureNumber(end);
-    }
-
-    if (chaininfo) {
-      options.chainInfo = serviceHelper.ensureBoolean(chaininfo);
-    }
 
     const rpccall = 'getaddressdeltas';
     const rpcparameters = [options];
@@ -181,18 +163,10 @@ async function getSingleAddressDeltas(req, res) {
 
   const options = {
     addresses: [address],
+    start,
+    end,
+    chainInfo: chaininfo,
   };
-
-  if (start) {
-    options.start = serviceHelper.ensureNumber(start);
-  }
-  if (end) {
-    options.end = serviceHelper.ensureNumber(end);
-  }
-
-  if (chaininfo) {
-    options.chainInfo = serviceHelper.ensureBoolean(chaininfo);
-  }
 
   const rpccall = 'getaddressdeltas';
   const rpcparameters = [options];

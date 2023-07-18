@@ -44,7 +44,7 @@ async function startBenchmarkD(req, res) {
     response = messageHelper.errUnauthorizedMessage();
     return res ? res.json(response) : response;
   }
-  const rpccall = 'startzelbenchd'; // startfluxbenchd
+  const rpccall = 'startzelbenchd';
   response = await daemonServiceUtils.executeCall(rpccall);
 
   return res ? res.json(response) : response;
@@ -62,7 +62,7 @@ async function stopBenchmarkD(req, res) {
     response = messageHelper.errUnauthorizedMessage();
     return res ? res.json(response) : response;
   }
-  const rpccall = 'stopzelbenchd'; // stopfluxbenchd
+  const rpccall = 'stopzelbenchd';
   response = await daemonServiceUtils.executeCall(rpccall);
 
   return res ? res.json(response) : response;
