@@ -75,7 +75,7 @@ async function getSyncthingApiKey() { // can throw
  * @param {object} data Request data.
  * @returns {object} Message.
  */
-async function performRequest(method = 'get', urlpath = '', data, timeout = 5000) {
+async function performRequest(method = 'get', urlpath = '', data) {
   try {
     if (!syncthingApiKey) {
       const apiKey = await getSyncthingApiKey();
@@ -83,7 +83,7 @@ async function performRequest(method = 'get', urlpath = '', data, timeout = 5000
     }
     const instance = axios.create({
       baseURL: syncthingURL,
-      timeout,
+      timeout: 5000,
       headers: {
         'X-API-Key': syncthingApiKey,
       },
@@ -1686,13 +1686,7 @@ async function postDbScan(req, res) {
  * @returns {object} Message
  */
 async function debugPeerCompletion(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/debug/peerCompletion');
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
+  const response = await performRequest('get', '/rest/debug/peerCompletion');
   return res ? res.json(response) : response;
 }
 
@@ -1703,13 +1697,7 @@ async function debugPeerCompletion(req, res) {
  * @returns {object} Message
  */
 async function debugHttpmetrics(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/debug/httpmetrics');
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
+  const response = await performRequest('get', '/rest/debug/httpmetrics');
   return res ? res.json(response) : response;
 }
 
@@ -1720,14 +1708,8 @@ async function debugHttpmetrics(req, res) {
  * @returns {object} Message
  */
 async function debugCpuprof(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/debug/cpuprof', undefined, 60000);
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
-  return response;
+  const response = await performRequest('get', '/rest/debug/cpuprof');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1737,14 +1719,8 @@ async function debugCpuprof(req, res) {
  * @returns {object} Message
  */
 async function debugHeapprof(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/debug/heapprof', undefined, 60000);
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
-  return response;
+  const response = await performRequest('get', '/rest/debug/heapprof');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1754,14 +1730,8 @@ async function debugHeapprof(req, res) {
  * @returns {object} Message
  */
 async function debugSupport(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  let response = null;
-  if (authorized === true) {
-    response = await performRequest('get', '/rest/debug/support', undefined, 60000);
-  } else {
-    response = messageHelper.errUnauthorizedMessage();
-  }
-  return response;
+  const response = await performRequest('get', '/rest/debug/support');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1787,13 +1757,7 @@ async function debugFile(req, res) {
     } else {
       throw new Error('file parameter is mandatory');
     }
-    const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-    let response = null;
-    if (authorized === true) {
-      response = await performRequest('get', apiPath);
-    } else {
-      response = messageHelper.errUnauthorizedMessage();
-    }
+    const response = await performRequest('get', apiPath);
     return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
@@ -2119,20 +2083,6 @@ async function startSyncthing() {
       const restartRequired = await getConfigRestartRequired();
       if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
         await systemRestart();
-      }
-      // enable gui debugging for development nodes only
-      if (config.development) {
-        const currentGUIOptions = await getConfigGui();
-        if (currentGUIOptions.status === 'success') {
-          const newGUIOptions = currentGUIOptions.data;
-          if (newGUIOptions.debugging !== true) {
-            log.info('Applying SyncthingGUI debuggin options...');
-            newGUIOptions.debugging = true;
-            await performRequest('patch', '/rest/config/gui', newGUIOptions);
-          } else {
-            log.info('Syncthing GUI in debugging options.');
-          }
-        }
       }
       await serviceHelper.delay(8 * 60 * 1000);
       startSyncthing();
