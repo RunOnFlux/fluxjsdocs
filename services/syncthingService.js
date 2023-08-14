@@ -1993,22 +1993,16 @@ async function getSvcReport(req, res) {
  * @returns {object} Message
  */
 let syncthingStatusOk = false;
-let getDeviceIDRunning = false;
 async function getDeviceID(req, res) {
-  if (getDeviceIDRunning) {
-    await serviceHelper.delay(2000);
-    return getDeviceID(req, res);
-  }
-  getDeviceIDRunning = true;
-  let meta;
-  let healthy;
-  let pingResponse;
   try {
-    meta = await getMeta();
+    const meta = await getMeta();
+    log.info(meta);
     await serviceHelper.delay(500);
-    healthy = await getHealth(); // check that syncthing instance is healthy
+    const healthy = await getHealth(); // check that syncthing instance is healthy
+    log.info(healthy);
     await serviceHelper.delay(500);
-    pingResponse = await systemPing(); // check that flux has proper api key
+    const pingResponse = await systemPing(); // check that flux has proper api key
+    log.info(pingResponse);
     const execSynct = 'ps aux | grep -i syncthing';
     const synthingRunning = await cmdAsync(execSynct);
     log.info(synthingRunning);
@@ -2020,17 +2014,15 @@ async function getDeviceID(req, res) {
       syncthingStatusOk = true;
       return res ? res.json(successResponse) : successResponse;
     }
+    log.info(meta.status);
+    log.info(pingResponse.data);
+    log.info(healthy.data);
     throw new Error('Syncthing is not running properly');
   } catch (error) {
     syncthingStatusOk = false;
     log.error(error);
-    log.error(meta);
-    log.error(healthy);
-    log.error(pingResponse);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
     return res ? res.json(errorResponse) : errorResponse;
-  } finally {
-    getDeviceIDRunning = false;
   }
 }
 
@@ -2077,6 +2069,7 @@ async function adjustSyncthing() {
     if (adjustSyncthingRunning) {
       return;
     }
+    adjustSyncthingRunning = true;
     const currentConfigOptions = await getConfigOptions();
     const currentDefaultsFolderOptions = await getConfigDefaultsFolder();
     const apiPort = userconfig.initial.apiport || config.server.apiport;
@@ -2149,6 +2142,8 @@ async function adjustSyncthing() {
 /**
  * To Start Syncthing
  */
+let previousSyncthingErrored = false;
+let lastGetDeviceIdCallOk = false;
 let run = 0;
 async function startSyncthing() {
   try {
@@ -2160,9 +2155,21 @@ async function startSyncthing() {
       return;
     }
     // check wether syncthing is running or not
-    const myDevice = await getDeviceID();
+    let myDevice = await getDeviceID();
     if (myDevice.status === 'error') {
+      // retry before killing and restarting
+      if (!previousSyncthingErrored && lastGetDeviceIdCallOk) {
+        await systemRestart();
+        lastGetDeviceIdCallOk = false;
+        previousSyncthingErrored = true;
+        await serviceHelper.delay(60 * 1000);
+        startSyncthing();
+        return;
+      }
+      lastGetDeviceIdCallOk = false;
+      previousSyncthingErrored = false;
       log.error('Syncthing Error');
+      log.error(myDevice);
       const execDIRcr = 'mkdir -p $HOME/.config'; // create .config folder first for it to have standard user ownership. With -p no error will be thrown in case of exists
       await cmdAsync(execDIRcr).catch((error) => log.error(error));
       const execDIRown = 'sudo chown $USER:$USER $HOME/.config'; // adjust .config folder for ownership of running user
@@ -2176,13 +2183,11 @@ async function startSyncthing() {
       const checkSyncthingRunning = 'sudo pgrep syncthing';
       let cmdres = await cmdAsync(checkSyncthingRunning).catch((error) => log.error(error));
       if (cmdres && cmdres.length > 0) {
-        log.error('Stopping gracefully syncthing service');
         await cmdAsync(execKill).catch((error) => log.error(error));
         await cmdAsync(execKillB).catch((error) => log.error(error));
         await serviceHelper.delay(10 * 1000);
         cmdres = await cmdAsync(checkSyncthingRunning).catch((error) => log.error(error));
         if (cmdres && cmdres.length > 0) {
-          log.error('Stopping syncthing service');
           await cmdAsync(execKillC).catch((error) => log.error(error));
         }
       }
@@ -2195,14 +2200,19 @@ async function startSyncthing() {
         }
       });
       await serviceHelper.delay(60 * 1000);
-      run = 0;
+      myDevice = await getDeviceID();
+      if (myDevice.status === 'success') {
+        await adjustSyncthing();
+        run = 0;
+      }
       startSyncthing();
     } else {
-      if (run === 1 || run % 8 === 0) {
+      if (run % 4 === 0) {
         // every 8 minutes call adjustSyncthing to check service folders
         await adjustSyncthing();
       }
-      await serviceHelper.delay(60 * 1000);
+      lastGetDeviceIdCallOk = true;
+      await serviceHelper.delay(2 * 60 * 1000);
       startSyncthing();
     }
   } catch (error) {
