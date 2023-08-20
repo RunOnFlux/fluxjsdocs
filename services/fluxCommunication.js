@@ -1,6 +1,7 @@
 /* eslint-disable no-underscore-dangle */
 const config = require('config');
-const LRU = require('lru-cache');
+const { LRUCache } = require('lru-cache');
+const hash = require('object-hash');
 const WebSocket = require('ws');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
@@ -18,19 +19,38 @@ let response = messageHelper.createErrorMessage();
 // default cache
 const LRUoptions = {
   max: 20000, // currently 20000 nodes
+  ttl: 1000 * 360, // 360 seconds, 3 blocks
   maxAge: 1000 * 360, // 360 seconds, 3 blocks
 };
 
 const LRUNodeListSortedoptions = {
   max: 1, // NodeListSorted
+  ttl: 10 * 60 * 1000, // 10m , 5 blocks
   maxAge: 10 * 60 * 1000, // 10m , 5 blocks
 };
 
-const sortedNodeListCache = new LRU(LRUNodeListSortedoptions);
+const sortedNodeListCache = new LRUCache(LRUNodeListSortedoptions);
+
+// cache for temporary messages
+const LRUoptionsTemp = { // cache for temporary messages
+  max: 20000, // store max 20000 values
+  ttl: 1000 * 60 * 70, // 70 minutes
+  maxAge: 1000 * 60 * 70, // 70 minutes
+};
+
+const myCacheTemp = new LRUCache(LRUoptionsTemp);
+
+/* const LRUTest = {
+  max: 25000000, // 25M
+  ttl: 60 * 60 * 1000, // 1h
+  maxAge: 60 * 60 * 1000, // 1h
+};
+
+const testListCache = new LRUCache(LRUTest); */
 
 let numberOfFluxNodes = 0;
 
-const blockedPubKeysCache = new LRU(LRUoptions);
+const blockedPubKeysCache = new LRUCache(LRUoptions);
 
 const privateIpsList = [
   '192.168.', '10.',
@@ -98,6 +118,7 @@ async function handleAppRunningMessage(message, fromIP) {
  * @param {object} expressWS Express web socket.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
+// let messageNumber = 0;
 // eslint-disable-next-line no-unused-vars
 function handleIncomingConnection(ws, req, expressWS) {
   // now we are in connections state. push the websocket to our incomingconnections
@@ -135,6 +156,26 @@ function handleIncomingConnection(ws, req, expressWS) {
   incomingPeers.push(peer);
   // verify data integrity, if not signed, close connection
   ws.on('message', async (msg) => {
+    if (!msg) {
+      return;
+    }
+    // uncomment block bellow to know how many messages is a fluxNode receiving every hour
+    /* messageNumber += 1;
+    testListCache.set(messageNumber, messageNumber);
+    if (messageNumber % 200 === 0) {
+      testListCache.purgeStale();
+      log.info(`Number of messages received in the last hour:${testListCache.size}`);
+    }
+    if (messageNumber === 100000000) {
+      messageNumber = 0;
+    } */
+
+    // check if we have the message in cache. If yes, return false. If not, store it and continue
+    const messageHash = hash(msg);
+    if (myCacheTemp.has(messageHash)) {
+      return;
+    }
+    myCacheTemp.set(messageHash, messageHash);
     // check rate limit
     const rateOK = fluxNetworkHelper.lruRateLimit(ipv4Peer, 90);
     if (!rateOK) {
@@ -387,6 +428,23 @@ async function initiateAndHandleConnection(connection) {
   };
 
   websocket.onmessage = async (evt) => {
+    if (!evt) {
+      return;
+    }
+    // uncomment block bellow to know how many messages is a fluxNode receiving every hour
+    /* messageNumber += 1;
+    testListCache.set(messageNumber, messageNumber);
+    if (messageNumber % 200 === 0) {
+      testListCache.purgeStale();
+      log.info(`Number of messages received in the last hour:${testListCache.size}`);
+    }
+    if (messageNumber === 100000000) {
+      messageNumber = 0;
+    }
+    const messageHash = hash(evt.data);
+    if (myCacheTemp.has(messageHash)) {
+      return;
+    } */
     // incoming messages from outgoing connections
     const currentTimeStamp = Date.now(); // ms
     // check rate limit

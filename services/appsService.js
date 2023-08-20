@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const nodecmd = require('node-cmd');
 const df = require('node-df');
-const LRU = require('lru-cache');
+const { LRUCache } = require('lru-cache');
 const systemcrontab = require('crontab');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const util = require('util');
@@ -55,29 +55,18 @@ const globalAppsLocations = config.database.appsglobal.collections.appsLocations
 const testingAppExpress = express();
 const testingAppserver = http.createServer(testingAppExpress);
 
-// cache for app running messages
-const LRUoptionsRun = { // cache for app running messages
-  max: 50000, // store max 50000 values, eventhough we can have more values. this accounts for more than 15000 app instances. Less than 500 Bytes per value -> 25MB cache
-  maxAge: 1000 * 60 * 70, // 70 minutes
-};
-
-// cache for temporary messages
-const LRUoptionsTemp = { // cache for temporary messages
-  max: 10000, // store max 10000 values
-  maxAge: 1000 * 60 * 70, // 70 minutes
-};
 const GlobalAppsSpawnLRUoptions = {
   max: 2000,
+  ttl: 1000 * 60 * 60 * 2, // 2 hours
   maxAge: 1000 * 60 * 60 * 2, // 2 hours
 };
 const longCache = {
   max: 500,
+  ttl: 1000 * 60 * 60 * 3, // 3 hours
   maxAge: 1000 * 60 * 60 * 3, // 3 hours
 };
-const myCacheRun = new LRU(LRUoptionsRun);
-const myCacheTemp = new LRU(LRUoptionsTemp);
-const trySpawningGlobalAppCache = new LRU(GlobalAppsSpawnLRUoptions);
-const myLongCache = new LRU(longCache);
+const trySpawningGlobalAppCache = new LRUCache(GlobalAppsSpawnLRUoptions);
+const myLongCache = new LRUCache(longCache);
 
 let removalInProgress = false;
 let installationInProgress = false;
@@ -6054,11 +6043,7 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
   if (typeof message.appSpecifications !== 'object' && typeof message.zelAppSpecifications !== 'object') {
     return new Error('Invalid Flux App message for storing');
   }
-  // check if we have the message in cache. If yes, return false. If not, store it and continue
-  if (myCacheTemp.has(message.hash)) {
-    return false;
-  }
-  myCacheTemp.set(message.hash, message);
+
   const specifications = message.appSpecifications || message.zelAppSpecifications;
   // eslint-disable-next-line no-use-before-define
   const appSpecFormatted = specificationFormatter(specifications);
@@ -6175,12 +6160,6 @@ async function storeAppRunningMessage(message) {
       }
     }
   }
-
-  // check if we have the message in cache. If yes, return false. If not, store it and continue
-  if (myCacheRun.has(serviceHelper.ensureString(message))) {
-    return false;
-  }
-  myCacheRun.set(serviceHelper.ensureString(message), message);
 
   const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
 
