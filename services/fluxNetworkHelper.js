@@ -8,7 +8,7 @@ const path = require('path');
 const util = require('util');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const net = require('net');
-const { LRUCache } = require('lru-cache');
+const LRU = require('lru-cache');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const messageHelper = require('./messageHelper');
@@ -750,7 +750,6 @@ async function checkMyFluxAvailability(retryNumber = 0) {
     askingIpPort = splittedIP[1];
   }
   let myIP = myFluxIP;
-  const oldIP = myFluxIP;
   if (myIP.includes(':')) { // has port specification
     myIP = myIP.split(':')[0];
   }
@@ -780,53 +779,32 @@ async function checkMyFluxAvailability(retryNumber = 0) {
   if (resMyAvailability.data.status === 'error' || resMyAvailability.data.data.message.includes('not')) {
     log.error(`My Flux unavailability detected from ${askingIP}`);
     // Asked Flux cannot reach me lets check if ip changed
-    if (retryNumber === 4 || dosState > 10) {
-      log.info('Getting publicIp from FluxBench');
-      const benchIpResponse = await benchmarkService.getPublicIp();
-      if (benchIpResponse.status === 'success') {
-        const benchMyIP = benchIpResponse.data.length > 5 ? benchIpResponse.data : null;
-        if (benchMyIP && benchMyIP.split(':')[0] !== myIP.split(':')[0]) {
-          log.info(`New public Ip detected: ${benchMyIP.split(':')[0]}, old Ip:${myIP.split(':')[0]} , updating the FluxNode info in the network`);
-          const newIP = await getMyFluxIPandPort(); // to update node Ip on FluxOs;
-          // eslint-disable-next-line global-require
-          const dockerService = require('./dockerService');
-          let apps = await dockerService.dockerListContainers(true);
-          if (apps.length > 0) {
-            apps = apps.filter((app) => ((app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux') && app.Names[0] !== '/flux_watchtower'));
-          }
-          if (apps.length > 0) {
-            const broadcastedAt = new Date().getTime();
-            const newIpChangedMessage = {
-              type: 'fluxipchanged',
-              version: 1,
-              oldIP,
-              newIP,
-              broadcastedAt,
-            };
-            // broadcast messages about ip changed to all peers
-            // eslint-disable-next-line global-require
-            const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-            await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newIpChangedMessage);
-            await serviceHelper.delay(500);
-            await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newIpChangedMessage);
-            await serviceHelper.delay(2 * 60 * 1000); // lets wait 2 minutes to give time for message being propagated on the network before we try to update the ip on blockchain
-          }
-          daemonServiceWalletRpcs.createConfirmationTransaction();
-          await serviceHelper.delay(4 * 60 * 1000); // lets wait 2 blocks time for the transaction to be mined
-          return true;
-        } if (benchMyIP && benchMyIP.split(':')[0] === myIP.split(':')[0]) {
-          log.info('FluxBench reported the same Ip that was already in use');
-        } else {
-          setDosMessage('Error getting publicIp from FluxBench');
-          dosState += 15;
-          log.error('FluxBench wasnt able to detect flux node public ip');
-        }
+    log.info('Getting publicIp from FluxBench');
+    const benchIpResponse = await benchmarkService.getPublicIp();
+    if (benchIpResponse.status === 'success') {
+      let benchMyIP = benchIpResponse.data.length > 5 ? benchIpResponse.data : null;
+      if (benchMyIP && userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) {
+        // add port
+        benchMyIP += userconfig.initial.apiport;
+      }
+      if (benchMyIP && benchMyIP !== myIP) {
+        log.info('New public Ip detected, updating the FluxNode info in the network');
+        myIP = benchMyIP;
+        daemonServiceWalletRpcs.createConfirmationTransaction();
+        await serviceHelper.delay(4 * 60 * 1000); // lets wait 2 blocks time for the transaction to be mined
+        return true;
+      } if (benchMyIP && benchMyIP === myIP) {
+        log.info('FluxBench reported the same Ip that was already in use');
       } else {
         setDosMessage('Error getting publicIp from FluxBench');
         dosState += 15;
-        log.error(dosMessage);
-        return false;
+        log.error('FluxBench wasnt able to detect flux node public ip');
       }
+    } else {
+      setDosMessage('Error getting publicIp from FluxBench');
+      dosState += 15;
+      log.error(dosMessage);
+      return false;
     }
     dosState += 2;
     if (dosState > 10) {
@@ -1315,10 +1293,9 @@ async function purgeUFW() {
 
 const lruRateOptions = {
   max: 500,
-  ttl: 1000 * 15, // 15 seconds
   maxAge: 1000 * 15, // 15 seconds
 };
-const lruRateCache = new LRUCache(lruRateOptions);
+const lruRateCache = new LRU(lruRateOptions);
 /**
  * To check rate limit.
  * @param {string} ip IP address.
