@@ -179,11 +179,10 @@ function isPortBanned(port) {
  */
 async function isPortOpen(ip, port, app, timeout = 5000) {
   let resp;
-  let firewallActive;
   try {
     let portResponse = true;
     // eslint-disable-next-line no-use-before-define
-    firewallActive = await isFirewallActive();
+    const firewallActive = await isFirewallActive();
     // open port first
     if (firewallActive) {
       // eslint-disable-next-line no-use-before-define
@@ -236,7 +235,7 @@ async function isPortOpen(ip, port, app, timeout = 5000) {
     }));
     await promise;
     setTimeout(() => { // timeout ensure return first
-      if (app && firewallActive) {
+      if (app) {
         // delete the rule
         if (resp.message !== 'existing') { // new or updated rule or firewall not active from above
           // eslint-disable-next-line no-use-before-define
@@ -247,7 +246,7 @@ async function isPortOpen(ip, port, app, timeout = 5000) {
     return portResponse; // true for OK port. listening for port that is being listened to
   } catch (error) {
     setTimeout(() => { // timeout ensure return first
-      if (app && firewallActive) {
+      if (app) {
         // delete the rule
         if (resp.message !== 'existing') { // new or updated rule or firewall not active from above
           // eslint-disable-next-line no-use-before-define
@@ -787,37 +786,34 @@ async function checkMyFluxAvailability(retryNumber = 0) {
       if (benchIpResponse.status === 'success') {
         const benchMyIP = benchIpResponse.data.length > 5 ? benchIpResponse.data : null;
         if (benchMyIP && benchMyIP.split(':')[0] !== myIP.split(':')[0]) {
-          await serviceHelper.delay(2 * 1000); // await two seconds
+          log.info(`New public Ip detected: ${benchMyIP.split(':')[0]}, old Ip:${myIP.split(':')[0]} , updating the FluxNode info in the network`);
           const newIP = await getMyFluxIPandPort(); // to update node Ip on FluxOs;
-          if (newIP && newIP !== oldIP) { // double check
-            log.info(`New public Ip detected: ${newIP}, old Ip:${oldIP} , updating the FluxNode info in the network`);
-            // eslint-disable-next-line global-require
-            const dockerService = require('./dockerService');
-            let apps = await dockerService.dockerListContainers(true);
-            if (apps.length > 0) {
-              apps = apps.filter((app) => ((app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux') && app.Names[0] !== '/flux_watchtower'));
-            }
-            if (apps.length > 0) {
-              const broadcastedAt = new Date().getTime();
-              const newIpChangedMessage = {
-                type: 'fluxipchanged',
-                version: 1,
-                oldIP,
-                newIP,
-                broadcastedAt,
-              };
-              // broadcast messages about ip changed to all peers
-              // eslint-disable-next-line global-require
-              const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-              await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newIpChangedMessage);
-              await serviceHelper.delay(500);
-              await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newIpChangedMessage);
-              await serviceHelper.delay(2 * 60 * 1000); // lets wait 2 minutes to give time for message being propagated on the network before we try to update the ip on blockchain
-            }
-            daemonServiceWalletRpcs.createConfirmationTransaction();
-            await serviceHelper.delay(4 * 60 * 1000); // lets wait 2 blocks time for the transaction to be mined
-            return true;
+          // eslint-disable-next-line global-require
+          const dockerService = require('./dockerService');
+          let apps = await dockerService.dockerListContainers(true);
+          if (apps.length > 0) {
+            apps = apps.filter((app) => ((app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux') && app.Names[0] !== '/flux_watchtower'));
           }
+          if (apps.length > 0) {
+            const broadcastedAt = new Date().getTime();
+            const newIpChangedMessage = {
+              type: 'fluxipchanged',
+              version: 1,
+              oldIP,
+              newIP,
+              broadcastedAt,
+            };
+            // broadcast messages about ip changed to all peers
+            // eslint-disable-next-line global-require
+            const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
+            await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newIpChangedMessage);
+            await serviceHelper.delay(500);
+            await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newIpChangedMessage);
+            await serviceHelper.delay(2 * 60 * 1000); // lets wait 2 minutes to give time for message being propagated on the network before we try to update the ip on blockchain
+          }
+          daemonServiceWalletRpcs.createConfirmationTransaction();
+          await serviceHelper.delay(4 * 60 * 1000); // lets wait 2 blocks time for the transaction to be mined
+          return true;
         } if (benchMyIP && benchMyIP.split(':')[0] === myIP.split(':')[0]) {
           log.info('FluxBench reported the same Ip that was already in use');
         } else {
@@ -1028,18 +1024,14 @@ function getDOSState(req, res) {
  * @returns {object} Command status.
  */
 async function allowPort(port) {
+  const exec = `sudo ufw allow ${port} && sudo ufw allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
+  const cmdres = await cmdAsync(exec);
   const cmdStat = {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw allow ${port} && sudo ufw allow out ${port}`;
-  const cmdAsync = util.promisify(nodecmd.get);
-
-  const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('updated') || serviceHelper.ensureString(cmdres).includes('added')) {
     cmdStat.status = true;
@@ -1058,18 +1050,14 @@ async function allowPort(port) {
  * @returns {object} Command status.
  */
 async function allowOutPort(port) {
+  const exec = `sudo ufw allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
+  const cmdres = await cmdAsync(exec);
   const cmdStat = {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw allow out ${port}`;
-  const cmdAsync = util.promisify(nodecmd.get);
-
-  const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('updated') || serviceHelper.ensureString(cmdres).includes('added')) {
     cmdStat.status = true;
@@ -1092,16 +1080,12 @@ async function denyPort(port) {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
   const portBanned = isPortBanned(+port);
   if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw deny ${port} && sudo ufw deny out ${port}`;
+  const exec = `sudo ufw deny ${port} && sudo ufw deny out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
@@ -1127,16 +1111,12 @@ async function deleteAllowPortRule(port) {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
   const portBanned = isPortBanned(+port);
   if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw delete allow ${port} && sudo ufw delete allow out ${port}`;
+  const exec = `sudo ufw delete allow ${port} && sudo ufw delete allow out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
@@ -1159,16 +1139,12 @@ async function deleteDenyPortRule(port) {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
   const portBanned = isPortBanned(+port);
   if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw delete deny ${port} && sudo ufw delete deny out ${port}`;
+  const exec = `sudo ufw delete deny ${port} && sudo ufw delete deny out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
@@ -1191,16 +1167,12 @@ async function deleteAllowOutPortRule(port) {
     status: false,
     message: null,
   };
-  if (Number.isNaN(+port)) {
-    cmdStat.message = 'Port needs to be a number';
-    return cmdStat;
-  }
   const portBanned = isPortBanned(+port);
   if (+port < (config.fluxapps.portMinNew) || +port > config.fluxapps.portMaxNew || portBanned) {
     cmdStat.message = 'Port out of deletable app ports range';
     return cmdStat;
   }
-  const exec = `LANG="en_US.UTF-8" && sudo ufw delete allow out ${port}`;
+  const exec = `sudo ufw delete allow out ${port}`;
   const cmdAsync = util.promisify(nodecmd.get);
 
   const cmdres = await cmdAsync(exec);
@@ -1250,7 +1222,7 @@ async function allowPortApi(req, res) {
 async function isFirewallActive() {
   try {
     const cmdAsync = util.promisify(nodecmd.get);
-    const execA = 'LANG="en_US.UTF-8" && sudo ufw status | grep Status';
+    const execA = 'sudo ufw status | grep Status';
     const cmdresA = await cmdAsync(execA);
     if (serviceHelper.ensureString(cmdresA).includes('Status: active')) {
       return true;
@@ -1280,8 +1252,8 @@ async function adjustFirewall() {
     if (firewallActive) {
       // eslint-disable-next-line no-restricted-syntax
       for (const port of ports) {
-        const execB = `LANG="en_US.UTF-8" && sudo ufw allow ${port}`;
-        const execC = `LANG="en_US.UTF-8" && sudo ufw allow out ${port}`;
+        const execB = `sudo ufw allow ${port}`;
+        const execC = `sudo ufw allow out ${port}`;
 
         // eslint-disable-next-line no-await-in-loop
         const cmdresB = await cmdAsync(execB);
@@ -1312,7 +1284,7 @@ async function purgeUFW() {
     const cmdAsync = util.promisify(nodecmd.get);
     const firewallActive = await isFirewallActive();
     if (firewallActive) {
-      const execB = 'LANG="en_US.UTF-8" && sudo ufw status | grep \'DENY\' | grep -E \'(3[0-9]{4})\''; // 30000 - 39999
+      const execB = 'sudo ufw status | grep \'DENY\' | grep -E \'(3[0-9]{4})\''; // 30000 - 39999
       const cmdresB = await cmdAsync(execB).catch(() => { }) || ''; // fail silently,
       if (serviceHelper.ensureString(cmdresB).includes('DENY')) {
         const deniedPorts = cmdresB.split('\n'); // split by new line

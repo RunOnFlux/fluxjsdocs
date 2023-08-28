@@ -29,7 +29,7 @@ function isUPNP() {
 async function isFirewallActive() {
   try {
     const cmdAsync = util.promisify(nodecmd.get);
-    const execA = 'LANG="en_US.UTF-8" && sudo ufw status | grep Status';
+    const execA = 'sudo ufw status | grep Status';
     const cmdresA = await cmdAsync(execA);
     if (serviceHelper.ensureString(cmdresA).includes('Status: active')) {
       return true;
@@ -97,10 +97,10 @@ async function verifyUPNPsupport(apiport = config.server.apiport) {
   }
   try {
     await client.createMapping({
-      public: +apiport + 3,
-      private: +apiport + 3,
+      public: +apiport + 1,
+      private: +apiport + 1,
       ttl: 0,
-      description: 'Flux_UPNP_Mapping_Test',
+      description: 'Flux_Backend_API_SSL',
     });
   } catch (error) {
     log.error(error);
@@ -118,7 +118,7 @@ async function verifyUPNPsupport(apiport = config.server.apiport) {
   }
   try {
     await client.removeMapping({
-      public: +apiport + 3,
+      public: +apiport + 1,
     });
   } catch (error) {
     log.error(error);
