@@ -287,11 +287,10 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
     if (!UIok) return false;
 
     const syncthingPort = +port + 2;
-    // eslint-disable-next-line no-use-before-define
-    const syncthingOpen = await isPortOpen(ip, syncthingPort);
-    if (!syncthingOpen) return false;
-
-    return true;
+    const exec = `nc -w 2 -z -v ${ip} ${syncthingPort} </dev/null; echo $?`;
+    const cmdAsync = util.promisify(nodecmd.get);
+    const result = await cmdAsync(exec);
+    return !+result;
   } catch (e) {
     return false;
   }
