@@ -65,8 +65,15 @@ const longCache = {
   ttl: 1000 * 60 * 60 * 3, // 3 hours
   maxAge: 1000 * 60 * 60 * 3, // 3 hours
 };
+
+const testPortsCache = {
+  max: 60,
+  ttl: 1000 * 60 * 60 * 3, // 3 hours
+  maxAge: 1000 * 60 * 60 * 3, // 3 hours
+};
 const trySpawningGlobalAppCache = new LRUCache(GlobalAppsSpawnLRUoptions);
 const myLongCache = new LRUCache(longCache);
+const failedNodesTestPortsCache = new LRUCache(testPortsCache);
 
 let removalInProgress = false;
 let installationInProgress = false;
@@ -10088,13 +10095,17 @@ async function checkMyAppsAvailability() {
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.mapUpnpPort(testingPort, 'Flux_Test_App');
     }
-    await serviceHelper.delay(5 * 1000);
+    await serviceHelper.delay(25 * 1000);
     testingAppserver.listen(testingPort).on('error', (err) => {
       throw err.message;
     });
-    await serviceHelper.delay(10 * 1000);
+    await serviceHelper.delay(50 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
+    if (!askingIP) {
+      checkMyAppsAvailability();
+      return;
+    }
     let askingIpPort = config.server.apiport;
     if (askingIP.includes(':')) { // has port specification
       // it has port specification
@@ -10103,6 +10114,10 @@ async function checkMyAppsAvailability() {
       askingIpPort = splittedIP[1];
     }
     if (myIP === askingIP) {
+      checkMyAppsAvailability();
+      return;
+    }
+    if (failedNodesTestPortsCache.has(askingIP)) {
       checkMyAppsAvailability();
       return;
     }
@@ -10126,6 +10141,7 @@ async function checkMyAppsAvailability() {
     const resMyAppAvailability = await axios.post(`http://${askingIP}:${askingIpPort}/flux/checkappavailability`, JSON.stringify(data), axiosConfig).catch((error) => {
       log.error(`${askingIP} for app availability is not reachable`);
       log.error(error);
+      failedNodesTestPortsCache.set(askingIP, askingIP);
     });
     if (resMyAppAvailability && resMyAppAvailability.data.status === 'error') {
       log.warn(`Applications port range unavailability detected from ${askingIP}:${askingIpPort} on ${testingPort}`);
@@ -10133,13 +10149,14 @@ async function checkMyAppsAvailability() {
       currentDos += 0.4;
       dosState += 0.4;
       failedPort = testingPort;
+      failedNodesTestPortsCache.set(askingIP, askingIP);
     } else if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
       log.info(`${resMyAppAvailability.data.data.message} Detected from ${askingIP}:${askingIpPort} on ${testingPort}`);
       failedPort = null;
     }
 
     if (dosState > 10) {
-      dosMessage = 'Applications port range is not reachable from outside!';
+      dosMessage = `Applications port range ${askingIpPort} is not reachable from outside!`;
     }
     // stop listening on the port, close the port
     if (firewallActive) {
@@ -10226,7 +10243,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
     await serviceHelper.delay(10 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
-    while (askingIP.split(':')[0] === myIP) {
+    while (!askingIP || askingIP.split(':')[0] === myIP) {
       // eslint-disable-next-line no-await-in-loop
       askingIP = await fluxNetworkHelper.getRandomConnection();
     }
