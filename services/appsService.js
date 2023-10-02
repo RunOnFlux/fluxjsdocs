@@ -9998,8 +9998,10 @@ async function signCheckAppData(message) {
 /**
  * Periodically check for our applications port range is available
 */
-let testingPort = 84;
+let testingPort = 85;
 let failedPort;
+const portsNotWorking = [];
+let numberOfFailedTests = 0;
 async function checkMyAppsAvailability() {
   const isUPNP = upnpService.isUPNP();
   try {
@@ -10066,6 +10068,7 @@ async function checkMyAppsAvailability() {
     if (testingPort > 65535) {
       testingPort = 1;
     }
+    log.info(`checkMyAppsAvailability - portsNotWorking: ${JSON.stringify(portsNotWorking)}.`);
     log.info(`checkMyAppsAvailability - Testing port ${testingPort}.`);
     const iBP = fluxNetworkHelper.isPortBanned(testingPort);
     if (iBP) {
@@ -10101,11 +10104,11 @@ async function checkMyAppsAvailability() {
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.mapUpnpPort(testingPort, 'Flux_Test_App');
     }
-    await serviceHelper.delay(3 * 1000);
+    await serviceHelper.delay(1 * 1000);
     testingAppserver.listen(testingPort).on('error', (err) => {
       throw err.message;
     });
-    await serviceHelper.delay(7 * 1000);
+    await serviceHelper.delay(10 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
     if (!askingIP) {
@@ -10154,6 +10157,7 @@ async function checkMyAppsAvailability() {
       log.warn(`checkMyAppsAvailability - Applications port range unavailability detected from ${askingIP}:${askingIpPort} on ${testingPort}`);
       log.warn(JSON.stringify(data));
       portTestFailed = true;
+      numberOfFailedTests += 1;
       dosState += 0.4;
       failedPort = testingPort;
       failedNodesTestPortsCache.set(askingIP, askingIP);
@@ -10179,6 +10183,11 @@ async function checkMyAppsAvailability() {
       // await serviceHelper.delay(60 * 60 * 1000);
     } else {
       // await serviceHelper.delay(4 * 60 * 1000);
+    }
+
+    if (portTestFailed && numberOfFailedTests >= 10) {
+      portsNotWorking.push(failedPort);
+      failedPort = null;
     }
     checkMyAppsAvailability();
   } catch (error) {
