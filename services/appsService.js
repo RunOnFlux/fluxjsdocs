@@ -1,3 +1,4 @@
+// const createHttpTerminator = require('http-terminator');
 const config = require('config');
 const axios = require('axios');
 const express = require('express');
@@ -54,6 +55,9 @@ const globalAppsLocations = config.database.appsglobal.collections.appsLocations
 
 const testingAppExpress = express();
 const testingAppserver = http.createServer(testingAppExpress);
+/* const httpTerminator = createHttpTerminator({
+  testingAppserver,
+}); */
 
 const GlobalAppsSpawnLRUoptions = {
   max: 2000,
@@ -9995,14 +9999,6 @@ async function signCheckAppData(message) {
   return signature;
 }
 
-const server1Sockets = new Set();
-function destroySockets(sockets) {
-  // eslint-disable-next-line no-restricted-syntax
-  for (const socket of sockets.values()) {
-    socket.destroy();
-  }
-}
-
 /**
  * Periodically check for our applications port range is available
 */
@@ -10116,12 +10112,6 @@ async function checkMyAppsAvailability() {
     testingAppserver.listen(testingPort).on('error', (err) => {
       throw err.message;
     });
-    testingAppserver.on('connection', (socket) => {
-      server1Sockets.add(socket);
-      socket.on('close', () => {
-        server1Sockets.delete(socket);
-      });
-    });
     await serviceHelper.delay(8 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
@@ -10191,9 +10181,8 @@ async function checkMyAppsAvailability() {
       await upnpService.removeMapUpnpPort(testingPort, 'Flux_Test_App');
     }
 
-    destroySockets(server1Sockets);
+    // await httpTerminator.terminate();
     testingAppserver.close();
-
     if (!portTestFailed) {
       dosState = 0;
       numberOfFailedTests = 0;
@@ -10223,6 +10212,7 @@ async function checkMyAppsAvailability() {
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.removeMapUpnpPort(testingPort, 'Flux_Test_App').catch((e) => log.error(e));
     }
+    // await httpTerminator.terminate();
     testingAppserver.close();
     log.error(`checkMyAppsAvailability - Error: ${error}`);
     // await serviceHelper.delay(4 * 60 * 1000);
