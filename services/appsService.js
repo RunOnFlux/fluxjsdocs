@@ -9995,6 +9995,14 @@ async function signCheckAppData(message) {
   return signature;
 }
 
+const server1Sockets = new Set();
+function destroySockets(sockets) {
+  // eslint-disable-next-line no-restricted-syntax
+  for (const socket of sockets.values()) {
+    socket.destroy();
+  }
+}
+
 /**
  * Periodically check for our applications port range is available
 */
@@ -10002,7 +10010,6 @@ let testingPort = 0;
 let failedPort;
 const portsNotWorking = [];
 let numberOfFailedTests = 0;
-let checkMyAppsAvailabilityCallNumber = 1;
 async function checkMyAppsAvailability() {
   const isUPNP = upnpService.isUPNP();
   try {
@@ -10109,6 +10116,12 @@ async function checkMyAppsAvailability() {
     testingAppserver.listen(testingPort).on('error', (err) => {
       throw err.message;
     });
+    testingAppserver.on('connection', (socket) => {
+      server1Sockets.add(socket);
+      socket.on('close', () => {
+        server1Sockets.delete(socket);
+      });
+    });
     await serviceHelper.delay(8 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
@@ -10177,7 +10190,10 @@ async function checkMyAppsAvailability() {
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
       await upnpService.removeMapUpnpPort(testingPort, 'Flux_Test_App');
     }
+
+    destroySockets(server1Sockets);
     testingAppserver.close();
+
     if (!portTestFailed) {
       dosState = 0;
       numberOfFailedTests = 0;
@@ -10193,15 +10209,6 @@ async function checkMyAppsAvailability() {
       numberOfFailedTests = 0;
       dosState = 0;
     }
-    await serviceHelper.delay(10 * 1000);
-    log.info('checkMyAppsAvailability - Awaiting to testingAppserver to be closed');
-    while (testingAppserver.address() && checkMyAppsAvailabilityCallNumber < 120) {
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(2 * 1000);
-      checkMyAppsAvailabilityCallNumber += 1;
-    }
-    log.info('checkMyAppsAvailability - testingAppserver is now closed');
-    checkMyAppsAvailabilityCallNumber = 1;
     checkMyAppsAvailability();
   } catch (error) {
     if (dosMountMessage || dosDuplicateAppMessage) {
@@ -10219,7 +10226,6 @@ async function checkMyAppsAvailability() {
     testingAppserver.close();
     log.error(`checkMyAppsAvailability - Error: ${error}`);
     // await serviceHelper.delay(4 * 60 * 1000);
-    await serviceHelper.delay(60 * 1000);
     checkMyAppsAvailability();
   }
 }
