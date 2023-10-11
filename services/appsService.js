@@ -6213,6 +6213,7 @@ async function storeAppRunningMessage(message) {
       ip: message.ip,
       broadcastedAt: new Date(message.broadcastedAt),
       expireAt: new Date(validTill),
+      removedBroadcastedAt: null,
     };
 
     // indexes over name, hash, ip. Then name + ip and name + ip + broadcastedAt.
@@ -6330,11 +6331,40 @@ async function storeAppRemovedMessage(message) {
     return false;
   }
 
+  const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+  const daemonHeight = syncStatus.data.height || 0;
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
-  const query = { ip: message.ip, name: message.appName };
-  const projection = {};
-  await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
+  if (daemonHeight < config.sentinelActivation) {
+    const query = { ip: message.ip, name: message.appName };
+    const projection = {};
+    await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
+  } else {
+    const appRunningMessage = {
+      name: message.appName,
+      ip: message.ip,
+      expireAt: new Date(validTill),
+      removedBroadcastedAt: new Date(message.broadcastedAt),
+    };
+
+    // indexes over name, hash, ip. Then name + ip and name + ip + broadcastedAt.
+    const queryFind = { name: appRunningMessage.name, ip: appRunningMessage.ip };
+    const projection = { _id: 0 };
+    // we already have the exact same data
+    // eslint-disable-next-line no-await-in-loop
+    const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
+    if (result) {
+      appRunningMessage.broadcastedAt = result.broadcastedAt;
+      appRunningMessage.hash = result.hash;
+      const queryUpdate = { name: appRunningMessage.name, ip: appRunningMessage.ip };
+      const update = { $set: appRunningMessage };
+      const options = {
+        upsert: true,
+      };
+      // eslint-disable-next-line no-await-in-loop
+      await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
+    }
+  }
 
   // all stored, rebroadcast
   return true;
@@ -7730,6 +7760,9 @@ async function reindexGlobalAppsLocation() {
     await database.collection(globalAppsLocations).createIndex({ ip: 1 }, { name: 'query for getting zelapp location based on ip' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting app based on ip and name' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1, broadcastedAt: 1 }, { name: 'query for getting app to ensure we possess a message' });
+    await database.collection(globalAppsLocations).createIndex({
+      name: 1, ip: 1, broadcastedAt: 1, removedBroadcastedAt: 1,
+    }, { name: 'query for getting all apps, including the ones that were removed from nodes in the last 30 days' });
     return true;
   } catch (error) {
     log.error(error);
@@ -8667,6 +8700,7 @@ async function trySpawningGlobalApplication() {
 /**
  * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
  */
+let checkAndNotifyPeersOfRunningAppsRun = 0;
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     // get my external IP and check that it is longer than 5 in length.
@@ -8749,6 +8783,19 @@ async function checkAndNotifyPeersOfRunningApps() {
     } else {
       log.warn('Stopped application checks not running, some removal or installation is in progress');
     }
+
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height || 0;
+    if (daemonHeight >= config.sentinelActivation) {
+      if (checkAndNotifyPeersOfRunningAppsRun > 0) {
+        return;
+      }
+      const db = dbHelper.databaseConnection();
+      const databaseTemp = db.db(config.database.appsglobal.database);
+      await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 });
+    }
+    checkAndNotifyPeersOfRunningAppsRun += 1;
+
     const installedAndRunning = [];
     appsInstalled.forEach((app) => {
       if (app.version >= 4) {
@@ -8766,8 +8813,10 @@ async function checkAndNotifyPeersOfRunningApps() {
       }
     });
 
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
+    if (installedAndRunning.length === 0) {
+      return;
+    }
+
     const apps = [];
     try {
       // eslint-disable-next-line no-restricted-syntax
@@ -8791,7 +8840,7 @@ async function checkAndNotifyPeersOfRunningApps() {
         // store it in local database first
         // eslint-disable-next-line no-await-in-loop
         await storeAppRunningMessage(newAppRunningMessage);
-        if (daemonHeight < config.fluxapps.apprunningv2 || installedAndRunning.length === 1) {
+        if (daemonHeight < config.sentinelActivation && (daemonHeight < config.fluxapps.apprunningv2 || installedAndRunning.length === 1)) {
           // eslint-disable-next-line no-await-in-loop
           await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
           // eslint-disable-next-line no-await-in-loop
@@ -8801,7 +8850,7 @@ async function checkAndNotifyPeersOfRunningApps() {
           // broadcast messages about running apps to all peers
         }
       }
-      if (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1) {
+      if (daemonHeight >= config.sentinelActivation || (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1)) {
         // send v2 unique message instead
         const newAppRunningMessageV2 = {
           type: 'fluxapprunning',
