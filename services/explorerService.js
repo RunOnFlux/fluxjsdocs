@@ -707,14 +707,6 @@ async function processBlock(blockHeight, isInsightExplorer) {
           log.error(error);
         }
       }
-      if (blockDataVerbose.height === config.sentinelActivation) {
-        try {
-          const databaseTemp = db.db(config.database.appsglobal.database);
-          await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 });
-        } catch (error) {
-          log.error(error);
-        }
-      }
     }
     const scannedHeight = blockDataVerbose.height;
     // update scanned Height in scannedBlockHeightCollection
@@ -964,9 +956,6 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ ip: 1 }, { name: 'query for getting zelapp location based on ip' });
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting app based on ip and name' });
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ name: 1, ip: 1, broadcastedAt: 1 }, { name: 'query for getting app to ensure we possess a message' });
-      await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({
-        name: 1, ip: 1, broadcastedAt: 1, removedBroadcastedAt: 1,
-      }, { name: 'query for getting all apps, including the ones that were removed from nodes in the last 30 days' });
       // what if 2 app adjustment come in the same block?
       // log.info(resultE, resultF);
       log.info('Preparation done');
