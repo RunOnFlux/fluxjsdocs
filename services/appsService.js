@@ -10002,8 +10002,9 @@ async function signCheckAppData(message) {
 */
 let failedPort;
 let testingPort;
-let startPortTest = 81;
+let startPortTest = 36666;
 let testRun = 0;
+const portsNotWorking = [];
 async function checkMyAppsAvailability() {
   testRun += 1;
   const isUPNP = upnpService.isUPNP();
@@ -10068,6 +10069,7 @@ async function checkMyAppsAvailability() {
     const max = maxPort; */
     testingPort = failedPort || startPortTest;
 
+    log.info(`checkMyAppsAvailability - portsNotWorking ${JSON.stringify(portsNotWorking)}.`);
     log.info(`checkMyAppsAvailability - Testing port ${testingPort}.`);
     let iBP = fluxNetworkHelper.isPortBanned(testingPort);
     if (iBP) {
@@ -10120,7 +10122,7 @@ async function checkMyAppsAvailability() {
     }).on('uncaughtException', (err) => {
       throw err.message;
     });
-    await serviceHelper.delay(10 * 1000);
+    await serviceHelper.delay(60 * 1000);
     // eslint-disable-next-line no-await-in-loop
     let askingIP = await fluxNetworkHelper.getRandomConnection();
     if (!askingIP) {
@@ -10199,6 +10201,7 @@ async function checkMyAppsAvailability() {
       dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
       // await serviceHelper.delay(60 * 60 * 1000);
     } else if (testRun === 4) {
+      portsNotWorking.push(failedPort);
       testRun = 0;
       startPortTest += 1;
       failedPort = null;
@@ -10226,7 +10229,15 @@ async function checkMyAppsAvailability() {
       }
     });
     log.error(`checkMyAppsAvailability - Error: ${error}`);
-    await serviceHelper.delay(4 * 60 * 1000);
+    if (testRun === 4) {
+      portsNotWorking.push(failedPort);
+      testRun = 0;
+      startPortTest += 1;
+      failedPort = null;
+      dosState = 0;
+      dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
+      // await serviceHelper.delay(4 * 60 * 1000);
+    }
     checkMyAppsAvailability();
   }
 }
