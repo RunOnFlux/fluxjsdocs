@@ -195,7 +195,6 @@ function isPortUPNPBanned(port) {
  */
 async function isPortOpen(ip, port) {
   try {
-    // requirest netcat tool
     const exec = `nc -w 5 -z -v ${ip} ${port} </dev/null; echo $?`;
     const cmdAsync = util.promisify(nodecmd.get);
     const result = await cmdAsync(exec);
@@ -667,6 +666,15 @@ async function checkMyFluxAvailability(retryNumber = 0) {
       return false;
     }
   }
+  let userBlockedRepositories = userconfig.initial.blockedRepositories || [];
+  userBlockedRepositories = serviceHelper.ensureObject(userBlockedRepositories);
+  if (Array.isArray(userBlockedRepositories)) {
+    if (userBlockedRepositories.length > 10) {
+      dosState += 11;
+      setDosMessage('User blocked repositories above 10 limit');
+      return false;
+    }
+  }
   const fluxBenchVersionAllowed = await checkFluxbenchVersionAllowed();
   if (!fluxBenchVersionAllowed) {
     return false;
@@ -838,6 +846,7 @@ async function adjustExternalIP(ip) {
     pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
     pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
     blockedPorts: [${userconfig.initial.blockedPorts || ''}],
+    blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || [])},
   }
 }`;
 

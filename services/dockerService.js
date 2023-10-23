@@ -314,13 +314,27 @@ async function dockerContainerExec(container, cmd, env, res, callback) {
       Detach: false,
       Tty: false,
     };
-
     const exec = await container.exec(options);
     exec.start(optionsExecStart, (err, mystream) => {
       if (err) {
         callback(err);
       }
-      mystream.on('data', (data) => res.write(data.toString()));
+      let dataBuffer = Buffer.from([]);
+      mystream.on('data', (data) => {
+        dataBuffer = Buffer.concat([dataBuffer, data]);
+        while (dataBuffer.length >= 8) {
+          const strToUnpack = dataBuffer.slice(0, 8);
+          dataBuffer = dataBuffer.slice(8);
+          const sizeValue = strToUnpack.readUInt32BE(4);
+          if (dataBuffer.length >= sizeValue) {
+            const str = dataBuffer.slice(0, sizeValue).toString('utf8');
+            dataBuffer = dataBuffer.slice(sizeValue);
+            res.write(str);
+          } else {
+            break;
+          }
+        }      
+      });
       mystream.on('end', () => callback(null));
     });
   } catch (error) {
@@ -583,6 +597,10 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   if (options.Env.length) {
     const fluxStorageEnv = options.Env.find((env) => env.startsWith(('F_S_ENV=')));
     if (fluxStorageEnv) {
+      const index = options.Env.indexOf(fluxStorageEnv);
+      if (index > -1) {
+        options.Env.splice(index, 1);
+      }
       const url = fluxStorageEnv.split('F_S_ENV=')[1];
       const envVars = await obtainPayloadFromStorage(url, appName);
       if (Array.isArray(envVars) && envVars.length < 200) {
@@ -602,6 +620,10 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   if (options.Cmd.length) {
     const fluxStorageCmd = options.Cmd.find((cmd) => cmd.startsWith(('F_S_CMD=')));
     if (fluxStorageCmd) {
+      const index = options.Cmd.indexOf(fluxStorageCmd);
+      if (index > -1) {
+        options.Cmd.splice(index, 1);
+      }
       const url = fluxStorageCmd.split('F_S_CMD=')[1];
       const cmdVars = await obtainPayloadFromStorage(url, appName);
       if (Array.isArray(cmdVars) && cmdVars.length < 200) {
@@ -609,7 +631,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
           if (typeof parameter !== 'string' || parameter.length > 5000000) {
             throw new Error(`Commands parameters from Flux Storage ${fluxStorageCmd} are invalid`);
           } else if (parameter !== '--privileged') {
-            options.Env.push(parameter);
+            options.Cmd.push(parameter);
           }
         });
       } else {

@@ -73,13 +73,6 @@ const testPortsCache = {
   ttl: 1000 * 60 * 60 * 3, // 3 hours
   maxAge: 1000 * 60 * 60 * 3, // 3 hours
 };
-
-const appsRunningCache = {
-  max: 1,
-  ttl: 1000 * 60 * 60 * 24, // 24 hours
-  maxAge: 1000 * 60 * 60 * 24, // 24 hours
-};
-const broadCastAppsRunningCache = new LRUCache(appsRunningCache);
 const trySpawningGlobalAppCache = new LRUCache(GlobalAppsSpawnLRUoptions);
 const myLongCache = new LRUCache(longCache);
 const failedNodesTestPortsCache = new LRUCache(testPortsCache);
@@ -194,38 +187,6 @@ async function installedApps(req, res) {
     const appsProjection = {
       projection: {
         _id: 0,
-      },
-    };
-    const apps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
-    const dataResponse = messageHelper.createDataMessage(apps);
-    return res ? res.json(dataResponse) : dataResponse;
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    return res ? res.json(errorResponse) : errorResponse;
-  }
-}
-
-/**
- * To get a list of installed apps names.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-async function installedAppsNames(req, res) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-
-    const appsDatabase = dbopen.db(config.database.appslocal.database);
-    const appsQuery = {};
-    const appsProjection = {
-      projection: {
-        _id: 0,
-        name: 1,
       },
     };
     const apps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
@@ -4380,6 +4341,47 @@ async function getBlockedRepositores() {
 }
 
 /**
+ * Check fluxOs configuration to see if there is any repository blocked and return a list of them that doesn't exist on marketplace
+ * As any change of the config will restart FluxOs we cache the first execution and always return that.
+ * @returns {array} array of string repositories.
+ */
+let cacheUserBlockedRepos = null;
+async function getUserBlockedRepositores() {
+  try {
+    if (cacheUserBlockedRepos) {
+      return cacheUserBlockedRepos;
+    }
+    const userBlockedRepos = userconfig.initial.blockedRepositories || [];
+    if (userBlockedRepos.length === 0) {
+      return userBlockedRepos;
+    }
+    const usableUserBlockedRepos = [];
+    const marketPlaceUrl = 'https://stats.runonflux.io/marketplace/listapps';
+    const response = await axios.get(marketPlaceUrl);
+    console.log(response);
+    if (response.data.status === 'success') {
+      const visibleApps = response.data.data.filter((val) => val.visible);
+      for (let i = 0; i < userBlockedRepos.length; i += 1) {
+        const userRepo = userBlockedRepos[i];
+        userRepo.substring(0, userRepo.lastIndexOf(':') > -1 ? userRepo.lastIndexOf(':') : userRepo.length);
+        const exist = visibleApps.find((app) => app.compose.find((compose) => compose.repotag.substring(0, compose.repotag.lastIndexOf(':') > -1 ? compose.repotag.lastIndexOf(':') : compose.repotag.length).toLowerCase() === userRepo.toLowerCase()));
+        if (!exist) {
+          usableUserBlockedRepos.push(userRepo);
+        } else {
+          log.info(`${userRepo} is part of marketplace offer and despite being on blockedRepositories it will not be take in consideration`);
+        }
+      }
+      cacheUserBlockedRepos = usableUserBlockedRepos;
+      return cacheUserBlockedRepos;
+    }
+    return [];
+  } catch (error) {
+    log.error(error);
+    return null;
+  }
+}
+
+/**
  * To check compliance of app images (including images for each component if a Docker Compose app). Checks Flux OS's GitHub repository for list of blocked Docker Hub/Github/Google repositories.
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if no errors are thrown.
@@ -4441,52 +4443,61 @@ async function checkApplicationImagesComplience(appSpecs) {
  */
 async function checkApplicationImagesBlocked(appSpecs) {
   const repos = await getBlockedRepositores();
-
+  const userBlockedRepos = await getUserBlockedRepositores();
   let isBlocked = false;
-
-  if (!repos) {
+  if (!repos && !userBlockedRepos) {
     return isBlocked;
   }
-
-  const pureImagesOrOrganisationsRepos = [];
-  repos.forEach((repo) => {
-    pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':') > -1 ? repo.lastIndexOf(':') : repo.length));
-  });
-
-  // blacklist works also for zelid and app hash
-  if (pureImagesOrOrganisationsRepos.includes(appSpecs.hash)) {
-    return `${appSpecs.hash} is not allowed to be spawned`;
-  }
-  if (pureImagesOrOrganisationsRepos.includes(appSpecs.owner)) {
-    return `${appSpecs.owner} is not allowed to run applications`;
-  }
-
   const images = [];
-  const organisations = [];
-  if (appSpecs.version <= 3) {
-    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
-    images.push(repository);
-    const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
-    organisations.push(pureNamespace);
-  } else {
-    appSpecs.compose.forEach((component) => {
-      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
+  if (repos) {
+    const pureImagesOrOrganisationsRepos = [];
+    repos.forEach((repo) => {
+      pureImagesOrOrganisationsRepos.push(repo.substring(0, repo.lastIndexOf(':') > -1 ? repo.lastIndexOf(':') : repo.length));
+    });
+
+    // blacklist works also for zelid and app hash
+    if (pureImagesOrOrganisationsRepos.includes(appSpecs.hash)) {
+      return `${appSpecs.hash} is not allowed to be spawned`;
+    }
+    if (pureImagesOrOrganisationsRepos.includes(appSpecs.owner)) {
+      return `${appSpecs.owner} is not allowed to run applications`;
+    }
+
+    const organisations = [];
+    if (appSpecs.version <= 3) {
+      const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
       images.push(repository);
       const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
       organisations.push(pureNamespace);
+    } else {
+      appSpecs.compose.forEach((component) => {
+        const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
+        images.push(repository);
+        const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+        organisations.push(pureNamespace);
+      });
+    }
+
+    images.forEach((image) => {
+      if (pureImagesOrOrganisationsRepos.includes(image)) {
+        isBlocked = `Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`;
+      }
+    });
+    organisations.forEach((org) => {
+      if (pureImagesOrOrganisationsRepos.includes(org)) {
+        isBlocked = `Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`;
+      }
     });
   }
 
-  images.forEach((image) => {
-    if (pureImagesOrOrganisationsRepos.includes(image)) {
-      isBlocked = `Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`;
-    }
-  });
-  organisations.forEach((org) => {
-    if (pureImagesOrOrganisationsRepos.includes(org)) {
-      isBlocked = `Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`;
-    }
-  });
+  if (!isBlocked && userBlockedRepos) {
+    log.info(`userBlockedRepos: ${JSON.stringify(userBlockedRepos)}`);
+    images.forEach((image) => {
+      if (userBlockedRepos.includes(image.toLowerCase())) {
+        isBlocked = `Image ${image} is user blocked. Application ${appSpecs.name} connot be spawned.`;
+      }
+    });
+  }
 
   return isBlocked;
 }
@@ -6252,7 +6263,6 @@ async function storeAppRunningMessage(message) {
       ip: message.ip,
       broadcastedAt: new Date(message.broadcastedAt),
       expireAt: new Date(validTill),
-      removedBroadcastedAt: null,
     };
 
     // indexes over name, hash, ip. Then name + ip and name + ip + broadcastedAt.
@@ -6370,40 +6380,11 @@ async function storeAppRemovedMessage(message) {
     return false;
   }
 
-  const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-  const daemonHeight = syncStatus.data.height || 0;
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
-  if (daemonHeight < config.sentinelActivation) {
-    const query = { ip: message.ip, name: message.appName };
-    const projection = {};
-    await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
-  } else {
-    const appRunningMessage = {
-      name: message.appName,
-      ip: message.ip,
-      expireAt: new Date(validTill),
-      removedBroadcastedAt: new Date(message.broadcastedAt),
-    };
-
-    // indexes over name, hash, ip. Then name + ip and name + ip + broadcastedAt.
-    const queryFind = { name: appRunningMessage.name, ip: appRunningMessage.ip };
-    const projection = { _id: 0 };
-    // we already have the exact same data
-    // eslint-disable-next-line no-await-in-loop
-    const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
-    if (result) {
-      appRunningMessage.broadcastedAt = result.broadcastedAt;
-      appRunningMessage.hash = result.hash;
-      const queryUpdate = { name: appRunningMessage.name, ip: appRunningMessage.ip };
-      const update = { $set: appRunningMessage };
-      const options = {
-        upsert: true,
-      };
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
-    }
-  }
+  const query = { ip: message.ip, name: message.appName };
+  const projection = {};
+  await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
 
   // all stored, rebroadcast
   return true;
@@ -7799,9 +7780,6 @@ async function reindexGlobalAppsLocation() {
     await database.collection(globalAppsLocations).createIndex({ ip: 1 }, { name: 'query for getting zelapp location based on ip' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting app based on ip and name' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1, broadcastedAt: 1 }, { name: 'query for getting app to ensure we possess a message' });
-    await database.collection(globalAppsLocations).createIndex({
-      name: 1, ip: 1, broadcastedAt: 1, removedBroadcastedAt: 1,
-    }, { name: 'query for getting all apps, including the ones that were removed from nodes in the last 30 days' });
     return true;
   } catch (error) {
     log.error(error);
@@ -8130,25 +8108,6 @@ async function appLocation(appname) {
       ip: 1,
       broadcastedAt: 1,
       expireAt: 1,
-    },
-  };
-  const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
-  return results;
-}
-
-/**
- * To get known apps running on a node ip
- * @param {string} nodeIp Node IP.
- */
-async function appsRunningOnNodeIp(nodeIp) {
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  const query = { ip: nodeIp };
-  const projection = {
-    projection: {
-      _id: 0,
-      name: 1,
-      hash: 1,
     },
   };
   const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
@@ -8758,7 +8717,6 @@ async function trySpawningGlobalApplication() {
 /**
  * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
  */
-let checkAndNotifyPeersOfRunningAppsRun = 0;
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     // get my external IP and check that it is longer than 5 in length.
@@ -8841,19 +8799,6 @@ async function checkAndNotifyPeersOfRunningApps() {
     } else {
       log.warn('Stopped application checks not running, some removal or installation is in progress');
     }
-
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-    if (daemonHeight >= config.sentinelActivation) {
-      if (checkAndNotifyPeersOfRunningAppsRun > 0) {
-        return;
-      }
-      const db = dbHelper.databaseConnection();
-      const databaseTemp = db.db(config.database.appsglobal.database);
-      await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ removedBroadcastedAt: 1 }, { expireAfterSeconds: 2592000 });
-    }
-    checkAndNotifyPeersOfRunningAppsRun += 1;
-
     const installedAndRunning = [];
     appsInstalled.forEach((app) => {
       if (app.version >= 4) {
@@ -8871,10 +8816,8 @@ async function checkAndNotifyPeersOfRunningApps() {
       }
     });
 
-    if (installedAndRunning.length === 0) {
-      return;
-    }
-
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height || 0;
     const apps = [];
     try {
       // eslint-disable-next-line no-restricted-syntax
@@ -8898,7 +8841,7 @@ async function checkAndNotifyPeersOfRunningApps() {
         // store it in local database first
         // eslint-disable-next-line no-await-in-loop
         await storeAppRunningMessage(newAppRunningMessage);
-        if (daemonHeight < config.sentinelActivation && (daemonHeight < config.fluxapps.apprunningv2 || installedAndRunning.length === 1)) {
+        if (daemonHeight < config.fluxapps.apprunningv2 || installedAndRunning.length === 1) {
           // eslint-disable-next-line no-await-in-loop
           await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
           // eslint-disable-next-line no-await-in-loop
@@ -8908,7 +8851,7 @@ async function checkAndNotifyPeersOfRunningApps() {
           // broadcast messages about running apps to all peers
         }
       }
-      if (daemonHeight >= config.sentinelActivation || (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1)) {
+      if (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1) {
         // send v2 unique message instead
         const newAppRunningMessageV2 = {
           type: 'fluxapprunning',
@@ -9382,7 +9325,7 @@ async function reinstallOldApplications() {
             }
           }
         } else {
-          log.info('Other Fluxes are redeploying application. Waiting for next round.');
+          log.warn('Other Fluxes are redeploying application. Waiting for next round.');
         }
       }
       // else specifications do not exist anymore, app shall expire itself
@@ -10109,6 +10052,8 @@ async function signCheckAppData(message) {
 */
 let failedPort;
 let testingPort;
+const portsNotWorking = [];
+let lastUPNPMapFailed = false;
 async function checkMyAppsAvailability() {
   const isUPNP = upnpService.isUPNP();
   try {
@@ -10173,6 +10118,15 @@ async function checkMyAppsAvailability() {
     testingPort = failedPort || Math.floor(Math.random() * (max - min) + min);
 
     log.info(`checkMyAppsAvailability - Testing port ${testingPort}.`);
+    const portNotWorking = portsNotWorking.includes(testingPort);
+    if (portNotWorking) {
+      log.info(`checkMyAppsAvailability - Testing port ${testingPort} is part of the list of ports not working on this node.`);
+      failedPort = null;
+      // skip this check, port is not possible to run on flux
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
     let iBP = fluxNetworkHelper.isPortBanned(testingPort);
     if (iBP) {
       log.info(`checkMyAppsAvailability - Testing port ${testingPort} is banned.`);
@@ -10216,7 +10170,20 @@ async function checkMyAppsAvailability() {
       await fluxNetworkHelper.allowPort(testingPort);
     }
     if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
-      await upnpService.mapUpnpPort(testingPort, 'Flux_Test_App');
+      const upnpMapResult = await upnpService.mapUpnpPort(testingPort, 'Flux_Test_App');
+      if (!upnpMapResult) {
+        if (lastUPNPMapFailed) {
+          dosState += 0.4;
+          if (dosState > 10) {
+            dosMessage = 'Not possible to run applications on the node, router retuning exceptions when creating UPNP mappings.';
+          }
+        }
+        lastUPNPMapFailed = true;
+        log.info(`checkMyAppsAvailability - Testing port ${testingPort} failed to create on UPNP mappings. Possible already assigned?`);
+        failedPort = null;
+        throw new Error('Failed to create map UPNP port');
+      }
+      lastUPNPMapFailed = false;
     }
     await serviceHelper.delay(5 * 1000);
     testingAppserver.listen(testingPort).on('error', (err) => {
@@ -10282,7 +10249,7 @@ async function checkMyAppsAvailability() {
     }
 
     if (dosState > 10) {
-      dosMessage = `Applications port range is not reachable from outside! Last failure on port ${testingPort}`;
+      dosMessage = `Applications port range is not reachable from outside! All ports that have failed: ${JSON.stringify(portsNotWorking)}`;
     }
     // stop listening on the port, close the port
     if (firewallActive) {
@@ -10302,7 +10269,14 @@ async function checkMyAppsAvailability() {
       dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
       await serviceHelper.delay(60 * 60 * 1000);
     } else {
-      await serviceHelper.delay(4 * 60 * 1000);
+      portsNotWorking.push(failedPort);
+      log.error(`checkMyAppsAvailability - portsNotWorking ${JSON.stringify(portsNotWorking)}.`);
+      if (portsNotWorking.length <= 100) {
+        failedPort = null;
+        dosState = 0;
+        dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
+      }
+      await serviceHelper.delay(1 * 60 * 1000);
     }
     checkMyAppsAvailability();
   } catch (error) {
@@ -10376,7 +10350,10 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       }
       if ((userconfig.initial.apiport && userconfig.initial.apiport !== config.server.apiport) || isUPNP) {
         // eslint-disable-next-line no-await-in-loop
-        await upnpService.mapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
+        const upnpMapResult = await upnpService.mapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
+        if (!upnpMapResult) {
+          throw new Error('Failed to create map UPNP port');
+        }
       }
       const beforeAppInstallTestingExpress = express();
       let beforeAppInstallTestingServer = http.createServer(beforeAppInstallTestingExpress);
@@ -10661,192 +10638,6 @@ async function checkForNonAllowedAppsOnLocalNetwork() {
   }
 }
 
-/**
- * Method called by other nodes that had different information of apps running on this node,
- * this node will brodcast new message to the network with the information of the apps that are running
- * @param {object} req Request.
- * @param {object} res Response.
- */
-let broadcastAppsRunningInExecution = false;
-async function broadcastAppsRunning(req, res) {
-  try {
-    broadcastAppsRunningInExecution = true;
-    const response = 'Running apps broadcasted to the network';
-    if (broadCastAppsRunningCache.has(1) || broadcastAppsRunningInExecution) {
-      const resultsResponse = messageHelper.createDataMessage(response);
-      res.json(resultsResponse);
-      return;
-    }
-
-    // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
-    let myIP = null;
-    if (benchmarkResponse.status === 'success') {
-      const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
-      if (benchmarkResponseData.ipaddress) {
-        log.info(`Gathered IP ${benchmarkResponseData.ipaddress}`);
-        myIP = benchmarkResponseData.ipaddress.length > 5 ? benchmarkResponseData.ipaddress : null;
-      }
-    }
-    if (myIP === null) {
-      throw new Error('Unable to detect Flux IP address');
-    }
-    // get list of locally installed apps. Store them in database as running and send info to our peers.
-    // check if they are running?
-    const installedAppsRes = await installedApps();
-    if (installedAppsRes.status !== 'success') {
-      throw new Error('Failed to get installed Apps');
-    }
-    const runningAppsRes = await listRunningApps();
-    if (runningAppsRes.status !== 'success') {
-      throw new Error('Unable to check running Apps');
-    }
-    const appsInstalled = installedAppsRes.data;
-    const runningApps = runningAppsRes.data;
-    // kadena and folding is old naming scheme having /zel.  all global application start with /flux
-    const runningAppsNames = runningApps.map((app) => {
-      if (app.Names[0].startsWith('/zel')) {
-        return app.Names[0].slice(4);
-      }
-      return app.Names[0].slice(5);
-    });
-
-    const installedAndRunning = [];
-    appsInstalled.forEach((app) => {
-      if (app.version >= 4) {
-        let appRunningWell = true;
-        app.compose.forEach((appComponent) => {
-          if (!runningAppsNames.includes(`${appComponent.name}_${app.name}`)) {
-            appRunningWell = false;
-          }
-        });
-        if (appRunningWell) {
-          installedAndRunning.push(app);
-        }
-      } else if (runningAppsNames.includes(app.name)) {
-        installedAndRunning.push(app);
-      }
-    });
-
-    const apps = [];
-    try {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const application of installedAndRunning) {
-        // eslint-disable-next-line no-await-in-loop
-        // we can distinguish pure local apps from global with hash and height
-        const newAppRunningMessage = {
-          type: 'fluxapprunning',
-          version: 1,
-          name: application.name,
-          hash: application.hash, // hash of application specifics that are running
-          ip: myIP,
-          broadcastedAt: new Date().getTime(),
-        };
-        const app = {
-          name: application.name,
-          hash: application.hash,
-        };
-        apps.push(app);
-        // store it in local database first
-        // eslint-disable-next-line no-await-in-loop
-        await storeAppRunningMessage(newAppRunningMessage);
-      }
-    } catch (err) {
-      log.error(err);
-    }
-
-    // send v2 unique message instead
-    const newAppRunningMessageV2 = {
-      type: 'fluxapprunning',
-      version: 2,
-      apps,
-      ip: myIP,
-      broadcastedAt: new Date().getTime(),
-    };
-      // eslint-disable-next-line no-await-in-loop
-    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessageV2);
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.delay(500);
-    // eslint-disable-next-line no-await-in-loop
-    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
-    // broadcast messages about running apps to all peers
-    const resultsResponse = messageHelper.createDataMessage(response);
-    log.info('Running Apps broadcasted');
-    res.json(resultsResponse);
-    broadCastAppsRunningCache.set(1, 1);
-    broadcastAppsRunningInExecution = false;
-  } catch (error) {
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    res.json(errorResponse);
-    broadcastAppsRunningInExecution = false;
-  }
-}
-
-/**
- * Method called by sentinel to update appsLocation database with new information provided by the node.
- * @param {ip} req ip port bomcination of the node.
- * @param {appsRunning} req applications that the node is running.
- */
-async function updateAppsRunningOnNodeIP(ip, appsRunning) {
-  let fixedIp = ip;
-  if (fixedIp.endsWith(':16127')) {
-    fixedIp = fixedIp.split(':')[0];
-  }
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  const removedQuery = [];
-  for (let i = 0; i < appsRunning.length; i += 1) {
-    const app = appsRunning[i];
-    const nameSearch = {
-      name: { $ne: app.name },
-    };
-    removedQuery.push(nameSearch);
-    const newAppRunningMessage = {
-      name: app.name,
-      hash: app.hash, // hash of application specifics that are running
-      ip: fixedIp,
-      broadcastedAt: new Date(),
-      removedBroadcastedAt: null,
-    };
-    const queryUpdate = { name: newAppRunningMessage.name, ip: newAppRunningMessage.ip };
-    const update = { $set: newAppRunningMessage };
-    const options = {
-      upsert: true,
-    };
-    // eslint-disable-next-line no-await-in-loop
-    await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
-  }
-  const ipSearch = {
-    ip: fixedIp,
-  };
-  removedQuery.push(ipSearch);
-  const queryUpdate = { $and: removedQuery };
-  const update = { $set: { removedBroadcastedAt: new Date() } };
-  // eslint-disable-next-line no-await-in-loop
-  await dbHelper.updateInDatabase(database, globalAppsLocations, queryUpdate, update);
-}
-
-/**
- * To remove from DB that the IP is running any app.
- * @param {object} ip Node ip and port of the running app.
- */
-async function removeAppsRunningOnNodeIP(ip) {
-  let fixedIp = ip;
-  if (fixedIp.endsWith(':16127')) {
-    fixedIp = fixedIp.split(':')[0];
-  }
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  const queryUpdate = { ip: fixedIp };
-  const update = { $set: { removedBroadcastedAt: new Date() } };
-  // eslint-disable-next-line no-await-in-loop
-  await dbHelper.updateInDatabase(database, globalAppsLocations, queryUpdate, update);
-}
-
 function removalInProgressReset() {
   removalInProgress = false;
 }
@@ -10959,9 +10750,6 @@ module.exports = {
   checkMyAppsAvailability,
   checkApplicationsCompliance,
   testAppMount,
-  broadcastAppsRunning,
-  updateAppsRunningOnNodeIP,
-  removeAppsRunningOnNodeIP,
 
   // exports for testing purposes
   setAppsMonitored,
@@ -10986,6 +10774,4 @@ module.exports = {
   setInstallationInProgressTrue,
   checkForNonAllowedAppsOnLocalNetwork,
   triggerAppHashesCheckAPI,
-  installedAppsNames,
-  appsRunningOnNodeIp,
 };
