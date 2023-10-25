@@ -220,14 +220,14 @@ async function dockerContainerStatsStream(idOrName, req, res, callback) {
  * Returns changes on a container’s filesystem.
  *
  * @param {string} idOrName
- * @returns {string}
+ * @returns  docker container changes
  */
 async function dockerContainerChanges(idOrName) {
   // container ID or name
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   const response = await dockerContainer.changes();
-  return serviceHelper.ensureString(response);
+  return response;
 }
 
 /**
@@ -314,13 +314,16 @@ async function dockerContainerExec(container, cmd, env, res, callback) {
       Detach: false,
       Tty: false,
     };
-
+    let resultString = '';
     const exec = await container.exec(options);
     exec.start(optionsExecStart, (err, mystream) => {
       if (err) {
         callback(err);
       }
-      mystream.on('data', (data) => res.write(data.toString()));
+      mystream.on('data', (data) => {
+        resultString = serviceHelper.dockerBufferToString(data);
+        res.write(resultString);
+      });
       mystream.on('end', () => callback(null));
     });
   } catch (error) {
@@ -383,7 +386,7 @@ async function dockerContainerLogsStream(idOrName, res, callback) {
  * @param {string} idOrName
  * @param {number} lines
  *
- * @returns {string}
+ * @returns {buffer}
  */
 async function dockerContainerLogs(idOrName, lines) {
   // container ID or name
@@ -396,7 +399,7 @@ async function dockerContainerLogs(idOrName, lines) {
     tail: lines, // TODO FIXME when using tail, some nodes hang on execution, those nodes need to update, upgrade restart docker daemon.
   };
   const logs = await dockerContainer.logs(options);
-  return logs.toString();
+  return logs;
 }
 
 async function obtainPayloadFromStorage(url, appName) {
@@ -583,6 +586,10 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   if (options.Env.length) {
     const fluxStorageEnv = options.Env.find((env) => env.startsWith(('F_S_ENV=')));
     if (fluxStorageEnv) {
+      const index = options.Env.indexOf(fluxStorageEnv);
+      if (index > -1) {
+        options.Env.splice(index, 1);
+      }
       const url = fluxStorageEnv.split('F_S_ENV=')[1];
       const envVars = await obtainPayloadFromStorage(url, appName);
       if (Array.isArray(envVars) && envVars.length < 200) {
@@ -602,6 +609,10 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   if (options.Cmd.length) {
     const fluxStorageCmd = options.Cmd.find((cmd) => cmd.startsWith(('F_S_CMD=')));
     if (fluxStorageCmd) {
+      const index = options.Cmd.indexOf(fluxStorageCmd);
+      if (index > -1) {
+        options.Cmd.splice(index, 1);
+      }
       const url = fluxStorageCmd.split('F_S_CMD=')[1];
       const cmdVars = await obtainPayloadFromStorage(url, appName);
       if (Array.isArray(cmdVars) && cmdVars.length < 200) {
@@ -609,7 +620,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
           if (typeof parameter !== 'string' || parameter.length > 5000000) {
             throw new Error(`Commands parameters from Flux Storage ${fluxStorageCmd} are invalid`);
           } else if (parameter !== '--privileged') {
-            options.Env.push(parameter);
+            options.Cmd.push(parameter);
           }
         });
       } else {
