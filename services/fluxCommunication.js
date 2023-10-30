@@ -225,6 +225,7 @@ function handleIncomingConnection(ws, req, expressWS) {
     } */
 
     // check if we have the message in cache. If yes, return false. If not, store it and continue
+    await serviceHelper.delay(Math.floor(Math.random() * 100 + 1)); // await max 100 miliseconds random, should jelp on processing duplicated messages received at same timestamp
     const messageHash = hash(msg);
     if (myCacheTemp.has(messageHash)) {
       return;
@@ -501,6 +502,7 @@ async function initiateAndHandleConnection(connection) {
         messageNumber = 0;
       } */
       // check if we have the message in cache. If yes, return false. If not, store it and continue
+      await serviceHelper.delay(Math.floor(Math.random() * 100 + 1)); // await max 100 miliseconds random, should help processing duplicated messages received at same timestamp
       const messageHash = hash(evt.data);
       if (myCacheTemp.has(messageHash)) {
         return;
