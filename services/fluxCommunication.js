@@ -40,8 +40,6 @@ const LRUoptionsTemp = { // cache for temporary messages
 
 const myCacheTemp = new LRUCache(LRUoptionsTemp);
 
-const nodeDownIpCache = new LRUCache(LRUoptionsTemp);
-
 /* const LRUTest = {
   max: 25000000, // 25M
   ttl: 60 * 60 * 1000, // 1h
@@ -168,62 +166,6 @@ async function handleAppRemovedMessage(message, fromIP) {
 }
 
 /**
- * To handle node down message.
- * @param {object} message Message.
- * @param {string} fromIP Sender's IP address and port.
- */
-async function handleNodeDownMessage(message, fromIP) {
-  try {
-    if (nodeDownIpCache.has(fromIP)) {
-      throw new Error('It was already received a message for same ip down in the last 70 minutes');
-    }
-    nodeDownIpCache.set(fromIP, fromIP);
-    // rebroadcast message to the network if it's valid
-    // eslint-disable-next-line global-require
-    const appsService = require('./appsService');
-    if (!message || typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number'
-      || typeof message.broadcastedAt !== 'number' || typeof message.ip !== 'string') {
-      throw new Error('Invalid Flux App Removed message for storing');
-    }
-
-    if (message.version !== 1) {
-      throw new Error(`Invalid Flux App Removed message for storing version ${message.version} not supported`);
-    }
-
-    if (!message.ip) {
-      throw new Error('Invalid Flux App Removed message ip cannot be empty');
-    }
-
-    log.info('New Flux Node Down message received.');
-    log.info(message);
-    const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
-    if (validTill < new Date().getTime()) {
-      throw new Error('Flux Node Down message received no longer valid');
-    }
-    const splittedIP = message.ip.split(':');
-    const askingIP = splittedIP[0];
-    const askingIpPort = splittedIP[1];
-    const isNodeRunning = await fluxNetworkHelper.isPortOpen(askingIP, askingIpPort);
-    const appsRunningOnTheSelectedNode = await appsService.appsRunningOnNodeIp(message.ip);
-    if (!isNodeRunning && appsRunningOnTheSelectedNode.length > 0) {
-      await appsService.removeAppsRunningOnNodeIP(message.ip);
-    }
-    const currentTimeStamp = new Date().getTime();
-    const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
-    if (!isNodeRunning && timestampOK) {
-      const messageString = serviceHelper.ensureString(message);
-      const wsListOut = outgoingConnections.filter((client) => client._socket.remoteAddress !== fromIP);
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
-      const wsList = incomingConnections.filter((client) => client._socket.remoteAddress.replace('::ffff:', '') !== fromIP);
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
-    }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
-/**
  * To handle incoming connection. Several types of verification are performed.
  * @param {object} ws Web socket.
  * @param {object} req Request.
@@ -283,7 +225,9 @@ function handleIncomingConnection(ws, req, expressWS) {
     } */
 
     // check if we have the message in cache. If yes, return false. If not, store it and continue
-    const messageHash = hash(msg);
+    await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should jelp on processing duplicated messages received at same timestamp
+    const msgObj = serviceHelper.ensureObject(msg);
+    const messageHash = hash(msgObj.data);
     if (myCacheTemp.has(messageHash)) {
       return;
     }
@@ -311,7 +255,6 @@ function handleIncomingConnection(ws, req, expressWS) {
       const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(msg, currentTimeStamp);
       if (timestampOK === true) {
         try {
-          const msgObj = serviceHelper.ensureObject(msg);
           if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
             handleAppMessages(msgObj, peer.ip.replace('::ffff:', ''));
           } else if (msgObj.data.type === 'fluxapprequest') {
@@ -322,8 +265,6 @@ function handleIncomingConnection(ws, req, expressWS) {
             handleIPChangedMessage(msgObj, peer.ip.replace('::ffff:', ''));
           } else if (msgObj.data.type === 'fluxappremoved') {
             handleAppRemovedMessage(msgObj, peer.ip.replace('::ffff:', ''));
-          } else if (msgObj.data.type === 'fluxnodedown') {
-            handleNodeDownMessage(msgObj, peer.ip.replace('::ffff:', ''));
           } else {
             log.warn(`Unrecognised message type of ${msgObj.data.type}`);
           }
@@ -561,7 +502,9 @@ async function initiateAndHandleConnection(connection) {
         messageNumber = 0;
       } */
       // check if we have the message in cache. If yes, return false. If not, store it and continue
-      const messageHash = hash(evt.data);
+      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should help processing duplicated messages received at same timestamp
+      const msgObj = serviceHelper.ensureObject(evt.data);
+      const messageHash = hash(msgObj.data);
       if (myCacheTemp.has(messageHash)) {
         return;
       }
@@ -574,7 +517,6 @@ async function initiateAndHandleConnection(connection) {
         return; // do not react to the message
       }
       // check blocked list
-      const msgObj = serviceHelper.ensureObject(evt.data);
       const { pubKey } = msgObj;
       if (blockedPubKeysCache.has(pubKey)) {
         try {
@@ -597,8 +539,6 @@ async function initiateAndHandleConnection(connection) {
           handleIPChangedMessage(msgObj, ip);
         } else if (msgObj.data.type === 'fluxappremoved') {
           handleAppRemovedMessage(msgObj, ip);
-        } else if (msgObj.data.type === 'fluxnodedown') {
-          handleNodeDownMessage(msgObj, ip);
         } else {
           log.warn(`Unrecognised message type of ${msgObj.data.type}`);
         }
@@ -739,11 +679,9 @@ async function addOutgoingPeer(req, res) {
 /**
  * To discover and connect to other randomly selected FluxNodes. Maintains connections with 1-2% of nodes on the Flux network. Ensures that FluxNode connections are not duplicated.
  */
-let fluxDiscoveryFirstRun = true;
 async function fluxDiscovery() {
   try {
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
     if (!syncStatus.data.synced) {
       throw new Error('Daemon not yet synced. Flux discovery is awaiting.');
     }
@@ -775,24 +713,6 @@ async function fluxDiscovery() {
       sortedNodeListCache.set('sortedNodeList', sortedNodeList);
       log.info('sortedNodeList stored in cache');
     }
-    if (fluxDiscoveryFirstRun && daemonHeight >= config.sentinelActivation) {
-      // eslint-disable-next-line global-require
-      const appsService = require('./appsService');
-      let broadcastedSince = await appsService.getMaxBroadcastedAtAppList();
-      const maxRemovedBroadcastedAt = await appsService.getMaxRemovedBroadcastedAtAppList();
-      if (maxRemovedBroadcastedAt > broadcastedSince) {
-        broadcastedSince = maxRemovedBroadcastedAt;
-      }
-      if (broadcastedSince && broadcastedSince < new Date() - (20 * 24 * 60 * 60 * 1000)) {
-        broadcastedSince = null;
-      }
-      setTimeout(() => {
-        // eslint-disable-next-line global-require
-        const fluxService = require('./fluxService');
-        fluxService.updateAppsLocationsAtStartup(myIP.split(':')[0], nodeList, broadcastedSince);
-      }, 2 * 60 * 1000);
-    }
-    fluxDiscoveryFirstRun = false;
     log.info('Searching for my node on sortedNodeList');
     const fluxNodeIndex = sortedNodeList.findIndex((node) => node.ip === myIP);
     log.info(`My node was found on index: ${fluxNodeIndex} of ${sortedNodeList.length} nodes`);

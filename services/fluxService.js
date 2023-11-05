@@ -1,10 +1,10 @@
+/* global userconfig */
 const nodecmd = require('node-cmd');
 const path = require('path');
 const config = require('config');
 const fullnode = require('fullnode');
 const util = require('util');
 const fs = require('fs');
-const axios = require('axios');
 
 const fsPromises = fs.promises;
 
@@ -24,20 +24,6 @@ const explorerService = require('./explorerService');
 const fluxCommunication = require('./fluxCommunication');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const geolocationService = require('./geolocationService');
-const dbHelper = require('./dbHelper');
-const { LRUCache } = require('lru-cache');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-const userconfig = require('../../../config/userconfig');
-
-const scannedHeightCollection = config.database.daemon.collections.scannedHeight;
-
-const sentinelCache = {
-  max: 80,
-  ttl: 1000 * 60 * 60 * 6, // 6 hours
-  maxAge: 1000 * 60 * 60 * 6, // 6 hours
-};
-const nodesSentinelCheckedCache = new LRUCache(sentinelCache);
 
 /**
  * To show the directory on the node machine where FluxOS files are stored.
@@ -521,6 +507,70 @@ function getFluxCruxID(req, res) {
 function getFluxKadena(req, res) {
   const kadena = userconfig.initial.kadena || null;
   const message = messageHelper.createDataMessage(kadena);
+  return res ? res.json(message) : message;
+}
+
+/**
+ * To show the current user's Router IP setup in configuration file that is being used with FluxOS.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+function getRouterIP(req, res) {
+  const routerIP = userconfig.initial.routerIP || '';
+  const message = messageHelper.createDataMessage(routerIP);
+  return res ? res.json(message) : message;
+}
+
+/**
+ * To show the current user's blocked Ports setup in configuration file that is being used with FluxOS.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+function getBlockedPorts(req, res) {
+  const blockedPorts = userconfig.initial.blockedPorts || [];
+  const message = messageHelper.createDataMessage(blockedPorts);
+  return res ? res.json(message) : message;
+}
+
+/**
+ * To show the current user's Api Port setup in configuration file that is being used with FluxOS.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+function getAPIPort(req, res) {
+  const routerIP = userconfig.initial.apiport || '16127';
+  const message = messageHelper.createDataMessage(routerIP);
+  return res ? res.json(message) : message;
+}
+
+/**
+ * To show the current user's blocked respositories setup in configuration file that is being used with FluxOS.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+function getBlockedRepositories(req, res) {
+  const blockedPorts = userconfig.initial.blockedRepositories || [];
+  const message = messageHelper.createDataMessage(blockedPorts);
+  return res ? res.json(message) : message;
+}
+
+/**
+ * To marketplace URL to show based on current development flag setup in configuration file that is being used with FluxOS.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+function getMarketplaceURL(req, res) {
+  const development = userconfig.initial.development || false;
+  let marketPlaceUrl = 'https://stats.runonflux.io/marketplace/listapps';
+  if (development) {
+    marketPlaceUrl = 'https://stats.runonflux.io/marketplace/listdevapps';
+  }
+  const message = messageHelper.createDataMessage(marketPlaceUrl);
   return res ? res.json(message) : message;
 }
 
@@ -1011,7 +1061,8 @@ async function adjustCruxID(req, res) {
           routerIP: '${userconfig.initial.routerIP || ''}',
           pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
           pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
-          blockedPorts: [${userconfig.initial.blockedPorts || ''}],
+          blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
+          blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
         }
       }`;
 
@@ -1066,7 +1117,8 @@ async function adjustKadenaAccount(req, res) {
     routerIP: '${userconfig.initial.routerIP || ''}',
     pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
     pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
-    blockedPorts: [${userconfig.initial.blockedPorts || ''}],
+    blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
+    blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
   }
 }`;
 
@@ -1082,6 +1134,242 @@ async function adjustKadenaAccount(req, res) {
     log.error(error);
     const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
     res.json(errMessage);
+  }
+}
+
+/**
+ * To update the current routerIP that is being used with FluxOS. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ */
+async function adjustRouterIP(req, res) {
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    if (authorized === true) {
+      let { routerip } = req.params;
+      routerip = routerip || req.query.routerip || '';
+
+      const dataToWrite = `module.exports = {
+        initial: {
+          ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
+          zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
+          kadena: '${userconfig.initial.kadena || ''}',
+          testnet: ${userconfig.initial.testnet || false},
+          development: ${userconfig.initial.development || false},
+          apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
+          routerIP: '${routerip}',
+          pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
+          pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+          blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
+          blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
+        }
+      }`;
+      const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
+      await fsPromises.writeFile(fluxDirPath, dataToWrite);
+
+      const successMessage = messageHelper.createSuccessMessage('Router IP adjusted');
+      res.json(successMessage);
+    } else {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+    }
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
+}
+
+/**
+ * To update the current user blocked ports that is being used with FluxOS. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ */
+async function adjustBlockedPorts(req, res) {
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    if (authorized === true) {
+      let body = '';
+      req.on('data', (data) => {
+        body += data;
+      });
+      req.on('end', async () => {
+        try {
+          if (!body) {
+            throw new Error('Missing Blocked Ports Information.');
+          }
+          const processedBody = serviceHelper.ensureObject(body);
+          const { blockedPorts } = processedBody;
+          log.info(`blockedPorts: ${JSON.stringify(blockedPorts)}`);
+          if (!Array.isArray(blockedPorts)) {
+            throw new Error('Blocked Ports is not a valid array');
+          }
+          const dataToWrite = `module.exports = {
+            initial: {
+              ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
+              zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
+              kadena: '${userconfig.initial.kadena || ''}',
+              testnet: ${userconfig.initial.testnet || false},
+              development: ${userconfig.initial.development || false},
+              apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
+              routerIP: '${userconfig.initial.routerIP || ''}',
+              pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
+              pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+              blockedPorts: ${JSON.stringify(blockedPorts || [])},
+              blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
+            }
+          }`;
+          const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
+          await fsPromises.writeFile(fluxDirPath, dataToWrite);
+          const successMessage = messageHelper.createSuccessMessage('User Blocked Ports adjusted');
+          res.json(successMessage);
+        } catch (error) {
+          log.error(error);
+          const errorResponse = messageHelper.createErrorMessage(
+            error.message || error,
+            error.name,
+            error.code,
+          );
+          res.json(errorResponse);
+        }
+      });
+    } else {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+    }
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
+}
+
+/**
+ * To update the current api port that is being used with FluxOS. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ */
+async function adjustAPIPort(req, res) {
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    if (authorized === true) {
+      let { apiport } = req.params;
+      apiport = apiport || req.query.apiport || '';
+
+      const allowedAPIPorts = [16127, 16137, 16147, 16157, 16167, 16177, 16187, 16197];
+      if (!allowedAPIPorts.includes(apiport)) {
+        const errMessage = messageHelper.createErrorMessage('API Port not valid');
+        res.json(errMessage);
+        return;
+      }
+
+      const dataToWrite = `module.exports = {
+        initial: {
+          ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
+          zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
+          kadena: '${userconfig.initial.kadena || ''}',
+          testnet: ${userconfig.initial.testnet || false},
+          development: ${userconfig.initial.development || false},
+          apiport: ${Number(+apiport)},
+          routerIP: '${userconfig.initial.routerIP || ''}',
+          pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
+          pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+          blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
+          blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
+        }
+      }`;
+      const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
+      await fsPromises.writeFile(fluxDirPath, dataToWrite);
+
+      const successMessage = messageHelper.createSuccessMessage('API Port adjusted. A restart of FluxOS is necessary');
+      res.json(successMessage);
+    } else {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+    }
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
+}
+
+/**
+ * To update the current user blocked repositories that is being used with FluxOS. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ */
+async function adjustBlockedRepositories(req, res) {
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    if (authorized === true) {
+      let body = '';
+      req.on('data', (data) => {
+        body += data;
+      });
+      req.on('end', async () => {
+        try {
+          if (!body) {
+            throw new Error('Missing Blocked Repositories Information.');
+          }
+          log.info(`body: ${JSON.stringify(body)}`);
+          const processedBody = serviceHelper.ensureObject(body);
+          const { blockedRepositories } = processedBody;
+          log.info(`blockedRepositories: ${JSON.stringify(blockedRepositories)}`);
+          if (!Array.isArray(blockedRepositories)) {
+            throw new Error('Blocked Repositories is not a valid array');
+          }
+          blockedRepositories.forEach((parameter) => {
+            if (typeof parameter !== 'string') {
+              throw new Error('Blocked Repositories are invalid');
+            }
+          });
+
+          const dataToWrite = `module.exports = {
+            initial: {
+              ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
+              zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
+              kadena: '${userconfig.initial.kadena || ''}',
+              testnet: ${userconfig.initial.testnet || false},
+              development: ${userconfig.initial.development || false},
+              apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
+              routerIP: '${userconfig.initial.routerIP || ''}',
+              pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
+              pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+              blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
+              blockedRepositories: ${JSON.stringify(blockedRepositories || []).replace(/"/g, "'")},
+            }
+          }`;
+          const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
+          await fsPromises.writeFile(fluxDirPath, dataToWrite);
+          const successMessage = messageHelper.createSuccessMessage('User Blocked Repositories adjusted');
+          res.json(successMessage);
+        } catch (error) {
+          log.error(error);
+          const errorResponse = messageHelper.createErrorMessage(
+            error.message || error,
+            error.name,
+            error.code,
+          );
+          res.json(errorResponse); 
+        }
+      });
+    } else {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+    }
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
   }
 }
 
@@ -1135,193 +1423,28 @@ async function installFluxWatchTower() {
 }
 
 /**
- * Function responsable to update appsLocations database on fluxNodeStartup
- * @param {string} myIP my node ip without port information.
- * @param {array[]} nodeList.
- * @param {number} timestamp with the time from that the node needs information or null if all data is needed.
+ * Restart FluxOS via nodemon (executes the command `touch ` on package.json).
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
-async function updateAppsLocationsAtStartup(myIP, nodeList, broadcasteSince) {
+async function restartFluxOS(req, res) {
   try {
-    let maxUptime = 0;
-    let auxAskingIP = null;
-    let auxAskingIPPort = null;
-    const timeout = 10000;
-    const axiosConfig = {
-      timeout,
-    };
-    for (let i = 0; i < 20; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      let askingIP = await fluxNetworkHelper.getRandomConnection();
-      if (!askingIP) {
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      let askingIpPort = config.server.apiport;
-      if (askingIP.includes(':')) { // has port specification
-        // it has port specification
-        const splittedIP = askingIP.split(':');
-        askingIP = splittedIP[0];
-        askingIpPort = splittedIP[1];
-      }
-      if (myIP === askingIP) {
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      const urlToConnect = `${askingIP}:${askingIpPort}`;
-      // eslint-disable-next-line no-await-in-loop
-      const resUptime = await axios.get(`http://${urlToConnect}/flux/uptime`, axiosConfig).catch(async (error) => {
-        log.error(`updateAppsLocationsAtStartup - ${urlToConnect} for flux uptime is not reachable`);
-        log.error(error);
-      });
-      if (resUptime && resUptime.data.status === 'success') {
-        const uptimeReturned = resUptime.data.data;
-        if (uptimeReturned > maxUptime) {
-          maxUptime = uptimeReturned;
-          auxAskingIP = askingIP;
-          auxAskingIPPort = askingIpPort;
-        }
-      }
-    }
-    if (maxUptime < 1800) {
-      return updateAppsLocationsAtStartup(myIP, nodeList, broadcasteSince);
-    }
-    const urlToConnect = `${auxAskingIP}:${auxAskingIPPort}`;
-    const resApps = await axios.get(`http://${urlToConnect}/apps/locationssince/${broadcasteSince}`, axiosConfig).catch(async (error) => {
-      log.error(`updateAppsLocationsAtStartup - ${urlToConnect} for apps locations is not reachable`);
-      log.error(error);
-    });
-    if (resApps && resApps.data.status === 'success') {
-      await appsService.importAppsLocations(resApps.data.data);
-      return true;
-    }
-    return updateAppsLocationsAtStartup(myIP, nodeList, broadcasteSince);
-  } catch (error) {
-    log.error(`updateAppsLocationsAtStartup - Error: ${error}`);
-    await serviceHelper.delay(2 * 60 * 100);
-    return updateAppsLocationsAtStartup(myIP, nodeList, broadcasteSince);
-  }
-}
-
-/**
- * Function responsable for check if a node is already reachable after first connection failure, if continues down, broadcast to the network a message telling the node is down
- * @param {string} urlToConnect ip port combination of the node.
- */
-async function sentinelDoubleCheck(urlToConnect) {
-  try {
-    const timeout = 30000;
-    const axiosConfig = {
-      timeout,
-    };
-    log.info(`sentinelDoubleCheck - checking ${urlToConnect} apps running`);
-    const appsRunningOnTheSelectedNode = await appsService.getRunningAppIpList(urlToConnect);
-    const resMyAppAvailability = await axios.get(`http://${urlToConnect}/apps/installedappsnames`, axiosConfig).catch(async (error) => {
-      log.error(`sentinelDoubleCheck - ${urlToConnect} for app installedappsnames is not reachable`);
-      log.error(error);
-      const broadcastedAt = new Date().getTime();
-      const nodeDownMessage = {
-        type: 'fluxnodedown',
-        version: 1,
-        ip: urlToConnect,
-        broadcastedAt,
-      };
-      // broadcast messages about running apps to all peers
-      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(nodeDownMessage);
-      await serviceHelper.delay(500);
-      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(nodeDownMessage);
-    });
-    if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-      const appsReturned = resMyAppAvailability.data.data;
-      if (appsRunningOnTheSelectedNode.length !== appsReturned.length || !appsRunningOnTheSelectedNode.every((appA) => appsReturned.includes((appB) => appB.name === appA.name))) {
-        log.info(`sentinelDoubleCheck - ${urlToConnect} apps doesnt match local database information`);
-        await appsService.updateAppsRunningOnNodeIP(urlToConnect, appsReturned);
-        await axios.get(`http://${urlToConnect}/apps/broadcastAppsRunning`, axiosConfig).catch((error) => {
-          log.error(`sentinelDoubleCheck - ${urlToConnect} for apps broadcastAppsRunning is not reachable`);
-          log.error(error);
-        });
-      }
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    if (authorized === true) {
+      const exec = 'pm2 restart flux';
+      const cmdAsync = util.promisify(nodecmd.get);
+      await cmdAsync(exec);
+      log.info('Restarting FluxOS..');
+      const response = messageHelper.createDataMessage('Restarting FluxOS');
+      res.json(response);
+    } else {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
     }
   } catch (error) {
-    log.error(`sentinelDoubleCheck - Error: ${error}`);
-  }
-}
-
-/**
- * Function responsable for sentinel work, randomly select a node from deterministic list, check if it is running and if the apps running match the information on local database
- */
-async function sentinel() {
-  try {
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-    if (daemonHeight < config.sentinelActivation) {
-      return;
-    }
-    const dbopen = dbHelper.databaseConnection();
-    const database = dbopen.db(config.database.daemon.database);
-    const query = { generalScannedHeight: { $gte: 0 } };
-    const projection = {
-      projection: {
-        _id: 0,
-        generalScannedHeight: 1,
-      },
-    };
-    const currentHeight = await dbHelper.findOneInDatabase(database, scannedHeightCollection, query, projection);
-    if (!currentHeight) {
-      throw new Error('No scanned height found');
-    }
-    const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
-    if (!isNodeConfirmed) {
-      return;
-    }
-    let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-    myIP = myIP.split(':')[0];
-    // eslint-disable-next-line no-await-in-loop
-    let askingIP = await fluxNetworkHelper.getRandomConnection();
-    if (!askingIP) {
-      return;
-    }
-    let askingIpPort = config.server.apiport;
-    if (askingIP.includes(':')) { // has port specification
-      // it has port specification
-      const splittedIP = askingIP.split(':');
-      askingIP = splittedIP[0];
-      askingIpPort = splittedIP[1];
-    }
-    if (myIP === askingIP) {
-      return;
-    }
-    const urlToConnect = `${askingIP}:${askingIpPort}`;
-    if (nodesSentinelCheckedCache.has(urlToConnect)) {
-      sentinel();
-      return;
-    }
-    nodesSentinelCheckedCache.set(urlToConnect, urlToConnect);
-    const timeout = 30000;
-    const axiosConfig = {
-      timeout,
-    };
-    log.info(`sentinel - checking ${urlToConnect} apps running`);
-    const appsRunningOnTheSelectedNode = await appsService.getRunningAppIpList(urlToConnect);
-    const resMyAppAvailability = await axios.get(`http://${urlToConnect}/apps/installedappsnames`, axiosConfig).catch(async (error) => {
-      log.error(`sentinel - ${urlToConnect} for app installedappsnames is not reachable`);
-      log.error(error);
-      if (appsRunningOnTheSelectedNode.length > 0) {
-        await serviceHelper.delay(5 * 60 * 1000);
-        sentinelDoubleCheck(urlToConnect);
-      }
-    });
-    if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-      const appsReturned = resMyAppAvailability.data.data;
-      if (appsRunningOnTheSelectedNode.length !== appsReturned.length || !appsRunningOnTheSelectedNode.every((appA) => appsReturned.includes((appB) => appB.name === appA.name))) {
-        log.info(`sentinel - ${urlToConnect} apps doesnt match local database information`);
-        await appsService.updateAppsRunningOnNodeIP(urlToConnect, appsReturned);
-        await axios.get(`http://${urlToConnect}/apps/broadcastAppsRunning`, axiosConfig).catch((error) => {
-          log.error(`sentinel - ${urlToConnect} for apps broadcastAppsRunning is not reachable`);
-          log.error(error);
-        });
-      }
-    }
-  } catch (error) {
-    log.error(`sentinel - Error: ${error}`);
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
   }
 }
 
@@ -1360,6 +1483,10 @@ module.exports = {
   fluxDebugLog,
   adjustCruxID,
   adjustKadenaAccount,
+  adjustRouterIP,
+  adjustBlockedPorts,
+  adjustAPIPort,
+  adjustBlockedRepositories,
   fluxBackendFolder,
   getNodeTier,
   installFluxWatchTower,
@@ -1367,8 +1494,12 @@ module.exports = {
   enterMaster,
   isStaticIPapi,
   getFluxGeolocation,
-  sentinel,
-  updateAppsLocationsAtStartup,
+  getRouterIP,
+  getBlockedPorts,
+  getAPIPort,
+  getBlockedRepositories,
+  getMarketplaceURL,
+  restartFluxOS,
 
   // Exports for testing purposes
   fluxLog,
