@@ -9816,36 +9816,32 @@ async function stopSyncthingApp(appComponentName, res) {
       return;
     }
     let folderId = null;
-    // eslint-disable-next-line no-restricted-syntax
-    for (const syncthingFolder of allSyncthingFolders.data) {
-      if (syncthingFolder.path === folder || syncthingFolder.path.includes(`${folder}/`)) {
+    allSyncthingFolders.data.forEach((syncthingFolder) => {
+      if (syncthingFolder.path === folder) {
         folderId = syncthingFolder.id;
       }
-      if (folderId) {
-        const adjustSyncthingA = {
-          status: `Stopping syncthing on folder ${syncthingFolder.path}...`,
-        };
-        // remove folder from syncthing
-        // eslint-disable-next-line no-await-in-loop
-        await syncthingService.adjustConfigFolders('delete', undefined, folderId);
-        // eslint-disable-next-line no-await-in-loop
-        const restartRequired = await syncthingService.getConfigRestartRequired();
-        if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-          // eslint-disable-next-line no-await-in-loop
-          await syncthingService.systemRestart();
-        }
-        const adjustSyncthingB = {
-          status: 'Syncthing adjusted',
-        };
-        log.info(adjustSyncthingA);
-        if (res) {
-          res.write(serviceHelper.ensureString(adjustSyncthingA));
-        }
-        if (res) {
-          res.write(serviceHelper.ensureString(adjustSyncthingB));
-        }
-      }
-      folderId = null;
+    });
+    if (!folderId) {
+      return;
+    }
+    const adjustSyncthingA = {
+      status: 'Adjusting Syncthing...',
+    };
+    // remove folder from syncthing
+    await syncthingService.adjustConfigFolders('delete', undefined, folderId);
+    const restartRequired = await syncthingService.getConfigRestartRequired();
+    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
+      await syncthingService.systemRestart();
+    }
+    const adjustSyncthingB = {
+      status: 'Syncthing adjusted',
+    };
+    log.info(adjustSyncthingA);
+    if (res) {
+      res.write(serviceHelper.ensureString(adjustSyncthingA));
+    }
+    if (res) {
+      res.write(serviceHelper.ensureString(adjustSyncthingB));
     }
   } catch (error) {
     log.error(error);
