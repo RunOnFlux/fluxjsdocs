@@ -39,7 +39,7 @@ async function sendToAllPeers(data, wsList) {
           if (!data) {
             const pingTime = new Date().getTime();
             client.ping('flux'); // do ping with flux str instead
-            const foundPeer = outgoingPeers.find((peer) => peer.ip === client._socket.remoteAddress && peer.port === client._socket.port);
+            const foundPeer = outgoingPeers.find((peer) => peer.ip === client._socket.remoteAddress);
             if (foundPeer) {
               foundPeer.lastPingTime = pingTime;
             }
@@ -53,8 +53,7 @@ async function sendToAllPeers(data, wsList) {
         removals.push(client);
         try {
           const ip = client._socket.remoteAddress;
-          const { port } = client._socket;
-          const foundPeer = outgoingPeers.find((peer) => peer.ip === ip && peer.port === port);
+          const foundPeer = outgoingPeers.find((peer) => peer.ip === ip);
           ipremovals.push(foundPeer);
           // eslint-disable-next-line no-use-before-define
           fluxNetworkHelper.closeConnection(ip);
