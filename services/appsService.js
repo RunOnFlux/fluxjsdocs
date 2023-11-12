@@ -1859,30 +1859,23 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     }
 
     // if s flag create .stfolder
-    const containersData = appSpecifications.containerData.split('|');
-    // eslint-disable-next-line no-restricted-syntax
-    for (let i = 0; i < containersData.length; i += 1) {
-      const container = containersData[i];
-      const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
-      if (containerDataFlags.includes('s')) {
-        const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
-        const stFolderCreation = {
-          status: 'Creating .stfolder for syncthing...',
-        };
-        log.info(stFolderCreation);
-        if (res) {
-          res.write(serviceHelper.ensureString(stFolderCreation));
-        }
-        const execDIRst = `sudo mkdir -p ${appsFolder + appId + containerFolder}/.stfolder`;
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(execDIRst);
-        const stFolderCreation2 = {
-          status: '.stfolder created',
-        };
-        log.info(stFolderCreation2);
-        if (res) {
-          res.write(serviceHelper.ensureString(stFolderCreation2));
-        }
+    const containerDataFlags = appSpecifications.containerData.split('|')[0].split(':')[1] ? appSpecifications.containerData.split('|')[0].split(':')[0] : '';
+    if (containerDataFlags.includes('s')) {
+      const stFolderCreation = {
+        status: 'Creating .stfolder for syncthing...',
+      };
+      log.info(stFolderCreation);
+      if (res) {
+        res.write(serviceHelper.ensureString(stFolderCreation));
+      }
+      const execDIRst = `sudo mkdir -p ${appsFolder + appId}/.stfolder`;
+      await cmdAsync(execDIRst);
+      const stFolderCreation2 = {
+        status: '.stfolder created',
+      };
+      log.info(stFolderCreation2);
+      if (res) {
+        res.write(serviceHelper.ensureString(stFolderCreation2));
       }
     }
 
@@ -9823,36 +9816,32 @@ async function stopSyncthingApp(appComponentName, res) {
       return;
     }
     let folderId = null;
-    // eslint-disable-next-line no-restricted-syntax
-    for (const syncthingFolder of allSyncthingFolders.data) {
-      if (syncthingFolder.path === folder || syncthingFolder.path.includes(`${folder}/`)) {
+    allSyncthingFolders.data.forEach((syncthingFolder) => {
+      if (syncthingFolder.path === folder) {
         folderId = syncthingFolder.id;
       }
-      if (folderId) {
-        const adjustSyncthingA = {
-          status: `Stopping syncthing on folder ${syncthingFolder.path}...`,
-        };
-        // remove folder from syncthing
-        // eslint-disable-next-line no-await-in-loop
-        await syncthingService.adjustConfigFolders('delete', undefined, folderId);
-        // eslint-disable-next-line no-await-in-loop
-        const restartRequired = await syncthingService.getConfigRestartRequired();
-        if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-          // eslint-disable-next-line no-await-in-loop
-          await syncthingService.systemRestart();
-        }
-        const adjustSyncthingB = {
-          status: 'Syncthing adjusted',
-        };
-        log.info(adjustSyncthingA);
-        if (res) {
-          res.write(serviceHelper.ensureString(adjustSyncthingA));
-        }
-        if (res) {
-          res.write(serviceHelper.ensureString(adjustSyncthingB));
-        }
-      }
-      folderId = null;
+    });
+    if (!folderId) {
+      return;
+    }
+    const adjustSyncthingA = {
+      status: 'Adjusting Syncthing...',
+    };
+    // remove folder from syncthing
+    await syncthingService.adjustConfigFolders('delete', undefined, folderId);
+    const restartRequired = await syncthingService.getConfigRestartRequired();
+    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
+      await syncthingService.systemRestart();
+    }
+    const adjustSyncthingB = {
+      status: 'Syncthing adjusted',
+    };
+    log.info(adjustSyncthingA);
+    if (res) {
+      res.write(serviceHelper.ensureString(adjustSyncthingA));
+    }
+    if (res) {
+      res.write(serviceHelper.ensureString(adjustSyncthingB));
     }
   } catch (error) {
     log.error(error);
@@ -9907,7 +9896,7 @@ async function syncthingApps() {
           const container = containersData[i];
           const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
           if (containerDataFlags.includes('s')) {
-            const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
+            const containerFolder = i === 0 ? '' : container.split(':')[1];
             const identifier = installedApp.name;
             const appId = dockerService.getAppIdentifier(identifier);
             const folder = `${appsFolder + appId + containerFolder}`;
@@ -9964,7 +9953,7 @@ async function syncthingApps() {
             const container = containersData[i];
             const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
             if (containerDataFlags.includes('s')) {
-              const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
+              const containerFolder = i === 0 ? '' : container.split(':')[1];
               const identifier = `${installedComponent.name}_${installedApp.name}`;
               const appId = dockerService.getAppIdentifier(identifier);
               const folder = `${appsFolder + appId + containerFolder}`;
