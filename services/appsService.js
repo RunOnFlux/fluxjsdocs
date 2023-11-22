@@ -10033,7 +10033,11 @@ async function syncthingApps() {
               let folderSyncType = 'sendreceive';
               if (containerDataFlags.includes('r')) {
                 if (syncthingAppsFirstRun) {
+                  // eslint-disable-next-line no-await-in-loop
+                  const folderReset = await syncthingService.dbRevert(id);
+                  log.info(`Reset syncthing app ${identifier} result: ${folderReset}`);
                   receiveOnlySyncthingAppsCache.set(identifier, 6);
+                  folderSyncType = 'sendreceive';
                 } else if (receiveOnlySyncthingAppsCache.has(identifier)) {
                   const numberOfRuns = receiveOnlySyncthingAppsCache.get(identifier);
                   if (numberOfRuns === 4) {
@@ -10041,7 +10045,7 @@ async function syncthingApps() {
                     const folderReset = await syncthingService.dbRevert(id);
                     log.info(`Reset syncthing app ${identifier} result: ${folderReset}`);
                   }
-                  if (numberOfRuns === 5) {
+                  if (numberOfRuns >= 5) {
                     folderSyncType = 'sendreceive';
                   }
                   receiveOnlySyncthingAppsCache.set(identifier, numberOfRuns + 1);
