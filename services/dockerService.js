@@ -139,26 +139,13 @@ async function dockerListImages() {
 
 /**
  * Returns a docker container found by name or ID
- * @param {string} idOrName
- * @returns {object} dockerContainer from list containers
- */
-async function getDockerContainerOnly(idOrName) {
-  const containers = await dockerListContainers(true);
-  const myContainer = containers.find((container) => (container.Names[0] === getAppDockerNameIdentifier(idOrName) || container.Id === idOrName));
-  if (!myContainer) {
-    log.error(`Container ${idOrName} not found`);
-  }
-  return myContainer;
-}
-
-/**
- * Returns a docker container found by name or ID
  *
  * @param {string} idOrName
  * @returns {object} dockerContainer
  */
 async function getDockerContainerByIdOrName(idOrName) {
-  const myContainer = await getDockerContainerOnly(idOrName);
+  const containers = await dockerListContainers(true);
+  const myContainer = containers.find((container) => (container.Names[0] === getAppDockerNameIdentifier(idOrName) || container.Id === idOrName));
   const dockerContainer = docker.getContainer(myContainer.Id);
   return dockerContainer;
 }
@@ -894,7 +881,6 @@ module.exports = {
   appDockerUnpause,
   appDockerTop,
   createFluxDockerNetwork,
-  getDockerContainerOnly,
   getDockerContainerByIdOrName,
   createFluxAppDockerNetwork,
   removeFluxAppDockerNetwork,

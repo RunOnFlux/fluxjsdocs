@@ -242,8 +242,7 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
     if (!UIok) return false;
 
     const syncthingPort = +port + 2;
-    const portOpen = await isPortOpen(ip, syncthingPort);
-    return portOpen;
+    return isPortOpen(ip, syncthingPort);
   } catch (e) {
     log.error(e);
     return false;
@@ -463,14 +462,17 @@ async function getRandomConnection() {
  */
 async function closeConnection(ip, port) {
   if (!ip) return messageHelper.createWarningMessage('To close a connection please provide a proper IP number.');
-  const ocIndex = outgoingConnections.findIndex((client) => client._socket.remoteAddress === ip && client.port === port);
-  if (ocIndex < 0) {
+  const wsObj = outgoingConnections.find((client) => client._socket.remoteAddress === ip && client.port === port);
+  if (!wsObj) {
     return messageHelper.createWarningMessage(`Connection to ${ip}:${port} does not exists.`);
   }
+  const ocIndex = outgoingConnections.indexOf(wsObj);
   const foundPeer = outgoingPeers.find((peer) => peer.ip === ip && peer.port === port);
-  const wsObj = outgoingConnections[ocIndex];
-  wsObj.close(4009, 'purpusfully closed');
-  log.info(`Connection to ${ip}:${port} closed with code 4009`);
+  if (ocIndex === -1) {
+    return messageHelper.createErrorMessage(`Unable to close connection ${ip}:${port}. Try again later.`);
+  }
+  wsObj.close(1000, 'purpusfully closed');
+  log.info(`Connection to ${ip}:${port} closed`);
   outgoingConnections.splice(ocIndex, 1);
   if (foundPeer) {
     const peerIndex = outgoingPeers.indexOf(foundPeer);
@@ -494,7 +496,7 @@ async function closeIncomingConnection(ip, port, expressWS, clientToClose) {
   const clientsSet = expressWS.clients || [];
   let wsObj = null || clientToClose;
   clientsSet.forEach((client) => {
-    if (client._socket.remoteAddress.replace('::ffff:', '') === ip && client.port === port) {
+    if (client._socket.remoteAddress === ip && client.port === port) {
       wsObj = client;
     }
   });
@@ -506,8 +508,8 @@ async function closeIncomingConnection(ip, port, expressWS, clientToClose) {
   if (ocIndex === -1) {
     return messageHelper.createErrorMessage(`Unable to close incoming connection ${ip}:${port}. Try again later.`);
   }
-  wsObj.close(4010, 'purpusfully closed');
-  log.info(`Connection from ${ip}:${port} closed with code 4010`);
+  wsObj.close(1000, 'purpusfully closed');
+  log.info(`Connection from ${ip}:${port} closed`);
   incomingConnections.splice(ocIndex, 1);
   if (foundPeer) {
     const peerIndex = incomingPeers.indexOf(foundPeer);
@@ -820,26 +822,6 @@ async function adjustExternalIP(ip) {
     if (ip === userconfig.initial.ipaddress) {
       return;
     }
-
-    log.info(`Adjusting External IP from ${userconfig.initial.ipaddress} to ${ip}`);
-    const dataToWrite = `module.exports = {
-  initial: {
-    ipaddress: '${ip}',
-    zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
-    kadena: '${userconfig.initial.kadena || ''}',
-    testnet: ${userconfig.initial.testnet || false},
-    development: ${userconfig.initial.development || false},
-    apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
-    routerIP: '${userconfig.initial.routerIP || ''}',
-    pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
-    pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
-    blockedPorts: [${userconfig.initial.blockedPorts || ''}],
-    blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
-  }
-}`;
-
-    await fs.writeFile(fluxDirPath, dataToWrite);
-
     if (userconfig.initial.ipaddress && v4exact.test(userconfig.initial.ipaddress) && !myCache.has(ip)) {
       myCache.set(ip, ip);
       const newIP = userconfig.initial.apiport !== 16127 ? `${ip}:${userconfig.initial.apiport}` : ip;
@@ -871,6 +853,25 @@ async function adjustExternalIP(ip) {
       const result = await daemonServiceWalletRpcs.createConfirmationTransaction();
       log.info(`createConfirmationTransaction: ${JSON.stringify(result)}`);
     }
+
+    log.info(`Adjusting External IP from ${userconfig.initial.ipaddress} to ${ip}`);
+    const dataToWrite = `module.exports = {
+  initial: {
+    ipaddress: '${ip}',
+    zelid: '${userconfig.initial.zelid || config.fluxTeamZelId}',
+    kadena: '${userconfig.initial.kadena || ''}',
+    testnet: ${userconfig.initial.testnet || false},
+    development: ${userconfig.initial.development || false},
+    apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
+    routerIP: '${userconfig.initial.routerIP || ''}',
+    pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
+    pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
+    blockedPorts: [${userconfig.initial.blockedPorts || ''}],
+    blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
+  }
+}`;
+
+    await fs.writeFile(fluxDirPath, dataToWrite);
   } catch (error) {
     log.error(error);
   }
