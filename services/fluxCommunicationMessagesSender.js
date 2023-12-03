@@ -27,6 +27,7 @@ let response = messageHelper.createErrorMessage();
 async function sendToAllPeers(data, wsList) {
   try {
     const removals = [];
+    const ipremovals = [];
     // wsList is always a sublist of outgoingConnections
     const outConList = wsList || outgoingConnections;
     // eslint-disable-next-line no-restricted-syntax
@@ -37,8 +38,8 @@ async function sendToAllPeers(data, wsList) {
         if (client.readyState === WebSocket.OPEN) {
           if (!data) {
             const pingTime = new Date().getTime();
-            client.ping(); // do ping instead
-            const foundPeer = outgoingPeers.find((peer) => peer.ip === client.ip && peer.port === client.port);
+            client.ping('flux'); // do ping with flux str instead
+            const foundPeer = outgoingPeers.find((peer) => peer.ip === client._socket.remoteAddress && peer.port === client.port);
             if (foundPeer) {
               foundPeer.lastPingTime = pingTime;
             }
@@ -46,13 +47,15 @@ async function sendToAllPeers(data, wsList) {
             client.send(data);
           }
         } else {
-          throw new Error(`Connection to ${client.ip} is not open`);
+          throw new Error(`Connection to ${client._socket.remoteAddress} is not open`);
         }
       } catch (e) {
         removals.push(client);
         try {
-          const { ip } = client;
+          const ip = client._socket.remoteAddress;
           const { port } = client;
+          const foundPeer = outgoingPeers.find((peer) => peer.ip === ip && peer.port === port);
+          ipremovals.push(foundPeer);
           // eslint-disable-next-line no-use-before-define
           fluxNetworkHelper.closeConnection(ip, port);
         } catch (err) {
@@ -61,16 +64,16 @@ async function sendToAllPeers(data, wsList) {
       }
     }
 
-    for (let i = 0; i < removals.length; i += 1) {
-      const ocIndex = outgoingConnections.findIndex((ws) => removals[i].ip === ws.ip && removals[i].port === ws.port);
-      if (ocIndex > -1) {
-        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingConnections`);
-        outgoingConnections.splice(ocIndex, 1);
-      }
-      const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === removals[i].ip && peer.port === removals[i].port);
+    for (let i = 0; i < ipremovals.length; i += 1) {
+      const peerIndex = outgoingPeers.indexOf(ipremovals[i]);
       if (peerIndex > -1) {
         outgoingPeers.splice(peerIndex, 1);
-        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingPeers`);
+      }
+    }
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = outgoingConnections.indexOf(removals[i]);
+      if (ocIndex > -1) {
+        outgoingConnections.splice(ocIndex, 1);
       }
     }
   } catch (error) {
@@ -86,6 +89,7 @@ async function sendToAllPeers(data, wsList) {
 async function sendToAllIncomingConnections(data, wsList) {
   try {
     const removals = [];
+    const ipremovals = [];
     // wsList is always a sublist of incomingConnections
     const incConList = wsList || incomingConnections;
     // eslint-disable-next-line no-restricted-syntax
@@ -95,35 +99,37 @@ async function sendToAllIncomingConnections(data, wsList) {
         await serviceHelper.delay(25);
         if (client.readyState === WebSocket.OPEN) {
           if (!data) {
-            client.ping(); // do ping instead
+            client.ping('flux'); // do ping with flux str instead
           } else {
             client.send(data);
           }
         } else {
-          throw new Error(`Connection to ${client.ip} is not open`);
+          throw new Error(`Connection to ${client._socket.remoteAddress} is not open`);
         }
       } catch (e) {
         removals.push(client);
         try {
-          const { ip } = client;
+          const ip = client._socket.remoteAddress;
           const { port } = client;
-          fluxNetworkHelper.closeIncomingConnection(ip, port);
+          const foundPeer = incomingPeers.find((peer) => peer.ip === ip && peer.port === port);
+          ipremovals.push(foundPeer);
+          fluxNetworkHelper.closeIncomingConnection(ip, port, [], client); // this is wrong
         } catch (err) {
           log.error(err);
         }
       }
     }
 
-    for (let i = 0; i < removals.length; i += 1) {
-      const ocIndex = incomingConnections.findIndex((incomingCon) => removals[i].ip === incomingCon.ip && removals[i].port === incomingCon.port);
-      if (ocIndex > -1) {
-        log.info(`Connection to ${removals[i].ip}:${removals[i].port} removed from incomingConnections`);
-        incomingConnections.splice(ocIndex, 1);
-      }
-      const peerIndex = incomingPeers.findIndex((mypeer) => mypeer.ip === removals[i].ip && mypeer.port === removals[i].port);
+    for (let i = 0; i < ipremovals.length; i += 1) {
+      const peerIndex = incomingPeers.indexOf(ipremovals[i]);
       if (peerIndex > -1) {
-        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from incomingPeers`);
         incomingPeers.splice(peerIndex, 1);
+      }
+    }
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = incomingConnections.indexOf(removals[i]);
+      if (ocIndex > -1) {
+        incomingConnections.splice(ocIndex, 1);
       }
     }
   } catch (error) {
