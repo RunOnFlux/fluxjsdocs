@@ -883,16 +883,6 @@ async function dockerGetEvents() {
   return events;
 }
 
-/**
- * Returns docker usage information
- *
- * @returns {object}
- */
-async function dockerGetUsage() {
-  const df = await docker.df();
-  return df;
-}
-
 module.exports = {
   getDockerContainer,
   getAppIdentifier,
@@ -929,5 +919,4 @@ module.exports = {
   dockerInfo,
   dockerVersion,
   dockerGetEvents,
-  dockerGetUsage,
 };
