@@ -1627,18 +1627,18 @@ async function appsResources(req, res) {
             appsRamLocked += serviceHelper.ensureNumber(component.ram) || 0;
             appsHddLocked += serviceHelper.ensureNumber(component.hdd) || 0;
           }
-          appsHddLocked += config.fluxapps.hddFileSystemMinimum + config.fluxapps.defaultSwap; // 5gb per component + 2gb swap
+          appsHddLocked += 2; // 2gb per image
         });
       } else if (app.tiered && tier) {
         appsCpusLocked += serviceHelper.ensureNumber(app[cpuTier] || app.cpu) || 0;
         appsRamLocked += serviceHelper.ensureNumber(app[ramTier] || app.ram) || 0;
         appsHddLocked += serviceHelper.ensureNumber(app[hddTier] || app.hdd) || 0;
-        appsHddLocked += config.fluxapps.hddFileSystemMinimum + config.fluxapps.defaultSwap; // 5gb per component + 2gb swap
+        appsHddLocked += 2; // 2gb per image
       } else {
         appsCpusLocked += serviceHelper.ensureNumber(app.cpu) || 0;
         appsRamLocked += serviceHelper.ensureNumber(app.ram) || 0;
         appsHddLocked += serviceHelper.ensureNumber(app.hdd) || 0;
-        appsHddLocked += config.fluxapps.hddFileSystemMinimum + config.fluxapps.defaultSwap; // 5gb per component + 2gb swap
+        appsHddLocked += 2; // 2gb per image
       }
     });
     const appsUsage = {
@@ -1750,13 +1750,13 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
 
   await getNodeSpecs();
   const totalSpaceOnNode = nodeSpecs.ssdStorage;
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd;
   const resourcesLocked = await appsResources();
   if (resourcesLocked.status !== 'success') {
     throw new Error('Unable to obtain locked system resources by Flux App. Aborting.');
   }
   const hddLockedByApps = resourcesLocked.data.appsHddLocked;
-  const availableSpaceForApps = useableSpaceOnNode - hddLockedByApps + appSpecifications.hdd + config.fluxapps.hddFileSystemMinimum + config.fluxapps.defaultSwap; // because our application is already accounted in locked resources
+  const availableSpaceForApps = useableSpaceOnNode - hddLockedByApps + appSpecifications.hdd; // because our application is already accounted in locked resources
   // bigger or equal so we have the 1 gb free...
   if (appSpecifications.hdd >= availableSpaceForApps) {
     throw new Error('Insufficient space on Flux Node to spawn an application');
@@ -1768,21 +1768,20 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     usedSpace += serviceHelper.ensureNumber(volume.used);
     availableSpace += serviceHelper.ensureNumber(volume.available);
   });
-  // space that is further reserved for flux os and that will be later substracted from available space. Max 40 + 20.
-  const fluxSystemReserve = config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace > 0 ? config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace : 0;
-  const minSystemReserve = Math.max(config.lockedSystemResources.extrahdd, fluxSystemReserve);
-  const totalAvailableSpaceLeft = availableSpace - minSystemReserve;
+  // space that is further reserved for flux os and that will be later substracted from available space. Max 30.
+  const fluxSystemReserve = config.lockedSystemResources.hdd - usedSpace > 0 ? config.lockedSystemResources.hdd - usedSpace : 0;
+  const totalAvailableSpaceLeft = availableSpace - fluxSystemReserve;
   if (appSpecifications.hdd >= totalAvailableSpaceLeft) {
     // sadly user free space is not enough for this application
     throw new Error('Insufficient space on Flux Node. Space is already assigned to system files');
   }
 
-  // check if space is not sharded in some bad way. Always count the minSystemReserve
+  // check if space is not sharded in some bad way. Always count the fluxSystemReserve
   let useThisVolume = null;
   const totalVolumes = okVolumes.length;
   for (let i = 0; i < totalVolumes; i += 1) {
     // check available volumes one by one. If a sufficient is found. Use this one.
-    if (okVolumes[i].available > appSpecifications.hdd + minSystemReserve) {
+    if (okVolumes[i].available > appSpecifications.hdd + fluxSystemReserve) {
       useThisVolume = okVolumes[i];
       break;
     }
@@ -2924,7 +2923,7 @@ async function checkAppHWRequirements(appSpecs) {
   if (totalSpaceOnNode === 0) {
     throw new Error('Insufficient space on Flux Node to spawn an application');
   }
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd;
   const hddLockedByApps = resourcesLocked.data.appsHddLocked;
   const availableSpaceForApps = useableSpaceOnNode - hddLockedByApps;
   // bigger or equal so we have the 1 gb free...
@@ -4595,20 +4594,6 @@ async function checkApplicationImagesBlocked(appSpecs) {
     return isBlocked;
   }
   const images = [];
-  const organisations = [];
-  if (appSpecs.version <= 3) {
-    const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
-    images.push(repository);
-    const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
-    organisations.push(pureNamespace);
-  } else {
-    appSpecs.compose.forEach((component) => {
-      const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
-      images.push(repository);
-      const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
-      organisations.push(pureNamespace);
-    });
-  }
   if (repos) {
     const pureImagesOrOrganisationsRepos = [];
     repos.forEach((repo) => {
@@ -4621,6 +4606,21 @@ async function checkApplicationImagesBlocked(appSpecs) {
     }
     if (pureImagesOrOrganisationsRepos.includes(appSpecs.owner)) {
       return `${appSpecs.owner} is not allowed to run applications`;
+    }
+
+    const organisations = [];
+    if (appSpecs.version <= 3) {
+      const repository = appSpecs.repotag.substring(0, appSpecs.repotag.lastIndexOf(':') > -1 ? appSpecs.repotag.lastIndexOf(':') : appSpecs.repotag.length);
+      images.push(repository);
+      const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+      organisations.push(pureNamespace);
+    } else {
+      appSpecs.compose.forEach((component) => {
+        const repository = component.repotag.substring(0, component.repotag.lastIndexOf(':') > -1 ? component.repotag.lastIndexOf(':') : component.repotag.length);
+        images.push(repository);
+        const pureNamespace = repository.substring(0, repository.lastIndexOf('/') > -1 ? repository.lastIndexOf('/') : repository.length);
+        organisations.push(pureNamespace);
+      });
     }
 
     images.forEach((image) => {
