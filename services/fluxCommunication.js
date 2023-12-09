@@ -301,7 +301,19 @@ function handleIncomingConnection(websocket, req) {
         messageNumber = 0;
       } */
 
+      // check if we have the message in cache. If yes, return false. If not, store it and continue
+      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should jelp on processing duplicated messages received at same timestamp
       const msgObj = serviceHelper.ensureObject(msg.data);
+      const messageHash = hash(msgObj);
+      if (myCacheTemp.has(messageHash)) {
+        return;
+      }
+      myCacheTemp.set(messageHash, messageHash);
+      // check rate limit
+      const rateOK = fluxNetworkHelper.lruRateLimit(`${ipv4Peer}:${port}`, 90);
+      if (!rateOK) {
+        return; // do not react to the message
+      }
       const { pubKey } = msgObj;
       const { timestamp } = msgObj;
       const { signature } = msgObj;
@@ -316,20 +328,6 @@ function handleIncomingConnection(websocket, req) {
         }
         return;
       }
-
-      // check if we have the message in cache. If yes, return false. If not, store it and continue
-      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should jelp on processing duplicated messages received at same timestamp
-      const messageHash = hash(msgObj.data);
-      if (myCacheTemp.has(messageHash)) {
-        return;
-      }
-      myCacheTemp.set(messageHash, messageHash);
-      // check rate limit
-      const rateOK = fluxNetworkHelper.lruRateLimit(`${ipv4Peer}:${port}`, 90);
-      if (!rateOK) {
-        return; // do not react to the message
-      }
-
       // check blocked list
       if (blockedPubKeysCache.has(pubKey)) {
         try {
@@ -531,7 +529,7 @@ async function removeIncomingPeer(req, res, expressWS) {
  * To initiate and handle a connection. Opens a web socket and handles various events during connection.
  * @param {string} connection IP address (and port if applicable).
  */
-let myPort = null;
+let socketPortsInformationActive = false;
 async function initiateAndHandleConnection(connection) {
   let ip = connection;
   let port = config.server.apiport;
@@ -540,14 +538,20 @@ async function initiateAndHandleConnection(connection) {
       ip = connection.split(':')[0];
       port = connection.split(':')[1];
     }
-    if (!myPort) {
-      const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-      if (!myIP) {
-        return;
+    let wsuri = `ws://${ip}:${port}/ws/flux/`;
+    if (!socketPortsInformationActive) {
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.socketPortsInformation) {
+        socketPortsInformationActive = true;
       }
-      myPort = myIP.split(':')[1] || 16127;
     }
-    const wsuri = `ws://${ip}:${port}/ws/flux/${myPort}`;
+    if (socketPortsInformationActive) {
+      const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+      const myPort = myIP.split(':')[1] || 16127;
+      wsuri = `ws://${ip}:${port}/ws/flux/${myPort}`;
+    }
+
     const websocket = new WebSocket(wsuri);
     websocket.port = port;
     websocket.ip = ip;
@@ -603,7 +607,21 @@ async function initiateAndHandleConnection(connection) {
       if (messageNumber === 100000000) {
         messageNumber = 0;
       } */
+      // check if we have the message in cache. If yes, return false. If not, store it and continue
+      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should help processing duplicated messages received at same timestamp
       const msgObj = serviceHelper.ensureObject(evt.data);
+      const messageHash = hash(msgObj.data);
+      if (myCacheTemp.has(messageHash)) {
+        return;
+      }
+      myCacheTemp.set(messageHash, messageHash);
+      // incoming messages from outgoing connections
+      const currentTimeStamp = Date.now(); // ms
+      // check rate limit
+      const rateOK = fluxNetworkHelper.lruRateLimit(`${ip}:${port}`, 90);
+      if (!rateOK) {
+        return; // do not react to the message
+      }
       const { pubKey } = msgObj;
       const { timestamp } = msgObj;
       const { signature } = msgObj;
@@ -617,20 +635,6 @@ async function initiateAndHandleConnection(connection) {
           log.error(e);
         }
         return;
-      }
-      // check if we have the message in cache. If yes, return false. If not, store it and continue
-      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should help processing duplicated messages received at same timestamp
-      const messageHash = hash(msgObj.data);
-      if (myCacheTemp.has(messageHash)) {
-        return;
-      }
-      myCacheTemp.set(messageHash, messageHash);
-      // incoming messages from outgoing connections
-      const currentTimeStamp = Date.now(); // ms
-      // check rate limit
-      const rateOK = fluxNetworkHelper.lruRateLimit(`${ip}:${port}`, 90);
-      if (!rateOK) {
-        return; // do not react to the message
       }
       // check blocked list
       if (blockedPubKeysCache.has(pubKey)) {
@@ -664,7 +668,7 @@ async function initiateAndHandleConnection(connection) {
           // check if message comes from IP belonging to the public Key
           const zl = await fluxCommunicationUtils.deterministicFluxList(pubKey); // this itself is sufficient.
           const possibleNodes = zl.filter((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
-          const nodeFound = possibleNodes.find((n) => n.ip === connection); // connection is either ip or ip:port (if port is not 16127)
+          const nodeFound = possibleNodes.find((n) => n.ip === connection);
           if (!nodeFound) {
             log.warn(`Invalid message received from outgoing peer ${connection} which is not an originating node of ${pubKey}.`);
             websocket.close(4007, 'invalid message, disconnect'); // close as of policy violation
