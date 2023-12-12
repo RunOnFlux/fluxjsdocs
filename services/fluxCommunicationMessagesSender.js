@@ -49,7 +49,6 @@ async function sendToAllPeers(data, wsList) {
           throw new Error(`Connection to ${client.ip} is not open`);
         }
       } catch (e) {
-        log.error(e);
         removals.push(client);
         try {
           const { ip } = client;
