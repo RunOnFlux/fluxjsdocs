@@ -12,9 +12,7 @@ const log = require('../lib/log');
  * @returns {Promise} Promise object.
  */
 function delay(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
