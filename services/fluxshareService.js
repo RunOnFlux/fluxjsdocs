@@ -323,6 +323,7 @@ async function fluxShareDownloadFolder(req, res, authorized = false) {
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
+      return;
     }
   } catch (error) {
     log.error(error);
