@@ -1904,7 +1904,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     for (let i = 0; i < containersData.length; i += 1) {
       const container = containersData[i];
       const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
-      if (containerDataFlags.includes('s') || containerDataFlags.includes('r')) {
+      if (containerDataFlags.includes('s') || containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
         const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
         const stFolderCreation = {
           status: 'Creating .stfolder for syncthing...',
@@ -10122,7 +10122,7 @@ async function syncthingApps() {
         for (let i = 0; i < containersData.length; i += 1) {
           const container = containersData[i];
           const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
-          if (containerDataFlags.includes('s') || containerDataFlags.includes('r')) {
+          if (containerDataFlags.includes('s') || containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
             const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
             const identifier = installedApp.name;
             const appId = dockerService.getAppIdentifier(identifier);
@@ -10177,7 +10177,7 @@ async function syncthingApps() {
               type: 'sendreceive',
             };
             const syncFolder = allFoldersResp.data.find((x) => x.id === id);
-            if (containerDataFlags.includes('r')) {
+            if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
               if (syncthingAppsFirstRun) {
                 if (!syncFolder) {
                   log.info(`SyncthingApps stopping and cleaning appIdentifier ${appId}`);
@@ -10284,7 +10284,7 @@ async function syncthingApps() {
           for (let i = 0; i < containersData.length; i += 1) {
             const container = containersData[i];
             const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
-            if (containerDataFlags.includes('s') || containerDataFlags.includes('r')) {
+            if (containerDataFlags.includes('s') || containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
               const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
               const identifier = `${installedComponent.name}_${installedApp.name}`;
               const appId = dockerService.getAppIdentifier(identifier);
@@ -10339,7 +10339,7 @@ async function syncthingApps() {
                 type: 'sendreceive',
               };
               const syncFolder = allFoldersResp.data.find((x) => x.id === id);
-              if (containerDataFlags.includes('r')) {
+              if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
                 if (syncthingAppsFirstRun) {
                   if (!syncFolder) {
                     log.info(`SyncthingApps stopping and cleaning appIdentifier ${appId}`);
@@ -10511,6 +10511,157 @@ async function syncthingApps() {
     syncthingAppsFirstRun = false;
     await serviceHelper.delay(30 * 1000);
     syncthingApps();
+  }
+}
+
+// function responsable for starting and stopping apps to have only one instance running as master
+async function masterSlaveApps() {
+  try {
+    // get list of all installed apps
+    const appsInstalled = await installedApps();
+    if (appsInstalled.status === 'error') {
+      return;
+    }
+    const axiosOptions = {
+      timeout: 10000,
+    };
+    // eslint-disable-next-line no-restricted-syntax
+    for (const installedApp of appsInstalled.data) {
+      let fdmOk = false;
+      if (installedApp.version <= 3) {
+        const identifier = installedApp.name;
+        const appId = dockerService.getAppIdentifier(identifier);
+        if (installedApp.containerData.includes('g:') && receiveOnlySyncthingAppsCache.get(appId).restarted) {
+          let ip = null;
+          let serverStatus = null;
+          // eslint-disable-next-line no-await-in-loop
+          const fdmEUData = await serviceHelper.axiosGet(`https://fdm-fn-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+            log.error(`masterSlaveApps: Failed to reach EU FDM with error: ${error}`);
+          });
+          fdmOk = true;
+          if (fdmEUData && fdmEUData.length > 0) {
+            const ipElement = fdmEUData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+            if (ipElement) {
+              ip = ipElement[0].value.value.split(':');
+              serverStatus = fdmEUData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+            }
+          }
+          if (!ip || !serverStatus) {
+            // eslint-disable-next-line no-await-in-loop
+            const fdmUSAData = await serviceHelper.axiosGet(`https://fdm-usa-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+              log.error(`masterSlaveApps: Failed to reach USA FDM with error: ${error}`);
+            });
+            fdmOk = true;
+            if (fdmUSAData && fdmUSAData.length > 0) {
+              const ipElement = fdmUSAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+              if (ipElement) {
+                ip = ipElement[0].value.value.split(':');
+                serverStatus = fdmUSAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+              }
+            }
+          }
+          if (!ip || !serverStatus) {
+            // eslint-disable-next-line no-await-in-loop
+            const fdmASIAData = await serviceHelper.axiosGet(`https://fdm-sg-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+              log.error(`masterSlaveApps: Failed to reach ASIA FDM with error: ${error}`);
+            });
+            fdmOk = true;
+            if (fdmASIAData && fdmASIAData.length > 0) {
+              const ipElement = fdmASIAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+              if (ipElement) {
+                ip = ipElement[0].value.value.split(':');
+                serverStatus = fdmASIAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+              }
+            }
+          }
+          if (fdmOk) {
+            if (!ip || serverStatus === 'DOWN') {
+              appDockerRestart(installedApp.name);
+            } else {
+              // eslint-disable-next-line no-await-in-loop
+              let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+              myIP = myIP.split(':')[0];
+              if (myIP !== ip) {
+                appDockerStop(installedApp.name);
+              }
+            }
+          }
+        }
+      } else {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const installedComponent of installedApp.compose) {
+          const identifier = `${installedComponent.name}_${installedApp.name}`;
+          const appId = dockerService.getAppIdentifier(identifier);
+          if (installedComponent.containerData.includes('g:') && receiveOnlySyncthingAppsCache.get(appId).restarted) {
+            let ip = null;
+            let serverStatus = null;
+            // eslint-disable-next-line no-await-in-loop
+            const fdmEUData = await serviceHelper.axiosGet(`https://fdm-fn-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+              log.error(`masterSlaveApps: Failed to reach EU FDM with error: ${error}`);
+            });
+            log.info(`masterSlaveApps: fdmEUData:${JSON.stringify(fdmEUData)}`);
+            fdmOk = true;
+            if (fdmEUData && fdmEUData.length > 0) {
+              const ipElement = fdmEUData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+              if (ipElement) {
+                ip = ipElement[0].value.value.split(':');
+                serverStatus = fdmEUData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+              }
+            }
+            if (!ip || !serverStatus) {
+              // eslint-disable-next-line no-await-in-loop
+              const fdmUSAData = await serviceHelper.axiosGet(`https://fdm-usa-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+                log.error(`masterSlaveApps: Failed to reach USA FDM with error: ${error}`);
+              });
+              log.info(`masterSlaveApps: fdmUSAData:${JSON.stringify(fdmUSAData)}`);
+              fdmOk = true;
+              if (fdmUSAData && fdmUSAData.length > 0) {
+                const ipElement = fdmUSAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+                if (ipElement) {
+                  ip = ipElement[0].value.value.split(':');
+                  serverStatus = fdmUSAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+                }
+              }
+            }
+            if (!ip || !serverStatus) {
+              // eslint-disable-next-line no-await-in-loop
+              const fdmASIAData = await serviceHelper.axiosGet(`https://fdm-sg-1-4.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+                log.error(`masterSlaveApps: Failed to reach ASIA FDM with error: ${error}`);
+              });
+              log.info(`masterSlaveApps: fdmASIAData:${JSON.stringify(fdmASIAData)}`);
+              fdmOk = true;
+              if (fdmASIAData && fdmASIAData.length > 0) {
+                const ipElement = fdmASIAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+                if (ipElement) {
+                  ip = ipElement[0].value.value.split(':');
+                  serverStatus = fdmASIAData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
+                }
+              }
+            }
+            if (fdmOk) {
+              if (!ip || serverStatus === 'DOWN') {
+                appDockerRestart(installedApp.name);
+                log.info(`masterSlaveApps: starting docker app:${installedApp.name}`);
+              } else {
+                // eslint-disable-next-line no-await-in-loop
+                let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+                myIP = myIP.split(':')[0];
+                if (myIP !== ip) {
+                  appDockerStop(installedApp.name);
+                  log.info(`masterSlaveApps: stopping docker app:${installedApp.name}`);
+                }
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    log.error(`masterSlaveApps: ${error}`);
+  } finally {
+    await serviceHelper.delay(30 * 1000);
+    masterSlaveApps();
   }
 }
 
@@ -11363,4 +11514,5 @@ module.exports = {
   checkForNonAllowedAppsOnLocalNetwork,
   triggerAppHashesCheckAPI,
   getAuthToken,
+  masterSlaveApps,
 };
