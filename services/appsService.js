@@ -1923,19 +1923,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
         if (res) {
           res.write(serviceHelper.ensureString(stFolderCreation2));
         }
-        if (appId.toLowerCase().includes('minecraft')) {
-          const stignore = `sudo echo '*.paused' >| ${appsFolder + appId + containerFolder}/.stignore`;
-          log.info(stignore);
-          // eslint-disable-next-line no-await-in-loop
-          await cmdAsync(stignore);
-          const stiFileCreation = {
-            status: '.stignore created',
-          };
-          log.info(stiFileCreation);
-          if (res) {
-            res.write(serviceHelper.ensureString(stiFileCreation));
-          }
-        }
       }
     }
 
@@ -9971,7 +9958,11 @@ async function stopSyncthingApp(appComponentName, res) {
         // eslint-disable-next-line no-await-in-loop
         await syncthingService.adjustConfigFolders('delete', undefined, folderId);
         // eslint-disable-next-line no-await-in-loop
-        await syncthingService.systemRestart();
+        const restartRequired = await syncthingService.getConfigRestartRequired();
+        if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
+          // eslint-disable-next-line no-await-in-loop
+          await syncthingService.systemRestart();
+        }
         const adjustSyncthingB = {
           status: 'Syncthing adjusted',
         };
@@ -10130,9 +10121,6 @@ async function syncthingApps() {
             const id = appId;
             const label = appId;
             const devices = [{ deviceID: myDeviceID.data }];
-            const execDIRst = `[ ! -d \\"${folder}/.stfolder\\" ] && sudo mkdir -p ${folder}/.stfolder`; // if stfolder doesn't exist creates it
-            // eslint-disable-next-line no-await-in-loop
-            await cmdAsync(execDIRst);
             // eslint-disable-next-line no-await-in-loop
             const locations = await appLocation(installedApp.name);
             // eslint-disable-next-line no-restricted-syntax
@@ -10292,9 +10280,6 @@ async function syncthingApps() {
               const id = appId;
               const label = appId;
               const devices = [{ deviceID: myDeviceID.data }];
-              const execDIRst = `[ ! -d \\"${folder}/.stfolder\\" ] && sudo mkdir -p ${folder}/.stfolder`; // if stfolder doesn't exist creates it
-              // eslint-disable-next-line no-await-in-loop
-              await cmdAsync(execDIRst);
               // eslint-disable-next-line no-await-in-loop
               const locations = await appLocation(installedApp.name);
               // eslint-disable-next-line no-restricted-syntax

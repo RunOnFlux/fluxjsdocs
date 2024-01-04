@@ -75,7 +75,6 @@ async function getSyncthingApiKey() { // can throw
  * @param {object} data Request data.
  * @returns {object} Message.
  */
-// eslint-disable-next-line default-param-last
 async function performRequest(method = 'get', urlpath = '', data, timeout = 5000) {
   try {
     if (!syncthingApiKey) {

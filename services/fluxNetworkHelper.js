@@ -23,7 +23,6 @@ const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const {
   outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
 } = require('./utils/establishedConnections');
-const cmdAsync = util.promisify(nodecmd.get);
 
 let dosState = 0; // we can start at bigger number later
 let dosMessage = null;
@@ -207,6 +206,7 @@ function isPortUPNPBanned(port) {
 async function isPortOpen(ip, port) {
   try {
     const exec = `nc -w 5 -z -v ${ip} ${port} </dev/null; echo $?`;
+    const cmdAsync = util.promisify(nodecmd.get);
     const result = await cmdAsync(exec);
     return !+result;
   } catch (error) {
@@ -1028,6 +1028,8 @@ async function allowPort(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw allow ${port} && sudo ufw allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('updated') || serviceHelper.ensureString(cmdres).includes('added')) {
@@ -1056,6 +1058,8 @@ async function allowOutPort(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('updated') || serviceHelper.ensureString(cmdres).includes('added')) {
@@ -1089,6 +1093,8 @@ async function denyPort(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw deny ${port} && sudo ufw deny out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('updated') || serviceHelper.ensureString(cmdres).includes('added')) {
@@ -1122,6 +1128,8 @@ async function deleteAllowPortRule(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw delete allow ${port} && sudo ufw delete allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('delete')) { // Rule deleted or Could not delete non-existent rule both ok
@@ -1152,6 +1160,8 @@ async function deleteDenyPortRule(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw delete deny ${port} && sudo ufw delete deny out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('delete')) { // Rule deleted or Could not delete non-existent rule both ok
@@ -1182,6 +1192,8 @@ async function deleteAllowOutPortRule(port) {
     return cmdStat;
   }
   const exec = `LANG="en_US.UTF-8" && sudo ufw delete allow out ${port}`;
+  const cmdAsync = util.promisify(nodecmd.get);
+
   const cmdres = await cmdAsync(exec);
   cmdStat.message = cmdres;
   if (serviceHelper.ensureString(cmdres).includes('delete')) { // Rule deleted or Could not delete non-existent rule both ok
@@ -1228,6 +1240,7 @@ async function allowPortApi(req, res) {
  */
 async function isFirewallActive() {
   try {
+    const cmdAsync = util.promisify(nodecmd.get);
     const execA = 'LANG="en_US.UTF-8" && sudo ufw status | grep Status';
     const cmdresA = await cmdAsync(execA);
     if (serviceHelper.ensureString(cmdresA).includes('Status: active')) {
@@ -1246,6 +1259,7 @@ async function isFirewallActive() {
  */
 async function adjustFirewall() {
   try {
+    const cmdAsync = util.promisify(nodecmd.get);
     const apiPort = userconfig.initial.apiport || config.server.apiport;
     const homePort = +apiPort - 1;
     const apiSSLPort = +apiPort + 1;
@@ -1286,6 +1300,7 @@ async function adjustFirewall() {
 
 async function purgeUFW() {
   try {
+    const cmdAsync = util.promisify(nodecmd.get);
     const firewallActive = await isFirewallActive();
     if (firewallActive) {
       const execB = 'LANG="en_US.UTF-8" && sudo ufw status | grep \'DENY\' | grep -E \'(3[0-9]{4})\''; // 30000 - 39999
@@ -1380,6 +1395,7 @@ function lruRateLimit(ip, limitPerSecond = 20) {
 async function allowNodeToBindPrivilegedPorts() {
   try {
     const exec = "sudo setcap 'cap_net_bind_service=+ep' `which node`";
+    const cmdAsync = util.promisify(nodecmd.get);
     await cmdAsync(exec);
   } catch (error) {
     log.error(error);
@@ -1392,8 +1408,9 @@ async function allowNodeToBindPrivilegedPorts() {
  */
 async function installNetcat() {
   try {
-    const exec = 'sudo apt install netcat-openbsd -y';
-    await cmdAsync(exec);
+    const exec = 'sudo apt install netcat -y';
+    const cmdAsync = util.promisify(nodecmd.get);
+    cmdAsync(exec);
   } catch (error) {
     log.error(error);
   }
