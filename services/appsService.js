@@ -3151,7 +3151,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   startAppMonitoring(identifier);
   const appResponse = messageHelper.createDataMessage(app);
   log.info(appResponse);
-  if (appSpecifications.containerData.includes('g:') || appSpecifications.containerData.includes('r:')) {
+  if (appSpecifications.containerData.includes('r:')) {
     dockerService.appDockerStop(identifier).catch((error) => log.error(`Error stopping app docker after installApplicationHard:${error}`));
   }
   if (res) {
@@ -3269,6 +3269,41 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
       return false;
     }
 
+    const installedAppsRes = await installedApps();
+    if (installedAppsRes.status !== 'success') {
+      throw new Error('Failed to get installed Apps');
+    }
+    const runningAppsRes = await listRunningApps();
+    if (runningAppsRes.status !== 'success') {
+      throw new Error('Unable to check running Apps');
+    }
+    const appsInstalled = installedAppsRes.data;
+    const runningApps = runningAppsRes.data;
+    const installedAppComponentNames = [];
+    appsInstalled.forEach((app) => {
+      if (app.version >= 4) {
+        app.compose.forEach((appAux) => {
+          installedAppComponentNames.push(`${appAux.name}_${app.name}`);
+        });
+      } else {
+        installedAppComponentNames.push(app.name);
+      }
+    });
+    // kadena and folding is old naming scheme having /zel.  all global application start with /flux
+    const runningAppsNames = runningApps.map((app) => {
+      if (app.Names[0].startsWith('/zel')) {
+        return app.Names[0].slice(4);
+      }
+      return app.Names[0].slice(5);
+    });
+    // installed always is bigger array than running
+    const runningSet = new Set(runningAppsNames);
+    const stoppedApps = installedAppComponentNames.filter((installedApp) => !runningSet.has(installedApp));
+    // eslint-disable-next-line no-restricted-syntax
+    for (const stoppedApp of stoppedApps) {
+      // eslint-disable-next-line no-await-in-loop
+      await dockerService.appDockerStart(stoppedApp);
+    }
     const dockerNetworks = {
       status: 'Clearing up unused docker networks...',
     };
@@ -3312,6 +3347,11 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
     };
     if (res) {
       res.write(serviceHelper.ensureString(dockerImages2));
+    }
+    // eslint-disable-next-line no-restricted-syntax
+    for (const stoppedApp of stoppedApps) {
+      // eslint-disable-next-line no-await-in-loop
+      await dockerService.appDockerStop(stoppedApp);
     }
 
     if (!isComponent) {
@@ -3383,6 +3423,25 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
     } else {
       await installApplicationHard(specificationsToInstall, appName, isComponent, res, appSpecifications);
     }
+    const broadcastedAt = new Date().getTime();
+    const newAppRunningMessage = {
+      type: 'fluxapprunning',
+      version: 1,
+      name: appSpecifications.name,
+      hash: appSpecifications.hash, // hash of application specifics that are running
+      ip: myIP,
+      broadcastedAt,
+      runningSince: broadcastedAt,
+    };
+
+    // store it in local database first
+    // eslint-disable-next-line no-await-in-loop, no-use-before-define
+    await storeAppRunningMessage(newAppRunningMessage);
+    // broadcast messages about running apps to all peers
+    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
+    await serviceHelper.delay(500);
+    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
+    // broadcast messages about running apps to all peers
     // all done message
     const successStatus = messageHelper.createSuccessMessage(`Flux App ${appName} successfully installed and launched`);
     log.info(successStatus);
@@ -8871,31 +8930,12 @@ async function trySpawningGlobalApplication() {
       return;
     }
 
-    let broadcastedAt = new Date().getTime();
-    const newAppRunningMessage = {
-      type: 'fluxapprunning',
-      version: 1,
-      name: appSpecifications.name,
-      hash: appSpecifications.hash, // hash of application specifics that are running
-      ip: myIP,
-      broadcastedAt,
-      runningSince: broadcastedAt,
-    };
-
-    // store it in local database first
-    // eslint-disable-next-line no-await-in-loop, no-use-before-define
-    await storeAppRunningMessage(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
-    await serviceHelper.delay(500);
-    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-
     // an application was selected and checked that it can run on this node. try to install and run it locally
     // install the app
     const registerOk = await registerAppLocally(appSpecifications); // can throw
     if (!registerOk) {
       log.info('Error on registerAppLocally');
-      broadcastedAt = new Date().getTime();
+      const broadcastedAt = new Date().getTime();
       const appRemovedMessage = {
         type: 'fluxappremoved',
         version: 1,
@@ -8905,9 +8945,9 @@ async function trySpawningGlobalApplication() {
       };
       log.info('Broadcasting appremoved message to the network');
       // broadcast messages about app removed to all peers
-      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage);
+      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage).catch((error) => log.error(error));
       await serviceHelper.delay(500);
-      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage);
+      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage).catch((error) => log.error(error));
       await serviceHelper.delay(adjustedDelay);
       trySpawningGlobalApplication();
       return;
@@ -10572,6 +10612,10 @@ async function syncthingApps() {
 // function responsable for starting and stopping apps to have only one instance running as master
 async function masterSlaveApps() {
   try {
+    // do not run if installationInProgress or removalInProgress
+    if (installationInProgress || removalInProgress) {
+      return;
+    }
     // get list of all installed apps
     const appsInstalled = await installedApps();
     // eslint-disable-next-line no-await-in-loop
