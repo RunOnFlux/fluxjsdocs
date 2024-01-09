@@ -507,10 +507,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       });
     }
   }
-  let restartPolicy = 'unless-stopped';
-  if (appSpecifications.containerData.includes('g:')) {
-    restartPolicy = 'no';
-  }
   if (outsideVolumesToAttach.length && !fullAppSpecs) {
     throw new Error(`Complete App Specification was not supplied but additional volumes requested for ${appName}`);
   }
@@ -577,7 +573,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       ],
       PortBindings: portBindings,
       RestartPolicy: {
-        Name: restartPolicy,
+        Name: 'unless-stopped',
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
       LogConfig: {
@@ -875,14 +871,7 @@ async function removeFluxAppDockerNetwork(appname) {
 }
 
 /**
- * Remove all unused containers. Unused contaienrs are those wich are not running
- */
-async function pruneContainers() {
-  return docker.pruneContainers();
-}
-
-/**
- * Remove all unused networks. Unused networks are those which are not referenced by any running containers
+ * Remove all unused networks. Unused networks are those which are not referenced by any containers
  */
 async function pruneNetworks() {
   return docker.pruneNetworks();
@@ -977,7 +966,6 @@ module.exports = {
   pruneNetworks,
   pruneVolumes,
   pruneImages,
-  pruneContainers,
   dockerInfo,
   dockerVersion,
   dockerGetEvents,
