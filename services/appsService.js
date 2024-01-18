@@ -6585,7 +6585,7 @@ async function storeIPChangedMessage(message) {
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
   const query = { ip: message.oldIP };
-  const update = { $set: { ip: message.newIP } };
+  const update = { $set: { ip: message.newIP, broadcastedAt: new Date(message.broadcastedAt) } };
   await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
 
   // all stored, rebroadcast
@@ -9094,8 +9094,6 @@ async function checkAndNotifyPeersOfRunningApps() {
       }
     });
     installedAndRunning.push(...masterSlaveAppsInstalled);
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
     const apps = [];
     try {
       // eslint-disable-next-line no-restricted-syntax
@@ -9119,7 +9117,7 @@ async function checkAndNotifyPeersOfRunningApps() {
         // store it in local database first
         // eslint-disable-next-line no-await-in-loop
         await storeAppRunningMessage(newAppRunningMessage);
-        if (daemonHeight < config.fluxapps.apprunningv2 || installedAndRunning.length === 1) {
+        if (installedAndRunning.length === 1) {
           // eslint-disable-next-line no-await-in-loop
           await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
           // eslint-disable-next-line no-await-in-loop
@@ -9129,7 +9127,7 @@ async function checkAndNotifyPeersOfRunningApps() {
           // broadcast messages about running apps to all peers
         }
       }
-      if (daemonHeight >= config.fluxapps.apprunningv2 && installedAndRunning.length > 1) {
+      if (installedAndRunning.length > 1) {
         // send v2 unique message instead
         const newAppRunningMessageV2 = {
           type: 'fluxapprunning',
@@ -9150,7 +9148,6 @@ async function checkAndNotifyPeersOfRunningApps() {
       log.error(err);
       // removeAppLocally(stoppedApp);
     }
-
     log.info('Running Apps broadcasted');
   } catch (error) {
     log.error(error);
@@ -9308,21 +9305,43 @@ async function checkAndRemoveApplicationInstance() {
       // eslint-disable-next-line no-await-in-loop
       const runningAppList = await getRunningAppList(installedApp.name);
       const minInstances = installedApp.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
-      if (runningAppList.length > (minInstances + config.fluxapps.maximumAdditionalInstances)) {
+      if (runningAppList.length > minInstances) {
         // eslint-disable-next-line no-await-in-loop
         const appDetails = await getApplicationGlobalSpecifications(installedApp.name);
         if (appDetails) {
-          log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking removal availability..`);
-          const randomNumber = Math.floor((Math.random() * config.fluxapps.removal.probability));
-          if (randomNumber === 0) {
+          log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking if should be unninstalled from the FluxNode..`);
+          runningAppList.sort((a, b) => {
+            if (!a.runningSince && b.runningSince) {
+              return 1;
+            }
+            if (a.runningSince && !b.runningSince) {
+              return -1;
+            }
+            if (a.runningSince < b.runningSince) {
+              return 1;
+            }
+            if (a.runningSince > b.runningSince) {
+              return -1;
+            }
+            if (a.ip < b.ip) {
+              return 1;
+            }
+            if (a.ip > b.ip) {
+              return -1;
+            }
+            return 0;
+          });
+          // eslint-disable-next-line no-await-in-loop
+          const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+          const index = runningAppList.findIndex((x) => x.ip === myIP);
+          if (index === 0) {
+            log.info(`Application ${installedApp.name} going to be removed from node as it was the latest one running it to install it..`);
             log.warn(`Removing application ${installedApp.name} locally`);
             // eslint-disable-next-line no-await-in-loop
             await removeAppLocally(installedApp.name, null, false, true, true);
             log.warn(`Application ${installedApp.name} locally removed`);
             // eslint-disable-next-line no-await-in-loop
             await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
-          } else {
-            log.info(`Other Fluxes are evaluating application ${installedApp.name} removal.`);
           }
         }
       }
