@@ -23,6 +23,7 @@ const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const {
   outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
 } = require('./utils/establishedConnections');
+const cmdAsync = util.promisify(nodecmd.get);
 
 let dosState = 0; // we can start at bigger number later
 let dosMessage = null;
@@ -206,7 +207,6 @@ function isPortUPNPBanned(port) {
 async function isPortOpen(ip, port) {
   try {
     const exec = `nc -w 5 -z -v ${ip} ${port} </dev/null; echo $?`;
-    const cmdAsync = util.promisify(nodecmd.get);
     const result = await cmdAsync(exec);
     return !+result;
   } catch (error) {
@@ -428,9 +428,8 @@ async function getFluxNodePrivateKey(privatekey) {
 async function getFluxNodePublicKey(privatekey) {
   try {
     const pkWIF = await getFluxNodePrivateKey(privatekey);
-    const isCompressed = !pkWIF.startsWith('5');
     const privateKey = zeltrezjs.address.WIFToPrivKey(pkWIF);
-    const pubKey = zeltrezjs.address.privKeyToPubKey(privateKey, isCompressed);
+    const pubKey = zeltrezjs.address.privKeyToPubKey(privateKey, false);
     return pubKey;
   } catch (error) {
     return error;
@@ -1020,7 +1019,6 @@ function getDOSState(req, res) {
  * @returns {object} Command status.
  */
 async function allowPort(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1049,7 +1047,6 @@ async function allowPort(port) {
  * @returns {object} Command status.
  */
 async function allowOutPort(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1078,7 +1075,6 @@ async function allowOutPort(port) {
  * @returns {object} Command status.
  */
 async function denyPort(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1112,7 +1108,6 @@ async function denyPort(port) {
  * @returns {object} Command status.
  */
 async function deleteAllowPortRule(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1143,7 +1138,6 @@ async function deleteAllowPortRule(port) {
  * @returns {object} Command status.
  */
 async function deleteDenyPortRule(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1174,7 +1168,6 @@ async function deleteDenyPortRule(port) {
  * @returns {object} Command status.
  */
 async function deleteAllowOutPortRule(port) {
-  const cmdAsync = util.promisify(nodecmd.get);
   const cmdStat = {
     status: false,
     message: null,
@@ -1235,7 +1228,6 @@ async function allowPortApi(req, res) {
  */
 async function isFirewallActive() {
   try {
-    const cmdAsync = util.promisify(nodecmd.get);
     const execA = 'LANG="en_US.UTF-8" && sudo ufw status | grep Status';
     const cmdresA = await cmdAsync(execA);
     if (serviceHelper.ensureString(cmdresA).includes('Status: active')) {
@@ -1254,7 +1246,6 @@ async function isFirewallActive() {
  */
 async function adjustFirewall() {
   try {
-    const cmdAsync = util.promisify(nodecmd.get);
     const apiPort = userconfig.initial.apiport || config.server.apiport;
     const homePort = +apiPort - 1;
     const apiSSLPort = +apiPort + 1;
@@ -1293,12 +1284,8 @@ async function adjustFirewall() {
   }
 }
 
-/**
- * To clean a firewall deny policies, and delete them from it.
- */
 async function purgeUFW() {
   try {
-    const cmdAsync = util.promisify(nodecmd.get);
     const firewallActive = await isFirewallActive();
     if (firewallActive) {
       const execB = 'LANG="en_US.UTF-8" && sudo ufw status | grep \'DENY\' | grep -E \'(3[0-9]{4})\''; // 30000 - 39999
@@ -1326,24 +1313,6 @@ async function purgeUFW() {
     } else {
       log.info('Firewall is not active. Purging UFW not necessary');
     }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
-/**
- * This fix a docker security issue where docker containers can access host network, for example to create port forwarding on hosts
- */
-async function removeDockerContainerAccessToHost() {
-  try {
-    const cmdAsync = util.promisify(nodecmd.get);
-    const dropAccessToHostNetwork = "sudo iptables -I FORWARD -i docker0 -d $(ip route | grep \"src $(ip addr show dev $(ip route | awk '/default/ {print $5}') | grep \"inet\" | awk 'NR==1{print $2}' | cut -d'/' -f 1)\" | awk '{print $1}') -j DROP";
-    await cmdAsync(dropAccessToHostNetwork).catch((error) => log.error(`Error executing dropAccessToHostNetwork command:${error}`));
-    const giveHostAccessToDockerNetwork = "sudo iptables -I FORWARD -i docker0 -d $(ip route | grep \"src $(ip addr show dev $(ip route | awk '/default/ {print $5}') | grep \"inet\" | awk 'NR==1{print $2}' | cut -d'/' -f 1)\" | awk '{print $1}') -m state --state ESTABLISHED,RELATED -j ACCEPT";
-    await cmdAsync(giveHostAccessToDockerNetwork).catch((error) => log.error(`Error executing giveHostAccessToDockerNetwork command:${error}`));
-    const giveContainerAccessToDNS = "sudo iptables -I FORWARD -i docker0 -p udp -d $(ip route | grep \"src $(ip addr show dev $(ip route | awk '/default/ {print $5}') | grep \"inet\" | awk 'NR==1{print $2}' | cut -d'/' -f 1)\" | awk '{print $1}') --dport 53 -j ACCEPT";
-    await cmdAsync(giveContainerAccessToDNS).catch((error) => log.error(`Error executing giveContainerAccessToDNS command:${error}`));
-    log.info('Access to host from containers removed');
   } catch (error) {
     log.error(error);
   }
@@ -1410,7 +1379,6 @@ function lruRateLimit(ip, limitPerSecond = 20) {
  */
 async function allowNodeToBindPrivilegedPorts() {
   try {
-    const cmdAsync = util.promisify(nodecmd.get);
     const exec = "sudo setcap 'cap_net_bind_service=+ep' `which node`";
     await cmdAsync(exec);
   } catch (error) {
@@ -1424,7 +1392,6 @@ async function allowNodeToBindPrivilegedPorts() {
  */
 async function installNetcat() {
   try {
-    const cmdAsync = util.promisify(nodecmd.get);
     const exec = 'sudo apt install netcat-openbsd -y';
     await cmdAsync(exec);
   } catch (error) {
@@ -1479,5 +1446,4 @@ module.exports = {
   isPortUserBlocked,
   allowNodeToBindPrivilegedPorts,
   installNetcat,
-  removeDockerContainerAccessToHost,
 };

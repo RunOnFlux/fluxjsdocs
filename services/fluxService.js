@@ -420,18 +420,6 @@ function getFluxVersion(req, res) {
 }
 
 /**
- * To show NodeJS version.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-function getNodeJsVersions(req, res) {
-  const { versions } = process;
-  const message = messageHelper.createDataMessage(versions);
-  return res ? res.json(message) : message;
-}
-
-/**
  * To show FluxOS IP address.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -922,11 +910,6 @@ async function getFluxInfo(req, res) {
       throw versionRes.data;
     }
     info.flux.version = versionRes.data;
-    const nodeJsVersionsRes = await getNodeJsVersions();
-    if (nodeJsVersionsRes.status === 'error') {
-      throw nodeJsVersionsRes.data;
-    }
-    info.flux.nodeJsVersion = nodeJsVersionsRes.data.node;
     const ipRes = await getFluxIP();
     if (ipRes.status === 'error') {
       throw ipRes.data;
@@ -942,6 +925,7 @@ async function getFluxInfo(req, res) {
     if (pgp.status === 'error') {
       throw pgp.data;
     }
+    info.flux.pgp = pgp.data;
     const cruxidRes = await getFluxCruxID();
     if (cruxidRes.status === 'error') {
       throw cruxidRes.data;
@@ -957,22 +941,26 @@ async function getFluxInfo(req, res) {
       throw dosResult.data;
     }
     info.flux.dos = dosResult.data;
+
     const dosAppsResult = await appsService.getAppsDOSState();
     if (dosResult.status === 'error') {
       throw dosAppsResult.data;
     }
     info.flux.appsDos = dosAppsResult.data;
     info.flux.development = userconfig.initial.development || false;
+
     const daemonInfoRes = await daemonServiceControlRpcs.getInfo();
     if (daemonInfoRes.status === 'error') {
       throw daemonInfoRes.data;
     }
     info.daemon.info = daemonInfoRes.data;
+
     const daemonNodeStatusRes = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
     if (daemonNodeStatusRes.status === 'error') {
       throw daemonNodeStatusRes.data;
     }
     info.node.status = daemonNodeStatusRes.data;
+
     const benchmarkInfoRes = await benchmarkService.getInfo();
     if (benchmarkInfoRes.status === 'error') {
       throw benchmarkInfoRes.data;
@@ -1472,7 +1460,6 @@ module.exports = {
   restartDaemon,
   reindexDaemon,
   getFluxVersion,
-  getNodeJsVersions,
   getFluxIP,
   getFluxZelID,
   getFluxPGPidentity,
