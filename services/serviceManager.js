@@ -67,9 +67,8 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsTemporaryMessages).createIndex({ receivedAt: 1 }, { expireAfterSeconds: 3600 }); // todo longer time? dropIndexes()
     log.info('Temporary database prepared');
     log.info('Preparing Flux Apps locations');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).dropIndex({ broadcastedAt: 1 }).catch(() => { console.log('Welcome to FluxOS'); }); // drop old index or display message for new installations
-    // more than 2 hours and 5m. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 7500 });
+    // more than 1 hour. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 3900 });
     log.info('Flux Apps locations prepared');
     fluxNetworkHelper.adjustFirewall();
     log.info('Firewalls checked');
@@ -94,7 +93,6 @@ async function startFluxFunctions() {
     setTimeout(() => {
       log.info('Rechecking firewall app rules');
       fluxNetworkHelper.purgeUFW();
-      // fluxNetworkHelper.removeDockerContainerAccessToHost();
       appsService.testAppMount(); // test if our node can mount a volume
     }, 30 * 1000);
     setTimeout(() => {
@@ -122,13 +120,10 @@ async function startFluxFunctions() {
       setInterval(() => { // every 60 mins messages stay on db for 65m
         appsService.checkAndNotifyPeersOfRunningApps();
       }, 60 * 60 * 1000);
-    }, 2 * 60 * 1000);
+    }, 4 * 60 * 1000);
     setTimeout(() => {
       appsService.syncthingApps(); // rechecks and possibly adjust syncthing configuration every 2 minutes
-      setTimeout(() => {
-        appsService.masterSlaveApps(); // stop and starts apps using syncthing g: when a new master is required or was changed.
-      }, 30 * 1000);
-    }, 3 * 60 * 1000);
+    }, 2 * 60 * 1000);
     setTimeout(() => {
       setInterval(() => { // every 30 mins (15 blocks)
         appsService.continuousFluxAppHashesCheck();
@@ -136,11 +131,10 @@ async function startFluxFunctions() {
       appsService.continuousFluxAppHashesCheck();
     }, (Math.floor(Math.random() * (30 - 15 + 1)) + 15) * 60 * 1000); // start between 15m and 30m after fluxOs start
     setTimeout(() => {
-      // after 125 minutes of running ok and to make sure we are connected for enough time for receiving all apps running on other nodes
-      // 125 minutes should give enough time for node receive currently two times the apprunning messages
+      // after 90 minutes of running ok and to make sure we are connected for enough time for receiving all apps running on other nodes
       log.info('Starting to spawn applications');
       appsService.trySpawningGlobalApplication();
-    }, 125 * 60 * 1000);
+    }, 90 * 60 * 1000);
     setInterval(() => {
       appsService.checkApplicationsCompliance();
     }, 60 * 60 * 1000); //  every hour
