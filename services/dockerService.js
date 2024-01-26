@@ -507,6 +507,10 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       });
     }
   }
+  let restartPolicy = 'unless-stopped';
+  if (appSpecifications.containerData.includes('g:')) {
+    restartPolicy = 'no';
+  }
   if (outsideVolumesToAttach.length && !fullAppSpecs) {
     throw new Error(`Complete App Specification was not supplied but additional volumes requested for ${appName}`);
   }
@@ -559,9 +563,9 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     Tty: false,
     ExposedPorts: exposedPorts,
     HostConfig: {
-      NanoCPUs: appSpecifications.cpu * 1e9,
-      Memory: appSpecifications.ram * 1024 * 1024,
-      MemorySwap: (appSpecifications.ram + (config.fluxapps.defaultSwap * 1000)) * 1024 * 1024, // default 2GB swap
+      NanoCPUs: Math.round(appSpecifications.cpu * 1e9),
+      Memory: Math.round(appSpecifications.ram * 1024 * 1024),
+      MemorySwap: Math.round((appSpecifications.ram + (config.fluxapps.defaultSwap * 1000)) * 1024 * 1024), // default 2GB swap
       // StorageOpt: { size: '5G' }, // root fs has max default 5G size, v8 is 5G + specified as per config.fluxapps.hddFileSystemMinimum
       Binds: constructedVolumes,
       Ulimits: [
@@ -573,7 +577,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       ],
       PortBindings: portBindings,
       RestartPolicy: {
-        Name: 'unless-stopped',
+        Name: restartPolicy,
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
       LogConfig: {
@@ -871,7 +875,14 @@ async function removeFluxAppDockerNetwork(appname) {
 }
 
 /**
- * Remove all unused networks. Unused networks are those which are not referenced by any containers
+ * Remove all unused containers. Unused contaienrs are those wich are not running
+ */
+async function pruneContainers() {
+  return docker.pruneContainers();
+}
+
+/**
+ * Remove all unused networks. Unused networks are those which are not referenced by any running containers
  */
 async function pruneNetworks() {
   return docker.pruneNetworks();
@@ -966,6 +977,7 @@ module.exports = {
   pruneNetworks,
   pruneVolumes,
   pruneImages,
+  pruneContainers,
   dockerInfo,
   dockerVersion,
   dockerGetEvents,
