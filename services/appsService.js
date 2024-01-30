@@ -98,8 +98,6 @@ let reinstallationOfOldAppsInProgress = false;
 let masterSlaveAppsRunning = false;
 
 const hashesNumberOfSearchs = new Map();
-const mastersRunningGSyncthingApps = new Map();
-const timeTostartNewMasterApp = new Map();
 
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
 
@@ -8941,25 +8939,6 @@ async function trySpawningGlobalApplication() {
       return;
     }
 
-    let syncthingApp = false;
-    if (appSpecifications.version <= 3) {
-      syncthingApp = appSpecifications.containerData.includes('g:') || appSpecifications.containerData.includes('r:') || appSpecifications.containerData.includes('s:');
-    } else {
-      syncthingApp = appSpecifications.compose.find((comp) => comp.containerData.includes('g:') || comp.containerData.includes('r:') || comp.containerData.includes('s:'));
-    }
-
-    if (syncthingApp) {
-      const myIpWithoutPort = myIP.split(':')[0];
-      const lastIndex = myIpWithoutPort.lastIndexOf('.');
-      const sameIpRangeNode = runningAppList.find((location) => location.ip.includes(myIpWithoutPort.substring(0, lastIndex)));
-      if (sameIpRangeNode) {
-        log.info(`Application ${appToRun} uses syncthing and it is already spawned on Fluxnode with same ip range`);
-        await serviceHelper.delay(adjustedDelay);
-        trySpawningGlobalApplication();
-        return;
-      }
-    }
-
     // an application was selected and checked that it can run on this node. try to install and run it locally
     // install the app
     const registerOk = await registerAppLocally(appSpecifications); // can throw
@@ -8988,7 +8967,7 @@ async function trySpawningGlobalApplication() {
     minInstances = appSpecifications.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
     if (runningAppList.length > minInstances) {
       log.info(`Application ${appToRun} is already spawned on ${runningAppList.length} instances, will unninstall it`);
-      removeAppLocally(appSpecifications.name, null, true, null, true).catch((error) => log.error(error));
+      // removeAppLocally(appSpecifications.name, null, true, null, true).catch((error) => log.error(error));
     }
 
     await serviceHelper.delay(10 * config.fluxapps.installation.delay * 1000);
@@ -9020,7 +8999,7 @@ async function checkAndNotifyPeersOfRunningApps() {
           log.info(`Application ${installedApp.name} going to be removed from node as the node is not confirmed on the network for more than 2 hours..`);
           log.warn(`Removing application ${installedApp.name} locally`);
           // eslint-disable-next-line no-await-in-loop
-          await removeAppLocally(installedApp.name, null, false, true, true);
+          // await removeAppLocally(installedApp.name, null, false, true, true);
           log.warn(`Application ${installedApp.name} locally removed`);
           // eslint-disable-next-line no-await-in-loop
           await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
@@ -9380,7 +9359,7 @@ async function checkAndRemoveApplicationInstance() {
             log.info(`Application ${installedApp.name} going to be removed from node as it was the latest one running it to install it..`);
             log.warn(`Removing application ${installedApp.name} locally`);
             // eslint-disable-next-line no-await-in-loop
-            await removeAppLocally(installedApp.name, null, false, true, true);
+            // await removeAppLocally(installedApp.name, null, false, true, true);
             log.warn(`Application ${installedApp.name} locally removed`);
             // eslint-disable-next-line no-await-in-loop
             await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
@@ -10764,7 +10743,7 @@ async function masterSlaveApps() {
     };
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled.data) {
-      let fdmOk = true;
+      let fdmOk = false;
       let identifier;
       let needsToBeChecked = false;
       let appId;
@@ -10791,124 +10770,63 @@ async function masterSlaveApps() {
           fdmIndex = 4;
         }
         let ip = null;
+        let serverStatus = null;
         // eslint-disable-next-line no-await-in-loop
         let fdmEUData = await serviceHelper.axiosGet(`https://fdm-fn-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
           log.error(`masterSlaveApps: Failed to reach EU FDM with error: ${error}`);
-          fdmOk = false;
         });
-        if (fdmOk) {
-          fdmEUData = fdmEUData.data;
-          if (fdmEUData && fdmEUData.length > 0) {
-            const ipElement = fdmEUData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-            if (ipElement) {
-              ip = ipElement.value.value;
-            }
+        fdmEUData = fdmEUData.data;
+        fdmOk = true;
+        if (fdmEUData && fdmEUData.length > 0) {
+          const ipElement = fdmEUData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+          if (ipElement) {
+            ip = ipElement.value.value.split(':')[0];
+            serverStatus = fdmEUData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
           }
         }
-        if (!ip) {
-          fdmOk = true;
+        if (!ip || !serverStatus) {
           // eslint-disable-next-line no-await-in-loop
           let fdmUSAData = await serviceHelper.axiosGet(`https://fdm-usa-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
             log.error(`masterSlaveApps: Failed to reach USA FDM with error: ${error}`);
-            fdmOk = false;
           });
-          if (fdmOk) {
-            fdmUSAData = fdmUSAData.data;
-            if (fdmUSAData && fdmUSAData.length > 0) {
-              const ipElement = fdmUSAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-              if (ipElement) {
-                ip = ipElement.value.value;
-              }
+          fdmUSAData = fdmUSAData.data;
+          fdmOk = true;
+          if (fdmUSAData && fdmUSAData.length > 0) {
+            const ipElement = fdmUSAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+            if (ipElement) {
+              ip = ipElement.value.value.split(':')[0];
+              serverStatus = fdmUSAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
             }
           }
         }
-        if (!ip) {
-          fdmOk = true;
+        if (!ip || !serverStatus) {
           // eslint-disable-next-line no-await-in-loop
           let fdmASIAData = await serviceHelper.axiosGet(`https://fdm-sg-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
             log.error(`masterSlaveApps: Failed to reach ASIA FDM with error: ${error}`);
-            fdmOk = false;
           });
-          if (fdmOk) {
-            fdmASIAData = fdmASIAData.data;
-            if (fdmASIAData && fdmASIAData.length > 0) {
-              const ipElement = fdmASIAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-              if (ipElement) {
-                ip = ipElement.value.value;
-              }
+          fdmASIAData = fdmASIAData.data;
+          fdmOk = true;
+          if (fdmASIAData && fdmASIAData.length > 0) {
+            const ipElement = fdmASIAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+            if (ipElement) {
+              ip = ipElement.value.value.split(':')[0];
+              serverStatus = fdmASIAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'status').value.value;
             }
           }
         }
         if (fdmOk) {
           // no ip means there was no row with ip on fdm
           // down means there was a row ip with status down
-          // eslint-disable-next-line no-await-in-loop
-          const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-          if ((!ip)) {
+          if ((!ip || serverStatus === 'DOWN')) {
             if (!runningAppsNames.includes(identifier)) {
-              // eslint-disable-next-line no-await-in-loop
-              const runningAppList = await getRunningAppList(installedApp.name);
-              runningAppList.sort((a, b) => {
-                if (!a.runningSince && b.runningSince) {
-                  return -1;
-                }
-                if (a.runningSince && !b.runningSince) {
-                  return 1;
-                }
-                if (a.runningSince < b.runningSince) {
-                  return -1;
-                }
-                if (a.runningSince > b.runningSince) {
-                  return 1;
-                }
-                if (a.ip < b.ip) {
-                  return -1;
-                }
-                if (a.ip > b.ip) {
-                  return 1;
-                }
-                return 0;
-              });
-              const index = runningAppList.findIndex((x) => x.ip === myIP);
-              if (index === 0 && !mastersRunningGSyncthingApps.has(identifier)) {
-                appDockerRestart(installedApp.name);
-                log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-              } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && mastersRunningGSyncthingApps.get(identifier) !== myIP.split(':')[0]) {
-                // if it was running before on this node was removed from fdm, app was stopped or node rebooted, we will only start the app on a different node
-                if (index === 0) {
-                  appDockerRestart(installedApp.name);
-                  log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-                } else {
-                  const previousMasterIndex = runningAppList.findIndex((x) => x.ip === mastersRunningGSyncthingApps.get(identifier));
-                  let timetoStartApp = new Date().getTime();
-                  if (previousMasterIndex >= 0) {
-                    if (index > previousMasterIndex) {
-                      timetoStartApp += (index - 1) * 5 * 60 * 1000;
-                    } else {
-                      timetoStartApp += index * 5 * 60 * 1000;
-                    }
-                  } else {
-                    timetoStartApp += index * 5 * 60 * 1000;
-                  }
-                  if (timetoStartApp <= new Date().getTime()) {
-                    appDockerRestart(installedApp.name);
-                    log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-                  } else {
-                    timeTostartNewMasterApp.set(identifier, timetoStartApp);
-                  }
-                }
-              } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= new Date().getTime()) {
-                appDockerRestart(installedApp.name);
-                log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-              }
+              appDockerRestart(installedApp.name);
+              log.info(`masterSlaveApps: starting docker app:${installedApp.name}`);
             }
           } else {
-            ip = ip.split(':')[0];
-            mastersRunningGSyncthingApps.set(identifier, ip);
-            if (timeTostartNewMasterApp.has(identifier)) {
-              timeTostartNewMasterApp.delete(identifier);
-            }
-            if (myIP.split(':')[0] !== ip && runningAppsNames.includes(identifier)) {
+            // eslint-disable-next-line no-await-in-loop
+            let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+            myIP = myIP.split(':')[0];
+            if (myIP !== ip && runningAppsNames.includes(identifier)) {
               appDockerStop(installedApp.name);
               log.info(`masterSlaveApps: stopping docker app:${installedApp.name}`);
             }
