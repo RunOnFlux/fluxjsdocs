@@ -168,13 +168,13 @@ async function getDockerContainerByIdOrName(idOrName) {
  * Returns low-level information about a container.
  *
  * @param {string} idOrName
- * @param {object} options
  * @returns {object}
  */
-async function dockerContainerInspect(idOrName, options = {}) {
+async function dockerContainerInspect(idOrName) {
   // container ID or name
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
-  const response = await dockerContainer.inspect(options);
+
+  const response = await dockerContainer.inspect();
   return response;
 }
 
@@ -555,7 +555,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   const options = {
     Image: appSpecifications.repotag,
     name: getAppIdentifier(identifier),
-    Hostname: appSpecifications.name,
     AttachStdin: true,
     AttachStdout: true,
     AttachStderr: true,
