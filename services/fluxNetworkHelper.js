@@ -54,7 +54,7 @@ class TokenBucket {
     this.capacity = capacity;
     this.fillPerSecond = fillPerSecond;
 
-    this.lastFilled = Date.now();
+    this.lastFilled = new Date().getTime();
     this.tokens = capacity;
   }
 
@@ -71,7 +71,7 @@ class TokenBucket {
   }
 
   refill() {
-    const now = Date.now();
+    const now = new Date().getTime();
     const rate = (now - this.lastFilled) / (this.fillPerSecond * 1000);
 
     this.tokens = Math.min(this.capacity, this.tokens + Math.floor(rate * this.capacity));
@@ -286,61 +286,55 @@ async function checkFluxAvailability(req, res) {
  * @returns {object} Message.
  */
 async function checkAppAvailability(req, res) {
-  let body = '';
-  req.on('data', (data) => {
-    body += data;
-  });
-  req.on('end', async () => {
-    try {
-      const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
-      const processedBody = serviceHelper.ensureObject(body);
+    const processedBody = serviceHelper.ensureObject(req.body);
 
-      const {
-        ip, ports, pubKey, signature,
-      } = processedBody;
+    const {
+      ip, ports, pubKey, signature,
+    } = processedBody;
 
-      const ipPort = processedBody.port;
+    const ipPort = processedBody.port;
 
-      // pubkey of the message has to be on the list
-      const zl = await fluxCommunicationUtils.deterministicFluxList(pubKey); // this itself is sufficient.
-      const node = zl.find((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
-      const dataToVerify = processedBody;
-      delete dataToVerify.signature;
-      const messageToVerify = JSON.stringify(dataToVerify);
-      const verified = verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
-      if ((verified !== true || !node) && authorized !== true) {
-        throw new Error('Unable to verify request authenticity');
-      }
-
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-      const daemonHeight = syncStatus.data.height;
-      const minPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin - 1000;
-      const maxPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
-      // eslint-disable-next-line no-restricted-syntax
-      for (const port of ports) {
-        const iBP = isPortBanned(+port);
-        if (+port >= minPort && +port <= maxPort && !iBP) {
-          // eslint-disable-next-line no-await-in-loop
-          const isOpen = await isPortOpen(ip, port);
-          if (!isOpen) {
-            throw new Error(`Flux Applications on ${ip}:${ipPort} are not available. Failed port: ${port}`);
-          }
-        } else {
-          log.error(`Flux App port ${port} is outside allowed range.`);
-        }
-      }
-      const successResponse = messageHelper.createSuccessMessage(`Flux Applications on ${ip}:${ipPort} are available.`);
-      res.json(successResponse);
-    } catch (error) {
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      res.json(errorResponse);
+    // pubkey of the message has to be on the list
+    const zl = await fluxCommunicationUtils.deterministicFluxList(pubKey); // this itself is sufficient.
+    const node = zl.find((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
+    const dataToVerify = processedBody;
+    delete dataToVerify.signature;
+    const messageToVerify = JSON.stringify(dataToVerify);
+    const verified = verificationHelper.verifyMessage(messageToVerify, pubKey, signature);
+    if ((verified !== true || !node) && authorized !== true) {
+      throw new Error('Unable to verify request authenticity');
     }
-  });
+
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height;
+    const minPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin - 1000;
+    const maxPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const port of ports) {
+      const iBP = isPortBanned(+port);
+      if (+port >= minPort && +port <= maxPort && !iBP) {
+        // eslint-disable-next-line no-await-in-loop
+        const isOpen = await isPortOpen(ip, port);
+        if (!isOpen) {
+          throw new Error(`Flux Applications on ${ip}:${ipPort} are not available. Failed port: ${port}`);
+        }
+      } else {
+        log.error(`Flux App port ${port} is outside allowed range.`);
+      }
+    }
+    const successResponse = messageHelper.createSuccessMessage(`Flux Applications on ${ip}:${ipPort} are available.`);
+    res.json(successResponse);
+  } catch (error) {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
 }
 
 /**
@@ -889,7 +883,7 @@ async function adjustExternalIP(ip) {
           }
         }
         if (apps.length > appsRemoved) {
-          const broadcastedAt = Date.now();
+          const broadcastedAt = new Date().getTime();
           const newIpChangedMessage = {
             type: 'fluxipchanged',
             version: 1,
@@ -1376,7 +1370,7 @@ const lruRateCache = new LRUCache(lruRateOptions);
  */
 function lruRateLimit(ip, limitPerSecond = 20) {
   const lruResponse = lruRateCache.get(ip);
-  const newTime = Date.now();
+  const newTime = new Date().getTime();
   if (lruResponse) {
     const oldTime = lruResponse.time;
     const oldTokensRemaining = lruResponse.tokens;
