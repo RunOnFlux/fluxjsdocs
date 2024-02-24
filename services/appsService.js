@@ -3386,27 +3386,11 @@ async function registerAppLocally(appSpecs, componentSpecs, res) {
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetworkStatus));
       }
-      let fluxNet = null;
-      for (let i = 0; i <= 20; i += 1) {
-        // eslint-disable-next-line no-await-in-loop
-        fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
-        if (fluxNet || appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
-          break;
-        }
-        dockerNetworkAddrValue = Math.floor(Math.random() * 256);
-      }
+      const fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
       if (!fluxNet) {
-        throw new Error(`Flux App network of ${appName} failed to initiate. Not possible to create docker application network.`);
+        throw new Error(`Flux App network of ${appName} failed to initiate. Range already assigned to different application.`);
       }
       log.info(serviceHelper.ensureString(fluxNet));
-      const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
-      const accessRemoved = await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
-      const accessRemovedRes = {
-        status: accessRemoved ? `Private network access removed for ${appName}` : `Error removing private network access for ${appName}`,
-      };
-      if (res) {
-        res.write(serviceHelper.ensureString(accessRemovedRes));
-      }
       const fluxNetResponse = {
         status: `Docker network of ${appName} initiated.`,
       };
@@ -3775,27 +3759,11 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetworkStatus));
       }
-      let fluxNet = null;
-      for (let i = 0; i <= 20; i += 1) {
-        // eslint-disable-next-line no-await-in-loop
-        fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
-        if (fluxNet || appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
-          break;
-        }
-        dockerNetworkAddrValue = Math.floor(Math.random() * 256);
-      }
+      const fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
       if (!fluxNet) {
-        throw new Error(`Flux App network of ${appName} failed to initiate. Not possible to create docker application network.`);
+        throw new Error(`Flux App network of ${appName} failed to initiate. Range already assigned to different application`);
       }
       log.info(serviceHelper.ensureString(fluxNet));
-      const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
-      const accessRemoved = await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
-      const accessRemovedRes = {
-        status: accessRemoved ? `Private network access removed for ${appName}` : `Error removing private network access for ${appName}`,
-      };
-      if (res) {
-        res.write(serviceHelper.ensureString(accessRemovedRes));
-      }
       const fluxNetResponse = {
         status: `Docker network of ${appName} initiated.`,
       };
