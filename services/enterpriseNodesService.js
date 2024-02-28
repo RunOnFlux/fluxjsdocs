@@ -42,7 +42,7 @@ async function getEnterpriseList() {
         }
       });
     });
-    const currentTime = Date.now();
+    const currentTime = new Date().getTime();
     const collateralized = {}; // pubkey: points
     nodeList.forEach((node) => {
       let value = 0;
