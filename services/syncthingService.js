@@ -2230,9 +2230,7 @@ async function startSyncthing() {
           await cmdAsync(execKillC).catch((error) => log.error(error));
         }
       }
-      const exec = 'sudo nohup syncthing -logfile $HOME/.config/syncthing/syncthing.log --logflags=3 '
-        + '--log-max-old-files=2 --log-max-size=26214400 --allow-newer-config --no-browser '
-        + '--home=$HOME/.config/syncthing >/dev/null 2>&1 </dev/null &';
+      const exec = 'sudo nohup syncthing -logfile $HOME/.config/syncthing/syncthing.log --logflags=3 --log-max-old-files=2 --log-max-size=26214400 --allow-newer-config --no-browser --home=$HOME/.config/syncthing &';
       log.info('Spawning Syncthing instance...');
       nodecmd.get(exec, async (err) => {
         if (err) {
