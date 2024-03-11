@@ -8,8 +8,6 @@ const pgpService = require('./pgpService');
 const generalService = require('./generalService');
 const deviceHelper = require('./deviceHelper');
 const log = require('../lib/log');
-const util = require('util');
-const nodecmd = require('node-cmd');
 
 const fluxDirPath = path.join(__dirname, '../../../');
 const appsFolder = `${fluxDirPath}ZelApps/`;
@@ -985,21 +983,6 @@ async function dockerGetUsage() {
   return df;
 }
 
-/**
- * Fix docker logs.
- */
-async function dockerLogsFix() {
-  try {
-    const nodedpath = path.join(__dirname, '../../../helpers');
-    const exec = `cd ${nodedpath} && bash dockerLogsFix.sh`;
-    const cmdAsync = util.promisify(nodecmd.get);
-    const cmdres = await cmdAsync(exec);
-    log.info(cmdres);
-  } catch (error) {
-    log.error(error);
-  }
-}
-
 module.exports = {
   getDockerContainer,
   getAppIdentifier,
@@ -1042,5 +1025,4 @@ module.exports = {
   dockerVersion,
   dockerGetEvents,
   dockerGetUsage,
-  dockerLogsFix,
 };
