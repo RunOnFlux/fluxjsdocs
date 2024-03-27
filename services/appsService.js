@@ -1,3 +1,4 @@
+/* global userconfig */
 const config = require('config');
 const https = require('https');
 const axios = require('axios');
@@ -10696,10 +10697,10 @@ async function syncthingApps() {
     const folderIds = [];
     const foldersConfiguration = [];
     const newFoldersConfiguration = [];
-    const myDeviceId = await syncthingService.getDeviceId();
-
-    if (!myDeviceId) return;
-
+    const myDeviceID = await syncthingService.getDeviceID();
+    if (myDeviceID.status !== 'success') {
+      return;
+    }
     const allFoldersResp = await syncthingService.getConfigFolders();
     const allDevicesResp = await syncthingService.getConfigDevices();
     // eslint-disable-next-line no-restricted-syntax
@@ -10724,7 +10725,7 @@ async function syncthingApps() {
             const folder = `${appsFolder + appId + containerFolder}`;
             const id = appId;
             const label = appId;
-            const devices = [{ deviceID: myDeviceId }];
+            const devices = [{ deviceID: myDeviceID.data }];
             const execDIRst = `[ ! -d \\"${folder}/.stfolder\\" ] && sudo mkdir -p ${folder}/.stfolder`; // if stfolder doesn't exist creates it
             // eslint-disable-next-line no-await-in-loop
             await cmdAsync(execDIRst);
@@ -10756,7 +10757,7 @@ async function syncthingApps() {
                 }
               }
               if (deviceID) {
-                if (deviceID !== myDeviceId) { // skip my id, already present
+                if (deviceID !== myDeviceID.data) { // skip my id, already present
                   const folderDeviceExists = devices.find((device) => device.deviceID === deviceID);
                   if (!folderDeviceExists) { // double check if not multiple the same ids
                     devices.push({ deviceID });
@@ -10771,7 +10772,7 @@ async function syncthingApps() {
                     autoAcceptFolders: true,
                   };
                   devicesIds.push(deviceID);
-                  if (deviceID !== myDeviceId) {
+                  if (deviceID !== myDeviceID.data) {
                     const syncthingDeviceExists = allDevicesResp.data.find((device) => device.name === name);
                     if (!syncthingDeviceExists) {
                       devicesConfiguration.push(newDevice);
@@ -10918,7 +10919,7 @@ async function syncthingApps() {
               const folder = `${appsFolder + appId + containerFolder}`;
               const id = appId;
               const label = appId;
-              const devices = [{ deviceID: myDeviceId }];
+              const devices = [{ deviceID: myDeviceID.data }];
               const execDIRst = `[ ! -d \\"${folder}/.stfolder\\" ] && sudo mkdir -p ${folder}/.stfolder`; // if stfolder doesn't exist creates it
               // eslint-disable-next-line no-await-in-loop
               await cmdAsync(execDIRst);
@@ -10950,7 +10951,7 @@ async function syncthingApps() {
                   }
                 }
                 if (deviceID) {
-                  if (deviceID !== myDeviceId) { // skip my id, already present
+                  if (deviceID !== myDeviceID.data) { // skip my id, already present
                     const folderDeviceExists = devices.find((device) => device.deviceID === deviceID);
                     if (!folderDeviceExists) { // double check if not multiple the same ids
                       devices.push({ deviceID });
@@ -10965,7 +10966,7 @@ async function syncthingApps() {
                       autoAcceptFolders: true,
                     };
                     devicesIds.push(deviceID);
-                    if (deviceID !== myDeviceId) {
+                    if (deviceID !== myDeviceID.data) {
                       const syncthingDeviceExists = allDevicesResp.data.find((device) => device.name === name);
                       if (!syncthingDeviceExists) {
                         devicesConfiguration.push(newDevice);
@@ -11117,7 +11118,7 @@ async function syncthingApps() {
     // eslint-disable-next-line no-restricted-syntax
     for (const nonUsedDevice of nonUsedDevices) {
       // exclude our deviceID
-      if (nonUsedDevice.deviceID !== myDeviceId) {
+      if (nonUsedDevice.deviceID !== myDeviceID.data) {
         log.info(`Removing unused Syncthing device ${nonUsedDevice.deviceID}`);
         // eslint-disable-next-line no-await-in-loop
         await syncthingService.adjustConfigDevices('delete', undefined, nonUsedDevice.deviceID);

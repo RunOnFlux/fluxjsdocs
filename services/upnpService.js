@@ -1,3 +1,4 @@
+/* global userconfig */
 const config = require('config');
 const natUpnp = require('@runonflux/nat-upnp');
 const serviceHelper = require('./serviceHelper');
