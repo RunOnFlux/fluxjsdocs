@@ -4715,7 +4715,7 @@ async function getUserBlockedRepositores() {
     return [];
   } catch (error) {
     log.error(error);
-    return [];
+    return null;
   }
 }
 
@@ -9897,16 +9897,13 @@ async function getAppPrice(req, res) {
       if (myLongCache.has('appPrices')) {
         appPrices.push(myLongCache.get('appPrices'));
       } else {
-        /* const response = await axios.get('https://api.runonflux.io/apps/getappspecsusdprice', axiosConfig);
+        const response = await axios.get('https://stats.runonflux.io/apps/getappspecsusdprice', axiosConfig);
         if (response.data.status === 'success') {
           myLongCache.set('appPrices', response.data.data);
           appPrices.push(response.data.data);
         } else {
           throw new Error('Unable to get standard usd prices for app specs');
-        } */
-        const response = config.fluxapps.usdprice;
-        myLongCache.set('appPrices', response);
-        appPrices.push(response);
+        }
       }
       let actualPriceToPay = 0;
       const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
@@ -9933,12 +9930,12 @@ async function getAppPrice(req, res) {
           actualPriceToPay -= (perc * previousSpecsPrice);
         }
       }
-      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps').catch((error) => log.error(error));
-      let marketPlaceApps = [];
-      if (marketplaceResponse && marketplaceResponse.data && marketplaceResponse.data.status === 'success') {
+      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps');
+      let marketPlaceApps;
+      if (marketplaceResponse.data.status === 'success') {
         marketPlaceApps = marketplaceResponse.data.data;
       } else {
-        log.error('Unable to get marketplace information');
+        throw new Error('Unable to get marketplace information');
       }
 
       if (appSpecification.priceUSD) {
@@ -10035,16 +10032,13 @@ async function getAppFiatAndFluxPrice(req, res) {
       if (myLongCache.has('appPrices')) {
         appPrices.push(myLongCache.get('appPrices'));
       } else {
-        /* const response = await axios.get('https://api.runonflux.io/apps/getappspecsusdprice', axiosConfig);
+        const response = await axios.get('https://stats.runonflux.io/apps/getappspecsusdprice', axiosConfig);
         if (response.data.status === 'success') {
           myLongCache.set('appPrices', response.data.data);
           appPrices.push(response.data.data);
         } else {
           throw new Error('Unable to get standard usd prices for app specs');
-        } */
-        const response = config.fluxapps.usdprice;
-        myLongCache.set('appPrices', response);
-        appPrices.push(response);
+        }
       }
       let actualPriceToPay = 0;
       const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
@@ -10071,12 +10065,12 @@ async function getAppFiatAndFluxPrice(req, res) {
           actualPriceToPay -= (perc * previousSpecsPrice);
         }
       }
-      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps').catch((error) => log.error(error));
-      let marketPlaceApps = [];
-      if (marketplaceResponse && marketplaceResponse.data && marketplaceResponse.data.status === 'success') {
+      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps');
+      let marketPlaceApps;
+      if (marketplaceResponse.data.status === 'success') {
         marketPlaceApps = marketplaceResponse.data.data;
       } else {
-        log.error('Unable to get marketplace information');
+        throw new Error('Unable to get marketplace information');
       }
 
       if (appSpecification.priceUSD) {
@@ -12752,23 +12746,6 @@ async function downloadAppsFile(req, res) {
   }
 }
 
-/**
- * To get application specification usd prices.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Returns object with application specification usd prices.
- */
-async function getAppSpecsUSDPrice(req, res) {
-  try {
-    const resMessage = serviceHelper.createDataMessage(config.fluxapps.usdprice);
-    res.json(resMessage);
-  } catch (error) {
-    const errMessage = serviceHelper.createErrorMessage(error.message, error.name, error.code);
-    res.json(errMessage);
-    log.error(error);
-  }
-}
-
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -12901,5 +12878,4 @@ module.exports = {
   triggerAppHashesCheckAPI,
   getAuthToken,
   masterSlaveApps,
-  getAppSpecsUSDPrice,
 };
