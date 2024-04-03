@@ -10035,16 +10035,15 @@ async function getAppFiatAndFluxPrice(req, res) {
       if (myLongCache.has('appPrices')) {
         appPrices.push(myLongCache.get('appPrices'));
       } else {
-        /* const response = await axios.get('https://api.runonflux.io/apps/getappspecsusdprice', axiosConfig);
+        let response = await axios.get('https://stats.runonflux.io/apps/getappspecsusdprice', axiosConfig).catch((error) => log.error(error));
         if (response.data.status === 'success') {
           myLongCache.set('appPrices', response.data.data);
           appPrices.push(response.data.data);
         } else {
-          throw new Error('Unable to get standard usd prices for app specs');
-        } */
-        const response = config.fluxapps.usdprice;
-        myLongCache.set('appPrices', response);
-        appPrices.push(response);
+          response = config.fluxapps.usdprice;
+          myLongCache.set('appPrices', response);
+          appPrices.push(response);
+        }
       }
       let actualPriceToPay = 0;
       const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
@@ -10091,29 +10090,40 @@ async function getAppFiatAndFluxPrice(req, res) {
             actualPriceToPay *= marketPlaceApp.multiplier;
           }
         }
-
         actualPriceToPay = Number(actualPriceToPay * appPrices[0].multiplier).toFixed(2);
         if (actualPriceToPay < appPrices[0].minUSDPrice) {
           actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
         }
       }
       let fiatRates;
+      let fluxUSDRate;
       if (myShortCache.has('fluxRates')) {
-        fiatRates = myShortCache.get('fluxRates');
+        fluxUSDRate = myShortCache.get('fluxRates');
       } else {
-        fiatRates = await axios.get('https://viprates.runonflux.io/rates', axiosConfig).catch(() => { throw new Error('Unable to get Flux Rates'); });
-        myShortCache.set('fluxRates', fiatRates);
+        fiatRates = await axios.get('https://viprates.runonflux.io/ratess', axiosConfig).catch((error) => log.error(error));
+        if (fiatRates.data) {
+          const rateObj = fiatRates.data[0].find((rate) => rate.code === 'USD');
+          if (!rateObj) {
+            throw new Error('Unable to get USD rate.');
+          }
+          const btcRateforFlux = fiatRates.data[1].FLUX;
+          if (btcRateforFlux === undefined) {
+            throw new Error('Unable to get Flux USD Price.');
+          }
+          fluxUSDRate = rateObj.rate * btcRateforFlux;
+          myShortCache.set('fluxRates', fluxUSDRate);
+        } else {
+          fiatRates = await axios.get('https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=zelcash', axiosConfig);
+          log.info(`fiatRates:${JSON.stringify(fiatRates)}`);
+          if (fiatRates.data.zelcash.usd) {
+            log.info(`fluxUSDRate:${fluxUSDRate}`);
+            fluxUSDRate = fiatRates.data.zelcash.usd;
+          } else {
+            log.error('Unable to get rates information');
+          }
+        }
       }
-      const rateObj = fiatRates.data[0].find((rate) => rate.code === 'USD');
-      if (!rateObj) {
-        throw new Error('Unable to get USD rate.');
-      }
-      const btcRateforFlux = fiatRates.data[1].FLUX;
-      if (btcRateforFlux === undefined) {
-        throw new Error('Unable to get Flux USD Price.');
-      }
-      const fiatRate = rateObj.rate * btcRateforFlux;
-      const fluxPrice = Number(((actualPriceToPay / fiatRate) * appPrices[0].fluxmultiplier));
+      const fluxPrice = Number(((actualPriceToPay / fluxUSDRate) * appPrices[0].fluxmultiplier));
       const fluxChainPrice = Number(await getAppFluxOnChainPrice(appSpecification));
       const price = {
         usd: Number(actualPriceToPay),
