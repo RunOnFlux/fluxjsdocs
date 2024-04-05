@@ -1,3 +1,4 @@
+/* global userconfig */
 const config = require('config');
 const path = require('path');
 const fs = require('fs').promises;
