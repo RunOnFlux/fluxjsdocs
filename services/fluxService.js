@@ -713,7 +713,7 @@ function getMarketplaceURL(req, res) {
  */
 async function daemonDebug(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-  if (!authorized) {
+  if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
   }
@@ -733,7 +733,7 @@ async function daemonDebug(req, res) {
  */
 async function benchmarkDebug(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-  if (!authorized) {
+  if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
   }
@@ -840,7 +840,7 @@ async function fluxLog(res, filelog) {
 async function fluxErrorLog(req, res) {
   try {
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (!authorized) {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return;
@@ -860,7 +860,7 @@ async function fluxErrorLog(req, res) {
 async function fluxWarnLog(req, res) {
   try {
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (!authorized) {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return;
@@ -880,7 +880,7 @@ async function fluxWarnLog(req, res) {
 async function fluxInfoLog(req, res) {
   try {
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (!authorized) {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return;
@@ -900,7 +900,7 @@ async function fluxInfoLog(req, res) {
 async function fluxDebugLog(req, res) {
   try {
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (!authorized) {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return;
@@ -1342,7 +1342,7 @@ async function adjustRouterIP(req, res) {
 async function adjustBlockedPorts(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
-  if (!authorized) {
+  if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
     return;
@@ -1446,7 +1446,7 @@ async function adjustAPIPort(req, res) {
 async function adjustBlockedRepositories(req, res) {
   const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
-  if (!authorized) {
+  if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
     return;
@@ -1580,61 +1580,61 @@ async function restartFluxOS(req, res) {
 }
 
 module.exports = {
-  startDaemon,
-  updateFlux,
-  softUpdateFlux,
-  softUpdateFluxInstall,
-  hardUpdateFlux,
-  rebuildHome,
-  updateDaemon,
-  updateBenchmark,
-  restartDaemon,
-  reindexDaemon,
-  getFluxVersion,
-  getNodeJsVersions,
-  getFluxIP,
-  getFluxZelID,
-  getFluxPGPidentity,
-  getFluxCruxID,
-  getFluxKadena,
-  daemonDebug,
-  benchmarkDebug,
-  getFluxTimezone,
-  getFluxInfo,
-  startBenchmark,
-  restartBenchmark,
-  tailDaemonDebug,
-  tailBenchmarkDebug,
-  tailFluxErrorLog,
-  tailFluxWarnLog,
-  tailFluxDebugLog,
-  tailFluxInfoLog,
-  fluxErrorLog,
-  fluxWarnLog,
-  fluxInfoLog,
-  fluxDebugLog,
+  adjustAPIPort,
+  adjustBlockedPorts,
+  adjustBlockedRepositories,
   adjustCruxID,
   adjustKadenaAccount,
   adjustRouterIP,
-  adjustBlockedPorts,
-  adjustAPIPort,
-  adjustBlockedRepositories,
-  fluxBackendFolder,
-  getNodeTier,
-  installFluxWatchTower,
-  getCurrentBranch,
+  benchmarkDebug,
+  checkoutBranch,
+  daemonDebug,
   enterDevelopment,
   enterMaster,
-  isStaticIPapi,
-  getFluxGeolocation,
-  getRouterIP,
-  getBlockedPorts,
+  fluxBackendFolder,
+  fluxDebugLog,
+  fluxErrorLog,
+  fluxInfoLog,
+  fluxWarnLog,
   getAPIPort,
+  getBlockedPorts,
   getBlockedRepositories,
-  getMarketplaceURL,
-  restartFluxOS,
-  checkoutBranch,
+  getCurrentBranch,
   getCurrentCommitId,
+  getFluxCruxID,
+  getFluxGeolocation,
+  getFluxInfo,
+  getFluxIP,
+  getFluxKadena,
+  getFluxPGPidentity,
+  getFluxTimezone,
+  getFluxVersion,
+  getFluxZelID,
+  getMarketplaceURL,
+  getNodeJsVersions,
+  getNodeTier,
+  getRouterIP,
+  hardUpdateFlux,
+  installFluxWatchTower,
+  isStaticIPapi,
+  rebuildHome,
+  reindexDaemon,
+  restartBenchmark,
+  restartDaemon,
+  restartFluxOS,
+  softUpdateFlux,
+  softUpdateFluxInstall,
+  startBenchmark,
+  startDaemon,
+  tailBenchmarkDebug,
+  tailDaemonDebug,
+  tailFluxDebugLog,
+  tailFluxErrorLog,
+  tailFluxInfoLog,
+  tailFluxWarnLog,
+  updateBenchmark,
+  updateDaemon,
+  updateFlux,
   // Exports for testing purposes
   fluxLog,
   tailFluxLog,
