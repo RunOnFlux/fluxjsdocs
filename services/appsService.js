@@ -5526,12 +5526,8 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   }
 
   if (appSpecifications.version >= 6) {
-    if (height < config.fluxapps.newMinBlocksAllowanceBlock) {
-      if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
-        throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
-      }
-    } else if (appSpecifications.expire < config.fluxapps.newMinBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 3 hours`);
+    if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
+      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
     }
     if (appSpecifications.expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -7225,6 +7221,9 @@ function specificationFormatter(appSpecification) {
     }
     if (Number.isInteger(expire) !== true) {
       throw new Error('Invalid instances specified');
+    }
+    if (expire < config.fluxapps.minBlocksAllowance) {
+      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
     }
     if (expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -12351,7 +12350,7 @@ async function appendRestoreTask(req, res) {
             await sendChunk(res, `Downloading ${restoreItem.url}...\n`);
             // eslint-disable-next-line no-await-in-loop
             const downloadStatus = await IOUtils.downloadFileFromUrl(restoreItem.url, `${componentPath[0].mount}/backup/remote`, restoreItem.component, true);
-            if (downloadStatus === 'false') {
+            if (downloadStatus !== true) {
               throw new Error(`Error: Failed to download ${restoreItem.url}...`);
             }
           }
