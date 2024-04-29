@@ -39,8 +39,7 @@ async function startFluxFunctions() {
     }
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
-    systemService.monitorSystem();
-    log.info('System service initiated');
+    fluxNetworkHelper.installNetcat();
     log.info('Initiating MongoDB connection');
     await dbHelper.initiateDB(); // either true or throws error
     log.info('DB connected');
@@ -93,6 +92,8 @@ async function startFluxFunctions() {
     log.info('Syncthing service started');
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
+    systemService.monitorSystem();
+    log.info('System service initiated');
 
     setTimeout(() => {
       fluxCommunicationUtils.constantlyUpdateDeterministicFluxList(); // updates deterministic flux list for communication every 2 minutes, so we always trigger cache and have up to date value
