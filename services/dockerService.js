@@ -8,6 +8,8 @@ const pgpService = require('./pgpService');
 const generalService = require('./generalService');
 const deviceHelper = require('./deviceHelper');
 const log = require('../lib/log');
+const util = require('util');
+const nodecmd = require('node-cmd');
 
 const fluxDirPath = path.join(__dirname, '../../../');
 const appsFolder = `${fluxDirPath}ZelApps/`;
@@ -599,11 +601,16 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   const backingFs = driverStatus.find((status) => status[0] === 'Backing Filesystem'); // d_type must be true for overlay, docker would not work if not
   if (backingFs && backingFs[1] === 'xfs') {
     // check that we have quota
-
-    const hasQuotaPossibility = await deviceHelper.hasQuotaOptionForMountTarget('/var/lib/docker');
-
-    if (hasQuotaPossibility) {
-      options.HostConfig.StorageOpt = { size: `${config.fluxapps.hddFileSystemMinimum}G` }; // must also have 'pquota' mount option
+    const getDevice = await deviceHelper.getDfDevice('/var/lib/docker').catch((error) => {
+      log.error(error);
+    });
+    if (getDevice && getDevice !== false) {
+      const hasQuotaPossibility = await deviceHelper.hasQuotaOptionForDevice(getDevice).catch((error) => {
+        log.error(error);
+      });
+      if (hasQuotaPossibility === true) {
+        options.HostConfig.StorageOpt = { size: `${config.fluxapps.hddFileSystemMinimum}G` }; // must also have 'pquota' mount option
+      }
     }
   }
 
@@ -980,66 +987,60 @@ async function dockerGetUsage() {
 
 /**
  * Fix docker logs.
- * @returns {Promise<void>}
  */
 async function dockerLogsFix() {
   try {
-    const cwd = path.join(__dirname, '../../../helpers');
-    const scriptPath = path.join(cwd, 'dockerLogsFix.sh');
-    const { stdout } = await serviceHelper.runCommand(scriptPath, { cwd });
-
-    // we do this so we don't log empty lines if there is no output
-    const lines = stdout.split('\n');
-    // this always has length
-    if (lines.slice(-1)[0] === '') lines.pop();
-
-    lines.forEach((line) => log.info(line));
+    const nodedpath = path.join(__dirname, '../../../helpers');
+    const exec = `cd ${nodedpath} && bash dockerLogsFix.sh`;
+    const cmdAsync = util.promisify(nodecmd.get);
+    const cmdres = await cmdAsync(exec);
+    log.info(cmdres);
   } catch (error) {
     log.error(error);
   }
 }
 
 module.exports = {
-  appDockerCreate,
-  appDockerImageRemove,
-  appDockerKill,
-  appDockerPause,
-  appDockerRemove,
-  appDockerRestart,
-  appDockerStart,
-  appDockerStop,
-  appDockerTop,
-  appDockerUnpause,
-  createFluxAppDockerNetwork,
-  createFluxDockerNetwork,
-  dockerContainerChanges,
-  dockerContainerExec,
-  dockerContainerInspect,
-  dockerContainerLogs,
-  dockerContainerLogsStream,
-  dockerContainerStats,
-  dockerContainerStatsStream,
+  getDockerContainer,
+  getAppIdentifier,
+  getAppDockerNameIdentifier,
   dockerCreateNetwork,
-  dockerGetEvents,
-  dockerGetUsage,
-  dockerInfo,
+  dockerRemoveNetwork,
+  dockerNetworkInspect,
   dockerListContainers,
   dockerListImages,
-  dockerLogsFix,
-  dockerNetworkInspect,
+  dockerContainerInspect,
+  dockerContainerStats,
+  dockerContainerStatsStream,
+  dockerContainerChanges,
   dockerPullStream,
-  dockerRemoveNetwork,
-  dockerVersion,
-  getAppDockerNameIdentifier,
-  getAppIdentifier,
-  getDockerContainer,
-  getDockerContainerByIdOrName,
+  dockerContainerExec,
+  dockerContainerLogsStream,
+  dockerContainerLogs,
+  appDockerCreate,
+  appDockerStart,
+  appDockerStop,
+  appDockerRestart,
+  appDockerKill,
+  appDockerRemove,
+  appDockerImageRemove,
+  appDockerPause,
+  appDockerUnpause,
+  appDockerTop,
+  createFluxDockerNetwork,
   getDockerContainerOnly,
+  getDockerContainerByIdOrName,
   getFluxDockerNetworkPhysicalInterfaceNames,
   getFluxDockerNetworkSubnets,
-  pruneContainers,
-  pruneImages,
+  createFluxAppDockerNetwork,
+  removeFluxAppDockerNetwork,
   pruneNetworks,
   pruneVolumes,
-  removeFluxAppDockerNetwork,
+  pruneImages,
+  pruneContainers,
+  dockerInfo,
+  dockerVersion,
+  dockerGetEvents,
+  dockerGetUsage,
+  dockerLogsFix,
 };
