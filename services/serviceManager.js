@@ -16,7 +16,6 @@ const syncthingService = require('./syncthingService');
 const pgpService = require('./pgpService');
 const dockerService = require('./dockerService');
 const backupRestoreService = require('./backupRestoreService');
-const systemService = require('./systemService');
 
 const apiPort = userconfig.initial.apiport || config.server.apiport;
 const development = userconfig.initial.development || false;
@@ -39,8 +38,7 @@ async function startFluxFunctions() {
     }
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
-    systemService.monitorSystem();
-    log.info('System service initiated');
+    fluxNetworkHelper.installNetcat();
     log.info('Initiating MongoDB connection');
     await dbHelper.initiateDB(); // either true or throws error
     log.info('DB connected');
@@ -93,7 +91,6 @@ async function startFluxFunctions() {
     log.info('Syncthing service started');
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
-
     setTimeout(() => {
       fluxCommunicationUtils.constantlyUpdateDeterministicFluxList(); // updates deterministic flux list for communication every 2 minutes, so we always trigger cache and have up to date value
     }, 15 * 1000);
