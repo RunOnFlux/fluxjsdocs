@@ -1828,7 +1828,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
 
   await getNodeSpecs();
   const totalSpaceOnNode = nodeSpecs.ssdStorage;
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode * 0.95 - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
   const resourcesLocked = await appsResources();
   if (resourcesLocked.status !== 'success') {
     throw new Error('Unable to obtain locked system resources by Flux App. Aborting.');
@@ -1846,10 +1846,10 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     usedSpace += serviceHelper.ensureNumber(volume.used);
     availableSpace += serviceHelper.ensureNumber(volume.available);
   });
-  // space that is further reserved for flux os and that will be later substracted from available space. Max 40 + 20.
+  // space that is further reserved for flux os and that will be later substracted from available space. Max 60 + 20.
   const fluxSystemReserve = config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace > 0 ? config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace : 0;
   const minSystemReserve = Math.max(config.lockedSystemResources.extrahdd, fluxSystemReserve);
-  const totalAvailableSpaceLeft = availableSpace - minSystemReserve;
+  const totalAvailableSpaceLeft = availableSpace * 0.95 - minSystemReserve;
   if (appSpecifications.hdd >= totalAvailableSpaceLeft) {
     // sadly user free space is not enough for this application
     throw new Error('Insufficient space on Flux Node. Space is already assigned to system files');
@@ -3015,7 +3015,7 @@ async function checkAppHWRequirements(appSpecs) {
   if (totalSpaceOnNode === 0) {
     throw new Error('Insufficient space on Flux Node to spawn an application');
   }
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode * 0.95 - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
   const hddLockedByApps = resourcesLocked.data.appsHddLocked;
   const availableSpaceForApps = useableSpaceOnNode - hddLockedByApps;
   // bigger or equal so we have the 1 gb free...
@@ -5526,8 +5526,12 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   }
 
   if (appSpecifications.version >= 6) {
-    if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
+    if (height < config.fluxapps.newMinBlocksAllowanceBlock) {
+      if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
+        throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
+      }
+    } else if (appSpecifications.expire < config.fluxapps.newMinBlocksAllowance) {
+      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 3 hours`);
     }
     if (appSpecifications.expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -7221,9 +7225,6 @@ function specificationFormatter(appSpecification) {
     }
     if (Number.isInteger(expire) !== true) {
       throw new Error('Invalid instances specified');
-    }
-    if (expire < config.fluxapps.minBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
     }
     if (expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -10817,6 +10818,7 @@ async function syncthingApps() {
               paused: false,
               type: 'sendreceive',
               rescanIntervalS: 900,
+              maxConflicts: 0,
             };
             const syncFolder = allFoldersResp.data.find((x) => x.id === id);
             if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
@@ -10927,7 +10929,7 @@ async function syncthingApps() {
             foldersConfiguration.push(syncthingFolder);
             if (!syncFolder) {
               newFoldersConfiguration.push(syncthingFolder);
-            } else if (syncFolder && (syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
+            } else if (syncFolder && (syncFolder.maxConflicts !== 0 || syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
               newFoldersConfiguration.push(syncthingFolder);
             }
           }
@@ -11011,6 +11013,7 @@ async function syncthingApps() {
                 paused: false,
                 type: 'sendreceive',
                 rescanIntervalS: 900,
+                maxConflicts: 0,
               };
               const syncFolder = allFoldersResp.data.find((x) => x.id === id);
               if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
@@ -11124,7 +11127,7 @@ async function syncthingApps() {
               foldersConfiguration.push(syncthingFolder);
               if (!syncFolder) {
                 newFoldersConfiguration.push(syncthingFolder);
-              } else if (syncFolder && (syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
+              } else if (syncFolder && (syncFolder.maxConflicts !== 0 || syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
                 newFoldersConfiguration.push(syncthingFolder);
               }
             }
@@ -12350,7 +12353,7 @@ async function appendRestoreTask(req, res) {
             await sendChunk(res, `Downloading ${restoreItem.url}...\n`);
             // eslint-disable-next-line no-await-in-loop
             const downloadStatus = await IOUtils.downloadFileFromUrl(restoreItem.url, `${componentPath[0].mount}/backup/remote`, restoreItem.component, true);
-            if (downloadStatus !== true) {
+            if (downloadStatus === 'false') {
               throw new Error(`Error: Failed to download ${restoreItem.url}...`);
             }
           }
