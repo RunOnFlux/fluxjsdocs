@@ -2089,8 +2089,7 @@ function isRunning() {
 /**
  * Check if Synchtng is installed and if not install it
  */
-let syncthingExecutable = false;
-// eslint-disable-next-line no-unused-vars
+let syncthingInstalled = false;
 async function installSyncthing() { // can throw
   // check if syncthing is installed or not
   log.info('Checking if Syncthing is installed...');
@@ -2109,7 +2108,7 @@ async function installSyncthing() { // can throw
     const exec = `cd ${nodedpath} && bash installSyncthing.sh`;
     await cmdAsync(exec);
   }
-  syncthingExecutable = true;
+  syncthingInstalled = true;
   log.info('Syncthing installed');
 }
 
@@ -2198,20 +2197,12 @@ let run = 0;
 async function startSyncthing() {
   try {
     run += 1;
-
-    while (!syncthingExecutable) {
-      // eslint-disable-next-line no-await-in-loop
-      const { error } = await serviceHelper.runCommand('syncthing', { logError: false, params: ['--version'] });
-      if (!error) {
-        syncthingExecutable = true;
-        startSyncthing();
-        return;
-      }
-      log.warn('Unable to find syncthing excutable... trying again in 15s.');
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(15 * 1000);
+    if (!syncthingInstalled) {
+      await installSyncthing();
+      await serviceHelper.delay(10 * 1000);
+      startSyncthing();
+      return;
     }
-
     // check wether syncthing is running or not
     const myDevice = await getDeviceID();
     if (myDevice.status === 'error') {
