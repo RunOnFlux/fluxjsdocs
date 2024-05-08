@@ -1,4 +1,5 @@
 const config = require('config');
+const { LRUCache } = require('lru-cache');
 
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
@@ -26,6 +27,12 @@ let operationBlocked = false;
 let initBPfromNoBlockTimeout;
 let initBPfromErrorTimeout;
 
+// cache for nodes
+const LRUoptions = {
+  max: 20000, // store 20k of nodes value forever, no ttl
+};
+
+const nodeCollateralCache = new LRUCache(LRUoptions);
 // updateFluxAppsPeriod can be between every 4 to 9 blocks
 const updateFluxAppsPeriod = Math.floor(Math.random() * 6 + 4);
 
@@ -49,6 +56,44 @@ async function getSenderTransactionFromDaemon(txid) {
     return sender;
   }
   throw txContent.data;
+}
+
+/**
+ * To return sender for a transaction.
+ * @param {string} txid Transaction ID.
+ * @param {number} vout Transaction output number (vector of outputs).
+ * @returns {object} Document.
+ */
+async function getSenderForFluxTxInsight(txid, vout) {
+  const nodeCacheExists = nodeCollateralCache.get(`${txid}-${vout}`);
+  if (nodeCacheExists) {
+    return nodeCacheExists;
+  }
+
+  // ask blockchain for the transaction
+  const verbose = 1;
+  const req = {
+    params: {
+      txid,
+      verbose,
+    },
+  };
+  const transaction = await daemonServiceTransactionRpcs.getRawTransaction(req);
+  if (transaction.status === 'success' && transaction.data.vout && transaction.data.vout[0]) {
+    const transactionOutput = transaction.data.vout.find((txVout) => +txVout.n === +vout);
+    if (transactionOutput) {
+      const adjustedTxContent = {
+        txid,
+        address: transactionOutput.scriptPubKey.addresses[0],
+        satoshis: transactionOutput.valueSat,
+      };
+      nodeCollateralCache.set(`${txid}-${vout}`, adjustedTxContent);
+      return adjustedTxContent;
+    }
+  }
+
+  nodeCollateralCache.set(`${txid}-${vout}`, null);
+  return null;
 }
 
 /**
@@ -1436,6 +1481,7 @@ module.exports = {
 
   // exports for testing puproses
   getSenderTransactionFromDaemon,
+  getSenderForFluxTxInsight,
   getSender,
   processBlockTransactions,
   getVerboseBlock,

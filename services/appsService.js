@@ -2601,16 +2601,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
     monitoredName = `${appSpecifications.name}_${appName}`;
   }
   stopAppMonitoring(monitoredName, false);
-  await dockerService.appDockerStop(appId).catch((error) => {
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    if (res) {
-      res.write(serviceHelper.ensureString(errorResponse));
-    }
-  });
+  await dockerService.appDockerStop(appId);
 
   const stopStatus2 = {
     status: isComponent ? `Flux App Component ${appSpecifications.name} stopped` : `Flux App ${appName} stopped`,
@@ -9543,7 +9534,6 @@ async function softRedeploy(appSpecs, res) {
       }
       return;
     }
-    log.info('Starting softRedeploy');
     try {
       await softRemoveAppLocally(appSpecs.name, res);
     } catch (error) {
@@ -9563,7 +9553,6 @@ async function softRedeploy(appSpecs, res) {
     await softRegisterAppLocally(appSpecs, undefined, res);
     log.info('Application softly redeployed');
   } catch (error) {
-    log.info('Error on softRedeploy');
     log.error(error);
     removeAppLocally(appSpecs.name, res, true, true, true);
   }
