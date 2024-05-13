@@ -16,9 +16,15 @@ const syncthingService = require('./syncthingService');
 const pgpService = require('./pgpService');
 const dockerService = require('./dockerService');
 const backupRestoreService = require('./backupRestoreService');
+const systemService = require('./systemService');
 
 const apiPort = userconfig.initial.apiport || config.server.apiport;
 const development = userconfig.initial.development || false;
+const fluxTransactionCollection = config.database.daemon.collections.fluxTransactions;
+
+function setSyncthingApiKey(apiKey) {
+  syncthingService.setApiKey(apiKey);
+}
 
 /**
  * To start FluxOS. A series of checks are performed on port and UPnP (Universal Plug and Play) support and mapping. Database connections are established. The other relevant functions required to start FluxOS services are called.
@@ -38,7 +44,8 @@ async function startFluxFunctions() {
     }
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
-    fluxNetworkHelper.installNetcat();
+    systemService.monitorSystem();
+    log.info('System service initiated');
     log.info('Initiating MongoDB connection');
     await dbHelper.initiateDB(); // either true or throws error
     log.info('DB connected');
@@ -76,7 +83,9 @@ async function startFluxFunctions() {
     log.info('Flux Apps locations prepared');
     fluxNetworkHelper.adjustFirewall();
     log.info('Firewalls checked');
-    fluxNetworkHelper.allowNodeToBindPrivilegedPorts();
+    // removed this as we are running as root. (just temporary)
+    // a better, more controllable option is to use authbind (apt-get install authbind) and do it via uid.
+    // fluxNetworkHelper.allowNodeToBindPrivilegedPorts();
     log.info('Node allowed to bind privileged ports');
     fluxCommunication.keepConnectionsAlive();
     log.info('Connections polling prepared');
@@ -91,6 +100,14 @@ async function startFluxFunctions() {
     log.info('Syncthing service started');
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
+    const explorerDatabase = db.db(config.database.daemon.database);
+    await dbHelper.dropCollection(explorerDatabase, fluxTransactionCollection).catch((error) => {
+      if (error.message !== 'ns not found') {
+        log.error(error);
+      }
+    });
+    log.info('Mongodb zelnodetransactions dropped');
+
     setTimeout(() => {
       fluxCommunicationUtils.constantlyUpdateDeterministicFluxList(); // updates deterministic flux list for communication every 2 minutes, so we always trigger cache and have up to date value
     }, 15 * 1000);
@@ -180,4 +197,5 @@ async function startFluxFunctions() {
 
 module.exports = {
   startFluxFunctions,
+  setSyncthingApiKey,
 };
