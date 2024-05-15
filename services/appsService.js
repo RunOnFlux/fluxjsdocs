@@ -2551,9 +2551,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         res.write(serviceHelper.ensureString(databaseStatus2));
       }
     }
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was successfuly removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was successfuly removed`);
     log.info(appRemovalResponseDone);
 
     if (res) {
@@ -2789,10 +2787,7 @@ async function softRemoveAppLocally(app, res) {
     if (res) {
       res.write(serviceHelper.ensureString(databaseStatus2));
     }
-
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was partially removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
     log.info(appRemovalResponseDone);
     if (res) {
       res.write(serviceHelper.ensureString(appRemovalResponseDone));
