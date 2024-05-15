@@ -1828,7 +1828,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
 
   await getNodeSpecs();
   const totalSpaceOnNode = nodeSpecs.ssdStorage;
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode * 0.95 - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
   const resourcesLocked = await appsResources();
   if (resourcesLocked.status !== 'success') {
     throw new Error('Unable to obtain locked system resources by Flux App. Aborting.');
@@ -1846,7 +1846,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     usedSpace += serviceHelper.ensureNumber(volume.used);
     availableSpace += serviceHelper.ensureNumber(volume.available);
   });
-  // space that is further reserved for flux os and that will be later substracted from available space. Max 40 + 20.
+  // space that is further reserved for flux os and that will be later substracted from available space. Max 60 + 20.
   const fluxSystemReserve = config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace > 0 ? config.lockedSystemResources.hdd + config.lockedSystemResources.extrahdd - usedSpace : 0;
   const minSystemReserve = Math.max(config.lockedSystemResources.extrahdd, fluxSystemReserve);
   const totalAvailableSpaceLeft = availableSpace - minSystemReserve;
@@ -2551,9 +2551,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         res.write(serviceHelper.ensureString(databaseStatus2));
       }
     }
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was successfuly removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was successfuly removed`);
     log.info(appRemovalResponseDone);
 
     if (res) {
@@ -2601,7 +2599,16 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
     monitoredName = `${appSpecifications.name}_${appName}`;
   }
   stopAppMonitoring(monitoredName, false);
-  await dockerService.appDockerStop(appId);
+  await dockerService.appDockerStop(appId).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    if (res) {
+      res.write(serviceHelper.ensureString(errorResponse));
+    }
+  });
 
   const stopStatus2 = {
     status: isComponent ? `Flux App Component ${appSpecifications.name} stopped` : `Flux App ${appName} stopped`,
@@ -2780,10 +2787,7 @@ async function softRemoveAppLocally(app, res) {
     if (res) {
       res.write(serviceHelper.ensureString(databaseStatus2));
     }
-
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was partially removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
     log.info(appRemovalResponseDone);
     if (res) {
       res.write(serviceHelper.ensureString(appRemovalResponseDone));
@@ -3015,7 +3019,7 @@ async function checkAppHWRequirements(appSpecs) {
   if (totalSpaceOnNode === 0) {
     throw new Error('Insufficient space on Flux Node to spawn an application');
   }
-  const useableSpaceOnNode = totalSpaceOnNode - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
+  const useableSpaceOnNode = totalSpaceOnNode * 0.95 - config.lockedSystemResources.hdd - config.lockedSystemResources.extrahdd;
   const hddLockedByApps = resourcesLocked.data.appsHddLocked;
   const availableSpaceForApps = useableSpaceOnNode - hddLockedByApps;
   // bigger or equal so we have the 1 gb free...
@@ -5526,8 +5530,12 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   }
 
   if (appSpecifications.version >= 6) {
-    if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
+    if (height < config.fluxapps.newMinBlocksAllowanceBlock) {
+      if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
+        throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
+      }
+    } else if (appSpecifications.expire < config.fluxapps.newMinBlocksAllowance) {
+      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 3 hours`);
     }
     if (appSpecifications.expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -6761,6 +6769,26 @@ async function requestAppMessage(hash) {
 }
 
 /**
+ * To request app message.
+ * @param {string} apps list of apps, apps[i].hash have the message hash of each app.
+ * @param {boolean} incoming If true the message will be asked to a incoming peer, if false to an outgoing peer.
+ */
+async function requestAppsMessage(apps, incoming) {
+  // some message type request app message, message hash
+  // peer responds with data from permanent database or temporary database. If does not have it requests further
+  const message = {
+    type: 'fluxapprequest',
+    version: 2,
+    hahes: apps.map((a) => a.hash),
+  };
+  if (incoming) {
+    await fluxCommunicationMessagesSender.broadcastMessageToRandomIncoming(message);
+  } else {
+    await fluxCommunicationMessagesSender.broadcastMessageToRandomOutgoing(message);
+  }
+}
+
+/**
  * To manually request app message over api
  * @param {req} req api request
  * @param {res} res api response
@@ -7221,9 +7249,6 @@ function specificationFormatter(appSpecification) {
     }
     if (Number.isInteger(expire) !== true) {
       throw new Error('Invalid instances specified');
-    }
-    if (expire < config.fluxapps.minBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
     }
     if (expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
@@ -7851,7 +7876,7 @@ async function appHashHasMessageNotFound(hash) {
  * @param {number} height Block height.
  * @param {number} valueSat Satoshi denomination (100 millionth of 1 Flux).
  * @param {number} i Defaults to value of 0.
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
+ * @returns {boolean} Return true if app message is already present otherwise nothing is returned.
  */
 async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
   try {
@@ -8011,6 +8036,38 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
     } else {
       // update apphashes that we already have it stored
       await appHashHasMessage(hash);
+      // eslint-disable-next-line consistent-return
+      return true;
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
+ * To check and request an app. Handles fluxappregister type and fluxappupdate type.
+ * Verification of specification was already done except the price which is done here
+ * @param {object} apps array list with list of apps that are missing.
+ * @param {boolean} incoming If true the message will be asked to a incoming peer, if false to an outgoing peer.
+ * @param {number} i Defaults to value of 1.
+ * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
+ */
+async function checkAndRequestMultipleApps(apps, incoming = false, i = 1) {
+  try {
+    await requestAppsMessage(apps, incoming);
+    await serviceHelper.delay(30 * 1000);
+    const appsToRemove = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for (const app of apps) {
+      // eslint-disable-next-line no-await-in-loop
+      const messageReceived = await checkAndRequestApp(app.hash, app.txid, app.height, app.valueSat, 2);
+      if (messageReceived) {
+        appsToRemove.push(app);
+      }
+    }
+    apps.filter((item) => !appsToRemove.includes(item));
+    if (apps.length > 0 && i < 5) {
+      await checkAndRequestMultipleApps(apps, i % 2 === 0, i + 1);
     }
   } catch (error) {
     log.error(error);
@@ -8346,9 +8403,12 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
+    let appsMessagesMissing = [];
     // eslint-disable-next-line no-restricted-syntax
     for (const result of results) {
       if (!result.messageNotFound || force || firstContinuousFluxAppHashesCheckRun) { // most likely wrong data, if no message found. This attribute is cleaned every reconstructAppMessagesHashPeriod blocks so all nodes search again for missing messages
@@ -8374,15 +8434,34 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          checkAndRequestApp(result.hash, result.txid, result.height, result.value);
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
+          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
+            const appMessageInformation = {
+              hash: result.hash,
+              txid: result.txid,
+              height: result.height,
+              value: result.value,
+            };
+            appsMessagesMissing.push(appMessageInformation);
+            if (appsMessagesMissing.length === 500) {
+              checkAndRequestMultipleApps(appsMessagesMissing);
+              // eslint-disable-next-line no-await-in-loop
+              await serviceHelper.delay(60 + (Math.random() * 14) * 1000); // delay 60 and 75 seconds
+              appsMessagesMissing = [];
+            }
+          } else {
+            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+            // eslint-disable-next-line no-await-in-loop
+            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
+          }
         } else {
           // eslint-disable-next-line no-await-in-loop
           await appHashHasMessageNotFound(result.hash); // mark message as not found
           hashesNumberOfSearchs.delete(result.hash); // remove from our map
         }
       }
+    }
+    if (appsMessagesMissing.length > 0) {
+      checkAndRequestMultipleApps(appsMessagesMissing);
     }
     continuousFluxAppHashesCheckRunning = false;
     firstContinuousFluxAppHashesCheckRun = false;
@@ -9335,7 +9414,10 @@ async function expireGlobalApplications() {
       throw new Error('Scanning not initiated');
     }
     const explorerHeight = serviceHelper.ensureNumber(result.generalScannedHeight);
-    const minExpirationHeight = explorerHeight - config.fluxapps.minBlocksAllowance; // do a pre search in db as every app has to live for at least minBlocksAllowance
+    let minExpirationHeight = explorerHeight - config.fluxapps.newMinBlocksAllowance; // do a pre search in db as every app has to live for at least newMinBlocksAllowance
+    if (explorerHeight < config.fluxapps.newMinBlocksAllowanceBlock) {
+      minExpirationHeight = explorerHeight - config.fluxapps.minBlocksAllowance; // do a pre search in db as every app has to live for at least minBlocksAllowance
+    }
     // get global applications specification that have up to date data
     // find applications that have specifications height lower than minExpirationHeight
     const databaseApps = dbopen.db(config.database.appsglobal.database);
@@ -9533,6 +9615,7 @@ async function softRedeploy(appSpecs, res) {
       }
       return;
     }
+    log.info('Starting softRedeploy');
     try {
       await softRemoveAppLocally(appSpecs.name, res);
     } catch (error) {
@@ -9552,6 +9635,7 @@ async function softRedeploy(appSpecs, res) {
     await softRegisterAppLocally(appSpecs, undefined, res);
     log.info('Application softly redeployed');
   } catch (error) {
+    log.info('Error on softRedeploy');
     log.error(error);
     removeAppLocally(appSpecs.name, res, true, true, true);
   }
@@ -10334,6 +10418,9 @@ async function deploymentInformation(req, res) {
     if (daemonHeight >= config.fluxapps.appSpecsEnforcementHeights[6]) {
       deployAddr = config.fluxapps.addressMultisig;
     }
+    if (daemonHeight >= config.fluxapps.multisigAddressChange) {
+      deployAddr = config.fluxapps.addressMultisigB;
+    }
     // search in chainparams db for chainmessages of p version
     const appPrices = await getChainParamsPriceUpdates();
     const minPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
@@ -10817,6 +10904,7 @@ async function syncthingApps() {
               paused: false,
               type: 'sendreceive',
               rescanIntervalS: 900,
+              maxConflicts: 0,
             };
             const syncFolder = allFoldersResp.data.find((x) => x.id === id);
             if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
@@ -10927,7 +11015,7 @@ async function syncthingApps() {
             foldersConfiguration.push(syncthingFolder);
             if (!syncFolder) {
               newFoldersConfiguration.push(syncthingFolder);
-            } else if (syncFolder && (syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
+            } else if (syncFolder && (syncFolder.maxConflicts !== 0 || syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
               newFoldersConfiguration.push(syncthingFolder);
             }
           }
@@ -11011,6 +11099,7 @@ async function syncthingApps() {
                 paused: false,
                 type: 'sendreceive',
                 rescanIntervalS: 900,
+                maxConflicts: 0,
               };
               const syncFolder = allFoldersResp.data.find((x) => x.id === id);
               if (containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
@@ -11124,7 +11213,7 @@ async function syncthingApps() {
               foldersConfiguration.push(syncthingFolder);
               if (!syncFolder) {
                 newFoldersConfiguration.push(syncthingFolder);
-              } else if (syncFolder && (syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
+              } else if (syncFolder && (syncFolder.maxConflicts !== 0 || syncFolder.paused || syncFolder.type !== syncthingFolder.type || JSON.stringify(syncFolder.devices) !== JSON.stringify(syncthingFolder.devices))) {
                 newFoldersConfiguration.push(syncthingFolder);
               }
             }
@@ -12350,7 +12439,7 @@ async function appendRestoreTask(req, res) {
             await sendChunk(res, `Downloading ${restoreItem.url}...\n`);
             // eslint-disable-next-line no-await-in-loop
             const downloadStatus = await IOUtils.downloadFileFromUrl(restoreItem.url, `${componentPath[0].mount}/backup/remote`, restoreItem.component, true);
-            if (downloadStatus !== true) {
+            if (downloadStatus === 'false') {
               throw new Error(`Error: Failed to download ${restoreItem.url}...`);
             }
           }
