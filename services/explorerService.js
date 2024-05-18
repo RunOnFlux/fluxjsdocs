@@ -235,11 +235,6 @@ async function processSoftFork(txid, height, message) {
   // let it throw to stop block processing
   const splittedMess = message.split('_');
   const version = splittedMess[0];
-  if (!version || splittedMess.length < 2) {
-    log.info('Ignoring non valid Soft Fork message.');
-    log.info(`${txid}_${height}_${message}`);
-    return;
-  }
   const data = {
     txid,
     height,
@@ -306,9 +301,6 @@ async function processInsight(blockDataVerbose, database) {
         const priceSpecifications = intervals[intervals.length - 1]; // filter does not change order
         // MAY contain App transaction. Store it.
         if (isFluxAppMessageValue >= (priceSpecifications.minPrice * 1e8) && message.length === 64 && blockDataVerbose.height >= config.fluxapps.epochstart) { // min of X flux had to be paid for us bothering checking
-          const appTxRecord = {
-            txid: tx.txid, height: blockDataVerbose.height, hash: message, value: isFluxAppMessageValue, message: false, // message is boolean saying if we already have it stored as permanent message
-          };
           // Unique hash - If we already have a hash of this app in our database, do not insert it!
           try {
             // 5501c7dd6516c3fc2e68dee8d4fdd20d92f57f8cfcdc7b4fcbad46499e43ed6f
@@ -328,7 +320,7 @@ async function processInsight(blockDataVerbose, database) {
             // eslint-disable-next-line no-await-in-loop
             const result = await dbHelper.findOneInDatabase(database, appsHashesCollection, querySearch, projectionSearch); // this search can be later removed if nodes rescan apps and reconstruct the index for unique
             if (!result) {
-              appsTransactions.push(appTxRecord);
+              appsService.checkAndRequestApp(message, tx.txid, blockDataVerbose.height, isFluxAppMessageValue);
             } else {
               throw new Error(`Found an existing hash app ${serviceHelper.ensureString(result)}`);
             }
@@ -339,26 +331,18 @@ async function processInsight(blockDataVerbose, database) {
         }
       }
       // check for softForks
-      const isSoftFork = isSenderFoundation && isReceiverFounation && message;
+      const isSoftFork = isSenderFoundation && isReceiverFounation;
       if (isSoftFork) {
         // eslint-disable-next-line no-await-in-loop
         await processSoftFork(tx.txid, blockDataVerbose.height, message);
       }
     }
   }
+  const options = {
+    ordered: false, // If false, continue with remaining inserts when one fails.
+  };
   if (appsTransactions.length > 0) {
-    const options = {
-      ordered: false, // If false, continue with remaining inserts when one fails.
-    };
     await dbHelper.insertManyToDatabase(database, appsHashesCollection, appsTransactions, options);
-    while (appsTransactions.length > 500) {
-      appsService.checkAndRequestMultipleApps(appsTransactions.splice(0, 500));
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(60 + (Math.random() * 14) * 1000); // delay 60 and 75 seconds
-    }
-    if (appsTransactions.length > 0) {
-      appsService.checkAndRequestMultipleApps(appsTransactions);
-    }
   }
 }
 
@@ -370,7 +354,6 @@ async function processInsight(blockDataVerbose, database) {
 async function processStandard(blockDataVerbose, database) {
   // get Block transactions information
   const transactions = await processBlockTransactions(blockDataVerbose.tx, blockDataVerbose.height);
-  const appsTransactions = [];
   // now we have verbose transactions of the block extended for senders - object of
   // utxoDetail = { txid, vout, height, address, satoshis, scriptPubKey )
   // and can create addressTransactionIndex.
@@ -446,7 +429,8 @@ async function processStandard(blockDataVerbose, database) {
             };
             const result = await dbHelper.findOneInDatabase(database, appsHashesCollection, querySearch, projectionSearch); // this search can be later removed if nodes rescan apps and reconstruct the index for unique
             if (!result) {
-              appsTransactions.push(appTxRecord);
+              await dbHelper.insertOneToDatabase(database, appsHashesCollection, appTxRecord);
+              appsService.checkAndRequestApp(message, tx.txid, blockDataVerbose.height, isFluxAppMessageValue);
             } else {
               throw new Error(`Found an existing hash app ${serviceHelper.ensureString(result)}`);
             }
@@ -457,26 +441,12 @@ async function processStandard(blockDataVerbose, database) {
         }
       }
       // check for softForks
-      const isSoftFork = isSenderFoundation && isReceiverFounation && message;
+      const isSoftFork = isSenderFoundation && isReceiverFounation;
       if (isSoftFork) {
         await processSoftFork(tx.txid, blockDataVerbose.height, message);
       }
     }
   }));
-  if (appsTransactions.length > 0) {
-    const options = {
-      ordered: false, // If false, continue with remaining inserts when one fails.
-    };
-    await dbHelper.insertManyToDatabase(database, appsHashesCollection, appsTransactions, options);
-    while (appsTransactions.length > 500) {
-      appsService.checkAndRequestMultipleApps(appsTransactions.splice(0, 500));
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(60 + (Math.random() * 14) * 1000); // delay 60 and 75 seconds
-    }
-    if (appsTransactions.length > 0) {
-      appsService.checkAndRequestMultipleApps(appsTransactions);
-    }
-  }
 }
 
 /**
@@ -770,20 +740,20 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
         });
         log.info(resultE, resultF, resultG);
       }
-      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
+      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash' }); // , unique: true
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ txid: 1 }, { name: 'query for getting zelapp message based on txid' });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ height: 1 }, { name: 'query for getting zelapp message based on height' });
-      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'zelAppSpecifications.name': 1 }, { name: 'query for getting zelapp message based on zelapp specs name' });
+      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'zelAppSpecifications.name': 1 }, { name: 'query for getting zelapp message based on zelapp specs name' }); // , unique: true
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'zelAppSpecifications.owner': 1 }, { name: 'query for getting zelapp message based on zelapp specs owner' });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'zelAppSpecifications.repotag': 1 }, { name: 'query for getting zelapp message based on image' });
-      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.name': 1 }, { name: 'query for getting app message based on zelapp specs name' });
+      await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.name': 1 }, { name: 'query for getting app message based on zelapp specs name' }); // , unique: true
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.owner': 1 }, { name: 'query for getting app message based on zelapp specs owner' });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.repotag': 1 }, { name: 'query for getting app message based on image' });
-      await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ name: 1 }, { name: 'query for getting zelapp based on zelapp specs name' });
+      await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ name: 1 }, { name: 'query for getting zelapp based on zelapp specs name' }); // , unique: true
       await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ owner: 1 }, { name: 'query for getting zelapp based on zelapp specs owner' });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ repotag: 1 }, { name: 'query for getting zelapp based on image' });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ height: 1 }, { name: 'query for getting zelapp based on last height update' }); // we need to know the height of app adjustment
-      await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ hash: 1 }, { name: 'query for getting zelapp based on last hash' }); // todo evaluate unique: true // we need to know the hash of the last message update which is the true identifier
+      await databaseGlobal.collection(config.database.appsglobal.collections.appsInformation).createIndex({ hash: 1 }, { name: 'query for getting zelapp based on last hash' }); // , unique: true // we need to know the hash of the last message update which is the true identifier
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ name: 1 }, { name: 'query for getting zelapp location based on zelapp specs name' });
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ hash: 1 }, { name: 'query for getting zelapp location based on zelapp hash' });
       await database.collection(config.database.appsglobal.collections.appsLocations).createIndex({ ip: 1 }, { name: 'query for getting zelapp location based on ip' });
@@ -858,8 +828,8 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
 
       if (isInsightExplorer) {
         // if node is insight explorer based, we are only processing flux app messages
-        if (scannedBlockHeight < config.epochstart - 1) {
-          scannedBlockHeight = config.epochstart - 1;
+        if (scannedBlockHeight < config.deterministicNodesStart - 1) {
+          scannedBlockHeight = config.deterministicNodesStart - 1;
         }
       }
       processBlock(scannedBlockHeight + 1, isInsightExplorer);
@@ -1313,53 +1283,6 @@ async function reindexExplorer(req, res) {
   }
 }
 
-async function fixExplorer(height = 1637000, rescanApps = true) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-    const blockheight = serviceHelper.ensureNumber(height);
-    const database = dbopen.db(config.database.daemon.database);
-    const query = { generalScannedHeight: { $gte: 0 } };
-    const projection = {
-      projection: {
-        _id: 0,
-        generalScannedHeight: 1,
-      },
-    };
-    const currentHeight = await dbHelper.findOneInDatabase(database, scannedHeightCollection, query, projection);
-    if (!currentHeight) {
-      throw new Error('No scanned height found');
-    }
-    if (currentHeight.generalScannedHeight <= blockheight) {
-      throw new Error('Block height shall be lower than currently scanned');
-    }
-    if (blockheight < 0) {
-      throw new Error('BlockHeight lower than 0');
-    }
-    const rescanapps = serviceHelper.ensureBoolean(rescanApps);
-    if (blockheight === 0) {
-      await dbHelper.dropCollection(database, scannedHeightCollection).catch((error) => {
-        if (error.message !== 'ns not found') {
-          log.error(error);
-        }
-      });
-    } else {
-      // stop block processing
-      const update = { $set: { generalScannedHeight: blockheight } };
-      const options = {
-        upsert: true,
-      };
-      // update scanned Height in scannedBlockHeightCollection
-      await dbHelper.updateOneInDatabase(database, scannedHeightCollection, query, update, options);
-    }
-    initiateBlockProcessor(true, false, rescanapps); // restore database and possibly do rescan of apps
-    const message = messageHelper.createSuccessMessage(`Explorer rescan from blockheight ${blockheight} initiated`);
-    log.info(message);
-  } catch (error) {
-    log.warn(error);
-    initiateBlockProcessor(true, true);
-  }
-}
-
 /**
  * To rescan Flux explorer database from a specific block height. Only accessible by admins and Flux team members.
  * @param {object} req Request.
@@ -1527,7 +1450,4 @@ module.exports = {
   setBlockProccessingCanContinue,
   setIsInInitiationOfBP,
   restoreDatabaseToBlockheightState,
-
-  // temporary function
-  fixExplorer,
 };
