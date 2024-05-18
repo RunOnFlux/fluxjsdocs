@@ -19,8 +19,6 @@ const log = require('../lib/log');
 
 const syncthingURL = `http://${config.syncthing.ip}:${config.syncthing.port}`;
 
-const goodSyncthingChars = /^[a-zA-Z0-9-_]+$/;
-
 let syncthingApiKey = '';
 
 const parserOptions = {
@@ -30,14 +28,12 @@ const parserOptions = {
 };
 const parser = new XMLParser(parserOptions);
 
+const goodSyncthingChars = /^[a-zA-Z0-9-_]+$/;
+
 /**
  * If the syncthing binary is present
  */
 let syncthingExecutable = false;
-
-function setApiKey(apiKey) {
-  syncthingApiKey = apiKey;
-}
 
 /**
  * To get syncthing config xml file
@@ -2197,12 +2193,6 @@ async function startSyncthing() {
       await serviceHelper.delay(15 * 1000);
     }
 
-    while (!syncthingApiKey) {
-      log.info('Waiting for syncthing apikey, sleeping 15s.');
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(15 * 1000);
-    }
-
     // check wether syncthing is running or not
     const myDevice = await getDeviceID();
     if (myDevice.status === 'error') {
@@ -2291,7 +2281,6 @@ module.exports = {
   postSystemUpgrade,
   systemVersion,
   systemPing,
-  setApiKey,
   // CONFIG
   getConfig,
   postConfig,

@@ -15,9 +15,6 @@ const generalService = require('./generalService');
 const log = require('../lib/log');
 const IOUtils = require('./IOUtils');
 
-const dirpath = path.join(__dirname, '../../../');
-const appsFolder = process.env.FLUX_APPS_FOLDER || path.join(dirpath, 'ZelApps');
-
 /**
  * Delete a specific FluxShare file.
  * @param {string} file Name of file to be deleted.
@@ -91,7 +88,8 @@ function getAllFiles(dirPath, arrayOfFiles) {
  * @returns {number} Total file size (GB).
  */
 function getFluxShareSize() {
-  const directoryPath = path.join(appsFolder, 'ZelShare');
+  const dirpath = path.join(__dirname, '../../../');
+  const directoryPath = `${dirpath}ZelApps/ZelShare`;
 
   const arrayOfFiles = getAllFiles(directoryPath);
 
@@ -302,7 +300,8 @@ async function fluxShareDownloadFolder(req, res, authorized = false) {
         return;
       }
 
-      const folderpath = path.join(appsFolder, 'ZelShare', folder);
+      const dirpath = path.join(__dirname, '../../../');
+      const folderpath = `${dirpath}ZelApps/ZelShare/${folder}`;
 
       // beautify name
       const folderNameArray = folderpath.split('/');
@@ -361,7 +360,8 @@ async function fluxShareDownloadFile(req, res) {
         return;
       }
 
-      const filepath = path.join(appsFolder, 'ZelShare', file);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${file}`;
 
       // beautify name
       const fileNameArray = file.split('/');
@@ -392,7 +392,8 @@ async function fluxShareDownloadFile(req, res) {
       }
 
       // check if file is file. If directory use zelshareDwonloadFolder
-      const filepath = path.join(appsFolder, 'ZelShare', file);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${file}`;
       const fileStats = await fs.promises.lstat(filepath);
       const isDirectory = fileStats.isDirectory();
 
@@ -451,13 +452,14 @@ async function fluxShareRename(req, res) {
       const fileURI = encodeURIComponent(oldpath);
       await fluxShareDatabaseFileDeleteMultiple(fileURI);
 
-      const oldfullpath = path.join(appsFolder, 'ZelShare', oldpath);
-      let newfullpath = path.join(appsFolder, 'ZelShare', newname);
+      const dirpath = path.join(__dirname, '../../../');
+      const oldfullpath = `${dirpath}ZelApps/ZelShare/${oldpath}`;
+      let newfullpath = `${dirpath}ZelApps/ZelShare/${newname}`;
       const fileURIArray = fileURI.split('%2F');
       fileURIArray.pop();
       if (fileURIArray.length > 0) {
         const renamingFolder = fileURIArray.join('/');
-        newfullpath = path.join(appsFolder, 'ZelShare', renamingFolder, newname);
+        newfullpath = `${dirpath}ZelApps/ZelShare/${renamingFolder}/${newname}`;
       }
       await fs.promises.rename(oldfullpath, newfullpath);
 
@@ -502,7 +504,8 @@ async function fluxShareRemoveFile(req, res) {
 
       await fluxShareDatabaseFileDelete(fileURI);
 
-      const filepath = path.join(appsFolder, 'ZelShare', file);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${file}`;
       await fs.promises.unlink(filepath);
 
       const response = messageHelper.createSuccessMessage('File Removed');
@@ -542,7 +545,8 @@ async function fluxShareRemoveFolder(req, res) {
         throw new Error('No folder specified');
       }
 
-      const filepath = path.join(appsFolder, 'ZelShare', folder);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${folder}`;
       // await fs.promises.rmdir(filepath);
       await IOUtils.removeDirectory(filepath);
       const response = messageHelper.createSuccessMessage('Folder Removed');
@@ -579,7 +583,8 @@ async function fluxShareGetFolder(req, res) {
       let { folder } = req.params;
       folder = folder || req.query.folder || '';
 
-      const filepath = path.join(appsFolder, 'ZelShare', folder);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${folder}`;
       const options = {
         withFileTypes: false,
       };
@@ -649,7 +654,8 @@ async function fluxShareCreateFolder(req, res) {
       let { folder } = req.params;
       folder = folder || req.query.folder || '';
 
-      const filepath = path.join(appsFolder, 'ZelShare', folder);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${folder}`;
 
       await fs.promises.mkdir(filepath);
 
@@ -678,7 +684,8 @@ async function fluxShareFileExists(req, res) {
       let { file } = req.params;
       file = file || req.query.file;
 
-      const filepath = path.join(appsFolder, 'ZelShare', file);
+      const dirpath = path.join(__dirname, '../../../');
+      const filepath = `${dirpath}ZelApps/ZelShare/${file}`;
       let fileExists = true;
       try {
         await fs.promises.access(filepath, fs.constants.F_OK); // check file exists and write ability
@@ -795,7 +802,8 @@ async function fluxShareUpload(req, res) {
     if (folder) {
       folder += '/';
     }
-    const uploadDir = path.join(appsFolder, 'ZelShare', folder);
+    const dirpath = path.join(__dirname, '../../../');
+    const uploadDir = `${dirpath}ZelApps/ZelShare/${folder}`;
     const options = {
       multiples: true,
       uploadDir,
