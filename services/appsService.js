@@ -2551,9 +2551,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         res.write(serviceHelper.ensureString(databaseStatus2));
       }
     }
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was successfuly removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was successfuly removed`);
     log.info(appRemovalResponseDone);
 
     if (res) {
@@ -2789,10 +2787,7 @@ async function softRemoveAppLocally(app, res) {
     if (res) {
       res.write(serviceHelper.ensureString(databaseStatus2));
     }
-
-    const appRemovalResponseDone = {
-      status: `Removal step done. Result: Flux App ${appName} was partially removed`,
-    };
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
     log.info(appRemovalResponseDone);
     if (res) {
       res.write(serviceHelper.ensureString(appRemovalResponseDone));
@@ -12370,7 +12365,7 @@ async function appendRestoreTask(req, res) {
             await sendChunk(res, `Downloading ${restoreItem.url}...\n`);
             // eslint-disable-next-line no-await-in-loop
             const downloadStatus = await IOUtils.downloadFileFromUrl(restoreItem.url, `${componentPath[0].mount}/backup/remote`, restoreItem.component, true);
-            if (downloadStatus === 'false') {
+            if (downloadStatus !== true) {
               throw new Error(`Error: Failed to download ${restoreItem.url}...`);
             }
           }
