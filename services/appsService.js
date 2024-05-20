@@ -6769,26 +6769,6 @@ async function requestAppMessage(hash) {
 }
 
 /**
- * To request app message.
- * @param {string} apps list of apps, apps[i].hash have the message hash of each app.
- * @param {boolean} incoming If true the message will be asked to a incoming peer, if false to an outgoing peer.
- */
-async function requestAppsMessage(apps, incoming) {
-  // some message type request app message, message hash
-  // peer responds with data from permanent database or temporary database. If does not have it requests further
-  const message = {
-    type: 'fluxapprequest',
-    version: 2,
-    hashes: apps.map((a) => a.hash),
-  };
-  if (incoming) {
-    await fluxCommunicationMessagesSender.broadcastMessageToRandomIncoming(message);
-  } else {
-    await fluxCommunicationMessagesSender.broadcastMessageToRandomOutgoing(message);
-  }
-}
-
-/**
  * To manually request app message over api
  * @param {req} req api request
  * @param {res} res api response
@@ -7876,7 +7856,7 @@ async function appHashHasMessageNotFound(hash) {
  * @param {number} height Block height.
  * @param {number} valueSat Satoshi denomination (100 millionth of 1 Flux).
  * @param {number} i Defaults to value of 0.
- * @returns {boolean} Return true if app message is already present otherwise nothing is returned.
+ * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
   try {
@@ -8022,10 +8002,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
             log.warn(`Apps message ${permanentAppMessage.hash} is underpaid`);
           }
         }
-        // eslint-disable-next-line consistent-return
-        return true;
-      }
-      if (i < 2) {
+      } else if (i < 2) {
         // request the message and broadcast the message further to our connected peers.
         // rerun this after 1 min delay
         // We ask to the connected nodes 2 times in 1 minute interval for the app message, if connected nodes don't
@@ -8039,38 +8016,6 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
     } else {
       // update apphashes that we already have it stored
       await appHashHasMessage(hash);
-      // eslint-disable-next-line consistent-return
-      return true;
-    }
-  } catch (error) {
-    log.error(error);
-  }
-}
-
-/**
- * To check and request an app. Handles fluxappregister type and fluxappupdate type.
- * Verification of specification was already done except the price which is done here
- * @param {object} apps array list with list of apps that are missing.
- * @param {boolean} incoming If true the message will be asked to a incoming peer, if false to an outgoing peer.
- * @param {number} i Defaults to value of 1.
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
- */
-async function checkAndRequestMultipleApps(apps, incoming = false, i = 1) {
-  try {
-    await requestAppsMessage(apps, incoming);
-    await serviceHelper.delay(30 * 1000);
-    const appsToRemove = [];
-    // eslint-disable-next-line no-restricted-syntax
-    for (const app of apps) {
-      // eslint-disable-next-line no-await-in-loop
-      const messageReceived = await checkAndRequestApp(app.hash, app.txid, app.height, app.valueSat, 2);
-      if (messageReceived) {
-        appsToRemove.push(app);
-      }
-    }
-    apps.filter((item) => !appsToRemove.includes(item));
-    if (apps.length > 0 && i < 5) {
-      await checkAndRequestMultipleApps(apps, i % 2 === 0, i + 1);
     }
   } catch (error) {
     log.error(error);
@@ -8406,12 +8351,9 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
-    let appsMessagesMissing = [];
     // eslint-disable-next-line no-restricted-syntax
     for (const result of results) {
       if (!result.messageNotFound || force || firstContinuousFluxAppHashesCheckRun) { // most likely wrong data, if no message found. This attribute is cleaned every reconstructAppMessagesHashPeriod blocks so all nodes search again for missing messages
@@ -8437,34 +8379,15 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
-            const appMessageInformation = {
-              hash: result.hash,
-              txid: result.txid,
-              height: result.height,
-              value: result.value,
-            };
-            appsMessagesMissing.push(appMessageInformation);
-            if (appsMessagesMissing.length === 500) {
-              checkAndRequestMultipleApps(appsMessagesMissing);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay(60 + (Math.random() * 14) * 1000); // delay 60 and 75 seconds
-              appsMessagesMissing = [];
-            }
-          } else {
-            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
-            // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
-          }
+          checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
         } else {
           // eslint-disable-next-line no-await-in-loop
           await appHashHasMessageNotFound(result.hash); // mark message as not found
           hashesNumberOfSearchs.delete(result.hash); // remove from our map
         }
       }
-    }
-    if (appsMessagesMissing.length > 0) {
-      checkAndRequestMultipleApps(appsMessagesMissing);
     }
     continuousFluxAppHashesCheckRunning = false;
     firstContinuousFluxAppHashesCheckRun = false;
