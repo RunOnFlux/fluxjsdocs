@@ -1,3 +1,4 @@
+/* global userconfig */
 const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const daemonServiceBlockchainRpcs = require('./daemonServiceBlockchainRpcs');
