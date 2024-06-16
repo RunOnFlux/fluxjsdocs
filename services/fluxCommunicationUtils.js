@@ -135,36 +135,24 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
   if (!node) {
     // node that broadcasted the message has to be on list
     // pubkey of the broadcast has to be on the list
-    let zl = await deterministicFluxList(pubKey);
+    const zl = await deterministicFluxList(pubKey);
     if (dataObj.data && dataObj.data.type === 'fluxapprunning') {
       node = zl.find((key) => key.pubkey === pubKey && dataObj.data.ip && dataObj.data.ip === key.ip); // check ip is on the network and belongs to broadcasted public key
       if (!node) {
-        zl = await deterministicFluxList();
-        node = zl.find((key) => key.pubkey === pubKey && dataObj.data.ip === key.ip); // check ip is on the network and belongs to broadcasted public key
-        if (!node) {
-          log.warn(`Invalid fluxapprunning message, ip: ${dataObj.data.ip} pubkey: ${pubKey}`); // most of invalids are caused because our deterministic list is cached for couple of minutes
-          return false;
-        }
+        log.warn(`Invalid fluxapprunning message, ip: ${dataObj.data.ip} pubkey: ${pubKey} nodelistSize: ${zl.length}`); // most of invalids are caused because our deterministic list is cached for couple of minutes
+        return false;
       }
     } else if (dataObj.data && dataObj.data.type === 'fluxipchanged') {
       node = zl.find((key) => key.pubkey === pubKey && dataObj.data.oldIP && dataObj.data.oldIP === key.ip); // check ip is on the network and belongs to broadcasted public key
       if (!node) {
-        zl = await deterministicFluxList();
-        node = zl.find((key) => key.pubkey === pubKey && dataObj.data.oldIP === key.ip); // check ip is on the network and belongs to broadcasted public key
-        if (!node) {
-          log.warn(`Invalid fluxipchanged message, oldIP: ${dataObj.data.oldIP} pubkey: ${pubKey}`);
-          return false;
-        }
+        log.warn(`Invalid fluxipchanged message, oldIP: ${dataObj.data.oldIP} pubkey: ${pubKey} nodelistSize: ${zl.length}`);
+        return false;
       }
     } else if (dataObj.data && dataObj.data.type === 'fluxappremoved') {
       node = zl.find((key) => key.pubkey === pubKey && dataObj.data.ip && dataObj.data.ip === key.ip); // check ip is on the network and belongs to broadcasted public key
       if (!node) {
-        zl = await deterministicFluxList();
-        node = zl.find((key) => key.pubkey === pubKey && dataObj.data.ip === key.ip); // check ip is on the network and belongs to broadcasted public key
-        if (!node) {
-          log.warn(`Invalid fluxappremoved message, ip: ${dataObj.data.ip} pubkey: ${pubKey}`);
-          return false;
-        }
+        log.warn(`Invalid fluxappremoved message, ip: ${dataObj.data.ip} pubkey: ${pubKey} nodelistSize: ${zl.length}`);
+        return false;
       }
     } else {
       node = zl.find((key) => key.pubkey === pubKey);

@@ -6588,10 +6588,12 @@ async function storeAppRunningMessage(message) {
 
   const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
   if (validTill < Date.now()) {
-    log.warn(`Rejecting old/not valid Fluxapprunning message, message:${JSON.stringify(message)}`);
     // reject old message
     return false;
   }
+
+  const randomDelay = Math.floor((Math.random() * 1280)) + 240;
+  await serviceHelper.delay(randomDelay);
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
@@ -6614,7 +6616,8 @@ async function storeAppRunningMessage(message) {
     // eslint-disable-next-line no-await-in-loop
     const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
     if (result && result.broadcastedAt && result.broadcastedAt >= newAppRunningMessage.broadcastedAt) {
-      // found a message that was already stored/probably from duplicated message processsed
+      // found a message that was already stored/bad message
+      log.warn(`Old Fluxapprunning message, more recent available, appName:${newAppRunningMessage.name} ip: ${newAppRunningMessage.ip}`);
       messageNotOk = true;
       break;
     }
