@@ -6588,12 +6588,10 @@ async function storeAppRunningMessage(message) {
 
   const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
   if (validTill < Date.now()) {
+    log.warn(`Rejecting old/not valid Fluxapprunning message, message:${JSON.stringify(message)}`);
     // reject old message
     return false;
   }
-
-  const randomDelay = Math.floor((Math.random() * 1280)) + 240;
-  await serviceHelper.delay(randomDelay);
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
@@ -6616,13 +6614,14 @@ async function storeAppRunningMessage(message) {
     // eslint-disable-next-line no-await-in-loop
     const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
     if (result && result.broadcastedAt && result.broadcastedAt >= newAppRunningMessage.broadcastedAt) {
-      // found a message that was already stored/bad message
-      log.warn(`Old Fluxapprunning message, more recent available, appName:${newAppRunningMessage.name} ip: ${newAppRunningMessage.ip}`);
+      // found a message that was already stored/probably from duplicated message processsed
       messageNotOk = true;
       break;
     }
     if (message.runningSince) {
       newAppRunningMessage.runningSince = new Date(message.runningSince);
+    } else if (app.runningSince) {
+      newAppRunningMessage.runningSince = new Date(app.runningSince);
     } else if (result && result.runningSince) {
       newAppRunningMessage.runningSince = result.runningSince;
     }
@@ -9318,11 +9317,23 @@ async function checkAndNotifyPeersOfRunningApps() {
       }
     });
     installedAndRunning.push(...masterSlaveAppsInstalled);
+    const applicationsToBroadcast = [...new Set(installedAndRunning)];
     const apps = [];
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
     try {
       // eslint-disable-next-line no-restricted-syntax
-      for (const application of installedAndRunning) {
-        log.info(`${application.name} is running properly. Broadcasting status.`);
+      for (const application of applicationsToBroadcast) {
+        const queryFind = { name: application.name, ip: myIP };
+        const projection = { _id: 0, runningSince: 1 };
+        let runningOnMyNodeSince = Date.now();
+        // we already have the exact same data
+        // eslint-disable-next-line no-await-in-loop
+        const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
+        if (result && result.runningSince) {
+          runningOnMyNodeSince = result.runningSince;
+        }
+        log.info(`${application.name} is running/installed properly. Broadcasting status.`);
         // eslint-disable-next-line no-await-in-loop
         // we can distinguish pure local apps from global with hash and height
         const newAppRunningMessage = {
@@ -9332,10 +9343,12 @@ async function checkAndNotifyPeersOfRunningApps() {
           hash: application.hash, // hash of application specifics that are running
           ip: myIP,
           broadcastedAt: Date.now(),
+          runningSince: runningOnMyNodeSince,
         };
         const app = {
           name: application.name,
           hash: application.hash,
+          runningSince: runningOnMyNodeSince,
         };
         apps.push(app);
         // store it in local database first
@@ -9349,6 +9362,7 @@ async function checkAndNotifyPeersOfRunningApps() {
           // eslint-disable-next-line no-await-in-loop
           await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
           // broadcast messages about running apps to all peers
+          log.info(`App Running Message broadcasted ${JSON.stringify(newAppRunningMessage)}`);
         }
       }
       if (installedAndRunning.length > 1) {
@@ -9367,6 +9381,7 @@ async function checkAndNotifyPeersOfRunningApps() {
         // eslint-disable-next-line no-await-in-loop
         await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
         // broadcast messages about running apps to all peers
+        log.info(`App Running Message broadcasted ${JSON.stringify(newAppRunningMessageV2)}`);
       }
     } catch (err) {
       log.error(err);
