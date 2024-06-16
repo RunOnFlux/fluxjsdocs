@@ -1,3 +1,4 @@
+/* global userconfig */
 const config = require('config');
 const log = require('../lib/log');
 
@@ -39,6 +40,7 @@ async function startFluxFunctions() {
     }
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
+    await systemService.mongodGpgKeyVeryfity();
     await systemService.mongoDBConfig();
     systemService.monitorSystem();
     log.info('System service initiated');
@@ -90,7 +92,7 @@ async function startFluxFunctions() {
     log.info('Flux checks operational');
     fluxCommunication.fluxDiscovery();
     log.info('Flux Discovery started');
-    syncthingService.startSyncthingSentinel();
+    syncthingService.startSyncthing();
     log.info('Syncthing service started');
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
