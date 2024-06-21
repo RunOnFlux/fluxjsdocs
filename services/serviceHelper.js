@@ -1,4 +1,6 @@
 const util = require('node:util');
+const path = require('node:path');
+const { readdir, stat } = require('node:fs/promises');
 const execFile = util.promisify(require('node:child_process').execFile);
 
 const axios = require('axios').default;
@@ -197,11 +199,11 @@ async function axiosPost(url, data, userOptions = {}) {
  * merged (if debug enabled this logs outbound requests). If no abort signal
  * is passed in, the global service helper controller signal is used.
  *
- * @param {object} options Standard axios options with extra disableGlobalInterceptors Boolean
+ * @param {object} options Standard axios options
  * @returns {object} AxiosInstance
  */
-function axiosInstance(userOptions = {}) {
-  const { disableGlobalInterceptors, ...options } = userOptions;
+function createAxiosinstance(userOptions = {}) {
+  const options = { ...userOptions };
 
   if (!options.signal) options.signal = shc.signal;
 
@@ -209,11 +211,6 @@ function axiosInstance(userOptions = {}) {
     ...axios.defaults,
     ...options,
   });
-
-  if (!disableGlobalInterceptors) {
-    axios.interceptors.request.handlers.forEach((h) => { instance.interceptors.request.handlers.push(h); });
-    axios.interceptors.response.handlers.forEach((h) => { instance.interceptors.response.handlers.push(h); });
-  }
 
   return instance;
 }
@@ -266,6 +263,26 @@ function validIpv4Address(ip) {
   const octets = ip.split('.');
   const isValid = octets.every((octet) => parseInt(octet, 10) < 256);
   return isValid;
+}
+
+/**
+ * Check if an Ipv4 address is in the RFC1918 range. I.e. NOT routable on
+ * the internet.
+ * @param {string} ip Target IP
+ * @returns {Boolean}
+ */
+function isPrivateAddress(ip) {
+  if (!(validIpv4Address(ip))) return false;
+
+  const quads = ip.split('.').map((quad) => +quad);
+
+  if (quads.length !== 4) return false;
+
+  if ((quads[0] === 10)) return true;
+  if ((quads[0] === 192) && (quads[1] === 168)) return true;
+  if ((quads[0] === 172) && (quads[1] >= 16) && (quads[1] <= 31)) return true;
+
+  return false;
 }
 
 /**
@@ -435,7 +452,7 @@ module.exports = {
   axiosGet,
   axiosPost,
   commandStringToArray,
-  axiosInstance,
+  createAxiosinstance,
   delay,
   deleteLoginPhrase,
   dockerBufferToString,
@@ -446,6 +463,7 @@ module.exports = {
   getApplicationOwner,
   ipInSubnet,
   isDecimalLimit,
+  isPrivateAddress,
   minVersionSatisfy,
   parseVersion,
   runCommand,
