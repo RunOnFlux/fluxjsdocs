@@ -1,6 +1,4 @@
 const util = require('node:util');
-const path = require('node:path');
-const { readdir, stat } = require('node:fs/promises');
 const execFile = util.promisify(require('node:child_process').execFile);
 
 const axios = require('axios').default;
@@ -266,26 +264,6 @@ function validIpv4Address(ip) {
 }
 
 /**
- * Check if an Ipv4 address is in the RFC1918 range. I.e. NOT routable on
- * the internet.
- * @param {string} ip Target IP
- * @returns {Boolean}
- */
-function isPrivateAddress(ip) {
-  if (!(validIpv4Address(ip))) return false;
-
-  const quads = ip.split('.').map((quad) => +quad);
-
-  if (quads.length !== 4) return false;
-
-  if ((quads[0] === 10)) return true;
-  if ((quads[0] === 192) && (quads[1] === 168)) return true;
-  if ((quads[0] === 172) && (quads[1] >= 16) && (quads[1] <= 31)) return true;
-
-  return false;
-}
-
-/**
  * To confirm if ip is in subnet
  * @param {string} ip
  * @param {string} subnet
@@ -412,35 +390,6 @@ function parseVersion(rawVersion) {
 }
 
 /**
- * Recursively sum size of directory and children, in bytes
- * @param {string} dir The directory we want the size of
- * @returns {Promise<number>}
- */
-async function dirSize(dir) {
-  const files = await readdir(dir, { withFileTypes: true });
-
-  const pathPromises = files.map(async (file) => {
-    const targetpath = path.join(dir, file.name);
-
-    if (file.isDirectory()) return dirSize(targetpath);
-
-    if (file.isFile()) {
-      const { size } = await stat(targetpath);
-
-      return size;
-    }
-
-    return 0;
-  });
-
-  const paths = await Promise.all(pathPromises);
-
-  const sizeBytes = paths.flat(Infinity).reduce((i, size) => i + size, 0);
-
-  return sizeBytes;
-}
-
-/**
  * Check if semantic version is bigger or equal to minimum version
  * @param {string} targetVersion Version to check
  * @param {string} minimumVersion minimum version that version must meet
@@ -484,7 +433,6 @@ module.exports = {
   createAxiosinstance,
   delay,
   deleteLoginPhrase,
-  dirSize,
   dockerBufferToString,
   ensureBoolean,
   ensureNumber,
@@ -493,7 +441,6 @@ module.exports = {
   getApplicationOwner,
   ipInSubnet,
   isDecimalLimit,
-  isPrivateAddress,
   minVersionSatisfy,
   parseVersion,
   runCommand,
