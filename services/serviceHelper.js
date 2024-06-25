@@ -199,11 +199,11 @@ async function axiosPost(url, data, userOptions = {}) {
  * merged (if debug enabled this logs outbound requests). If no abort signal
  * is passed in, the global service helper controller signal is used.
  *
- * @param {object} options Standard axios options
+ * @param {object} options Standard axios options with extra disableGlobalInterceptors Boolean
  * @returns {object} AxiosInstance
  */
-function createAxiosinstance(userOptions = {}) {
-  const options = { ...userOptions };
+function axiosInstance(userOptions = {}) {
+  const { disableGlobalInterceptors, ...options } = userOptions;
 
   if (!options.signal) options.signal = shc.signal;
 
@@ -211,6 +211,11 @@ function createAxiosinstance(userOptions = {}) {
     ...axios.defaults,
     ...options,
   });
+
+  if (!disableGlobalInterceptors) {
+    axios.interceptors.request.handlers.forEach((h) => { instance.interceptors.request.handlers.push(h); });
+    axios.interceptors.response.handlers.forEach((h) => { instance.interceptors.response.handlers.push(h); });
+  }
 
   return instance;
 }
@@ -452,7 +457,7 @@ module.exports = {
   axiosGet,
   axiosPost,
   commandStringToArray,
-  createAxiosinstance,
+  axiosInstance,
   delay,
   deleteLoginPhrase,
   dockerBufferToString,
