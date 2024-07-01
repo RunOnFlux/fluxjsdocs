@@ -11679,7 +11679,8 @@ async function checkMyAppsAvailability() {
       throw err.message;
     });
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     if (!askingIP) {
       checkMyAppsAvailability();
       return;
@@ -11854,9 +11855,11 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       });
     }
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     while (!askingIP || askingIP.split(':')[0] === myIP) {
-      askingIP = fluxNetworkHelper.getRandomConnection();
+      // eslint-disable-next-line no-await-in-loop
+      askingIP = await fluxNetworkHelper.getRandomConnection();
     }
     let askingIpPort = config.server.apiport;
     if (askingIP.includes(':')) { // has port specification

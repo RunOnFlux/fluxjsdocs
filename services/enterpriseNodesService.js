@@ -1,5 +1,5 @@
 const config = require('config');
-const networkStateService = require('./networkStateService');
+const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const messageHelper = require('./messageHelper');
 const dbHelper = require('./dbHelper');
 const log = require('../lib/log');
@@ -12,7 +12,7 @@ const globalAppsInformation = config.database.appsglobal.collections.appsInforma
  */
 async function getEnterpriseList() {
   try {
-    const nodeList = networkStateService.networkState();
+    const nodeList = await fluxCommunicationUtils.deterministicFluxList();
     const enterpriseList = []; // txhash, outidx, pubkey, score, ip, payment_address?, tier,
     // user collateralization, 200k in flux nodes is most trusted, get 500 points
     // 200k flux in nodes, is most trusted, 5 * 40, 200 * 1, get 500 points
