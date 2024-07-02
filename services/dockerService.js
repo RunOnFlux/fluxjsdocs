@@ -8,11 +8,20 @@ const pgpService = require('./pgpService');
 const generalService = require('./generalService');
 const deviceHelper = require('./deviceHelper');
 const log = require('../lib/log');
+const { LRUCache } = require('lru-cache');
 
 const fluxDirPath = path.join(__dirname, '../../../');
 const appsFolder = `${fluxDirPath}ZelApps/`;
 
 const docker = new Docker();
+
+const appsRunning = {
+  max: 2,
+  ttl: 1000 * 60 * 5, // 5 minutes
+  maxAge: 1000 * 60 * 5, // 5 minutes
+};
+
+const appsRunningCache = new LRUCache(appsRunning);
 
 /**
  * Creates a docker container object with a given ID.
@@ -119,6 +128,9 @@ async function dockerNetworkInspect(netw) {
  * @returns {array} containers list
  */
 async function dockerListContainers(all, limit, size, filter) {
+  if (appsRunningCache.has(all)) {
+    return appsRunningCache.get(all);
+  }
   const options = {
     all,
     limit,
@@ -126,6 +138,7 @@ async function dockerListContainers(all, limit, size, filter) {
     filter,
   };
   const containers = await docker.listContainers(options);
+  appsRunningCache.set(all, containers);
   return containers;
 }
 
@@ -671,6 +684,7 @@ async function appDockerStart(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.start(); // may throw
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully started.`;
 }
 
@@ -685,6 +699,7 @@ async function appDockerStop(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.stop();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully stopped.`;
 }
 
@@ -699,6 +714,7 @@ async function appDockerRestart(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.restart();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully restarted.`;
 }
 
@@ -713,6 +729,7 @@ async function appDockerKill(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.kill();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully killed.`;
 }
 
@@ -727,6 +744,7 @@ async function appDockerRemove(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.remove();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully removed.`;
 }
 
@@ -740,6 +758,7 @@ async function appDockerImageRemove(idOrName) {
   // container ID or name
   const dockerImage = docker.getImage(idOrName);
   await dockerImage.remove();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} image successfully removed.`;
 }
 
@@ -754,6 +773,7 @@ async function appDockerPause(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.pause();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully paused.`;
 }
 
@@ -768,6 +788,7 @@ async function appDockerUnpause(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   await dockerContainer.unpause();
+  appsRunningCache.clear();
   return `Flux App ${idOrName} successfully unpaused.`;
 }
 
