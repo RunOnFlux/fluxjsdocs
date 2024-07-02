@@ -11337,7 +11337,7 @@ async function masterSlaveApps() {
       const backupSkip = backupInProgress.some((backupItem) => installedApp.name === backupItem);
       const restoreSkip = restoreInProgress.some((backupItem) => installedApp.name === backupItem);
       if (backupSkip || restoreSkip) {
-        log.info(`masterSlaveApps: Backup/Restore is running for ${installedApp.name}, syncthing masterSlave check is disabled for that app`);
+        log.info(`Backup/Restore is running for ${installedApp.name}, syncthing masterSlave check is disabled for that app`);
         // eslint-disable-next-line no-continue
         continue;
       }
@@ -11372,16 +11372,9 @@ async function masterSlaveApps() {
         if (fdmOk) {
           fdmEUData = fdmEUData.data;
           if (fdmEUData && fdmEUData.length > 0) {
-            // eslint-disable-next-line no-restricted-syntax
-            for (const fdmData of fdmEUData) {
-              const serviceName = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'pxname' && element.value.value.toLowerCase().startsWith(`${installedApp.name.toLowerCase()}apprunonfluxio`));
-              if (serviceName) {
-                const ipElement = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-                if (ipElement) {
-                  ip = ipElement.value.value;
-                }
-                break;
-              }
+            const ipElement = fdmEUData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+            if (ipElement) {
+              ip = ipElement.value.value;
             }
           }
         }
@@ -11395,16 +11388,9 @@ async function masterSlaveApps() {
           if (fdmOk) {
             fdmUSAData = fdmUSAData.data;
             if (fdmUSAData && fdmUSAData.length > 0) {
-              // eslint-disable-next-line no-restricted-syntax
-              for (const fdmData of fdmUSAData) {
-                const serviceName = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'pxname' && element.value.value.toLowerCase().startsWith(`${installedApp.name.toLowerCase()}apprunonfluxio`));
-                if (serviceName) {
-                  const ipElement = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-                  if (ipElement) {
-                    ip = ipElement.value.value;
-                  }
-                  break;
-                }
+              const ipElement = fdmUSAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+              if (ipElement) {
+                ip = ipElement.value.value;
               }
             }
           }
@@ -11419,16 +11405,9 @@ async function masterSlaveApps() {
           if (fdmOk) {
             fdmASIAData = fdmASIAData.data;
             if (fdmASIAData && fdmASIAData.length > 0) {
-              // eslint-disable-next-line no-restricted-syntax
-              for (const fdmData of fdmASIAData) {
-                const serviceName = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'pxname' && element.value.value.toLowerCase().startsWith(`${installedApp.name.toLowerCase()}apprunonfluxio`));
-                if (serviceName) {
-                  const ipElement = fdmData.find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
-                  if (ipElement) {
-                    ip = ipElement.value.value;
-                  }
-                  break;
-                }
+              const ipElement = fdmASIAData[0].find((element) => element.id === 1 && element.objType === 'Server' && element.field.name === 'svname');
+              if (ipElement) {
+                ip = ipElement.value.value;
               }
             }
           }
@@ -11477,18 +11456,17 @@ async function masterSlaveApps() {
                   let timetoStartApp = Date.now();
                   if (previousMasterIndex >= 0) {
                     if (index > previousMasterIndex) {
-                      timetoStartApp += (index - 1) * 60 * 1000;
+                      timetoStartApp += (index - 1) * 5 * 60 * 1000;
                     } else {
-                      timetoStartApp += index * 60 * 1000;
+                      timetoStartApp += index * 5 * 60 * 1000;
                     }
                   } else {
-                    timetoStartApp += index * 60 * 1000;
+                    timetoStartApp += index * 5 * 60 * 1000;
                   }
                   if (timetoStartApp <= Date.now()) {
                     appDockerRestart(installedApp.name);
                     log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
                   } else {
-                    log.info(`masterSlaveApps: will start docker app:${installedApp.name} at ${timetoStartApp.toString()}`);
                     timeTostartNewMasterApp.set(identifier, timetoStartApp);
                   }
                 }
