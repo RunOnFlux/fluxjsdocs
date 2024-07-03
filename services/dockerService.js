@@ -5,6 +5,7 @@ const path = require('path');
 const serviceHelper = require('./serviceHelper');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const pgpService = require('./pgpService');
+const generalService = require('./generalService');
 const deviceHelper = require('./deviceHelper');
 const log = require('../lib/log');
 
@@ -251,10 +252,10 @@ async function dockerContainerChanges(idOrName) {
  * @param {function} callback Callback.
  */
 function dockerPullStream(pullConfig, res, callback) {
-  const { repoTag, provider, authToken } = pullConfig;
+  const { repoTag, authToken } = pullConfig;
   let pullOptions;
+  const { provider } = generalService.parseDockerTag(repoTag);
 
-  // fix this auth token stuff upstream
   if (authToken) {
     if (authToken.includes(':')) { // specified by username:token
       pullOptions = {
