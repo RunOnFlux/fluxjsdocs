@@ -8,7 +8,7 @@ const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-const networkStateService = require('./networkStateService');
+const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const messageHelper = require('./messageHelper');
 const {
@@ -71,8 +71,7 @@ async function handleAppMessages(message, fromIP, port) {
     // eslint-disable-next-line global-require
     const appsService = require('./appsService');
     const rebroadcastToPeers = await appsService.storeAppTemporaryMessage(message.data, true);
-
-    if (rebroadcastToPeers) {
+    if (rebroadcastToPeers === true) {
       const messageString = serviceHelper.ensureString(message);
       const wsListOut = [];
       outgoingConnections.forEach((client) => {
@@ -113,33 +112,30 @@ async function handleAppRunningMessage(message, fromIP, port) {
     // eslint-disable-next-line global-require
     const appsService = require('./appsService');
     const rebroadcastToPeers = await appsService.storeAppRunningMessage(message.data);
-
-    if (!rebroadcastToPeers) return;
-
-    const stale = networkStateService.isBroadcastStale(message, 240_000);
-
-    if (stale) return;
-
-    const messageString = serviceHelper.ensureString(message);
-    const wsListOut = [];
-    outgoingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsListOut.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-    await serviceHelper.delay(500);
-    const wsList = [];
-    incomingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsList.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    const currentTimeStamp = Date.now();
+    const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
+    if (rebroadcastToPeers === true && timestampOK) {
+      const messageString = serviceHelper.ensureString(message);
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsListOut.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsList.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    }
   } catch (error) {
     log.error(error);
   }
@@ -158,33 +154,30 @@ async function handleIPChangedMessage(message, fromIP, port) {
     // eslint-disable-next-line global-require
     const appsService = require('./appsService');
     const rebroadcastToPeers = await appsService.storeIPChangedMessage(message.data);
-
-    if (!rebroadcastToPeers) return;
-
-    const stale = networkStateService.isBroadcastStale(message, 240_000);
-
-    if (stale) return;
-
-    const messageString = serviceHelper.ensureString(message);
-    const wsListOut = [];
-    outgoingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsListOut.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-    await serviceHelper.delay(500);
-    const wsList = [];
-    incomingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsList.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    const currentTimeStamp = Date.now();
+    const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
+    if (rebroadcastToPeers && timestampOK) {
+      const messageString = serviceHelper.ensureString(message);
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsListOut.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsList.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    }
   } catch (error) {
     log.error(error);
   }
@@ -203,33 +196,30 @@ async function handleAppRemovedMessage(message, fromIP, port) {
     // eslint-disable-next-line global-require
     const appsService = require('./appsService');
     const rebroadcastToPeers = await appsService.storeAppRemovedMessage(message.data);
-
-    if (!rebroadcastToPeers) return;
-
-    const stale = networkStateService.isBroadcastStale(message, 240_000);
-
-    if (stale) return;
-
-    const messageString = serviceHelper.ensureString(message);
-    const wsListOut = [];
-    outgoingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsListOut.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-    await serviceHelper.delay(500);
-    const wsList = [];
-    incomingConnections.forEach((client) => {
-      if (client.ip === fromIP && client.port === port) {
-        // do not broadcast to this peer
-      } else {
-        wsList.push(client);
-      }
-    });
-    fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    const currentTimeStamp = Date.now();
+    const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
+    if (rebroadcastToPeers && timestampOK) {
+      const messageString = serviceHelper.ensureString(message);
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsListOut.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
+        if (client.ip === fromIP && client.port === port) {
+          // do not broadcast to this peer
+        } else {
+          wsList.push(client);
+        }
+      });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+    }
   } catch (error) {
     log.error(error);
   }
@@ -312,10 +302,11 @@ function handleIncomingConnection(websocket, req) {
       } */
 
       const msgObj = serviceHelper.ensureObject(msg.data);
-      const {
-        pubKey, timestamp, signature, version, data,
-      } = msgObj;
-
+      const { pubKey } = msgObj;
+      const { timestamp } = msgObj;
+      const { signature } = msgObj;
+      const { version } = msgObj;
+      const { data } = msgObj;
       if (!pubKey || !timestamp || !signature || !version || !data) {
         try {
           log.info(`Invalid received from incoming peer ${peer.ip}:${peer.port}. Closing incoming connection`);
@@ -327,19 +318,19 @@ function handleIncomingConnection(websocket, req) {
       }
 
       // check if we have the message in cache. If yes, return false. If not, store it and continue
-      // await max 75 miliseconds random, should help on processing duplicated messages received at same timestamp
-      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1));
-
+      await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should jelp on processing duplicated messages received at same timestamp
       const messageHash = hash(msgObj.data);
       if (myCacheTemp.has(messageHash)) {
         return;
       }
-
       myCacheTemp.set(messageHash, messageHash);
-
+      // check rate limit
       const rateOK = fluxNetworkHelper.lruRateLimit(`${ipv4Peer}:${port}`, 90);
-      if (!rateOK) return;
+      if (!rateOK) {
+        return; // do not react to the message
+      }
 
+      // check blocked list
       if (blockedPubKeysCache.has(pubKey)) {
         try {
           log.info('Closing incoming connection, peer is on blockedList');
@@ -349,19 +340,39 @@ function handleIncomingConnection(websocket, req) {
         }
         return;
       }
-
-      const messageOk = await networkStateService.verifyBroadcast(msgObj);
-
-      if (!messageOk) {
+      const currentTimeStamp = Date.now();
+      const messageOK = await fluxCommunicationUtils.verifyFluxBroadcast(msgObj, undefined, currentTimeStamp);
+      if (messageOK === true) {
+        const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(msgObj, currentTimeStamp);
+        if (timestampOK === true) {
+          try {
+            if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
+              handleAppMessages(msgObj, peer.ip, peer.port);
+            } else if (msgObj.data.type === 'fluxapprequest') {
+              fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, ws);
+            } else if (msgObj.data.type === 'fluxapprunning') {
+              handleAppRunningMessage(msgObj, peer.ip, peer.port);
+            } else if (msgObj.data.type === 'fluxipchanged') {
+              handleIPChangedMessage(msgObj, peer.ip, peer.port);
+            } else if (msgObj.data.type === 'fluxappremoved') {
+              handleAppRemovedMessage(msgObj, peer.ip, peer.port);
+            } else {
+              log.warn(`Unrecognised message type of ${msgObj.data.type}`);
+            }
+          } catch (e) {
+            log.error(e);
+          }
+        }
+      } else {
         // we dont like this peer as it sent wrong message (wrong, or message belonging to node no longer on network). Lets close the connection
         // and add him to blocklist
         try {
           // check if message comes from IP belonging to the public Key
-          let zl = await networkStateService.getFluxnodesByPubkey(pubKey); // this itself is sufficient.
+          let zl = await fluxCommunicationUtils.deterministicFluxList(pubKey); // this itself is sufficient.
           let nodeFound = zl.find((n) => n.ip.split(':')[0] === peer.ip && (n.ip.split(':')[1] || 16127) === peer.port);
           if (!nodeFound) {
             // check if message comes from IP belonging to the public Key
-            zl = networkStateService.networkState(); // this itself is sufficient.
+            zl = await fluxCommunicationUtils.deterministicFluxList(); // this itself is sufficient.
             const possibleNodes = zl.filter((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
             nodeFound = possibleNodes.find((n) => n.ip.split(':')[0] === peer.ip && (n.ip.split(':')[1] || 16127) === peer.port);
             if (!nodeFound) {
@@ -380,52 +391,8 @@ function handleIncomingConnection(websocket, req) {
         } catch (e) {
           log.error(e);
         }
-        return;
-      }
-
-      const stale = networkStateService.isBroadcastStale(msgObj);
-
-      // I'm not really sure of the intent here. It seems like if a message is older
-      // than 5 minutes, we silently drop it.
-
-      // Then, if it's a register or update message, we rebroadcast regardless.
-
-      // However, if it's a running, changed or removed message, if it is older than
-      // 4 minutes, we silently drop it.
-
-      // The reason I don't like this is we are checking the timestamp twice. Seems like
-      // each handler should just handle the timestamp itself. The running, changes and removed
-      // handlers are all basically the same anyway. The only difference is the store procedure called.
-
-      // The store should be on the db, not on appsService. I'm assuming you were getting circular imports,
-      // hence the local require; if we moved store procedures to db, it wouldn't be a problem.
-
-      if (stale) return;
-
-      // pretty sure we can remove the zel ones, not used anymore
-      const appMessageTypes = ['fluxappregister', 'fluxappupdate', 'zelappupdate', 'zelappregister'];
-
-      const { type: msgType } = data;
-
-      try {
-        if (appMessageTypes.includes(msgType)) {
-          handleAppMessages(msgObj, peer.ip, peer.port);
-        } else if (msgType === 'fluxapprequest') {
-          fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, ws);
-        } else if (msgType === 'fluxapprunning') {
-          handleAppRunningMessage(msgObj, peer.ip, peer.port);
-        } else if (msgType === 'fluxipchanged') {
-          handleIPChangedMessage(msgObj, peer.ip, peer.port);
-        } else if (msgType === 'fluxappremoved') {
-          handleAppRemovedMessage(msgObj, peer.ip, peer.port);
-        } else {
-          log.warn(`Unrecognised message type of ${msgType}`);
-        }
-      } catch (e) {
-        log.error(e);
       }
     };
-
     ws.onclose = (msg) => {
       const { ip } = ws;
       log.info(`Incoming connection to ${ip}:${port} closed with code ${msg.code}`);
@@ -646,10 +613,11 @@ async function initiateAndHandleConnection(connection) {
         messageNumber = 0;
       } */
       const msgObj = serviceHelper.ensureObject(evt.data);
-      const {
-        pubKey, timestamp, signature, version, data,
-      } = msgObj;
-
+      const { pubKey } = msgObj;
+      const { timestamp } = msgObj;
+      const { signature } = msgObj;
+      const { version } = msgObj;
+      const { data } = msgObj;
       if (!pubKey || !timestamp || !signature || !version || !data) {
         try {
           log.info(`Invalid received from outgoing peer ${ip}:${port}. Closing outgoing connection`);
@@ -659,20 +627,21 @@ async function initiateAndHandleConnection(connection) {
         }
         return;
       }
-
       // check if we have the message in cache. If yes, return false. If not, store it and continue
       await serviceHelper.delay(Math.floor(Math.random() * 75 + 1)); // await max 75 miliseconds random, should help processing duplicated messages received at same timestamp
-
       const messageHash = hash(msgObj.data);
       if (myCacheTemp.has(messageHash)) {
         return;
       }
-
       myCacheTemp.set(messageHash, messageHash);
-
+      // incoming messages from outgoing connections
+      const currentTimeStamp = Date.now(); // ms
+      // check rate limit
       const rateOK = fluxNetworkHelper.lruRateLimit(`${ip}:${port}`, 90);
-      if (!rateOK) return;
-
+      if (!rateOK) {
+        return; // do not react to the message
+      }
+      // check blocked list
       if (blockedPubKeysCache.has(pubKey)) {
         try {
           log.info('Closing outgoing connection, peer is on blockedList');
@@ -682,19 +651,27 @@ async function initiateAndHandleConnection(connection) {
         }
         return;
       }
-
-      const stale = networkStateService.isBroadcastStale(msgObj);
-
-      if (stale) return;
-
-      const messageOk = await networkStateService.verifyBroadcast(msgObj);
-
-      if (!messageOk) {
+      const messageOK = await fluxCommunicationUtils.verifyOriginalFluxBroadcast(msgObj, undefined, currentTimeStamp);
+      if (messageOK === true) {
+        if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
+          handleAppMessages(msgObj, ip, port);
+        } else if (msgObj.data.type === 'fluxapprequest') {
+          fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, websocket);
+        } else if (msgObj.data.type === 'fluxapprunning') {
+          handleAppRunningMessage(msgObj, ip, port);
+        } else if (msgObj.data.type === 'fluxipchanged') {
+          handleIPChangedMessage(msgObj, ip, port);
+        } else if (msgObj.data.type === 'fluxappremoved') {
+          handleAppRemovedMessage(msgObj, ip, port);
+        } else {
+          log.warn(`Unrecognised message type of ${msgObj.data.type}`);
+        }
+      } else {
         // we dont like this peer as it sent wrong message (wrong, or message belonging to node no longer on network). Lets close the connection
         // and add him to blocklist
         try {
           // check if message comes from IP belonging to the public Key
-          const zl = await networkStateService.getFluxnodesByPubkey(pubKey); // this itself is sufficient.
+          const zl = await fluxCommunicationUtils.deterministicFluxList(pubKey); // this itself is sufficient.
           const possibleNodes = zl.filter((key) => key.pubkey === pubKey); // another check in case sufficient check failed on daemon level
           const nodeFound = possibleNodes.find((n) => n.ip === connection); // connection is either ip or ip:port (if port is not 16127)
           if (!nodeFound) {
@@ -708,25 +685,6 @@ async function initiateAndHandleConnection(connection) {
         } catch (e) {
           log.error(e);
         }
-        return;
-      }
-
-      const appMessageTypes = ['fluxappregister', 'fluxappupdate', 'zelappupdate', 'zelappregister'];
-
-      const { type: msgType } = data;
-
-      if (appMessageTypes.includes(msgType)) {
-        handleAppMessages(msgObj, ip, port);
-      } else if (msgType === 'fluxapprequest') {
-        fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, websocket);
-      } else if (msgType === 'fluxapprunning') {
-        handleAppRunningMessage(msgObj, ip, port);
-      } else if (msgType === 'fluxipchanged') {
-        handleIPChangedMessage(msgObj, ip, port);
-      } else if (msgType === 'fluxappremoved') {
-        handleAppRemovedMessage(msgObj, ip, port);
-      } else {
-        log.warn(`Unrecognised message type of ${msgType}`);
       }
     };
 
@@ -795,7 +753,7 @@ async function addPeer(req, res) {
  * @param {object} res Response.
  * @returns {object} Message.
  */
-function addOutgoingPeer(req, res) {
+async function addOutgoingPeer(req, res) {
   try {
     let { ip } = req.params;
     ip = ip || req.query.ip;
@@ -821,7 +779,7 @@ function addOutgoingPeer(req, res) {
       return res.json(errMessage);
     }
 
-    const nodeList = networkStateService.networkState();
+    const nodeList = await fluxCommunicationUtils.deterministicFluxList();
     const fluxNode = nodeList.find((node) => node.ip.split(':')[0] === ip.split(':')[0] && (node.ip.split(':')[1] || 16127) === port);
     if (!fluxNode) {
       const errMessage = messageHelper.createErrorMessage(`FluxNode ${ip.split(':')[0]}:${port} is not confirmed on the network.`);
@@ -857,7 +815,7 @@ async function fluxDiscovery() {
 
     const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
     if (myIP) {
-      nodeList = networkStateService.networkState();
+      nodeList = await fluxCommunicationUtils.deterministicFluxList();
       numberOfFluxNodes = nodeList.length;
       const fluxNode = nodeList.find((node) => node.ip === myIP);
       if (!fluxNode) {
@@ -900,7 +858,7 @@ async function fluxDiscovery() {
       // additional precaution
       const clientExists = outgoingConnections.find((client) => client.ip === ipInc && client.port === portInc);
       const clientIncomingExists = incomingConnections.find((client) => client.ip === ipInc && client.port === portInc);
-      if (ipInc && !clientExists && !clientIncomingExists) {
+      if (!clientExists && !clientIncomingExists) {
         deterministicPeerConnections = true;
         initiateAndHandleConnection(ip);
         // eslint-disable-next-line no-await-in-loop
@@ -916,7 +874,7 @@ async function fluxDiscovery() {
       // additional precaution
       const clientExists = outgoingConnections.find((client) => client.ip === ipInc && client.port === portInc);
       const clientIncomingExists = incomingConnections.find((client) => client.ip === ipInc && client.port === portInc);
-      if (ipInc && !clientExists && !clientIncomingExists) {
+      if (!clientExists && !clientIncomingExists) {
         deterministicPeerConnections = true;
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.axiosGet(`http://${ipInc}:${portInc}/flux/addoutgoingpeer/${myIP}`).catch((error) => log.error(error));
@@ -931,7 +889,7 @@ async function fluxDiscovery() {
     while ((outgoingConnections.length < 14 || [...new Set(outgoingConnections.map((client) => client.ip))].length < 9) && index < 100) { // Max of 14 outgoing connections - 8 possible deterministic + min. 6 random
       index += 1;
       // eslint-disable-next-line no-await-in-loop
-      const connection = fluxNetworkHelper.getRandomConnection();
+      const connection = await fluxNetworkHelper.getRandomConnection();
       if (connection) {
         const ipInc = connection.split(':')[0];
         const portInc = connection.split(':')[1] || '16127';
@@ -939,7 +897,7 @@ async function fluxDiscovery() {
         const sameConnectedIp = currentIpsConnTried.find((connectedIP) => connectedIP === ipInc);
         const clientExists = outgoingConnections.find((client) => client.ip === ipInc && client.port === portInc);
         const clientIncomingExists = incomingConnections.find((client) => client.ip === ipInc && client.port === portInc);
-        if (ipInc && !sameConnectedIp && !clientExists && !clientIncomingExists) {
+        if (!sameConnectedIp && !clientExists && !clientIncomingExists) {
           log.info(`Adding random Flux peer: ${connection}`);
           currentIpsConnTried.push(connection);
           initiateAndHandleConnection(connection);
@@ -952,7 +910,7 @@ async function fluxDiscovery() {
     while ((incomingConnections.length < 12 || [...new Set(incomingConnections.map((client) => client.ip))].length < 5) && index < 100) { // Max of 12 incoming connections - 8 possible deterministic + min. 4 random (we will get more random as others nodes have more random outgoing connections)
       index += 1;
       // eslint-disable-next-line no-await-in-loop
-      const connection = fluxNetworkHelper.getRandomConnection();
+      const connection = await fluxNetworkHelper.getRandomConnection();
       if (connection) {
         const ipInc = connection.split(':')[0];
         const portInc = connection.split(':')[1] || '16127';
@@ -960,7 +918,7 @@ async function fluxDiscovery() {
         const sameConnectedIp = currentIpsConnTried.find((connectedIP) => connectedIP === ipInc);
         const clientExists = outgoingConnections.find((client) => client.ip === ipInc && client.port === portInc);
         const clientIncomingExists = incomingConnections.find((client) => client.ip === ipInc && client.port === portInc);
-        if (ipInc && !sameConnectedIp && !clientExists && !clientIncomingExists) {
+        if (!sameConnectedIp && !clientExists && !clientIncomingExists) {
           log.info(`Asking random Flux ${connection} to add us as a peer`);
           currentIpsConnTried.push(connection);
           // eslint-disable-next-line no-await-in-loop

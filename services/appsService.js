@@ -3564,12 +3564,14 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
     }
-    const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
-    log.info(removeStatus);
-    if (res) {
-      res.write(serviceHelper.ensureString(removeStatus));
+    if (!test) {
+      const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
+      log.info(removeStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(removeStatus));
+      }
+      removeAppLocally(appSpecs.name, res, true, true, false);
     }
-    removeAppLocally(appSpecs.name, res, true, true, false);
     return false;
   }
   return true;
@@ -7660,7 +7662,7 @@ async function installAppLocally(req, res) {
  * @param {object} req Request.
  * @param {object} res Response.
  */
-async function testInstallApp(req, res) {
+async function testAppInstall(req, res) {
   try {
     // appname can be app name or app hash of specific app version
     let { appname } = req.params;
@@ -7669,6 +7671,7 @@ async function testInstallApp(req, res) {
     if (!appname) {
       throw new Error('No Flux App specified');
     }
+    log.info(`testAppInstall: ${appname}`);
     let blockAllowance = config.fluxapps.ownerAppAllowance;
     // needs to be logged in
     const authorized = await verificationHelper.verifyPrivilege('user', req);
@@ -11817,7 +11820,8 @@ async function checkMyAppsAvailability() {
       throw err.message;
     });
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     if (!askingIP) {
       checkMyAppsAvailability();
       return;
@@ -11992,9 +11996,11 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       });
     }
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     while (!askingIP || askingIP.split(':')[0] === myIP) {
-      askingIP = fluxNetworkHelper.getRandomConnection();
+      // eslint-disable-next-line no-await-in-loop
+      askingIP = await fluxNetworkHelper.getRandomConnection();
     }
     let askingIpPort = config.server.apiport;
     if (askingIP.includes(':')) { // has port specification
@@ -13094,7 +13100,7 @@ module.exports = {
   reindexGlobalAppsLocationAPI,
   expireGlobalApplications,
   installAppLocally,
-  testInstallApp,
+  testAppInstall,
   updateAppGlobalyApi,
   getAppPrice,
   getAppFiatAndFluxPrice,

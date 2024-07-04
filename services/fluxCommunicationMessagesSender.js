@@ -10,16 +10,6 @@ const {
   outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
 } = require('./utils/establishedConnections');
 
-/**
- * @typedef {{
- *   version: number,
- *   timestamp: number,
- *   pubKey: string,
- *   signature: string,
- *   data : object,
- * }} FluxNetworkMessage
- */
-
 // default cache
 const LRUoptions = {
   max: 1000,
