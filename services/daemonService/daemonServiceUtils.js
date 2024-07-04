@@ -39,9 +39,7 @@ let daemonCallRunning = false;
  * @param {string[]} params RPC parameters.
  * @returns {object} Message.
  */
-async function executeCall(rpc, params, options = {}) {
-  const useCache = options.useCache ?? true;
-
+async function executeCall(rpc, params) {
   const rpcparameters = params || [];
   try {
     let data;
@@ -73,11 +71,11 @@ async function executeCall(rpc, params, options = {}) {
       const randomDelay = Math.floor((Math.random() * 25)) + 10;
       await serviceHelper.delay(randomDelay);
     }
-    if (useCache && rpc === 'getBlock') {
+    if (rpc === 'getBlock') {
       data = blockCache.get(rpc + serviceHelper.ensureString(rpcparameters));
-    } else if (useCache && rpc === 'getRawTransaction') {
+    } else if (rpc === 'getRawTransaction') {
       data = rawTxCache.get(rpc + serviceHelper.ensureString(rpcparameters));
-    } else if (useCache) {
+    } else {
       data = cache.get(rpc + serviceHelper.ensureString(rpcparameters));
     }
     if (!data) {
@@ -179,35 +177,9 @@ function getConfigValue(parameter) {
   return value;
 }
 
-/**
- * To set a value for a specified key from the configuration file.
- * @param {string} parameter Config key.
- * @param {string} value Config key value.
- * @param {{write?: boolean, replace?: boolean}} options
- * @returns {string} Config value.
- */
-function setConfigValue(parameter, value, options = {}) {
-  const write = options.write || false;
-  const replace = options.replace || false;
-
-  fnconfig.set(parameter, value, replace);
-  if (write) fnconfig.write();
-}
-
-/**
- * To get the fluxd config dir.
- * @returns {string} Config directory path.
- */
-function getConfigDir() {
-  const value = fnconfig.defaultFolderPath;
-  return value;
-}
-
 module.exports = {
   executeCall,
-  getConfigDir,
   getConfigValue,
-  setConfigValue,
 
   // exports for testing purposes
   setStandardCache,

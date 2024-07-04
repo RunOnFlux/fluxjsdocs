@@ -7669,6 +7669,7 @@ async function testInstallApp(req, res) {
     if (!appname) {
       throw new Error('No Flux App specified');
     }
+    log.info(`testInstallApp: ${appname}`);
     let blockAllowance = config.fluxapps.ownerAppAllowance;
     // needs to be logged in
     const authorized = await verificationHelper.verifyPrivilege('user', req);
@@ -11817,7 +11818,8 @@ async function checkMyAppsAvailability() {
       throw err.message;
     });
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     if (!askingIP) {
       checkMyAppsAvailability();
       return;
@@ -11992,9 +11994,11 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       });
     }
     await serviceHelper.delay(10 * 1000);
-    let askingIP = fluxNetworkHelper.getRandomConnection();
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
     while (!askingIP || askingIP.split(':')[0] === myIP) {
-      askingIP = fluxNetworkHelper.getRandomConnection();
+      // eslint-disable-next-line no-await-in-loop
+      askingIP = await fluxNetworkHelper.getRandomConnection();
     }
     let askingIpPort = config.server.apiport;
     if (askingIP.includes(':')) { // has port specification
