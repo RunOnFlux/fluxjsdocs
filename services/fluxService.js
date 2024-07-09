@@ -4,6 +4,7 @@ const os = require('node:os');
 const { promisify } = require('node:util');
 
 const config = require('config');
+const fullnode = require('fullnode');
 
 const log = require('../lib/log');
 const packageJson = require('../../../package.json');
@@ -745,7 +746,7 @@ async function daemonDebug(req, res) {
     return res.json(errMessage);
   }
   // check daemon datadir
-  const defaultDir = daemonServiceUtils.getFluxdDir();
+  const defaultDir = new fullnode.Config().defaultFolder();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = `${datadir}/debug.log`;
 
@@ -790,7 +791,7 @@ async function tailDaemonDebug(req, res) {
     return;
   }
 
-  const defaultDir = daemonServiceUtils.getFluxdDir();
+  const defaultDir = new fullnode.Config().defaultFolder();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = path.join(datadir, 'debug.log');
 
