@@ -852,6 +852,12 @@ async function adjustExternalIP(ip) {
           await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newIpChangedMessage);
         }
       }
+      const benchmarkResponse = await benchmarkService.getBenchmarks();
+      if (benchmarkResponse.status === 'error') {
+        await serviceHelper.delay(15 * 60 * 1000);
+      } else if (benchmarkResponse.status === 'running') {
+        await serviceHelper.delay(8 * 60 * 1000);
+      }
       const result = await daemonServiceWalletRpcs.createConfirmationTransaction();
       log.info(`createConfirmationTransaction: ${JSON.stringify(result)}`);
     }
@@ -885,7 +891,6 @@ async function checkDeterministicNodesCollisions() {
       if (nodeStatus.status === 'success') { // different scenario is caught elsewhere
         const myCollateral = nodeStatus.data.collateral;
         const myNode = result.find((node) => node.collateral === myCollateral);
-        const nodeCollateralDifferentIp = nodeList.find((node) => node.collateral === myCollateral && node.ip !== myIP);
         if (result.length > 1) {
           log.warn('Multiple Flux Node instances detected');
           if (myNode) {
@@ -913,22 +918,6 @@ async function checkDeterministicNodesCollisions() {
             }, 60 * 1000);
             return;
           }
-        } else if (nodeStatus.data.status === 'CONFIRMED' && nodeCollateralDifferentIp) {
-          let errorCall = false;
-          const askingIP = nodeCollateralDifferentIp.ip.split(':')[0];
-          const askingIpPort = nodeCollateralDifferentIp.ip.split(':')[1] || '16127';
-          await serviceHelper.axiosGet(`http://${askingIP}:${askingIpPort}/flux/version`, axiosConfig).catch(errorCall = true);
-          if (!errorCall) {
-            log.error('Flux collision detection. Another ip:port is confirmed and reachable on flux network with the same collateral transaction information.');
-            dosState = 100;
-            setDosMessage('Flux collision detection. Another ip:port is confirmed and reachable on flux network with the same collateral transaction information.');
-            setTimeout(() => {
-              checkDeterministicNodesCollisions();
-            }, 60 * 1000);
-            return;
-          }
-          const daemonResult = await daemonServiceWalletRpcs.createConfirmationTransaction();
-          log.info(`createConfirmationTransaction: ${JSON.stringify(daemonResult)}`);
         }
       }
       // early stages of the network or testnet
