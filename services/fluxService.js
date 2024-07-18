@@ -1102,6 +1102,7 @@ async function getFluxInfo(req, res) {
     }
     info.flux.ip = ipRes.data;
     info.flux.staticIp = geolocationService.isStaticIP();
+    info.flux.maxNumberOfIpChanges = fluxNetworkHelper.getMaxNumberOfIpChanges();
     const zelidRes = await getFluxZelID();
     if (zelidRes.status === 'error') {
       throw zelidRes.data;
