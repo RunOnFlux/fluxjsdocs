@@ -4,7 +4,6 @@ const os = require('node:os');
 const { promisify } = require('node:util');
 
 const config = require('config');
-const fullnode = require('fullnode');
 
 const log = require('../lib/log');
 const packageJson = require('../../../package.json');
@@ -746,7 +745,7 @@ async function daemonDebug(req, res) {
     return res.json(errMessage);
   }
   // check daemon datadir
-  const defaultDir = new fullnode.Config().defaultFolder();
+  const defaultDir = daemonServiceUtils.getFluxdDir();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = `${datadir}/debug.log`;
 
@@ -791,7 +790,7 @@ async function tailDaemonDebug(req, res) {
     return;
   }
 
-  const defaultDir = new fullnode.Config().defaultFolder();
+  const defaultDir = daemonServiceUtils.getFluxdDir();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = path.join(datadir, 'debug.log');
 
@@ -1103,7 +1102,6 @@ async function getFluxInfo(req, res) {
     }
     info.flux.ip = ipRes.data;
     info.flux.staticIp = geolocationService.isStaticIP();
-    info.flux.maxNumberOfIpChanges = fluxNetworkHelper.getMaxNumberOfIpChanges();
     const zelidRes = await getFluxZelID();
     if (zelidRes.status === 'error') {
       throw zelidRes.data;
