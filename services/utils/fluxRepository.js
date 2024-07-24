@@ -36,6 +36,9 @@ class FluxRepository {
     const reset = options.reset || false;
     const remote = options.remote || 'origin';
 
+    // fetch first incase there are errors.
+    await this.git.fetch(remote, branch);
+
     if (forceClean) {
       await this.git.clean(CleanOptions.FORCE + CleanOptions.RECURSIVE);
     }
@@ -44,19 +47,16 @@ class FluxRepository {
       await this.git.reset(ResetMode.HARD);
     }
 
-    await this.git.fetch(remote, branch);
+    const exists = await this.git.revparse(['--verify', branch]).catch(() => false);
 
-    await this.git.checkout(branch);
+    if (exists) {
+      await this.git.checkout(branch);
+      await this.git.merge(['--ff-only']);
+      return;
+    }
+
+    await this.git.checkout(['--track', `${remote}/${branch}`]);
   }
-}
-
-async function main() {
-  const repo = new FluxRepository();
-  await repo.switchBranch('noexist');
-}
-
-if (require.main === module) {
-  main();
 }
 
 module.exports = { FluxRepository };
