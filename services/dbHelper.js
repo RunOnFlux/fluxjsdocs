@@ -2,10 +2,6 @@
  * @module Helper module used for all interactions with database
  */
 
-/**
- * @import { MongoClient } from "mongodb"
- */
-
 const mongodb = require('mongodb');
 const config = require('config');
 
@@ -27,7 +23,7 @@ function databaseConnection() {
  *
  * @param {string} [url]
  *
- * @returns {MongoClient}
+ * @returns {object} mongodb.MongoClient
  */
 async function connectMongoDb(url) {
   const connectUrl = url || mongoUrl;
@@ -36,22 +32,21 @@ async function connectMongoDb(url) {
     useUnifiedTopology: true,
     maxPoolSize: 100,
   };
-  const client = await MongoClient.connect(connectUrl, mongoSettings);
-  return client;
+  const db = await MongoClient.connect(connectUrl, mongoSettings);
+  return db;
 }
 
 /**
  * Initiates default db connection.
- * @returns {MongoClient}
+ * @returns true
  */
 async function initiateDB() {
   if (!openDBConnection) openDBConnection = await connectMongoDb();
-  return openDBConnection;
+  return true;
 }
 
 /**
  * Closes DB connection if exists.
- * @returns {Promise<void>}
  */
 async function closeDbConnection() {
   if (openDBConnection) {
@@ -68,7 +63,7 @@ async function closeDbConnection() {
  * @param {string} distinct - field name
  * @param {object} [query]
  *
- * @returns {Proimise<Array>}
+ * @returns array
  */
 async function distinctDatabase(database, collection, distinct, query) {
   const results = await database.collection(collection).distinct(distinct, query);
@@ -83,7 +78,7 @@ async function distinctDatabase(database, collection, distinct, query) {
  * @param {object} query
  * @param {object} [projection]
  *
- * @returns {Promise<Array>}
+ * @returns array
  */
 async function findInDatabase(database, collection, query, projection) {
   const results = await database.collection(collection).find(query, projection).toArray();
