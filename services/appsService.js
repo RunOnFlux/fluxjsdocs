@@ -4771,9 +4771,9 @@ async function checkAppSecrets(appName, appComponentSpecs, registration = false)
       for (const component of app.compose) {
         if (component.secrets.length > 0 && component.secrets === appComponentSpecs.secrets) {
           if (registration) {
-            throw new Error('Provided component secrets are not valid');
+            throw new Error(`Provided component ${component.name} secrets are not valid`);
           } else if (app.name !== appName) {
-            throw new Error('Provided component secrets are not valid');
+            throw new Error(`Provided component ${component.name} secrets are not valid`);
           }
         }
       }
@@ -11386,6 +11386,7 @@ async function masterSlaveApps() {
           needsToBeChecked = receiveOnlySyncthingAppsCache.has(appId) && receiveOnlySyncthingAppsCache.get(appId).restarted;
         }
       }
+      log.info(`masterSlaveApps: ${installedApp.name} needsToBeChecked: ${needsToBeChecked}`);
       if (needsToBeChecked) {
         let fdmIndex = 1;
         const appNameFirstLetterLowerCase = installedApp.name.substring(0, 1).toLowerCase();
@@ -11471,6 +11472,7 @@ async function masterSlaveApps() {
           // down means there was a row ip with status down
           // eslint-disable-next-line no-await-in-loop
           const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+          log.info(`masterSlaveApps: ${installedApp.name} fdmOk: ${fdmOk} ip: ${ip} myIP: ${myIP}`);
           if ((!ip)) {
             if (!runningAppsNames.includes(identifier)) {
               // eslint-disable-next-line no-await-in-loop
@@ -11528,6 +11530,8 @@ async function masterSlaveApps() {
               } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= Date.now()) {
                 appDockerRestart(installedApp.name);
                 log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
+              } else {
+                log.info('masterSlaveApps: there is no ip but nothing done');
               }
             }
           } else {
