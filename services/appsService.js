@@ -4764,23 +4764,16 @@ async function checkAppSecrets(appName, appComponentSpecs, registration = false)
   const query = {};
   const projection = { projection: { _id: 0 } };
   const results = await dbHelper.findInDatabase(database, globalAppsInformation, query, projection);
-  log.info(`checkAppSecrets: ${appName} lets search on db for the secrets: ${JSON.stringify(appComponentSpecs.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, ''))}`);
   // eslint-disable-next-line no-restricted-syntax
   for (const app of results) {
     if (app.version >= 7 && app.nodes.length > 0) {
       // eslint-disable-next-line no-restricted-syntax
       for (const component of app.compose) {
-        if (component.secrets.length > 0) {
-          if (app.name === 'BrokerNode1677472532536') {
-            log.info(`checkAppSecrets: component ${component.name} of appName same secrets on app: ${app.name} secrets: ${JSON.stringify(component.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, ''))}`);
-          }
-          if (JSON.stringify(component.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, '')) === JSON.stringify(appComponentSpecs.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, ''))) {
-            log.info(`checkAppSecrets: ${appName} Found same secrets on app: ${app.name} registration: ${registration}`);
-            if (registration) {
-              throw new Error(`Provided component ${component.name} secrets are not valid`);
-            } else if (app.name !== appName) {
-              throw new Error(`Provided component ${component.name} secrets are not valid`);
-            }
+        if (component.secrets.length > 0 && JSON.stringify(component.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, '')) === JSON.stringify(appComponentSpecs.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, ''))) {
+          if (registration) {
+            throw new Error(`Provided component ${component.name} secrets are not valid`);
+          } else if (app.name !== appName) {
+            throw new Error(`Provided component ${component.name} secrets are not valid`);
           }
         }
       }
@@ -10421,11 +10414,9 @@ async function verifyAppUpdateParameters(req, res) {
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
       if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
-        log.info(`verifyAppUpdateParameters: ${appSpecFormatted.name} is enterprise app.`);
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets.length > 0) {
-            log.info(`verifyAppUpdateParameters: ${appSpecFormatted.name} have secrets.`);
             // eslint-disable-next-line no-await-in-loop
             await checkAppSecrets(appSpecFormatted.name, appComponent, false);
           }
@@ -11395,7 +11386,6 @@ async function masterSlaveApps() {
           needsToBeChecked = receiveOnlySyncthingAppsCache.has(appId) && receiveOnlySyncthingAppsCache.get(appId).restarted;
         }
       }
-      log.info(`masterSlaveApps: ${installedApp.name} needsToBeChecked: ${needsToBeChecked}`);
       if (needsToBeChecked) {
         let fdmIndex = 1;
         const appNameFirstLetterLowerCase = installedApp.name.substring(0, 1).toLowerCase();
@@ -11481,7 +11471,6 @@ async function masterSlaveApps() {
           // down means there was a row ip with status down
           // eslint-disable-next-line no-await-in-loop
           const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-          log.info(`masterSlaveApps: ${installedApp.name} fdmOk: ${fdmOk} ip: ${ip} myIP: ${myIP}`);
           if ((!ip)) {
             if (!runningAppsNames.includes(identifier)) {
               // eslint-disable-next-line no-await-in-loop
@@ -11539,8 +11528,6 @@ async function masterSlaveApps() {
               } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= Date.now()) {
                 appDockerRestart(installedApp.name);
                 log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-              } else {
-                log.info('masterSlaveApps: there is no ip but nothing done');
               }
             }
           } else {
