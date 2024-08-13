@@ -8,6 +8,7 @@ const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const appsService = require('./appsService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
+const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 const fluxService = require('./fluxService');
 const geolocationService = require('./geolocationService');
 const upnpService = require('./upnpService');
@@ -37,6 +38,7 @@ async function startFluxFunctions() {
         upnpService.adjustFirewallForUPNP();
       }, 1 * 60 * 60 * 1000); // every 1 hours
     }
+    await daemonServiceUtils.buildFluxdClient();
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
     await systemService.mongodGpgKeyVeryfity();
@@ -74,18 +76,9 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsTemporaryMessages).createIndex({ receivedAt: 1 }, { expireAfterSeconds: 3600 }); // todo longer time? dropIndexes()
     log.info('Temporary database prepared');
     log.info('Preparing Flux Apps locations');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).dropIndex({ hash: 1 }).catch(() => { console.log('Welcome to FluxOS'); }); // drop old index or display message for new installations
+    await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).dropIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash' }).catch(() => { console.log('Welcome to FluxOS'); }); // drop old index or display message for new installations
     // more than 2 hours and 5m. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-    if (daemonHeight < config.apprunningRefactorActivation) {
-      await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 7500 });
-    } else {
-      await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).dropIndex({ broadcastedAt: 1 }).catch(() => { console.log('Welcome to FluxOS'); }); // drop old index or display message for new installations
-      await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 });
-    }
-    // removed from database records that removedBroadcastedAt was sent 10 days ago
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ removedBroadcastedAt: 1 }, { expireAfterSeconds: 864000 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 7500 });
     log.info('Flux Apps locations prepared');
     fluxNetworkHelper.adjustFirewall();
     log.info('Firewalls checked');
@@ -116,10 +109,10 @@ async function startFluxFunctions() {
       fluxCommunicationUtils.constantlyUpdateDeterministicFluxList(); // updates deterministic flux list for communication every 2 minutes, so we always trigger cache and have up to date value
     }, 15 * 1000);
     setTimeout(async () => {
-      log.info('Rechecking firewall app rules');
-      fluxNetworkHelper.purgeUFW();
       const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
-      fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
+      await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
+      log.info('Rechecking firewall app rules');
+      await fluxNetworkHelper.purgeUFW();
       appsService.testAppMount(); // test if our node can mount a volume
     }, 30 * 1000);
     setTimeout(() => {
@@ -134,6 +127,15 @@ async function startFluxFunctions() {
       log.info('Starting setting Node Geolocation');
       geolocationService.setNodeGeolocation();
     }, 90 * 1000);
+    setTimeout(() => {
+      const { daemon: { zmqport } } = config;
+      log.info(`Ensuring zmq is enabled for fluxd on port: ${zmqport}`);
+      try {
+        systemService.enableFluxdZmq(`tcp://127.0.0.1:${zmqport}`);
+      } catch (err) {
+        log.error(err);
+      }
+    }, 20 * 60 * 1000);
     setTimeout(async () => { // wait as of restarts due to ui building
       try {
         // todo code shall be removed after some time
@@ -215,13 +217,10 @@ async function startFluxFunctions() {
       appsService.checkMyAppsAvailability(); // periodically checks
     }, 3 * 60 * 1000);
     setTimeout(() => {
-      appsService.checkAndNotifyPeersOfRunningApps(); // first broadcast after 2m of starting fluxos
+      appsService.checkAndNotifyPeersOfRunningApps(); // first broadcast after 4m of starting fluxos
       setInterval(() => { // every 60 mins messages stay on db for 65m
         appsService.checkAndNotifyPeersOfRunningApps();
       }, 60 * 60 * 1000);
-    }, 2 * 60 * 1000);
-    setTimeout(() => {
-      appsService.nodeAndAppsStatusCheck(); // start node and apps monitoring check
     }, 2 * 60 * 1000);
     setTimeout(() => {
       appsService.syncthingApps(); // rechecks and possibly adjust syncthing configuration every 2 minutes
@@ -256,11 +255,6 @@ async function startFluxFunctions() {
     setInterval(() => {
       backupRestoreService.cleanLocalBackup();
     }, 25 * 60 * 1000); // every 25 minutes
-    setTimeout(() => {
-      setInterval(() => {
-        fluxService.monitorAppsRunningOnNodes();
-      }, 5 * 60 * 1000); //  every 5 minutes
-    }, 5 * 60 * 1000);
     if (development) { // just on development branch
       setInterval(async () => {
         await fluxService.enterDevelopment().catch((error) => log.error(error));
