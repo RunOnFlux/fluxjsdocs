@@ -1,12 +1,9 @@
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const os = require('node:os');
-const axios = require('axios');
-const LZString = require('lz-string');
 const { promisify } = require('node:util');
 
 const config = require('config');
-const fullnode = require('fullnode');
 
 const log = require('../lib/log');
 const packageJson = require('../../../package.json');
@@ -27,21 +24,6 @@ const fluxNetworkHelper = require('./fluxNetworkHelper');
 const geolocationService = require('./geolocationService');
 const syncthingService = require('./syncthingService');
 const dockerService = require('./dockerService');
-const dbHelper = require('./dbHelper');
-const { LRUCache } = require('lru-cache');
-const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
-const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-
-const scannedHeightCollection = config.database.daemon.collections.scannedHeight;
-const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
-const appsRunningTimetstampRestoreCollection = config.database.appslocal.collections.appsRunningTimestampRestore;
-
-const monitorAppsCache = {
-  max: 80,
-  ttl: 1000 * 60 * 60 * 6, // 6 hours
-  maxAge: 1000 * 60 * 60 * 6, // 6 hours
-};
-const monitorAppsOnNodesCache = new LRUCache(monitorAppsCache);
 
 // for streamChain endpoint
 const zlib = require('node:zlib');
@@ -663,18 +645,6 @@ function getFluxPGPidentity(req, res) {
 }
 
 /**
- * To show the current CruxID that is being used with FluxOS.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-function getFluxCruxID(req, res) {
-  const cruxID = userconfig.initial.cruxid || null;
-  const message = messageHelper.createDataMessage(cruxID);
-  return res ? res.json(message) : message;
-}
-
-/**
  * To show the current user's Kadena address (public key) that is being used with FluxOS.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -763,7 +733,7 @@ async function daemonDebug(req, res) {
     return res.json(errMessage);
   }
   // check daemon datadir
-  const defaultDir = new fullnode.Config().defaultFolder();
+  const defaultDir = daemonServiceUtils.getFluxdDir();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = `${datadir}/debug.log`;
 
@@ -808,7 +778,7 @@ async function tailDaemonDebug(req, res) {
     return;
   }
 
-  const defaultDir = new fullnode.Config().defaultFolder();
+  const defaultDir = daemonServiceUtils.getFluxdDir();
   const datadir = daemonServiceUtils.getConfigValue('datadir') || defaultDir;
   const filepath = path.join(datadir, 'debug.log');
 
@@ -1130,11 +1100,6 @@ async function getFluxInfo(req, res) {
     if (pgp.status === 'error') {
       throw pgp.data;
     }
-    const cruxidRes = await getFluxCruxID();
-    if (cruxidRes.status === 'error') {
-      throw cruxidRes.data;
-    }
-    info.flux.cruxid = cruxidRes.data;
     const timeResult = await getFluxTimezone();
     if (timeResult.status === 'error') {
       throw timeResult.data;
@@ -1156,6 +1121,8 @@ async function getFluxInfo(req, res) {
       throw daemonInfoRes.data;
     }
     info.daemon.info = daemonInfoRes.data;
+    const zmqEnabled = Boolean(daemonServiceUtils.getConfigValue('zmqpubhashblock'));
+    info.daemon.zmqEnabled = zmqEnabled;
     const daemonNodeStatusRes = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
     if (daemonNodeStatusRes.status === 'error') {
       throw daemonNodeStatusRes.data;
@@ -1226,58 +1193,6 @@ async function getFluxInfo(req, res) {
       error.code,
     );
     return res ? res.json(errorResponse) : errorResponse;
-  }
-}
-
-/**
- * To adjust the current CruxID that is being used with FluxOS. Only accessible by admins.
- * @param {object} req Request.
- * @param {object} res Response.
- */
-async function adjustCruxID(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
-    if (authorized === true) {
-      let { cruxid } = req.params;
-      cruxid = cruxid || req.query.cruxid;
-      if (!cruxid) {
-        throw new Error('No Crux ID provided');
-      }
-      if (!cruxid.includes('@')) {
-        throw new Error('Invalid Crux ID provided');
-      }
-      if (!cruxid.includes('.crux')) {
-        throw new Error('Invalid Crux ID provided');
-      }
-      const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
-      const dataToWrite = `module.exports = {
-        initial: {
-          ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
-          zelid: '${userconfig.initial.zelid || config.fluxTeamFluxID}',
-          kadena: '${userconfig.initial.kadena || ''}',
-          testnet: ${userconfig.initial.testnet || false},
-          development: ${userconfig.initial.development || false},
-          apiport: ${Number(userconfig.initial.apiport || config.server.apiport)},
-          routerIP: '${userconfig.initial.routerIP || ''}',
-          pgpPrivateKey: \`${userconfig.initial.pgpPrivateKey || ''}\`,
-          pgpPublicKey: \`${userconfig.initial.pgpPublicKey || ''}\`,
-          blockedPorts: ${JSON.stringify(userconfig.initial.blockedPorts || [])},
-          blockedRepositories: ${JSON.stringify(userconfig.initial.blockedRepositories || []).replace(/"/g, "'")},
-        }
-      }`;
-
-      await fs.writeFile(fluxDirPath, dataToWrite);
-
-      const successMessage = messageHelper.createSuccessMessage('CruxID adjusted');
-      res.json(successMessage);
-    } else {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      res.json(errMessage);
-    }
-  } catch (error) {
-    log.error(error);
-    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    res.json(errMessage);
   }
 }
 
@@ -1793,261 +1708,10 @@ async function streamChain(req, res) {
   }
 }
 
-/**
- * Function responsable for check if a node is already reachable after first connection failure, if continues down, broadcast to the network a message telling the node is down
- * @param {urlToConnect} req ip port bomcination of the node.
- */
-async function monitorAppsRunningOnNodesDoubleCheck(urlToConnect) {
-  try {
-    const timeout = 30000;
-    const axiosConfig = {
-      timeout,
-    };
-    log.info(`monitorAppsRunningOnNodesDoubleCheck - checking ${urlToConnect} apps running`);
-    const appsRunningOnTheSelectedNode = await appsService.getRunningAppIpList(urlToConnect);
-    const resMyAppAvailability = await axios.get(`http://${urlToConnect}/apps/installedappsnames`, axiosConfig).catch(async (error) => {
-      log.error(`monitorAppsRunningOnNodesDoubleCheck - ${urlToConnect} for app installedappsnames is not reachable`);
-      log.error(error);
-      const broadcastedAt = new Date().getTime();
-      const nodeDownMessage = {
-        type: 'fluxnodedown',
-        version: 1,
-        ip: urlToConnect,
-        broadcastedAt,
-      };
-      // broadcast messages about running apps to all peers
-      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(nodeDownMessage);
-      await serviceHelper.delay(500);
-      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(nodeDownMessage);
-    });
-    if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-      const appsReturned = resMyAppAvailability.data.data;
-      if (appsRunningOnTheSelectedNode.length !== appsReturned.length || !appsRunningOnTheSelectedNode.every((appA) => appsReturned.includes((appB) => appB.name === appA.name))) {
-        log.info(`monitorAppsRunningOnNodesDoubleCheck - ${urlToConnect} apps doesnt match local database information`);
-        await axios.get(`http://${urlToConnect}/apps/broadcastAppsRunning`, axiosConfig).catch((error) => {
-          log.error(`monitorAppsRunningOnNodesDoubleCheck - ${urlToConnect} for apps broadcastAppsRunning is not reachable`);
-          log.error(error);
-        });
-      }
-    }
-  } catch (error) {
-    log.error(`monitorAppsRunningOnNodesDoubleCheck - Error: ${error}`);
-  }
-}
-
-/**
- * Function responsable for monitoring apps running on the network, randomly select a node from deterministic list, check if it is running and if the apps running match the information on local database
- */
-async function monitorAppsRunningOnNodes() {
-  try {
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-    if (daemonHeight < config.apprunningRefactorActivation) {
-      return;
-    }
-    const dbopen = dbHelper.databaseConnection();
-    const database = dbopen.db(config.database.daemon.database);
-    const query = { generalScannedHeight: { $gte: 0 } };
-    const projection = {
-      projection: {
-        _id: 0,
-        generalScannedHeight: 1,
-      },
-    };
-    const currentHeight = await dbHelper.findOneInDatabase(database, scannedHeightCollection, query, projection);
-    if (!currentHeight) {
-      throw new Error('No scanned height found');
-    }
-    const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
-    if (!isNodeConfirmed) {
-      return;
-    }
-    let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-    myIP = myIP.split(':')[0];
-    // eslint-disable-next-line no-await-in-loop
-    let askingIP = await fluxNetworkHelper.getRandomConnection();
-    if (!askingIP) {
-      return;
-    }
-    let askingIpPort = config.server.apiport;
-    if (askingIP.includes(':')) { // has port specification
-      // it has port specification
-      const splittedIP = askingIP.split(':');
-      askingIP = splittedIP[0];
-      askingIpPort = splittedIP[1];
-    }
-    if (myIP === askingIP) {
-      return;
-    }
-    const urlToConnect = `${askingIP}:${askingIpPort}`;
-    if (monitorAppsOnNodesCache.has(urlToConnect)) {
-      monitorAppsRunningOnNodes();
-      return;
-    }
-    monitorAppsOnNodesCache.set(urlToConnect, urlToConnect);
-    const timeout = 30000;
-    const axiosConfig = {
-      timeout,
-    };
-
-    log.info(`monitorAppsRunningOnNodes - checking ${urlToConnect} apps running`);
-    const appsRunningOnTheSelectedNode = await appsService.getRunningAppIpList(urlToConnect);
-    const resMyAppAvailability = await axios.get(`http://${urlToConnect}/apps/installedappsnames`, axiosConfig).catch(async (error) => {
-      log.error(`sentinel - ${urlToConnect} for app installedappsnames is not reachable`);
-      log.error(error);
-      if (appsRunningOnTheSelectedNode.length > 0) {
-        await serviceHelper.delay(5 * 60 * 1000);
-        monitorAppsRunningOnNodesDoubleCheck(urlToConnect);
-      }
-    });
-    if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-      const appsReturned = resMyAppAvailability.data.data;
-      if (appsRunningOnTheSelectedNode.length !== appsReturned.length || !appsRunningOnTheSelectedNode.every((appA) => appsReturned.includes((appB) => appB.name === appA.name))) {
-        log.info(`monitorAppsRunningOnNodes - ${urlToConnect} apps doesnt match local database information`);
-        await axios.get(`http://${urlToConnect}/apps/broadcastAppsRunning`, axiosConfig).catch((error) => {
-          log.error(`sentinel - ${urlToConnect} for apps broadcastAppsRunning is not reachable`);
-          log.error(error);
-        });
-      }
-    }
-  } catch (error) {
-    log.error(`monitorAppsRunningOnNodes - Error: ${error}`);
-  }
-}
-
-/**
- * Function responsable for clearing appslocations db and get information from other nodes on FluxOS launch
- */
-let otherNodesChecks = 0;
-async function prepareAppsLocationsDB() {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-    const database = dbopen.db(config.database.daemon.database);
-    let query;
-    let timestampForSearchs;
-    let projection;
-    log.info('prepareAppsLocationsDB - First run');
-    query = {};
-    projection = {
-      _id: 0,
-      broadcastedAt: 1,
-    };
-    let results = await dbHelper.findInDatabase(database, appsRunningTimetstampRestoreCollection, query, projection);
-    if (results && results.length > 0) {
-      log.info(`prepareAppsLocationsDB - maxBroadcastedAt found in database to be processed: ${JSON.stringify(results)}`);
-      if (results[0].broadcastedAt < 24 * 60 * 60 * 1000) { // timestamp to search over one day we delete entire db and insert the entire info from a new node
-        await dbHelper.removeDocumentsFromCollection(database, appsRunningTimetstampRestoreCollection, query);
-        await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, query);
-      } else {
-        timestampForSearchs = results[0].broadcastedAt - (60 * 60 * 1000); // lets put 1 hour before latest app running message received;
-      }
-    } else {
-      query = { broadcastedAt: -1 };
-      projection = {
-        _id: 0,
-        broadcastedAt: 1,
-      };
-      results = await dbHelper.limitFromCollection(database, globalAppsLocations, query, projection);
-      if (results && results.length > 0) {
-        log.info(`prepareAppsLocationsDB - maxBroadcastedAt: ${results[0].broadcastedAt}`);
-        if (results[0].broadcastedAt < 24 * 60 * 60 * 1000) { // last message received over one day we delete entire db and insert the info from a new node
-          await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, query);
-        } else {
-          const insert = {
-            broadcastedAt: results[0].broadcastedAt,
-          };
-          await dbHelper.insertOneToDatabase(database, appsRunningTimetstampRestoreCollection, insert);
-          timestampForSearchs = results[0].broadcastedAt - (60 * 60 * 1000); // lets put 1 hour before latest app running message received;
-        }
-      } else {
-        log.info('prepareAppsLocationsDB - maxBroadcastedAt not present, will get all DB');
-      }
-    }
-
-    // now let's get the list from two random nodes on the network that have uptime higher than 2 minutes;
-    const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-    let run = 0;
-    while (otherNodesChecks < 2 && run < 10) {
-      run += 1;
-      // eslint-disable-next-line no-await-in-loop
-      let askingIP = await fluxNetworkHelper.getRandomConnection();
-      if (!askingIP) {
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(10 * 1000);
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      if (myIP === askingIP) {
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      let askingIpPort = config.server.apiport;
-      if (askingIP.includes(':')) { // has port specification
-      // it has port specification
-        const splittedIP = askingIP.split(':');
-        askingIP = splittedIP[0];
-        askingIpPort = splittedIP[1];
-      }
-      const axiosConfig = {
-        timeout: 5000,
-      };
-      // eslint-disable-next-line no-await-in-loop
-      const uptimeResponse = await axios.get(`http://${askingIP}:${askingIpPort}/flux/uptime`, axiosConfig).catch((error) => log.error(error));
-      if (uptimeResponse && uptimeResponse.data && uptimeResponse.data.status === 'success' && uptimeResponse.data.data > 60 * 5) {
-        log.info(`prepareAppsLocationsDB - ${askingIP}:${askingIpPort} have uptime higher than 5 minutes: ${uptimeResponse}`);
-        let url = `http://${askingIP}:${askingIpPort}/apps/locationscompressed`;
-        if (timestampForSearchs) {
-          url += `/${timestampForSearchs}`;
-        }
-        log.info(`prepareAppsLocationsDB - ${url}`);
-        // eslint-disable-next-line no-await-in-loop
-        const appsLocationsResponse = await axios.get(url, axiosConfig).catch((error) => log.error(error));
-        if (appsLocationsResponse && appsLocationsResponse.data && appsLocationsResponse.data.status === 'success') {
-          const appsLocationsDBString = LZString.decompress(appsLocationsResponse.data.data);
-          const appsLocations = JSON.parse(appsLocationsDBString);
-          log.info(`prepareAppsLocationsDB - received ${appsLocations.length} locations from ${askingIP}:${askingIpPort} will update now DB`);
-          if (timestampForSearchs) {
-            // eslint-disable-next-line no-restricted-syntax
-            for (const location of appsLocations) {
-              const queryUpdate = { name: location.name, ip: location.ip };
-              const update = { $set: location };
-              const options = {
-                upsert: true,
-              };
-              // eslint-disable-next-line no-await-in-loop
-              await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
-            }
-            otherNodesChecks += 1;
-            log.info(`prepareAppsLocationsDB - DB updated with locations received from ${askingIP}:${askingIpPort}`);
-          } else {
-            // eslint-disable-next-line no-await-in-loop
-            await dbHelper.insertManyToDatabase(database, globalAppsLocations, appsLocations);
-            otherNodesChecks += 1;
-            log.info(`prepareAppsLocationsDB - DB updated with full locations received from ${askingIP}:${askingIpPort}`);
-            break; // we break because we will only get information from two other nodes if we are updating db and not fully recovering;
-          }
-        }
-      }
-    }
-    log.info(`prepareAppsLocationsDB - otherNodesChecks: ${otherNodesChecks}`);
-    if (otherNodesChecks > 0 && timestampForSearchs) {
-      query = {};
-      await dbHelper.removeDocumentsFromCollection(database, appsRunningTimetstampRestoreCollection, query);
-    }
-  } catch (error) {
-    log.error(`prepareAppsLocationsDB - Error: ${error}`);
-    if (otherNodesChecks === 0) { // this means it did not finish any processing
-      await serviceHelper.delay(5 * 60 * 1000);
-      prepareAppsLocationsDB();
-    }
-  }
-}
-
 module.exports = {
   adjustAPIPort,
   adjustBlockedPorts,
   adjustBlockedRepositories,
-  adjustCruxID,
   adjustKadenaAccount,
   adjustRouterIP,
   benchmarkDebug,
@@ -2065,7 +1729,6 @@ module.exports = {
   getBlockedRepositories,
   getCurrentBranch,
   getCurrentCommitId,
-  getFluxCruxID,
   getFluxGeolocation,
   getFluxInfo,
   getFluxIP,
@@ -2105,6 +1768,4 @@ module.exports = {
   // Exports for testing purposes
   fluxLog,
   tailFluxLog,
-  monitorAppsRunningOnNodes,
-  prepareAppsLocationsDB,
 };
