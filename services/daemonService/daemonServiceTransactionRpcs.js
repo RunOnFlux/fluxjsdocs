@@ -2,6 +2,7 @@ const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const verificationHelper = require('../verificationHelper');
+const client = require('../utils/daemonrpcClient').default;
 
 let response = messageHelper.createErrorMessage();
 
@@ -20,7 +21,7 @@ async function createRawTransaction(req, res) {
   addresses = addresses || req.query.addresses;
   let { locktime } = req.params;
   locktime = locktime || req.query.locktime || 0;
-  const blockcount = await daemonServiceUtils.getFluxdClient().getBlockCount().catch((error) => {
+  const blockcount = await client.getBlockCount().catch((error) => {
     response = messageHelper.createErrorMessage(error.message, error.name, error.code);
   });
   if (!blockcount) {
@@ -63,7 +64,7 @@ async function createRawTransactionPost(req, res) {
     let { addresses } = processedBody;
     let { locktime } = processedBody;
     locktime = locktime || 0;
-    const blockcount = await daemonServiceUtils.getFluxdClient().getBlockCount().catch((error) => {
+    const blockcount = await client.getBlockCount().catch((error) => {
       response = messageHelper.createErrorMessage(error.message, error.name, error.code);
     });
     if (!blockcount) {
