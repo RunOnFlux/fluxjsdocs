@@ -216,7 +216,6 @@ async function dockerContainerStatsStream(idOrName, req, res, callback) {
     function onProgress(event) {
       if (res) {
         res.write(serviceHelper.ensureString(event));
-        if (res.flush) res.flush();
       }
       log.info(event);
     }
@@ -282,7 +281,6 @@ function dockerPullStream(pullConfig, res, callback) {
     function onProgress(event) {
       if (res) {
         res.write(serviceHelper.ensureString(event));
-        if (res.flush) res.flush();
       }
       log.info(event);
     }
@@ -326,7 +324,6 @@ async function dockerContainerExec(container, cmd, env, res, callback) {
       mystream.on('data', (data) => {
         resultString = serviceHelper.dockerBufferToString(data);
         res.write(resultString);
-        if (res.flush) res.flush();
       });
       mystream.on('end', () => callback(null));
     });
@@ -351,7 +348,6 @@ async function dockerContainerLogsStream(idOrName, res, callback) {
     const logStream = new stream.PassThrough();
     logStream.on('data', (chunk) => {
       res.write(serviceHelper.ensureString(chunk.toString('utf8')));
-      if (res.flush) res.flush();
     });
 
     dockerContainer.logs(
@@ -540,13 +536,13 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     if (Array.isArray(arraySecrets)) {
       arraySecrets.forEach((parameter) => {
         if (typeof parameter !== 'string' || parameter.length > 5000000) {
-          throw new Error('Environment parameters from Secrets are invalid - type or length');
+          throw new Error('Environment parameters from Secrets are invalid');
         } else if (parameter !== 'privileged') {
           envParams.push(parameter);
         }
       });
     } else {
-      throw new Error('Environment parameters from Secrets are invalid - not an array');
+      throw new Error('Environment parameters from Secrets are invalid');
     }
   }
   const adjustedCommands = [];
@@ -661,30 +657,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     throw error;
   });
   return app;
-}
-
-/**
- * Updates the CPU limits of a Docker container.
- *
- * @param {string} idOrName - The ID or name of the Docker container.
- * @param {number} nanoCpus - The CPU limit in nanoCPUs (1 CPU = 1,000,000,000 nanoCPUs).
- * @returns {Promise<string>} message
- */
-async function appDockerUpdateCpu(idOrName, nanoCpus) {
-  try {
-    // Get the Docker container by ID or name
-    const dockerContainer = await getDockerContainerByIdOrName(idOrName);
-
-    // Update the container's CPU resources
-    await dockerContainer.update({
-      NanoCpus: nanoCpus,
-    });
-
-    return `Flux App ${idOrName} successfully updated with ${nanoCpus / 1e9} CPUs.`;
-  } catch (error) {
-    log.error(error);
-    throw new Error(`Failed to update CPU resources for ${idOrName}: ${error.message}`);
-  }
 }
 
 /**
@@ -1033,7 +1005,6 @@ async function dockerLogsFix() {
 
 module.exports = {
   appDockerCreate,
-  appDockerUpdateCpu,
   appDockerImageRemove,
   appDockerKill,
   appDockerPause,
