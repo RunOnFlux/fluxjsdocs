@@ -12,7 +12,7 @@ class ImageVerifier {
 
   static imagePattern = /^(?:(?<provider>(?:(?:[\w-]+(?:\.[\w-]+)+)(?::\d+)?)|[\w]+:\d+)\/)?\/?(?<namespace>(?:(?:[a-z0-9]+(?:(?:[._]|__|[-]*)[a-z0-9]+)*)\/){0,2})(?<repository>[a-z0-9-_.]+\/{0,1}[a-z0-9-_.]+)[:]?(?<tag>[\w][\w.-]{0,127})?/;
 
-  static wwwAuthHeaderPattern = /Bearer realm="(?<realm>(?:[0-9a-z:\-./]*?))"(?:,service="(?<service>(?:[0-9a-z:\-./]*?))")?(?:,scope="(?<scope>[0-9a-z:\-./]*?)")?/;
+  static wwwAuthHeaderPattern = /Bearer realm="(?<realm>(?:[0-9a-z:\-./]*?))"(?:,service="(?<service>(?:[0-9a-z:\-./]*?))")?(?:,scope="(?<scope>[0-9a-z:\-._/]*?)")?/;
 
   static supportedMediaTypes = [
     'application/vnd.oci.image.index.v1+json',
@@ -190,10 +190,16 @@ class ImageVerifier {
       return;
     }
 
+    if (this.rawImageTag.startsWith('/') || this.rawImageTag.endsWith('/')) {
+      this.#parseErrorDetail = `Image tag: "${this.rawImageTag}" cannot start or end with a backslash.`;
+      return;
+    }
+
     const match = ImageVerifier.imagePattern.exec(this.rawImageTag);
 
     if (match === null) {
       this.#parseErrorDetail = `Image tag: ${this.rawImageTag} is not in valid format [HOST[:PORT_NUMBER]/][NAMESPACE/]REPOSITORY[:TAG]`;
+      return;
     }
 
     const {

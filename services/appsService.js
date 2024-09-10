@@ -3,7 +3,6 @@ const https = require('https');
 const axios = require('axios');
 const express = require('express');
 const http = require('http');
-const LZString = require('lz-string');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const os = require('os');
 const path = require('path');
@@ -106,13 +105,6 @@ const syncthingDevicesCache = {
   maxAge: 1000 * 60 * 60 * 24, // 24 hours
 };
 
-const appsRunningCache = {
-  max: 1,
-  ttl: 1000 * 60 * 60 * 24, // 24 hours
-  maxAge: 1000 * 60 * 60 * 24, // 24 hours
-};
-
-const broadCastAppsRunningCache = new LRUCache(appsRunningCache);
 const trySpawningGlobalAppCache = new LRUCache(GlobalAppsSpawnLRUoptions);
 const myShortCache = new LRUCache(shortCache);
 const myLongCache = new LRUCache(longCache);
@@ -255,53 +247,6 @@ async function installedApps(req, res) {
 }
 
 /**
- * To get a list of installed apps Names. Where req can be url to get this information from another node.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-async function installedAppsNames(req, res) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-
-    const appsDatabase = dbopen.db(config.database.appslocal.database);
-    const appsQuery = {};
-    let url;
-    if (req && req.params && req.query) {
-      // eslint-disable-next-line prefer-destructuring
-      url = req.params.url; // we accept both help/command and help?command=getinfo
-      url = url || req.query.url;
-    } else if (req && typeof req === 'string') {
-      url = req;
-    }
-    if (url) {
-      const timeout = 10000;
-      const axiosConfig = {
-        timeout,
-      };
-      return axios.get(`http://${url}/apps/installedappsnames`, axiosConfig);
-    }
-    const appsProjection = {
-      projection: {
-        _id: 0,
-        name: 1,
-      },
-    };
-    const apps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
-    const dataResponse = messageHelper.createDataMessage(apps);
-    return res ? res.json(dataResponse) : dataResponse;
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    return res ? res.json(errorResponse) : errorResponse;
-  }
-}
-
-/**
  * To list running apps.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -409,7 +354,6 @@ async function executeAppGlobalCommand(appname, command, zelidauth, paramA, bypa
     const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
     const myUrl = myIP.split(':')[0];
     const myUrlPort = myIP.split(':')[1] || 16127;
-    let i = 1;
     // eslint-disable-next-line no-restricted-syntax
     for (const appInstance of locations) {
       // HERE let the node we are connected to handle it
@@ -428,14 +372,15 @@ async function executeAppGlobalCommand(appname, command, zelidauth, paramA, bypa
       if (paramA) {
         url += `/${paramA}`;
       }
-      axios.get(url, axiosConfig);// do not wait, we do not care of the response
+      axios.get(url, axiosConfig)
+        .then((response) => {
+          log.info(`Successfully sent command to ${url}: ${response.status}`);
+        })
+        .catch((error) => {
+          log.error(`Axios request failed for ${url}`, error);
+        });
       // eslint-disable-next-line no-await-in-loop
       await serviceHelper.delay(500);
-      if (command === 'redeploy' && !paramA && i < 4) {
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(i * 60 * 1000);
-      }
-      i += 1;
     }
   } catch (error) {
     log.error(error);
@@ -1864,6 +1809,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
   log.info(searchSpace);
   if (res) {
     res.write(serviceHelper.ensureString(searchSpace));
+    if (res.flush) res.flush();
   }
 
   // we want whole numbers in GB
@@ -1934,6 +1880,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
   log.info(searchSpace2);
   if (res) {
     res.write(serviceHelper.ensureString(searchSpace2));
+    if (res.flush) res.flush();
   }
 
   try {
@@ -1943,6 +1890,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(allocateSpace);
     if (res) {
       res.write(serviceHelper.ensureString(allocateSpace));
+      if (res.flush) res.flush();
     }
 
     let execDD = `sudo fallocate -l ${appSpecifications.hdd}G ${useThisVolume.mount}/${appId}FLUXFSVOL`; // eg /mnt/sthMounted
@@ -1957,6 +1905,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(allocateSpace2);
     if (res) {
       res.write(serviceHelper.ensureString(allocateSpace2));
+      if (res.flush) res.flush();
     }
 
     const makeFilesystem = {
@@ -1965,6 +1914,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(makeFilesystem);
     if (res) {
       res.write(serviceHelper.ensureString(makeFilesystem));
+      if (res.flush) res.flush();
     }
     let execFS = `sudo mke2fs -t ext4 ${useThisVolume.mount}/${appId}FLUXFSVOL`;
     if (useThisVolume.mount === '/') {
@@ -1977,6 +1927,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(makeFilesystem2);
     if (res) {
       res.write(serviceHelper.ensureString(makeFilesystem2));
+      if (res.flush) res.flush();
     }
 
     const makeDirectory = {
@@ -1985,6 +1936,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(makeDirectory);
     if (res) {
       res.write(serviceHelper.ensureString(makeDirectory));
+      if (res.flush) res.flush();
     }
     const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata`;
     await cmdAsync(execDIR);
@@ -1994,6 +1946,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(makeDirectory2);
     if (res) {
       res.write(serviceHelper.ensureString(makeDirectory2));
+      if (res.flush) res.flush();
     }
 
     const mountingStatus = {
@@ -2002,6 +1955,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(mountingStatus);
     if (res) {
       res.write(serviceHelper.ensureString(mountingStatus));
+      if (res.flush) res.flush();
     }
     let execMount = `sudo mount -o loop ${useThisVolume.mount}/${appId}FLUXFSVOL ${appsFolder + appId}`;
     if (useThisVolume.mount === '/') {
@@ -2014,6 +1968,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(mountingStatus2);
     if (res) {
       res.write(serviceHelper.ensureString(mountingStatus2));
+      if (res.flush) res.flush();
     }
 
     const permissionsDirectory = {
@@ -2022,6 +1977,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(permissionsDirectory);
     if (res) {
       res.write(serviceHelper.ensureString(permissionsDirectory));
+      if (res.flush) res.flush();
     }
     const execPERM = `sudo chmod 777 ${appsFolder + appId}`;
     await cmdAsync(execPERM);
@@ -2031,6 +1987,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(permissionsDirectory2);
     if (res) {
       res.write(serviceHelper.ensureString(permissionsDirectory2));
+      if (res.flush) res.flush();
     }
 
     // if s flag create .stfolder
@@ -2047,6 +2004,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
         log.info(stFolderCreation);
         if (res) {
           res.write(serviceHelper.ensureString(stFolderCreation));
+          if (res.flush) res.flush();
         }
         const execDIRst = `sudo mkdir -p ${appsFolder + appId + containerFolder}/.stfolder`;
         // eslint-disable-next-line no-await-in-loop
@@ -2057,6 +2015,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
         log.info(stFolderCreation2);
         if (res) {
           res.write(serviceHelper.ensureString(stFolderCreation2));
+          if (res.flush) res.flush();
         }
         if (i === 0) {
           const stignore = `sudo echo '/backup' >| ${appsFolder + appId + containerFolder}/.stignore`;
@@ -2069,6 +2028,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
           log.info(stiFileCreation);
           if (res) {
             res.write(serviceHelper.ensureString(stiFileCreation));
+            if (res.flush) res.flush();
           }
         }
       }
@@ -2080,6 +2040,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(cronStatus);
     if (res) {
       res.write(serviceHelper.ensureString(cronStatus));
+      if (res.flush) res.flush();
     }
     const crontab = await crontabLoad();
     const jobs = crontab.jobs();
@@ -2111,6 +2072,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(cronStatusB);
     if (res) {
       res.write(serviceHelper.ensureString(cronStatusB));
+      if (res.flush) res.flush();
     }
     const message = messageHelper.createSuccessMessage('Flux App volume creation completed.');
     return message;
@@ -2124,6 +2086,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(cleaningRemoval);
     if (res) {
       res.write(serviceHelper.ensureString(cleaningRemoval));
+      if (res.flush) res.flush();
     }
     let execRemoveAlloc = `sudo rm -rf ${useThisVolume.mount}/${appId}FLUXFSVOL`;
     if (useThisVolume.mount === '/') {
@@ -2138,6 +2101,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     log.info(aloocationRemoval2);
     if (res) {
       res.write(serviceHelper.ensureString(aloocationRemoval2));
+      if (res.flush) res.flush();
     }
     throw error;
   }
@@ -2158,6 +2122,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(stopStatus);
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus));
+    if (res.flush) res.flush();
   }
   let monitoredName = appName;
   if (isComponent) {
@@ -2172,6 +2137,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     );
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
   });
   const stopStatus2 = {
@@ -2180,6 +2146,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(stopStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus2));
+    if (res.flush) res.flush();
   }
 
   // eslint-disable-next-line no-use-before-define
@@ -2191,6 +2158,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(removeStatus);
   if (res) {
     res.write(serviceHelper.ensureString(removeStatus));
+    if (res.flush) res.flush();
   }
   await dockerService.appDockerRemove(appId).catch((error) => {
     const errorResponse = messageHelper.createErrorMessage(
@@ -2201,6 +2169,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.error(errorResponse);
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
   });
   const removeStatus2 = {
@@ -2209,6 +2178,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(removeStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(removeStatus2));
+    if (res.flush) res.flush();
   }
 
   const imageStatus = {
@@ -2217,6 +2187,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(imageStatus);
   if (res) {
     res.write(serviceHelper.ensureString(imageStatus));
+    if (res.flush) res.flush();
   }
   await dockerService.appDockerImageRemove(appSpecifications.repotag).catch((error) => {
     const errorResponse = messageHelper.createErrorMessage(
@@ -2227,6 +2198,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.error(errorResponse);
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
   });
   const imageStatus2 = {
@@ -2235,6 +2207,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(imageStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(imageStatus2));
+    if (res.flush) res.flush();
   }
 
   const portStatus = {
@@ -2243,6 +2216,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(portStatus);
   if (res) {
     res.write(serviceHelper.ensureString(portStatus));
+    if (res.flush) res.flush();
   }
   if (appSpecifications.ports) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
@@ -2278,6 +2252,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(portStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(portStatus2));
+    if (res.flush) res.flush();
   }
 
   const unmuontStatus = {
@@ -2286,6 +2261,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(unmuontStatus);
   if (res) {
     res.write(serviceHelper.ensureString(unmuontStatus));
+    if (res.flush) res.flush();
   }
   const execUnmount = `sudo umount ${appsFolder + appId}`;
   await cmdAsync(execUnmount).then(() => {
@@ -2295,6 +2271,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(unmuontStatus2);
     if (res) {
       res.write(serviceHelper.ensureString(unmuontStatus2));
+      if (res.flush) res.flush();
     }
   }).catch((e) => {
     log.error(e);
@@ -2304,6 +2281,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(unmuontStatus3);
     if (res) {
       res.write(serviceHelper.ensureString(unmuontStatus3));
+      if (res.flush) res.flush();
     }
   });
 
@@ -2313,6 +2291,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(cleaningStatus);
   if (res) {
     res.write(serviceHelper.ensureString(cleaningStatus));
+    if (res.flush) res.flush();
   }
   const execDelete = `sudo rm -rf ${appsFolder + appId}`;
   await cmdAsync(execDelete).catch((e) => {
@@ -2323,6 +2302,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(cleaningStatusE);
     if (res) {
       res.write(serviceHelper.ensureString(cleaningStatusE));
+      if (res.flush) res.flush();
     }
   });
   const cleaningStatus2 = {
@@ -2331,6 +2311,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(cleaningStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(cleaningStatus2));
+    if (res.flush) res.flush();
   }
 
   let volumepath;
@@ -2341,6 +2322,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(cronStatus);
   if (res) {
     res.write(serviceHelper.ensureString(cronStatus));
+    if (res.flush) res.flush();
   }
 
   const crontab = await crontabLoad().catch((e) => {
@@ -2351,6 +2333,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(cronE);
     if (res) {
       res.write(serviceHelper.ensureString(cronE));
+      if (res.flush) res.flush();
     }
   });
   if (crontab) {
@@ -2385,6 +2368,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
         log.info(cronE);
         if (res) {
           res.write(serviceHelper.ensureString(cronE));
+          if (res.flush) res.flush();
         }
       }
       const cronStatusDone = {
@@ -2393,6 +2377,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
       log.info(cronStatusDone);
       if (res) {
         res.write(serviceHelper.ensureString(cronStatusDone));
+        if (res.flush) res.flush();
       }
     } else {
       const cronStatusNotFound = {
@@ -2401,6 +2386,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
       log.info(cronStatusNotFound);
       if (res) {
         res.write(serviceHelper.ensureString(cronStatusNotFound));
+        if (res.flush) res.flush();
       }
     }
   }
@@ -2412,6 +2398,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(cleaningVolumeStatus);
     if (res) {
       res.write(serviceHelper.ensureString(cleaningVolumeStatus));
+      if (res.flush) res.flush();
     }
     const execVolumeDelete = `sudo rm -rf ${volumepath}`;
     await cmdAsync(execVolumeDelete).catch((e) => {
@@ -2422,6 +2409,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
       log.info(cleaningVolumeStatusE);
       if (res) {
         res.write(serviceHelper.ensureString(cleaningVolumeStatusE));
+        if (res.flush) res.flush();
       }
     });
     const cleaningVolumeStatus2 = {
@@ -2430,6 +2418,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     log.info(cleaningVolumeStatus2);
     if (res) {
       res.write(serviceHelper.ensureString(cleaningVolumeStatus2));
+      if (res.flush) res.flush();
     }
   }
   const appRemovalResponse = {
@@ -2438,6 +2427,7 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
   log.info(appRemovalResponse);
   if (res) {
     res.write(serviceHelper.ensureString(appRemovalResponse));
+    if (res.flush) res.flush();
   }
 }
 
@@ -2461,6 +2451,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         log.warn(warnResponse);
         if (res) {
           res.write(serviceHelper.ensureString(warnResponse));
+          if (res.flush) res.flush();
           if (endResponse) {
             res.end();
           }
@@ -2472,6 +2463,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         log.warn(warnResponse);
         if (res) {
           res.write(serviceHelper.ensureString(warnResponse));
+          if (res.flush) res.flush();
           if (endResponse) {
             res.end();
           }
@@ -2583,6 +2575,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       log.info(dockerNetworkStatus);
       if (res) {
         res.write(serviceHelper.ensureString(dockerNetworkStatus));
+        if (res.flush) res.flush();
       }
       await dockerService.removeFluxAppDockerNetwork(appName).catch((error) => log.error(error));
       const dockerNetworkStatus2 = {
@@ -2591,6 +2584,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       log.info(dockerNetworkStatus2);
       if (res) {
         res.write(serviceHelper.ensureString(dockerNetworkStatus2));
+        if (res.flush) res.flush();
       }
       const databaseStatus = {
         status: 'Cleaning up database...',
@@ -2598,6 +2592,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       log.info(databaseStatus);
       if (res) {
         res.write(serviceHelper.ensureString(databaseStatus));
+        if (res.flush) res.flush();
       }
       await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
       const databaseStatus2 = {
@@ -2606,6 +2601,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       log.info(databaseStatus2);
       if (res) {
         res.write(serviceHelper.ensureString(databaseStatus2));
+        if (res.flush) res.flush();
       }
     }
     const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was successfuly removed`);
@@ -2613,6 +2609,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
 
     if (res) {
       res.write(serviceHelper.ensureString(appRemovalResponseDone));
+      if (res.flush) res.flush();
     }
     if (res && endResponse) {
       res.end();
@@ -2628,6 +2625,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
     );
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
       if (endResponse) {
         res.end();
       }
@@ -2650,6 +2648,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(stopStatus);
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus));
+    if (res.flush) res.flush();
   }
   let monitoredName = appName;
   if (isComponent) {
@@ -2664,6 +2663,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
     );
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
   });
 
@@ -2673,6 +2673,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(stopStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(stopStatus2));
+    if (res.flush) res.flush();
   }
 
   const removeStatus = {
@@ -2681,6 +2682,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(removeStatus);
   if (res) {
     res.write(serviceHelper.ensureString(removeStatus));
+    if (res.flush) res.flush();
   }
 
   await dockerService.appDockerRemove(appId);
@@ -2691,6 +2693,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(removeStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(removeStatus2));
+    if (res.flush) res.flush();
   }
 
   const imageStatus = {
@@ -2699,6 +2702,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(imageStatus);
   if (res) {
     res.write(serviceHelper.ensureString(imageStatus));
+    if (res.flush) res.flush();
   }
   await dockerService.appDockerImageRemove(appSpecifications.repotag).catch((error) => {
     const errorResponse = messageHelper.createErrorMessage(
@@ -2709,6 +2713,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
     log.error(errorResponse);
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
   });
   const imageStatus2 = {
@@ -2717,6 +2722,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(imageStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(imageStatus2));
+    if (res.flush) res.flush();
   }
 
   const portStatus = {
@@ -2725,6 +2731,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(portStatus);
   if (res) {
     res.write(serviceHelper.ensureString(portStatus));
+    if (res.flush) res.flush();
   }
   if (appSpecifications.ports) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
@@ -2760,6 +2767,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(portStatus2);
   if (res) {
     res.write(serviceHelper.ensureString(portStatus2));
+    if (res.flush) res.flush();
   }
   const appRemovalResponse = {
     status: isComponent ? `Flux App component ${appSpecifications.name} of ${appName} was successfuly removed` : `Flux App ${appName} was successfuly removed`,
@@ -2767,6 +2775,7 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
   log.info(appRemovalResponse);
   if (res) {
     res.write(serviceHelper.ensureString(appRemovalResponse));
+    if (res.flush) res.flush();
   }
 }
 
@@ -2835,6 +2844,7 @@ async function softRemoveAppLocally(app, res) {
     log.info(databaseStatus);
     if (res) {
       res.write(serviceHelper.ensureString(databaseStatus));
+      if (res.flush) res.flush();
     }
     await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
     const databaseStatus2 = {
@@ -2843,11 +2853,13 @@ async function softRemoveAppLocally(app, res) {
     log.info(databaseStatus2);
     if (res) {
       res.write(serviceHelper.ensureString(databaseStatus2));
+      if (res.flush) res.flush();
     }
     const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
     log.info(appRemovalResponseDone);
     if (res) {
       res.write(serviceHelper.ensureString(appRemovalResponseDone));
+      if (res.flush) res.flush();
     }
   }
 
@@ -3201,6 +3213,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
 
   if (res) {
     res.write(serviceHelper.ensureString(pullStatus));
+    if (res.flush) res.flush();
   }
 
   await createAppVolume(appSpecifications, appName, isComponent, res);
@@ -3211,6 +3224,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   log.info(createApp);
   if (res) {
     res.write(serviceHelper.ensureString(createApp));
+    if (res.flush) res.flush();
   }
 
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
@@ -3221,6 +3235,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   log.info(portStatusInitial);
   if (res) {
     res.write(serviceHelper.ensureString(portStatusInitial));
+    if (res.flush) res.flush();
   }
   if (!test && appSpecifications.ports) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
@@ -3236,6 +3251,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
           log.info(portStatus);
           if (res) {
             res.write(serviceHelper.ensureString(portStatus));
+            if (res.flush) res.flush();
           }
         } else {
           throw new Error(`Error: Port ${port} FAILed to open.`);
@@ -3258,6 +3274,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
           log.info(portStatus);
           if (res) {
             res.write(serviceHelper.ensureString(portStatus));
+            if (res.flush) res.flush();
           }
         } else {
           throw new Error(`Error: Port ${port} FAILed to map.`);
@@ -3276,6 +3293,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
         log.info(portStatus);
         if (res) {
           res.write(serviceHelper.ensureString(portStatus));
+          if (res.flush) res.flush();
         }
       } else {
         throw new Error(`Error: Port ${appSpecifications.port} FAILed to open.`);
@@ -3294,6 +3312,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
         log.info(portStatus);
         if (res) {
           res.write(serviceHelper.ensureString(portStatus));
+          if (res.flush) res.flush();
         }
       } else {
         throw new Error(`Error: Port ${appSpecifications.port} FAILed to map.`);
@@ -3306,6 +3325,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   log.info(startStatus);
   if (res) {
     res.write(serviceHelper.ensureString(startStatus));
+    if (res.flush) res.flush();
   }
   if (test || (!appSpecifications.containerData.includes('r:') && !appSpecifications.containerData.includes('g:'))) {
     const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
@@ -3320,6 +3340,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
     log.info(appResponse);
     if (res) {
       res.write(serviceHelper.ensureString(appResponse));
+      if (res.flush) res.flush();
     }
   }
 }
@@ -3395,6 +3416,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     log.info(precheckForInstallation);
     if (res) {
       res.write(serviceHelper.ensureString(precheckForInstallation));
+      if (res.flush) res.flush();
     }
     // connect to mongodb
     const dbOpenTest = {
@@ -3403,6 +3425,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     log.info(dbOpenTest);
     if (res) {
       res.write(serviceHelper.ensureString(dbOpenTest));
+      if (res.flush) res.flush();
     }
     const dbopen = dbHelper.databaseConnection();
 
@@ -3422,6 +3445,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     log.info(checkDb);
     if (res) {
       res.write(serviceHelper.ensureString(checkDb));
+      if (res.flush) res.flush();
     }
     const appResult = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
     if (appResult && !isComponent) {
@@ -3472,6 +3496,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       log.info(dockerContainers);
       if (res) {
         res.write(serviceHelper.ensureString(dockerContainers));
+        if (res.flush) res.flush();
       }
       await dockerService.pruneContainers();
       const dockerContainers2 = {
@@ -3479,6 +3504,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(dockerContainers2));
+        if (res.flush) res.flush();
       }
 
       const dockerNetworks = {
@@ -3487,6 +3513,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       log.info(dockerNetworks);
       if (res) {
         res.write(serviceHelper.ensureString(dockerNetworks));
+        if (res.flush) res.flush();
       }
       await dockerService.pruneNetworks();
       const dockerNetworks2 = {
@@ -3494,6 +3521,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(dockerNetworks2));
+        if (res.flush) res.flush();
       }
 
       const dockerVolumes = {
@@ -3502,6 +3530,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       log.info(dockerVolumes);
       if (res) {
         res.write(serviceHelper.ensureString(dockerVolumes));
+        if (res.flush) res.flush();
       }
       await dockerService.pruneVolumes();
       const dockerVolumes2 = {
@@ -3509,6 +3538,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(dockerVolumes2));
+        if (res.flush) res.flush();
       }
 
       const dockerImages = {
@@ -3517,6 +3547,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       log.info(dockerImages);
       if (res) {
         res.write(serviceHelper.ensureString(dockerImages));
+        if (res.flush) res.flush();
       }
       await dockerService.pruneImages();
       const dockerImages2 = {
@@ -3524,6 +3555,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(dockerImages2));
+        if (res.flush) res.flush();
       }
     }
 
@@ -3538,6 +3570,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       log.info(fluxNetworkStatus);
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetworkStatus));
+        if (res.flush) res.flush();
       }
       let fluxNet = null;
       for (let i = 0; i <= 20; i += 1) {
@@ -3559,12 +3592,14 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(accessRemovedRes));
+        if (res.flush) res.flush();
       }
       const fluxNetResponse = {
         status: `Docker network of ${appName} initiated.`,
       };
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetResponse));
+        if (res.flush) res.flush();
       }
     }
 
@@ -3574,6 +3609,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     log.info(appInstallation);
     if (res) {
       res.write(serviceHelper.ensureString(appInstallation));
+      if (res.flush) res.flush();
     }
     if (!isComponent) {
       // register the app
@@ -3651,12 +3687,14 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     log.error(errorResponse);
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
     if (!test) {
       const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
       log.info(removeStatus);
       if (res) {
         res.write(serviceHelper.ensureString(removeStatus));
+        if (res.flush) res.flush();
       }
       removeAppLocally(appSpecs.name, res, true, true, false);
     }
@@ -3724,6 +3762,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   };
   if (res) {
     res.write(serviceHelper.ensureString(pullStatus));
+    if (res.flush) res.flush();
   }
 
   const createApp = {
@@ -3732,6 +3771,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   log.info(createApp);
   if (res) {
     res.write(serviceHelper.ensureString(createApp));
+    if (res.flush) res.flush();
   }
 
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
@@ -3742,6 +3782,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   log.info(portStatusInitial);
   if (res) {
     res.write(serviceHelper.ensureString(portStatusInitial));
+    if (res.flush) res.flush();
   }
   if (appSpecifications.ports) {
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
@@ -3757,6 +3798,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
           log.info(portStatus);
           if (res) {
             res.write(serviceHelper.ensureString(portStatus));
+            if (res.flush) res.flush();
           }
         } else {
           throw new Error(`Error: Port ${port} FAILed to open.`);
@@ -3779,6 +3821,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
           log.info(portStatus);
           if (res) {
             res.write(serviceHelper.ensureString(portStatus));
+            if (res.flush) res.flush();
           }
         } else {
           throw new Error(`Error: Port ${port} FAILed to map.`);
@@ -3797,6 +3840,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
         log.info(portStatus);
         if (res) {
           res.write(serviceHelper.ensureString(portStatus));
+          if (res.flush) res.flush();
         }
       } else {
         throw new Error(`Error: Port ${appSpecifications.port} FAILed to open.`);
@@ -3815,6 +3859,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
         log.info(portStatus);
         if (res) {
           res.write(serviceHelper.ensureString(portStatus));
+          if (res.flush) res.flush();
         }
       } else {
         throw new Error(`Error: Port ${appSpecifications.port} FAILed to map.`);
@@ -3827,6 +3872,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   log.info(startStatus);
   if (res) {
     res.write(serviceHelper.ensureString(startStatus));
+    if (res.flush) res.flush();
   }
   if (!appSpecifications.containerData.includes('g:')) {
     const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
@@ -3839,6 +3885,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
     log.info(appResponse);
     if (res) {
       res.write(serviceHelper.ensureString(appResponse));
+      if (res.flush) res.flush();
     }
   }
 }
@@ -3896,6 +3943,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     log.info(precheckForInstallation);
     if (res) {
       res.write(serviceHelper.ensureString(precheckForInstallation));
+      if (res.flush) res.flush();
     }
     // connect to mongodb
     const dbOpenTest = {
@@ -3904,6 +3952,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     log.info(dbOpenTest);
     if (res) {
       res.write(serviceHelper.ensureString(dbOpenTest));
+      if (res.flush) res.flush();
     }
     const dbopen = dbHelper.databaseConnection();
 
@@ -3923,6 +3972,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     log.info(checkDb);
     if (res) {
       res.write(serviceHelper.ensureString(checkDb));
+      if (res.flush) res.flush();
     }
     const appResult = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
     if (appResult && !isComponent) {
@@ -3947,6 +3997,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       log.info(fluxNetworkStatus);
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetworkStatus));
+        if (res.flush) res.flush();
       }
       let fluxNet = null;
       for (let i = 0; i <= 20; i += 1) {
@@ -3968,12 +4019,14 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       };
       if (res) {
         res.write(serviceHelper.ensureString(accessRemovedRes));
+        if (res.flush) res.flush();
       }
       const fluxNetResponse = {
         status: `Docker network of ${appName} initiated.`,
       };
       if (res) {
         res.write(serviceHelper.ensureString(fluxNetResponse));
+        if (res.flush) res.flush();
       }
     }
 
@@ -3983,6 +4036,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     log.info(appInstallation);
     if (res) {
       res.write(serviceHelper.ensureString(appInstallation));
+      if (res.flush) res.flush();
     }
     if (!isComponent) {
       // register the app
@@ -4038,11 +4092,13 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     log.error(errorResponse);
     if (res) {
       res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
     }
     const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
     log.info(removeStatus);
     if (res) {
       res.write(serviceHelper.ensureString(removeStatus));
+      if (res.flush) res.flush();
     }
     removeAppLocally(appSpecs.name, res, true);
   }
@@ -4693,6 +4749,42 @@ async function getUserBlockedRepositores() {
   } catch (error) {
     log.error(error);
     return [];
+  }
+}
+
+/**
+ * Check secrets, if they are being used return exception
+ * @param {string} appName App name.
+ * @param {object} appSpecs App specifications.
+ * @param {boolean} registration informs if it's an app registration or not.
+ */
+async function checkAppSecrets(appName, appComponentSpecs, registration = false) {
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appsglobal.database);
+  const query = {};
+  const projection = { projection: { _id: 0 } };
+  const results = await dbHelper.findInDatabase(database, globalAppsInformation, query, projection);
+  let foundSecretsWithSameAppName = false;
+  let foundSecretsWithDifferentAppName = false;
+  // eslint-disable-next-line no-restricted-syntax
+  for (const app of results) {
+    if (app.version >= 7 && app.nodes.length > 0) {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const component of app.compose) {
+        if (component.secrets.length > 0 && JSON.stringify(component.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, '')) === JSON.stringify(appComponentSpecs.secrets.replace(/(\r\n|\n|\r)/gm, '').replace(/\\/g, ''))) {
+          if (registration) {
+            throw new Error(`Provided component ${component.name} secrets are not valid`);
+          } else if (app.name !== appName) {
+            foundSecretsWithDifferentAppName = true;
+          } else if (app.name === appName) {
+            foundSecretsWithSameAppName = true;
+          }
+        }
+      }
+    }
+  }
+  if (!registration && foundSecretsWithDifferentAppName && !foundSecretsWithSameAppName) {
+    throw new Error('Provided component(s) secrets are not valid');
   }
 }
 
@@ -5771,10 +5863,6 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
     checkHWParameters(appSpecifications);
   } else {
     checkComposeHWParameters(appSpecifications);
-    // eslint-disable-next-line no-restricted-syntax
-    for (const appComponent of appSpecifications.compose) {
-      checkHWParameters(appComponent);
-    }
   }
 
   // Whitelist, repository checks
@@ -6396,8 +6484,6 @@ async function storeAppRunningMessage(message) {
   const database = db.db(config.database.appsglobal.database);
 
   let messageNotOk = false;
-  const queryUpdateRemovals = [];
-  queryUpdateRemovals.push({ ip: message.ip });
   for (let i = 0; i < appsMessages.length; i += 1) {
     const app = appsMessages[i];
     const newAppRunningMessage = {
@@ -6405,10 +6491,8 @@ async function storeAppRunningMessage(message) {
       hash: app.hash, // hash of application specifics that are running
       ip: message.ip,
       broadcastedAt: new Date(message.broadcastedAt),
-      expireAt: null,
-      removedBroadcastedAt: null,
+      expireAt: new Date(validTill),
     };
-    queryUpdateRemovals.push({ name: { $ne: app.name } });
 
     // indexes over name, hash, ip. Then name + ip and name + ip + broadcastedAt.
     const queryFind = { name: newAppRunningMessage.name, ip: newAppRunningMessage.ip };
@@ -6421,33 +6505,20 @@ async function storeAppRunningMessage(message) {
       messageNotOk = true;
       break;
     }
-    // eslint-disable-next-line global-require
-    const fluxService = require('./fluxService');
-    if (fluxService.canProcessAppsRunningMessages()) {
-      if (message.runningSince) {
-        newAppRunningMessage.runningSince = new Date(message.runningSince);
-      } else if (app.runningSince) {
-        newAppRunningMessage.runningSince = new Date(app.runningSince);
-      } else if (result && result.runningSince) {
-        newAppRunningMessage.runningSince = result.runningSince;
-      }
-      const queryUpdate = { name: newAppRunningMessage.name, ip: newAppRunningMessage.ip };
-      const update = { $set: newAppRunningMessage };
-      const options = {
-        upsert: true,
-      };
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
+    if (message.runningSince) {
+      newAppRunningMessage.runningSince = new Date(message.runningSince);
+    } else if (app.runningSince) {
+      newAppRunningMessage.runningSince = new Date(app.runningSince);
+    } else if (result && result.runningSince) {
+      newAppRunningMessage.runningSince = result.runningSince;
     }
-  }
-  // eslint-disable-next-line global-require
-  const fluxService = require('./fluxService');
-  if (message.version === 2 && fluxService.canProcessAppsRunningMessages()) {
-    const expire = message.broadcastedAt + (10 * 24 * 60 * 60 * 1000); // 10 days
-    const queryUpdate = { $and: queryUpdateRemovals };
-    const update = { $set: { removedBroadcastedAt: new Date(message.broadcastedAt), expireAt: new Date(expire) } };
+    const queryUpdate = { name: newAppRunningMessage.name, ip: newAppRunningMessage.ip };
+    const update = { $set: newAppRunningMessage };
+    const options = {
+      upsert: true,
+    };
     // eslint-disable-next-line no-await-in-loop
-    await dbHelper.updateInDatabase(database, globalAppsLocations, queryUpdate, update);
+    await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
   }
   if (messageNotOk) {
     return false;
@@ -6544,58 +6615,15 @@ async function storeAppRemovedMessage(message) {
     // reject old message
     return false;
   }
-  // eslint-disable-next-line global-require
-  const fluxService = require('./fluxService');
-  if (fluxService.canProcessAppsRunningMessages()) {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    const query = { ip: message.ip, name: message.appName };
-    const receivedAt = Date.now();
-    const expire = receivedAt + (10 * 24 * 60 * 60 * 1000); // 10 days
-    const update = { $set: { removedBroadcastedAt: new Date(message.broadcastedAt), expireAt: new Date(expire) } };
-    await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
-  }
+
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appsglobal.database);
+  const query = { ip: message.ip, name: message.appName };
+  const projection = {};
+  await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
 
   // all stored, rebroadcast
   return true;
-}
-
-/**
- * To remove from DB that the IP is running the app.
- * @param {object} message Message.
- * @returns {boolean} True if message is valid. Returns false if message is old. Throws an error if invalid/wrong properties.
- */
-async function processNodeDownMessage(message) {
-  // check if we have it any app running on that location and if yes, delete that information
-  if (!message || typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number'
-      || typeof message.broadcastedAt !== 'number' || typeof message.ip !== 'string') {
-    return new Error('Invalid Flux Node Down message for storing');
-  }
-
-  if (message.version !== 1) {
-    return new Error(`Invalid Flux Node Down message for storing version ${message.version} not supported`);
-  }
-
-  if (!message.ip) {
-    return new Error('Invalid Flux Node Down message ip cannot be empty');
-  }
-
-  log.info('New Flux Node Down message received.');
-  log.info(message);
-  const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
-  if (validTill < new Date().getTime()) {
-    return new Error('Flux Node Down message received no longer valid');
-  }
-  const splittedIP = message.ip.split(':');
-  const askingIP = splittedIP[0];
-  const askingIpPort = splittedIP[1] || '16127';
-  const isNodeRunning = await fluxNetworkHelper.isPortOpen(askingIP, askingIpPort);
-  if (!isNodeRunning) { // we double check that node is down
-    // eslint-disable-next-line no-use-before-define
-    await removeAppsRunningOnNodeIP(message.ip);
-    return true;
-  }
-  return false;
 }
 
 /**
@@ -7195,6 +7223,16 @@ async function registerAppGlobalyApi(req, res) {
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
+      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const appComponent of appSpecFormatted.compose) {
+          if (appComponent.secrets.length > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await checkAppSecrets(appSpecFormatted.name, appComponent, true);
+          }
+        }
+      }
+
       // check if name is not yet registered
       await checkApplicationRegistrationNameConflicts(appSpecFormatted);
 
@@ -7316,6 +7354,16 @@ async function updateAppGlobalyApi(req, res) {
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
+
+      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const appComponent of appSpecFormatted.compose) {
+          if (appComponent.secrets.length > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await checkAppSecrets(appSpecFormatted.name, appComponent, false);
+          }
+        }
+      }
 
       // verify that app exists, does not change repotag and is signed by app owner.
       const db = dbHelper.databaseConnection();
@@ -8167,9 +8215,6 @@ async function reindexGlobalAppsLocation() {
     await database.collection(globalAppsLocations).createIndex({ ip: 1 }, { name: 'query for getting zelapp location based on ip' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting app based on ip and name' });
     await database.collection(globalAppsLocations).createIndex({ name: 1, ip: 1, broadcastedAt: 1 }, { name: 'query for getting app to ensure we possess a message' });
-    await database.collection(globalAppsLocations).createIndex({
-      name: 1, ip: 1, broadcastedAt: 1, removedBroadcastedAt: 1,
-    }, { name: 'query for getting all apps, including the ones that were removed from nodes in the last 10 days' });
     return true;
   } catch (error) {
     log.error(error);
@@ -8508,12 +8553,10 @@ async function getAppHashes(req, res) {
 async function appLocation(appname) {
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
-  const query = [];
+  let query = {};
   if (appname) {
-    query.push({ name: new RegExp(`^${appname}$`, 'i') }); // case insensitive
+    query = { name: new RegExp(`^${appname}$`, 'i') }; // case insensitive
   }
-  query.push({ removedBroadcastedAt: null });
-  const querySearch = { $and: [query] };
   const projection = {
     projection: {
       _id: 0,
@@ -8525,7 +8568,7 @@ async function appLocation(appname) {
       runningSince: 1,
     },
   };
-  const results = await dbHelper.findInDatabase(database, globalAppsLocations, querySearch, projection);
+  const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
   return results;
 }
 
@@ -8577,48 +8620,6 @@ async function getAppsLocation(req, res) {
 }
 
 /**
- * To get apps locations db compressed this method is called when fluxos startups on nodes to get information from other nodes on the network
- * @param {object} req Request.
- * @param {object} res Response.
- */
-async function getAppsLocationsDB(req, res) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-    const database = dbopen.db(config.database.appsglobal.database);
-    let query = {};
-    let { sincewhen } = req.params;
-    sincewhen = sincewhen || req.query.appname;
-    if (sincewhen) {
-      query = { $and: [{ broadcastedAt: { $gt: sincewhen } }, { removedBroadcastedAt: { $gt: sincewhen } }] };
-    }
-    const projection = {
-      projection: {
-        _id: 0,
-        name: 1,
-        hash: 1,
-        ip: 1,
-        broadcastedAt: 1,
-        removedBroadcastedAt: 1,
-        expireAt: 1,
-        runningSince: 1,
-      },
-    };
-    const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
-    const compressedResult = LZString.compress(JSON.stringify(results));
-    const resultsResponse = messageHelper.createDataMessage(compressedResult);
-    res.json(resultsResponse);
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    res.json(errorResponse);
-  }
-}
-
-/**
  * To get all global app names.
  * @param {array} proj Array of wanted projection to get, If not submitted, all fields.
  * @returns {string[]} Array of app specifications or an empty array if an error is caught.
@@ -8651,7 +8652,7 @@ async function getAllGlobalApplications(proj = []) {
 async function getRunningAppIpList(ip) { // returns all apps running on this ip
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
-  const query = { ip: new RegExp(`^${ip}`), removedBroadcastedAt: null };
+  const query = { ip: new RegExp(`^${ip}`) };
   const projection = {
     projection: {
       _id: 0,
@@ -8888,14 +8889,6 @@ async function trySpawningGlobalApplication() {
     // how do we continue with this function?
     // we have globalapplication specifics list
     // check if we are synced
-    // eslint-disable-next-line global-require
-    const fluxService = require('./fluxService');
-    if (!fluxService.canProcessAppsRunningMessages()) {
-      log.info('Flux app locations not yet ready');
-      await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
-      trySpawningGlobalApplication();
-      return;
-    }
     const synced = await generalService.checkSynced();
     if (synced !== true) {
       log.info('Flux not yet synced');
@@ -9205,28 +9198,46 @@ async function trySpawningGlobalApplication() {
 }
 
 /**
- * Apps monitoring and node status check
+ * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
  */
-async function nodeAndAppsStatusCheck() {
+let nodeConfirmedOnLastCheck = true;
+async function checkAndNotifyPeersOfRunningApps() {
   try {
     const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
     if (!isNodeConfirmed) {
-      const installedAppsRes = await installedApps();
-      if (installedAppsRes.status !== 'success') {
-        throw new Error('Failed to get installed Apps');
+      if (!nodeConfirmedOnLastCheck) {
+        const installedAppsRes = await installedApps();
+        if (installedAppsRes.status !== 'success') {
+          throw new Error('Failed to get installed Apps');
+        }
+        const appsInstalled = installedAppsRes.data;
+        // eslint-disable-next-line no-restricted-syntax
+        for (const installedApp of appsInstalled) {
+          log.info(`Application ${installedApp.name} going to be removed from node as the node is not confirmed on the network for more than 2 hours..`);
+          log.warn(`Removing application ${installedApp.name} locally`);
+          // eslint-disable-next-line no-await-in-loop
+          await removeAppLocally(installedApp.name, null, false, true, true);
+          log.warn(`Application ${installedApp.name} locally removed`);
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
+        }
       }
-      const appsInstalled = installedAppsRes.data;
-      // eslint-disable-next-line no-restricted-syntax
-      for (const installedApp of appsInstalled) {
-        log.info(`Application ${installedApp.name} going to be removed from node as the node is not confirmed on the network for more than 2 hours..`);
-        log.warn(`Removing application ${installedApp.name} locally`);
-        // eslint-disable-next-line no-await-in-loop
-        await removeAppLocally(installedApp.name, null, false, true, true);
-        log.warn(`Application ${installedApp.name} locally removed`);
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
-      }
+      nodeConfirmedOnLastCheck = false;
       return;
+    }
+    nodeConfirmedOnLastCheck = true;
+    // get my external IP and check that it is longer than 5 in length.
+    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    let myIP = null;
+    if (benchmarkResponse.status === 'success') {
+      const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
+      if (benchmarkResponseData.ipaddress) {
+        log.info(`Gathered IP ${benchmarkResponseData.ipaddress}`);
+        myIP = benchmarkResponseData.ipaddress.length > 5 ? benchmarkResponseData.ipaddress : null;
+      }
+    }
+    if (myIP === null) {
+      throw new Error('Unable to detect Flux IP address');
     }
     // get list of locally installed apps. Store them in database as running and send info to our peers.
     // check if they are running?
@@ -9309,87 +9320,6 @@ async function nodeAndAppsStatusCheck() {
     } else {
       log.warn('Stopped application checks not running, some removal or installation is in progress');
     }
-  } catch (error) {
-    log.error(error);
-  } finally {
-    await serviceHelper.delay(10 * 60 * 1000);
-    nodeAndAppsStatusCheck();
-  }
-}
-/**
- * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
- */
-let lastPeersNotification;
-async function checkAndNotifyPeersOfRunningApps() {
-  try {
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height || 0;
-    if (daemonHeight >= config.apprunningRefactorActivation && lastPeersNotification && lastPeersNotification + 47.5 * 60 * 60 * 1000 > Date.now()) {
-      return;
-    }
-    lastPeersNotification = Date.now();
-
-    // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
-    let myIP = null;
-    if (benchmarkResponse.status === 'success') {
-      const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
-      if (benchmarkResponseData.ipaddress) {
-        log.info(`Gathered IP ${benchmarkResponseData.ipaddress}`);
-        myIP = benchmarkResponseData.ipaddress.length > 5 ? benchmarkResponseData.ipaddress : null;
-      }
-    }
-    if (myIP === null) {
-      throw new Error('Unable to detect Flux IP address');
-    }
-    // get list of locally installed apps. Store them in database as running and send info to our peers.
-    // check if they are running?
-    const installedAppsRes = await installedApps();
-    if (installedAppsRes.status !== 'success') {
-      throw new Error('Failed to get installed Apps');
-    }
-    const runningAppsRes = await listRunningApps();
-    if (runningAppsRes.status !== 'success') {
-      throw new Error('Unable to check running Apps');
-    }
-    const appsInstalled = installedAppsRes.data;
-    const runningApps = runningAppsRes.data;
-    const installedAppComponentNames = [];
-    appsInstalled.forEach((app) => {
-      if (app.version >= 4) {
-        app.compose.forEach((appComponent) => {
-          installedAppComponentNames.push(`${appComponent.name}_${app.name}`);
-        });
-      } else {
-        installedAppComponentNames.push(app.name);
-      }
-    });
-    // kadena and folding is old naming scheme having /zel.  all global application start with /flux
-    const runningAppsNames = runningApps.map((app) => {
-      if (app.Names[0].startsWith('/zel')) {
-        return app.Names[0].slice(4);
-      }
-      return app.Names[0].slice(5);
-    });
-    // installed always is bigger array than running
-    const runningSet = new Set(runningAppsNames);
-    const stoppedApps = installedAppComponentNames.filter((installedApp) => !runningSet.has(installedApp));
-    const masterSlaveAppsInstalled = [];
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const stoppedApp of stoppedApps) { // will uninstall app if some component is missing
-      try {
-        const mainAppName = stoppedApp.split('_')[1] || stoppedApp;
-        const appInstalledMasterSlave = appsInstalled.find((app) => app.name === mainAppName);
-        const appInstalledMasterSlaveCheck = appInstalledMasterSlave.compose.find((comp) => comp.containerData.includes('g:') || comp.containerData.includes('r:'));
-        if (appInstalledMasterSlaveCheck) {
-          masterSlaveAppsInstalled.push(appInstalledMasterSlave);
-        }
-      } catch (err) {
-        log.error(err);
-      }
-    }
-
     const installedAndRunning = [];
     appsInstalled.forEach((app) => {
       if (app.version >= 4) {
@@ -9444,9 +9374,19 @@ async function checkAndNotifyPeersOfRunningApps() {
         // store it in local database first
         // eslint-disable-next-line no-await-in-loop
         await storeAppRunningMessage(newAppRunningMessage);
+        if (installedAndRunning.length === 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay(500);
+          // eslint-disable-next-line no-await-in-loop
+          await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
+          // broadcast messages about running apps to all peers
+          log.info(`App Running Message broadcasted ${JSON.stringify(newAppRunningMessage)}`);
+        }
       }
-      if (installedAndRunning.length > 0 || daemonHeight >= config.apprunningRefactorActivation) {
-        // send v2 unique message instead even if there is no app running after apprunningRefactorActivation
+      if (installedAndRunning.length > 1) {
+        // send v2 unique message instead
         const newAppRunningMessageV2 = {
           type: 'fluxapprunning',
           version: 2,
@@ -9603,6 +9543,102 @@ async function checkApplicationsCompliance() {
 }
 
 /**
+ * check if app cpu is throttling
+ */
+async function checkApplicationsCpuUSage() {
+  try {
+    // get list of locally installed apps.
+    const installedAppsRes = await installedApps();
+    if (installedAppsRes.status !== 'success') {
+      throw new Error('Failed to get installed Apps');
+    }
+    const appsInstalled = installedAppsRes.data;
+    let stats;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const app of appsInstalled) {
+      if (app.version <= 3) {
+        stats = appsMonitored[app.name].oneMinuteStatsStore;
+        // eslint-disable-next-line no-await-in-loop
+        const inspect = await dockerService.dockerContainerInspect(app.name);
+        if (inspect && stats.length > 55) {
+          const nanoCpus = inspect.HostConfig.NanoCpus;
+          let cpuThrottling = true;
+          // eslint-disable-next-line no-restricted-syntax
+          for (const stat of stats) {
+            const cpuUsage = stat.data.cpu_stats.cpu_usage.total_usage - stat.data.precpu_stats.cpu_usage.total_usage;
+            const systemCpuUsage = stat.data.cpu_stats.system_cpu_usage - stat.data.precpu_stats.system_cpu_usage;
+            const cpu = ((cpuUsage / systemCpuUsage) * stat.data.cpu_stats.online_cpus * 100) / app.cpu || 0;
+            const realCpu = cpu / (nanoCpus / app.cpu / 1e9);
+            if (realCpu < 92) {
+              cpuThrottling = false;
+              break;
+            }
+          }
+          log.info(`checkApplicationsCpuUSage ${app.name} cpu high load: : ${cpuThrottling}`);
+          if (cpuThrottling && app.cpu > 1) {
+            if (nanoCpus / app.cpu / 1e9 === 1) {
+              if (cpuThrottling && app.cpu > 2) {
+                // eslint-disable-next-line no-await-in-loop
+                await dockerService.appDockerUpdateCpu(app.name, Math.round(app.cpu * 1e9 * 0.8));
+              } else {
+                // eslint-disable-next-line no-await-in-loop
+                await dockerService.appDockerUpdateCpu(app.name, Math.round(app.cpu * 1e9 * 0.9));
+              }
+              log.info(`checkApplicationsCpuUSage ${app.name} lowering cpu.`);
+            }
+          } else if (nanoCpus / app.cpu / 1e9 < 1) {
+            // eslint-disable-next-line no-await-in-loop
+            await dockerService.appDockerUpdateCpu(app.name, Math.round(app.cpu * 1e9));
+            log.info(`checkApplicationsCpuUSage ${app.name} increasing cpu.`);
+          }
+        }
+      } else {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const appComponent of app.compose) {
+          stats = appsMonitored[`${appComponent.name}_${app.name}`].oneMinuteStatsStore;
+          // eslint-disable-next-line no-await-in-loop
+          const inspect = await dockerService.dockerContainerInspect(`${appComponent.name}_${app.name}`);
+          if (inspect && stats.length > 55) {
+            const nanoCpus = inspect.HostConfig.NanoCpus;
+            let cpuThrottling = true;
+            // eslint-disable-next-line no-restricted-syntax
+            for (const stat of stats) {
+              const cpuUsage = stat.data.cpu_stats.cpu_usage.total_usage - stat.data.precpu_stats.cpu_usage.total_usage;
+              const systemCpuUsage = stat.data.cpu_stats.system_cpu_usage - stat.data.precpu_stats.system_cpu_usage;
+              const cpu = ((cpuUsage / systemCpuUsage) * 100 * stat.data.cpu_stats.online_cpus) / appComponent.cpu || 0;
+              const realCpu = cpu / (nanoCpus / appComponent.cpu / 1e9);
+              if (realCpu < 92) {
+                cpuThrottling = false;
+                break;
+              }
+            }
+            log.info(`checkApplicationsCpuUSage ${appComponent.name}_${app.name} cpu high load: : ${cpuThrottling}`);
+            if (cpuThrottling && appComponent.cpu > 1) {
+              if (nanoCpus / appComponent.cpu / 1e9 === 1) {
+                if (cpuThrottling && appComponent.cpu > 2) {
+                  // eslint-disable-next-line no-await-in-loop
+                  await dockerService.appDockerUpdateCpu(`${appComponent.name}_${app.name}`, Math.round(appComponent.cpu * 1e9 * 0.8));
+                } else {
+                  // eslint-disable-next-line no-await-in-loop
+                  await dockerService.appDockerUpdateCpu(`${appComponent.name}_${app.name}`, Math.round(appComponent.cpu * 1e9 * 0.9));
+                }
+                log.info(`checkApplicationsCpuUSage ${appComponent.name}_${app.name} lowering cpu.`);
+              }
+            } else if (nanoCpus / appComponent.cpu / 1e9 < 1) {
+              // eslint-disable-next-line no-await-in-loop
+              await dockerService.appDockerUpdateCpu(`${appComponent.name}_${app.name}`, Math.round(appComponent.cpu * 1e9));
+              log.info(`checkApplicationsCpuUSage ${appComponent.name}_${app.name} increasing cpu.`);
+            }
+          }
+        }
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
  * To find and remove apps that are spawned more than maximum number of instances allowed locally.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
@@ -9686,6 +9722,7 @@ async function softRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -9694,6 +9731,7 @@ async function softRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -9709,6 +9747,7 @@ async function softRedeploy(appSpecs, res) {
     log.info(appRedeployResponse);
     if (res) {
       res.write(serviceHelper.ensureString(appRedeployResponse));
+      if (res.flush) res.flush();
     }
     await serviceHelper.delay(config.fluxapps.redeploy.delay * 1000); // wait for delay mins
     // verify requirements
@@ -9735,6 +9774,7 @@ async function hardRedeploy(appSpecs, res) {
     log.info(appRedeployResponse);
     if (res) {
       res.write(serviceHelper.ensureString(appRedeployResponse));
+      if (res.flush) res.flush();
     }
     await serviceHelper.delay(config.fluxapps.redeploy.delay * 1000); // wait for delay mins
     // verify requirements
@@ -10021,152 +10061,63 @@ async function getAppFluxOnChainPrice(appSpecification) {
 }
 
 /**
- * DEPRECATED: To get app price. Should be used getAppFiatAndFluxPrice method instead
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
+ * To verify if app update have free network update
+ * @param {object} appSpecFormatted appSpecFormatted.
+ * @param {number} daemonHeight daemonHeight.
+ * @returns {boolean} yes if update message is network free.
  */
-async function getAppPrice(req, res) {
-  let body = '';
-  req.on('data', (data) => {
-    body += data;
-  });
-  req.on('end', async () => {
-    try {
-      const processedBody = serviceHelper.ensureObject(body);
-      let appSpecification = processedBody;
-
-      appSpecification = serviceHelper.ensureObject(appSpecification);
-      const appSpecFormatted = specificationFormatter(appSpecification);
-
-      // verifications skipped. This endpoint is only for price evaluation
-
-      // check if app exists or its a new registration price
-      const db = dbHelper.databaseConnection();
-      const database = db.db(config.database.appsglobal.database);
-      // may throw
-      const query = { name: appSpecFormatted.name };
-      const projection = {
-        projection: {
-          _id: 0,
-        },
-      };
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-      if (!syncStatus.data.synced) {
-        throw new Error('Daemon not yet synced.');
-      }
-      const daemonHeight = syncStatus.data.height;
-      const axiosConfig = {
-        timeout: 5000,
-      };
-      const appPrices = [];
-      if (myLongCache.has('appPrices')) {
-        appPrices.push(myLongCache.get('appPrices'));
-      } else {
-        let response = await axios.get('https://stats.runonflux.io/apps/getappspecsusdprice', axiosConfig).catch((error) => log.error(error));
-        if (response && response.data && response.data.status === 'success') {
-          myLongCache.set('appPrices', response.data.data);
-          appPrices.push(response.data.data);
-        } else {
-          response = config.fluxapps.usdprice;
-          myLongCache.set('appPrices', response);
-          appPrices.push(response);
-        }
-      }
-      let actualPriceToPay = 0;
-      const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-      const defaultExpire = config.fluxapps.blocksLasting; // if expire is not set in specs, use this default value
-      actualPriceToPay = await appPricePerMonth(appSpecFormatted, daemonHeight, appPrices);
-      const expireIn = appSpecFormatted.expire || defaultExpire;
-      // app prices are ceiled to highest 0.01
-      const multiplier = expireIn / defaultExpire;
-      actualPriceToPay *= multiplier;
-      actualPriceToPay = Number(actualPriceToPay).toFixed(2);
-      if (appInfo) {
-        let previousSpecsPrice = await appPricePerMonth(appInfo, daemonHeight, appPrices); // calculate previous based on CURRENT height, with current interval of prices!
-        let previousExpireIn = previousSpecsPrice.expire || defaultExpire; // bad typo bug line. Leave it like it is, this bug is a feature now.
-        if (daemonHeight > 1315000) {
-          previousExpireIn = appInfo.expire || defaultExpire;
-        }
-        const multiplierPrevious = previousExpireIn / defaultExpire;
-        previousSpecsPrice *= multiplierPrevious;
-        previousSpecsPrice = Number(previousSpecsPrice).toFixed(2);
-        // what is the height difference
-        const heightDifference = daemonHeight - appInfo.height;
-        const perc = (previousExpireIn - heightDifference) / previousExpireIn;
-        if (perc > 0) {
-          actualPriceToPay -= (perc * previousSpecsPrice);
-        }
-      }
-      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps').catch((error) => log.error(error));
-      let marketPlaceApps = [];
-      if (marketplaceResponse && marketplaceResponse.data && marketplaceResponse.data.status === 'success') {
-        marketPlaceApps = marketplaceResponse.data.data;
-      } else {
-        log.error('Unable to get marketplace information');
-      }
-
-      if (appSpecification.priceUSD) {
-        if (appSpecification.priceUSD < actualPriceToPay) {
-          throw new Error('USD price is not valid');
-        }
-        actualPriceToPay = Number(appSpecification.priceUSD).toFixed(2);
-      } else {
-        const marketPlaceApp = marketPlaceApps.find((app) => appSpecFormatted.name.toLowerCase().startsWith(app.name.toLowerCase()));
-        if (marketPlaceApp) {
-          if (marketPlaceApp.multiplier > 1) {
-            actualPriceToPay *= marketPlaceApp.multiplier;
+async function checkFreeAppUpdate(appSpecFormatted, daemonHeight) {
+  // check if it's a free app update offered by the network
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appsglobal.database);
+  // may throw
+  let query = { name: appSpecFormatted.name };
+  const projection = {
+    projection: {
+      _id: 0,
+    },
+  };
+  const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
+  if (appInfo && appInfo.expire && appSpecFormatted.expire) {
+    const blocksToExtend = (appSpecFormatted.expire + daemonHeight) - (appInfo.expire + appInfo.height);
+    if (((!appSpecFormatted.nodes && !appInfo.nodes) || (appSpecFormatted.nodes && appInfo.nodes && appSpecFormatted.nodes.length === appInfo.nodes.length))
+      && appSpecFormatted.instances === appInfo.instances && appSpecFormatted.staticip === appInfo.staticip && blocksToExtend <= 2) { // free updates should not extend app subscription
+      if (appSpecFormatted.compose.length === appInfo.compose.length) {
+        let changes = false;
+        for (let i = 0; i < appSpecFormatted.compose.length; i += 1) {
+          const compA = appSpecFormatted.compose[i];
+          const compB = appInfo.compose[i];
+          if (compA.cpu > compB.cpu || compA.ram > compB.ram || compA.hdd > compB.hdd) {
+            changes = true;
+            break;
           }
         }
-        actualPriceToPay = Number(actualPriceToPay * appPrices[0].multiplier).toFixed(2);
-        if (actualPriceToPay < appPrices[0].minUSDPrice) {
-          actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
-        }
-      }
-      let fiatRates;
-      let fluxUSDRate;
-      if (myShortCache.has('fluxRates')) {
-        fluxUSDRate = myShortCache.get('fluxRates');
-      } else {
-        fiatRates = await axios.get('https://viprates.runonflux.io/rates', axiosConfig).catch((error) => log.error(error));
-        if (fiatRates && fiatRates.data) {
-          const rateObj = fiatRates.data[0].find((rate) => rate.code === 'USD');
-          if (!rateObj) {
-            throw new Error('Unable to get USD rate.');
+        if (!changes) {
+          query = { 'appSpecifications.name': appSpecFormatted.name };
+          const permanentAppMessage = await dbHelper.findInDatabase(database, globalAppsMessages, query, projection);
+          let messagesInLasDays = permanentAppMessage.filter((message) => (message.type === 'fluxappupdate' || message.type === 'zelappupdate') && message.height > daemonHeight - 3600);
+          // we will give a maximum of 10 free updates in 5 days, 8 in two days, 5 in one day
+          if (!messagesInLasDays) {
+            // eslint-disable-next-line no-param-reassign
+            appSpecFormatted.expire -= blocksToExtend; // if it wasn't zero because some block was received between the validate app specs and this call, we will remove the extension.
+            return true;
           }
-          const btcRateforFlux = fiatRates.data[1].FLUX;
-          if (btcRateforFlux === undefined) {
-            throw new Error('Unable to get Flux USD Price.');
-          }
-          fluxUSDRate = rateObj.rate * btcRateforFlux;
-          myShortCache.set('fluxRates', fluxUSDRate);
-        } else {
-          fiatRates = await axios.get('https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=zelcash', axiosConfig);
-          if (fiatRates && fiatRates.data && fiatRates.data.zelcash && fiatRates.data.zelcash.usd) {
-            fluxUSDRate = fiatRates.data.zelcash.usd;
-            myShortCache.set('fluxRates', fluxUSDRate);
-          } else {
-            // eslint-disable-next-line prefer-destructuring
-            fluxUSDRate = config.fluxapps.fluxUSDRate;
-            myShortCache.set('fluxRates', fluxUSDRate);
+          if (messagesInLasDays.length < 11) {
+            messagesInLasDays = messagesInLasDays.filter((message) => message.height > daemonHeight - 1440);
+            if (messagesInLasDays.length < 9) {
+              messagesInLasDays = messagesInLasDays.filter((message) => message.height > daemonHeight - 720);
+              if (messagesInLasDays.length < 6) {
+                // eslint-disable-next-line no-param-reassign
+                appSpecFormatted.expire -= blocksToExtend; // if it wasn't zero because some block was received between the validate app specs and this call, we will remove the extension.
+                return true;
+              }
+            }
           }
         }
       }
-      const fluxPrice = Number(((actualPriceToPay / fluxUSDRate) * appPrices[0].fluxmultiplier));
-      const fluxChainPrice = Number(await getAppFluxOnChainPrice(appSpecification));
-      const price = fluxChainPrice > fluxPrice ? Number(fluxChainPrice.toFixed(2)) : Number(fluxPrice.toFixed(2));
-      const respondPrice = messageHelper.createDataMessage(price);
-      return res.json(respondPrice);
-    } catch (error) {
-      log.warn(error);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      return res.json(errorResponse);
     }
-  });
+  }
+  return false;
 }
 
 /**
@@ -10205,6 +10156,17 @@ async function getAppFiatAndFluxPrice(req, res) {
         throw new Error('Daemon not yet synced.');
       }
       const daemonHeight = syncStatus.data.height;
+
+      if (await checkFreeAppUpdate(appSpecFormatted, daemonHeight)) {
+        const price = {
+          usd: 0,
+          flux: 0,
+          fluxDiscount: 0,
+        };
+        const respondPrice = messageHelper.createDataMessage(price);
+        return res.json(respondPrice);
+      }
+
       const axiosConfig = {
         timeout: 5000,
       };
@@ -10223,7 +10185,6 @@ async function getAppFiatAndFluxPrice(req, res) {
         }
       }
       let actualPriceToPay = 0;
-      const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
       const defaultExpire = config.fluxapps.blocksLasting; // if expire is not set in specs, use this default value
       actualPriceToPay = await appPricePerMonth(appSpecFormatted, daemonHeight, appPrices);
       const expireIn = appSpecFormatted.expire || defaultExpire;
@@ -10231,6 +10192,7 @@ async function getAppFiatAndFluxPrice(req, res) {
       const multiplier = expireIn / defaultExpire;
       actualPriceToPay *= multiplier;
       actualPriceToPay = Number(actualPriceToPay).toFixed(2);
+      const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
       if (appInfo) {
         let previousSpecsPrice = await appPricePerMonth(appInfo, daemonHeight, appPrices); // calculate previous based on CURRENT height, with current interval of prices!
         let previousExpireIn = previousSpecsPrice.expire || defaultExpire; // bad typo bug line. Leave it like it is, this bug is a feature now.
@@ -10320,6 +10282,16 @@ async function getAppFiatAndFluxPrice(req, res) {
       return res.json(errorResponse);
     }
   });
+}
+
+/**
+ * DEPRECATED: To get app price. Should be used getAppFiatAndFluxPrice method instead
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function getAppPrice(req, res) {
+  return getAppFiatAndFluxPrice(req, res);
 }
 
 /**
@@ -10419,6 +10391,16 @@ async function verifyAppRegistrationParameters(req, res) {
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
+      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const appComponent of appSpecFormatted.compose) {
+          if (appComponent.secrets.length > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await checkAppSecrets(appSpecFormatted.name, appComponent, true);
+          }
+        }
+      }
+
       // check if name is not yet registered
       await checkApplicationRegistrationNameConflicts(appSpecFormatted);
 
@@ -10465,6 +10447,16 @@ async function verifyAppUpdateParameters(req, res) {
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
+
+      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const appComponent of appSpecFormatted.compose) {
+          if (appComponent.secrets.length > 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await checkAppSecrets(appSpecFormatted.name, appComponent, false);
+          }
+        }
+      }
 
       // check if name is not yet registered
       const timestamp = Date.now();
@@ -10724,9 +10716,11 @@ async function stopSyncthingApp(appComponentName, res, isBackRestore) {
         log.info(adjustSyncthingA);
         if (res) {
           res.write(serviceHelper.ensureString(adjustSyncthingA));
+          if (res.flush) res.flush();
         }
         if (res) {
           res.write(serviceHelper.ensureString(adjustSyncthingB));
+          if (res.flush) res.flush();
         }
       }
       folderId = null;
@@ -11439,7 +11433,7 @@ async function masterSlaveApps() {
         }
         let ip = null;
         // eslint-disable-next-line no-await-in-loop
-        let fdmEUData = await serviceHelper.axiosGet(`https://fdm-fn-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+        let fdmEUData = await serviceHelper.axiosGet(`https://fdm-fn-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name}apprunonfluxio;json;norefresh`, axiosOptions).catch((error) => {
           log.error(`masterSlaveApps: Failed to reach EU FDM with error: ${error}`);
           fdmOk = false;
         });
@@ -11462,7 +11456,7 @@ async function masterSlaveApps() {
         if (!ip) {
           fdmOk = true;
           // eslint-disable-next-line no-await-in-loop
-          let fdmUSAData = await serviceHelper.axiosGet(`https://fdm-usa-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+          let fdmUSAData = await serviceHelper.axiosGet(`https://fdm-usa-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name}apprunonfluxio;json;norefresh`, axiosOptions).catch((error) => {
             log.error(`masterSlaveApps: Failed to reach USA FDM with error: ${error}`);
             fdmOk = false;
           });
@@ -11486,7 +11480,7 @@ async function masterSlaveApps() {
         if (!ip) {
           fdmOk = true;
           // eslint-disable-next-line no-await-in-loop
-          let fdmASIAData = await serviceHelper.axiosGet(`https://fdm-sg-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name};json;norefresh`, axiosOptions).catch((error) => {
+          let fdmASIAData = await serviceHelper.axiosGet(`https://fdm-sg-1-${fdmIndex}.runonflux.io/fluxstatistics?scope=${installedApp.name}apprunonfluxio;json;norefresh`, axiosOptions).catch((error) => {
             log.error(`masterSlaveApps: Failed to reach ASIA FDM with error: ${error}`);
             fdmOk = false;
           });
@@ -11511,8 +11505,12 @@ async function masterSlaveApps() {
           // no ip means there was no row with ip on fdm
           // down means there was a row ip with status down
           // eslint-disable-next-line no-await-in-loop
-          const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+          let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+          if (myIP.indexOf(':') < 0) {
+            myIP += ':16127';
+          }
           if ((!ip)) {
+            log.info(`masterSlaveApps: app:${installedApp.name} has currently no primary set`);
             if (!runningAppsNames.includes(identifier)) {
               // eslint-disable-next-line no-await-in-loop
               const runningAppList = await getRunningAppList(installedApp.name);
@@ -11537,26 +11535,47 @@ async function masterSlaveApps() {
                 }
                 return 0;
               });
-              const index = runningAppList.findIndex((x) => x.ip === myIP);
+              const index = runningAppList.findIndex((x) => x.ip.split(':')[0] === myIP.split(':')[0]);
               if (index === 0 && !mastersRunningGSyncthingApps.has(identifier)) {
                 appDockerRestart(installedApp.name);
                 log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
-              } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && mastersRunningGSyncthingApps.get(identifier) !== myIP.split(':')[0]) {
+              } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && mastersRunningGSyncthingApps.get(identifier) !== myIP) {
+                const { CancelToken } = axios;
+                const source = CancelToken.source();
+                let isResolved = false;
+                const timeout = 5 * 1000; // 5 seconds
+                setTimeout(() => {
+                  if (!isResolved) {
+                    source.cancel('Operation canceled by the user.');
+                  }
+                }, timeout * 2);
+                const url = mastersRunningGSyncthingApps.get(identifier);
+                const ipToCheckAppRunning = url.split(':')[0];
+                const portToCheckAppRunning = url.split(':')[1] || 16127;
+                // eslint-disable-next-line no-await-in-loop
+                const response = await axios.get(`http://${ipToCheckAppRunning}:${portToCheckAppRunning}/apps/listrunningapps`, { timeout, cancelToken: source.token });
+                isResolved = true;
+                const appsRunning = response.data.data;
+                if (appsRunning.find((app) => app.Names[0].includes(installedApp.name))) {
+                  log.info(`masterSlaveApps: app:${installedApp.name} is not on fdm but previous master is running it at: ${url}`);
+                  return;
+                }
                 // if it was running before on this node was removed from fdm, app was stopped or node rebooted, we will only start the app on a different node
                 if (index === 0) {
                   appDockerRestart(installedApp.name);
                   log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
                 } else {
-                  const previousMasterIndex = runningAppList.findIndex((x) => x.ip === mastersRunningGSyncthingApps.get(identifier));
+                  const previousMasterIndex = runningAppList.findIndex((x) => x.ip.split(':')[0] === mastersRunningGSyncthingApps.get(identifier).split(':')[0]);
                   let timetoStartApp = Date.now();
                   if (previousMasterIndex >= 0) {
+                    log.info(`masterSlaveApps: app:${installedApp.name} had primary running at index: ${previousMasterIndex}`);
                     if (index > previousMasterIndex) {
-                      timetoStartApp += (index - 1) * 2 * 60 * 1000;
+                      timetoStartApp += (index - 1) * 3 * 60 * 1000;
                     } else {
-                      timetoStartApp += index * 2 * 60 * 1000;
+                      timetoStartApp += index * 3 * 60 * 1000;
                     }
                   } else {
-                    timetoStartApp += index * 2 * 60 * 1000;
+                    timetoStartApp += index * 3 * 60 * 1000;
                   }
                   if (timetoStartApp <= Date.now()) {
                     appDockerRestart(installedApp.name);
@@ -11568,19 +11587,21 @@ async function masterSlaveApps() {
                 }
               } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= Date.now()) {
                 appDockerRestart(installedApp.name);
-                log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
+                log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index} that was scheduled to start at ${timeTostartNewMasterApp.get(identifier).toString()}`);
+              } else {
+                appDockerRestart(installedApp.name);
+                log.info(`masterSlaveApps: no previous information about primary, starting docker app:${installedApp.name}`);
               }
             }
           } else {
-            ip = ip.split(':')[0];
             mastersRunningGSyncthingApps.set(identifier, ip);
             if (timeTostartNewMasterApp.has(identifier)) {
               log.info(`masterSlaveApps: app:${installedApp.name} removed from timeTostartNewMasterApp cache, already started on another standby node`);
               timeTostartNewMasterApp.delete(identifier);
             }
-            if (myIP.split(':')[0] !== ip && runningAppsNames.includes(identifier)) {
+            if (myIP !== ip && runningAppsNames.includes(identifier)) {
               appDockerStop(installedApp.name);
-              log.info(`masterSlaveApps: stopping docker app:${installedApp.name}`);
+              log.info(`masterSlaveApps: stopping docker app:${installedApp.name} it's running on ip:${ip} and myIP is: ${myIP}`);
             } else if (myIP === ip && !runningAppsNames.includes(identifier)) {
               appDockerRestart(installedApp.name);
               log.info(`masterSlaveApps: starting docker app:${installedApp.name}`);
@@ -12343,6 +12364,7 @@ async function sendChunk(res, chunk) {
   return new Promise((resolve) => {
     setTimeout(() => {
       res.write(`${chunk}\n`);
+      if (res.flush) res.flush();
       resolve();
     }, 3000); // Adjust the delay as needed
   });
@@ -12985,133 +13007,6 @@ async function getAppSpecsUSDPrice(req, res) {
   }
 }
 
-/**
- * Method called by other nodes that had different information of apps installed on this node,
- * this node will brodcast new message to the network with the information of the apps that are installed
- * @param {object} req Request.
- * @param {object} res Response.
- */
-let broadcastAppsInstalledInExecution = false;
-async function broadcastAppsInstalled(req, res) {
-  try {
-    broadcastAppsInstalledInExecution = true;
-    const response = 'Running apps broadcasted to the network';
-    if (broadCastAppsRunningCache.has(1) || broadcastAppsInstalledInExecution) {
-      const resultsResponse = messageHelper.createDataMessage(response);
-      res.json(resultsResponse);
-      return;
-    }
-
-    // get my external IP and check that it is longer than 5 in length.
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
-    let myIP = null;
-    if (benchmarkResponse.status === 'success') {
-      const benchmarkResponseData = JSON.parse(benchmarkResponse.data);
-      if (benchmarkResponseData.ipaddress) {
-        log.info(`Gathered IP ${benchmarkResponseData.ipaddress}`);
-        myIP = benchmarkResponseData.ipaddress.length > 5 ? benchmarkResponseData.ipaddress : null;
-      }
-    }
-    if (myIP === null) {
-      throw new Error('Unable to detect Flux IP address');
-    }
-    // get list of locally installed apps. Store them in database as running and send info to our peers.
-    // check if they are running?
-    const installedAppsRes = await installedApps();
-    if (installedAppsRes.status !== 'success') {
-      throw new Error('Failed to get installed Apps');
-    }
-
-    const appsInstalled = installedAppsRes.data;
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    const apps = [];
-    try {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const application of appsInstalled) {
-        const queryFind = { name: application.name, ip: myIP };
-        const projection = { _id: 0, runningSince: 1 };
-        let runningOnMyNodeSince = Date.now();
-        // we already have the exact same data
-        // eslint-disable-next-line no-await-in-loop
-        const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
-        if (result && result.runningSince) {
-          runningOnMyNodeSince = result.runningSince;
-        }
-        log.info(`${application.name} is running/installed properly. Broadcasting status.`);
-        // eslint-disable-next-line no-await-in-loop
-        // we can distinguish pure local apps from global with hash and height
-        const newAppRunningMessage = {
-          type: 'fluxapprunning',
-          version: 1,
-          name: application.name,
-          hash: application.hash, // hash of application specifics that are running
-          ip: myIP,
-          broadcastedAt: Date.now(),
-          runningSince: runningOnMyNodeSince,
-        };
-        const app = {
-          name: application.name,
-          hash: application.hash,
-          runningSince: runningOnMyNodeSince,
-        };
-        apps.push(app);
-        // store it in local database first
-        // eslint-disable-next-line no-await-in-loop
-        await storeAppRunningMessage(newAppRunningMessage);
-      }
-      // send v2 unique message instead even if there is no app running
-      const newAppRunningMessageV2 = {
-        type: 'fluxapprunning',
-        version: 2,
-        apps,
-        ip: myIP,
-        broadcastedAt: Date.now(),
-      };
-      // eslint-disable-next-line no-await-in-loop
-      await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessageV2);
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(500);
-      // eslint-disable-next-line no-await-in-loop
-      await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
-      // broadcast messages about running apps to all peers
-      log.info(`App Running Message broadcasted ${JSON.stringify(newAppRunningMessageV2)}`);
-    } catch (err) {
-      log.error(err);
-    }
-    log.info('Running Apps broadcasted');
-    const resultsResponse = messageHelper.createSuccessMessage(response);
-    res.json(resultsResponse);
-    broadCastAppsRunningCache.set(1, 1);
-  } catch (error) {
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    res.json(errorResponse);
-  }
-}
-
-/**
- * To remove from DB that the IP is running any app.
- * @param {object} ip Node ip and port of the running app.
- */
-async function removeAppsRunningOnNodeIP(ip) {
-  let fixedIp = ip;
-  if (fixedIp.endsWith(':16127')) {
-    fixedIp = fixedIp.split(':')[0];
-  }
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  const queryUpdate = { ip: fixedIp };
-  const receivedAt = Date.now();
-  const validTill = receivedAt + (10 * 24 * 60 * 60 * 1000); // 10 days
-  const update = { $set: { removedBroadcastedAt: new Date(receivedAt), expireAt: new Date(validTill) } };
-  // eslint-disable-next-line no-await-in-loop
-  await dbHelper.updateInDatabase(database, globalAppsLocations, queryUpdate, update);
-}
-
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -13246,10 +13141,5 @@ module.exports = {
   triggerAppHashesCheckAPI,
   masterSlaveApps,
   getAppSpecsUSDPrice,
-  nodeAndAppsStatusCheck,
-  broadcastAppsInstalled,
-  removeAppsRunningOnNodeIP,
-  getAppsLocationsDB,
-  installedAppsNames,
-  processNodeDownMessage,
+  checkApplicationsCpuUSage,
 };
