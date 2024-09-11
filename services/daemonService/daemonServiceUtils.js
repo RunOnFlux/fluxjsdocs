@@ -1,23 +1,10 @@
+const fullnode = require('fullnode');
 const { LRUCache } = require('lru-cache');
-
-const asyncLock = require('../utils/asyncLock');
-const fluxRpc = require('../utils/fluxRpc');
-const daemonConfig = require('../utils/daemonConfig');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
+const client = require('../utils/daemonrpcClient').default;
 
-const config = require('config');
-const userconfig = require('../../../../config/userconfig');
-
-const { initial: { testnet: isTestnet } } = userconfig;
-
-let fluxdConfig = null;
-let fluxdClient = null;
-
-/**
- * AsyncLock used to limit calls to the Daemon RPC endpoint
- */
-const lock = new asyncLock.AsyncLock();
+const fnconfig = new fullnode.Config();
 
 // default cache
 const LRUoptions = {
@@ -44,29 +31,7 @@ const LRUoptionsBlocks = {
 
 const blockCache = new LRUCache(LRUoptionsBlocks); // store 1.5k blocks in cache
 
-async function readDaemonConfig() {
-  fluxdConfig = new daemonConfig.DaemonConfig();
-  await fluxdConfig.parseConfig();
-}
-
-async function buildFluxdClient() {
-  if (!fluxdConfig) await readDaemonConfig();
-
-  const username = fluxdConfig.rpcuser || 'rpcuser';
-  const password = fluxdConfig.rpcpassword || 'rpcpassword';
-
-  const portId = isTestnet ? 'rpcporttestnet' : 'rpcport';
-
-  const rpcPort = fluxdConfig.rpcport || config.daemon[portId];
-
-  const client = new fluxRpc.FluxRpc(`http://127.0.0.1:${rpcPort}`, {
-    auth: { username, password }, timeout: 10_000,
-  });
-
-  fluxdClient = client;
-
-  return client;
-}
+let daemonCallRunning = false;
 
 /**
  * To execute a remote procedure call (RPC).
@@ -76,33 +41,36 @@ async function buildFluxdClient() {
  */
 async function executeCall(rpc, params) {
   const rpcparameters = params || [];
-
-  if (!fluxdClient) await buildFluxdClient();
-
-  /**
-   * This used to wait a bunch of separate times if a call was already running
-   * This averaged to be approx 635ms max. Eg Math.random * 250 would average to be 125ms.
-   * So 125 100 75 50 50 60 50 40 30 25 20 10 = 635ms.
-   *
-   * So it wasn't really sync, as it would wait some time, then run anyway, even if a call
-   * was already running.
-   *
-   * I don't really understand the intent of what this was trying to do. It was waiting a bit of time
-   * then just running anyway.
-   *
-   * The biggest api call by far will be getting the network state, which right now, is 8.2Mb. On my test
-   * machine, this takes approx 400-500ms.
-   *
-   * So in keeping with what we were doing, we now wait a max of 500ms, then run anyway.
-   */
-
-  await lock.readyTimeout(500);
-  const lockedByOther = lock.locked;
-  if (!lockedByOther) await lock.enable();
-
   try {
     let data;
-
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 250)) + 60;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 200)) + 50;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 150)) + 40;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 100)) + 30;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 75)) + 25;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 50)) + 20;
+      await serviceHelper.delay(randomDelay);
+    }
+    if (daemonCallRunning) {
+      const randomDelay = Math.floor((Math.random() * 25)) + 10;
+      await serviceHelper.delay(randomDelay);
+    }
     if (rpc === 'getBlock') {
       data = blockCache.get(rpc + serviceHelper.ensureString(rpcparameters));
     } else if (rpc === 'getRawTransaction') {
@@ -111,7 +79,8 @@ async function executeCall(rpc, params) {
       data = cache.get(rpc + serviceHelper.ensureString(rpcparameters));
     }
     if (!data) {
-      data = await fluxdClient.run(rpc, { params: rpcparameters });
+      daemonCallRunning = true;
+      data = await client[rpc](...rpcparameters);
       if (rpc === 'getBlock') {
         blockCache.set(rpc + serviceHelper.ensureString(rpcparameters), data);
       } else if (rpc === 'getRawTransaction') {
@@ -119,14 +88,13 @@ async function executeCall(rpc, params) {
       } else {
         cache.set(rpc + serviceHelper.ensureString(rpcparameters), data);
       }
+      daemonCallRunning = false;
     }
     const successResponse = messageHelper.createDataMessage(data);
     return successResponse;
   } catch (error) {
     const daemonError = messageHelper.createErrorMessage(error.message, error.name, error.code);
     return daemonError;
-  } finally {
-    if (!lockedByOther) lock.disable();
   }
 }
 
@@ -205,108 +173,19 @@ function getBlockCache(key) {
  * @returns {string} Config value.
  */
 function getConfigValue(parameter) {
-  if (!fluxdConfig) return undefined;
-
-  const value = fluxdConfig.get(parameter);
+  const value = fnconfig.get(parameter);
   return value;
 }
 
-/**
- * To set a value for a specified key from the configuration file.
- * @param {string} parameter Config key.
- * @param {string} value Config key value.
- * @param {{replace?: boolean}} options
- * @returns {<void>}
- */
-function setConfigValue(parameter, value, options = {}) {
-  if (!fluxdConfig) return;
-
-  const replace = options.replace || false;
-
-  fluxdConfig.set(parameter, value, replace);
-}
-
-/**
- * The DaemonConfig object
- * @returns {daemonConfig.DaemonConfig}
- */
-function getFluxdConfig() {
-  return fluxdConfig;
-}
-
-/**
- * The fluxd config file path
- * @returns {string}
- */
-function getFluxdConfigPath() {
-  return fluxdConfig.absConfigPath;
-}
-
-/**
- * The fluxd config directory
- * @returns {string}
- */
-function getFluxdDir() {
-  if (!fluxdConfig) return undefined;
-
-  return fluxdConfig.configDir;
-}
-
-/**
- * The fluxd daemon rpc client
- * @returns {daemonrpc.Client}
- */
-function getFluxdClient() {
-  return fluxdClient;
-}
-
-/**
- *  writes a flux config to the fluxd config directory
- * @param {string?} fileName The name of the config file to write. If empty, this
- * defaults to flux.conf
- * @returns {Promise<Boolean>}
- */
-async function writeFluxdConfig(fileName = null) {
-  await fluxdConfig.write({ fileName });
-}
-
-/**
- *
- * @param {string} fileName The name of the backup file to write (in the fluxd conf dir)
- * @returns {Promise<boolean>}
- */
-async function createBackupFluxdConfig(fileName) {
-  if (!fileName) return false;
-
-  return fluxdConfig.createBackupConfig(fileName);
-}
-
-/**
- * Testing
- */
-function setFluxdClient(testClient) {
-  fluxdClient = testClient;
-}
-
 module.exports = {
-  buildFluxdClient,
-  createBackupFluxdConfig,
   executeCall,
   getConfigValue,
-  getFluxdClient,
-  getFluxdConfig,
-  getFluxdConfigPath,
-  getFluxdDir,
-  readDaemonConfig,
-  setConfigValue,
-  writeFluxdConfig,
 
   // exports for testing purposes
-  getBlockCache,
-  getRawTxCacheCache,
-  getStandardCache,
-  setBlockCache,
-  setFluxdClient,
-  setRawTxCache,
   setStandardCache,
+  setRawTxCache,
+  setBlockCache,
+  getStandardCache,
+  getRawTxCacheCache,
+  getBlockCache,
 };
