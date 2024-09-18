@@ -224,6 +224,22 @@ async function removeDocumentsFromCollection(database, collection, query) {
 }
 
 /**
+ * Returns the Max or the Minimum value of the sort query.
+ *
+ * @param {string} database
+ * @param {string} collection
+ * @param {object} sort
+ * @param {object} [options]
+ *
+ * @returns object
+ */
+async function limitFromCollection(database, collection, sort, options) {
+  const results = await database.collection(collection).find({}, options).sort(sort).limit(1)
+    .toArray();
+  return results;
+}
+
+/**
  * Drops the whole collection.
  *
  * @param {string} database
@@ -266,4 +282,5 @@ module.exports = {
   collectionStats,
   closeDbConnection,
   insertManyToDatabase,
+  limitFromCollection,
 };
