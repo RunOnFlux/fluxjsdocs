@@ -419,10 +419,10 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
     logStream.on('data', (chunk) => {
       console.log('Received chunk of data');
       logBuffer += chunk.toString('utf8');
-      const lines = logBuffer.split('\n');
+      let lines = logBuffer.split('\n');
       logBuffer = lines.pop();
-      // eslint-disable-next-line no-restricted-syntax
-      for (const line of lines) {
+
+      for (let line of lines) {
         if (line.trim()) {
           if (callback) {
             callback(null, line);
@@ -445,7 +445,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
       }
     });
 
-    const logOptions = {
+    let logOptions = {
       follow: true,
       stdout: true,
       stderr: true,
@@ -457,7 +457,6 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
       logOptions.since = new Date(sinceTimestamp).getTime() / 1000;
     }
     await new Promise((resolve, reject) => {
-      // eslint-disable-next-line consistent-return
       dockerContainer.logs(logOptions, (err, mystream) => {
         if (err) {
           console.error('Error fetching logs:', err);
@@ -470,7 +469,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
           dockerContainer.modem.demuxStream(mystream, logStream, logStream);
           setTimeout(() => {
             logStream.end();
-          }, 1500);
+          }, 1500); 
           mystream.on('end', () => {
             console.log('mystream ended');
             logStream.end();
@@ -485,6 +484,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
             }
             reject(error);
           });
+
         } catch (error) {
           console.error('Error during stream processing:', error);
           if (callback) {
