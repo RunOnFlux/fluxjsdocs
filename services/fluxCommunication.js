@@ -73,39 +73,25 @@ async function handleAppMessages(message, fromIP, port) {
     const rebroadcastToPeers = await appsService.storeAppTemporaryMessage(message.data, true);
     if (rebroadcastToPeers === true) {
       const messageString = serviceHelper.ensureString(message);
-      const messageHash = hash(message.data);
-      const axiosConfig = {
-        timeout: 2000,
-      };
-      outgoingConnections.forEach(async (client) => {
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendPeer(messageString, client);
-          }
+          wsListOut.push(client);
         }
       });
-      await serviceHelper.delay(250);
-      incomingConnections.forEach(async (client) => {
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendToIncomingConnection(messageString, client);
-          }
+          wsList.push(client);
         }
       });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
     }
   } catch (error) {
     log.error(error);
@@ -130,39 +116,25 @@ async function handleAppRunningMessage(message, fromIP, port) {
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
     if (rebroadcastToPeers === true && timestampOK) {
       const messageString = serviceHelper.ensureString(message);
-      const messageHash = hash(message.data);
-      const axiosConfig = {
-        timeout: 2000,
-      };
-      outgoingConnections.forEach(async (client) => {
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendPeer(messageString, client);
-          }
+          wsListOut.push(client);
         }
       });
-      await serviceHelper.delay(250);
-      incomingConnections.forEach(async (client) => {
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendToIncomingConnection(messageString, client);
-          }
+          wsList.push(client);
         }
       });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
     }
   } catch (error) {
     log.error(error);
@@ -186,39 +158,25 @@ async function handleIPChangedMessage(message, fromIP, port) {
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
     if (rebroadcastToPeers && timestampOK) {
       const messageString = serviceHelper.ensureString(message);
-      const messageHash = hash(message.data);
-      const axiosConfig = {
-        timeout: 2000,
-      };
-      outgoingConnections.forEach(async (client) => {
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendPeer(messageString, client);
-          }
+          wsListOut.push(client);
         }
       });
-      await serviceHelper.delay(250);
-      incomingConnections.forEach(async (client) => {
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendToIncomingConnection(messageString, client);
-          }
+          wsList.push(client);
         }
       });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
     }
   } catch (error) {
     log.error(error);
@@ -242,39 +200,25 @@ async function handleAppRemovedMessage(message, fromIP, port) {
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
     if (rebroadcastToPeers && timestampOK) {
       const messageString = serviceHelper.ensureString(message);
-      const messageHash = hash(message.data);
-      const axiosConfig = {
-        timeout: 2000,
-      };
-      outgoingConnections.forEach(async (client) => {
+      const wsListOut = [];
+      outgoingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendPeer(messageString, client);
-          }
+          wsListOut.push(client);
         }
       });
-      await serviceHelper.delay(250);
-      incomingConnections.forEach(async (client) => {
+      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
+      await serviceHelper.delay(500);
+      const wsList = [];
+      incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
           // do not broadcast to this peer
         } else {
-          // let's check if peer already have received this message hash
-          const axiosResponse = await serviceHelper.axiosGet(`http://${client.ip}:${client.port}/flux/messageprocessed/${messageHash}`, axiosConfig).catch((error) => log.error(error));
-          if (axiosResponse && axiosResponse.data.status === 'success' && axiosResponse.data.data) {
-            // this peer already have received the message
-            log.info(`Peer ${client.ip}:${client.port} already have received message hash: ${messageHash}`);
-          } else {
-            fluxCommunicationMessagesSender.sendToIncomingConnection(messageString, client);
-          }
+          wsList.push(client);
         }
       });
+      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
     }
   } catch (error) {
     log.error(error);
@@ -1002,31 +946,6 @@ function getNumberOfPeers() {
   return incomingConnections.length + outgoingConnections.length;
 }
 
-/**
- * To check if node already have processed message hash.
- * @param {object} req Request.
- * @param {object} res Response.
- */
-async function checkMessageAlreadyProcessed(req, res) {
-  try {
-    let { messagehash } = req.params;
-    messagehash = messagehash || req.query.messagehash;
-    if (messagehash === undefined || messagehash === null) {
-      throw new Error('No messagehash specified.');
-    }
-    const message = messageHelper.createDataMessage(myCacheTemp.has(messagehash));
-    res.json(message);
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    res.json(errorResponse);
-  }
-}
-
 module.exports = {
   handleIncomingConnection,
   connectedPeers,
@@ -1043,5 +962,4 @@ module.exports = {
   initiateAndHandleConnection,
   getNumberOfPeers,
   addOutgoingPeer,
-  checkMessageAlreadyProcessed,
 };
