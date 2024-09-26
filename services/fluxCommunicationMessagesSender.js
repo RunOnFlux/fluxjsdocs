@@ -1,11 +1,14 @@
 /* eslint-disable no-underscore-dangle */
+const config = require('config');
 const { LRUCache } = require('lru-cache');
 const WebSocket = require('ws');
+const LZString = require('lz-string');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
+const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const {
   outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
 } = require('./utils/establishedConnections');
@@ -274,6 +277,21 @@ async function serialiseAndSignFluxBroadcast(dataToBroadcast, privatekey) {
     data: dataToBroadcast,
   };
   const dataString = JSON.stringify(dataObj);
+  const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+  const daemonHeight = syncStatus.data.height || 0;
+  if (daemonHeight >= 0) {
+    const dataObjAux = {
+      compressed: true,
+      dataObj: LZString.compress(dataString),
+    };
+    const dataStringAux = JSON.stringify(dataObjAux);
+    log.info(`Original of Sample is: ${dataString}`);
+    log.info(`Original lenght of Sample is: ${dataString.length}`);
+    log.info(`Sample lenght with compression is: ${dataStringAux.length}`);
+    const objectAux = JSON.parse(dataStringAux);
+    objectAux.dataObj = LZString.decompress(objectAux.dataObj);
+    log.info(`Sample after decompress is: ${objectAux.dataObj}`);
+  }
   return dataString;
 }
 
