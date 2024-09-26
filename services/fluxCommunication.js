@@ -3,7 +3,6 @@ const config = require('config');
 const { LRUCache } = require('lru-cache');
 const hash = require('object-hash');
 const WebSocket = require('ws');
-const LZString = require('lz-string');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
@@ -400,11 +399,7 @@ function handleIncomingConnection(websocket, optionalPort) {
       if (!rateOK) {
         return; // do not react to the message
       }
-      let msgObj = serviceHelper.ensureObject(msg.data);
-      const { compressed } = msgObj;
-      if (compressed) {
-        msgObj = serviceHelper.ensureObject(LZString.decompress(msgObj.dataObj));
-      }
+      const msgObj = serviceHelper.ensureObject(msg.data);
       const { pubKey } = msgObj;
       const { timestamp } = msgObj;
       const { signature } = msgObj;
@@ -743,11 +738,7 @@ async function initiateAndHandleConnection(connection) {
       if (!rateOK) {
         return; // do not react to the message
       }
-      let msgObj = serviceHelper.ensureObject(evt.data);
-      const { compressed } = msgObj;
-      if (compressed) {
-        msgObj = serviceHelper.ensureObject(LZString.decompress(msgObj.dataObj));
-      }
+      const msgObj = serviceHelper.ensureObject(evt.data);
       const { pubKey } = msgObj;
       const { timestamp } = msgObj;
       const { signature } = msgObj;
