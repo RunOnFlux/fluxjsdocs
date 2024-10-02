@@ -1997,7 +1997,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       res.write(serviceHelper.ensureString(makeDirectory));
       if (res.flush) res.flush();
     }
-    const execDIR = `sudo mkdir -p ${appsFolder + appId}`;
+    const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata`;
     await cmdAsync(execDIR);
     const makeDirectory2 = {
       status: 'Directory made',
@@ -2029,9 +2029,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       res.write(serviceHelper.ensureString(mountingStatus2));
       if (res.flush) res.flush();
     }
-
-    const execDIR2 = `sudo mkdir ${appsFolder + appId}/appdata`;
-    await cmdAsync(execDIR2);
 
     const permissionsDirectory = {
       status: 'Adjusting permissions...',
@@ -3730,7 +3727,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
       await serviceHelper.delay(500);
       await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-      // broadcast messages about running apps to all peers
+    // broadcast messages about running apps to all peers
     }
 
     // all done message
@@ -12242,7 +12239,7 @@ async function testAppMount() {
     log.info('Mount Test: Filesystem created');
     log.info('Mount Test: Making directory...');
 
-    const execDIR = `sudo mkdir -p ${appsFolder + appId}`;
+    const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata`;
     await cmdAsync(execDIR);
     log.info('Mount Test: Directory made');
     log.info('Mount Test: Mounting volume...');
