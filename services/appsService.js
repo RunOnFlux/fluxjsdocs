@@ -43,6 +43,7 @@ const IOUtils = require('./IOUtils');
 const log = require('../lib/log');
 const { PassThrough } = require('stream');
 const { invalidMessages } = require('./invalidMessages');
+const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 
 const fluxDirPath = path.join(__dirname, '../../../');
 const appsFolder = `${fluxDirPath}ZelApps/`;
@@ -9321,32 +9322,13 @@ async function trySpawningGlobalApplication() {
 /**
  * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
  */
-let nodeConfirmedOnLastCheck = true;
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
     if (!isNodeConfirmed) {
-      if (!nodeConfirmedOnLastCheck) {
-        const installedAppsRes = await installedApps();
-        if (installedAppsRes.status !== 'success') {
-          throw new Error('Failed to get installed Apps');
-        }
-        const appsInstalled = installedAppsRes.data;
-        // eslint-disable-next-line no-restricted-syntax
-        for (const installedApp of appsInstalled) {
-          log.info(`Application ${installedApp.name} going to be removed from node as the node is not confirmed on the network for more than 2 hours..`);
-          log.warn(`Removing application ${installedApp.name} locally`);
-          // eslint-disable-next-line no-await-in-loop
-          await removeAppLocally(installedApp.name, null, false, true, true);
-          log.warn(`Application ${installedApp.name} locally removed`);
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
-        }
-      }
-      nodeConfirmedOnLastCheck = false;
+      log.info('checkAndNotifyPeersOfRunningApps - FluxNode is not Confirmed');
       return;
     }
-    nodeConfirmedOnLastCheck = true;
     // get my external IP and check that it is longer than 5 in length.
     const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
     let myIP = null;
@@ -13126,6 +13108,85 @@ async function getAppSpecsUSDPrice(req, res) {
   }
 }
 
+let nodeConfirmedOnLastCheck = true;
+/**
+ * Method responsable to monitor node status ans uninstall apps if node is not confirmed
+ */
+// eslint-disable-next-line consistent-return
+async function monitorNodeStatus() {
+  try {
+    const isNodeConfirmed = await generalService.isNodeStatusConfirmed();
+    if (!isNodeConfirmed) {
+      log.info('monitorNodeStatus - Node is not Confirmed');
+      if (!nodeConfirmedOnLastCheck) {
+        const installedAppsRes = await installedApps();
+        if (installedAppsRes.status !== 'success') {
+          throw new Error('monitorNodeStatus - Failed to get installed Apps');
+        }
+        const appsInstalled = installedAppsRes.data;
+        // eslint-disable-next-line no-restricted-syntax
+        for (const installedApp of appsInstalled) {
+          log.info(`monitorNodeStatus - Application ${installedApp.name} going to be removed from node as the node is not confirmed on the network`);
+          log.warn(`monitorNodeStatus - Removing application ${installedApp.name} locally`);
+          // eslint-disable-next-line no-await-in-loop
+          await removeAppLocally(installedApp.name, null, true, false, false);
+          log.warn(`monitorNodeStatus - Application ${installedApp.name} locally removed`);
+          // eslint-disable-next-line no-await-in-loop
+          await serviceHelper.delay(60 * 1000); // wait for 1 min between each removal
+        }
+        await serviceHelper.delay(20 * 60 * 1000); // 20m delay before next check
+      } else {
+        nodeConfirmedOnLastCheck = false;
+        await serviceHelper.delay(2 * 60 * 1000); // 2m delay before next check
+      }
+      return monitorNodeStatus();
+    }
+    log.info('monitorNodeStatus - Node is Confirmed');
+    nodeConfirmedOnLastCheck = true;
+    // lets remove from locations when nodes are no longer confirmed
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    const variable = 'ip';
+    // we already have the exact same data
+    const appslocations = await dbHelper.distinctDatabase(database, globalAppsLocations, variable);
+    log.info(`monitorNodeStatus - Found ${appslocations.length} distinct IP's on appslocations`);
+    let nodeList = await fluxCommunicationUtils.deterministicFluxList();
+    nodeList = nodeList.map(({ ip }) => ip);
+    const appsLocationsNotOnNodelist = appslocations.filter((location) => !nodeList.includes(location));
+    log.info(`monitorNodeStatus - Found ${appsLocationsNotOnNodelist.length} IP(s) not present on determinisct node list`);
+    // eslint-disable-next-line no-restricted-syntax
+    for (const location of appsLocationsNotOnNodelist) {
+      log.info(`monitorNodeStatus - Checking IP ${location}.`);
+      const ip = location.split(':')[0];
+      const port = location.split(':')[1] || 16127;
+      const { CancelToken } = axios;
+      const source = CancelToken.source();
+      let isResolved = false;
+      const timeout = 10 * 1000; // 10 seconds
+      setTimeout(() => {
+        if (!isResolved) {
+          source.cancel('Operation canceled by the user.');
+        }
+      }, timeout * 2);
+      // eslint-disable-next-line no-await-in-loop
+      const response = await axios.get(`http://${ip}:${port}/daemon/getfluxnodestatus`, { timeout, cancelToken: source.token }).catch();
+      isResolved = true;
+      if (response && response.data && response.data.status === 'success' && response.data.data.status === 'CONFIRMED') {
+        log.info(`monitorNodeStatus - IP ${location} is available and confirmed, awaiting for a new confirmation transaction`);
+      } else {
+        log.info(`monitorNodeStatus - Removing IP ${location} from globalAppsLocations`);
+        const query = { ip: location };
+        // eslint-disable-next-line no-await-in-loop
+        await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, query);
+      }
+    }
+    await serviceHelper.delay(20 * 60 * 1000); // 20m delay before next check
+    monitorNodeStatus();
+  } catch (error) {
+    log.error(error);
+  }
+}
+
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -13263,4 +13324,5 @@ module.exports = {
   masterSlaveApps,
   getAppSpecsUSDPrice,
   checkApplicationsCpuUSage,
+  monitorNodeStatus,
 };
