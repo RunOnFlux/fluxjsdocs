@@ -51,39 +51,38 @@ const stc = new FluxController();
  * @returns {Promise<(string | null)>} config gile (XML).
  */
 async function getConfigFile() {
-  // const homedir = os.homedir();
-  // const configDir = path.join(homedir, '.config');
-  // const syncthingDir = path.join(configDir, 'syncthing');
-  // const configFile = path.join(syncthingDir, 'config.xml');
-  const configFile = '/dat/usr/lib/syncthing/config.xml';
+  const homedir = os.homedir();
+  const configDir = path.join(homedir, '.config');
+  const syncthingDir = path.join(configDir, 'syncthing');
+  const configFile = path.join(syncthingDir, 'config.xml');
 
-  // const user = os.userInfo().username;
-  // const owner = `${user}:${user}`;
+  const user = os.userInfo().username;
+  const owner = `${user}:${user}`;
 
   // As syncthing is running as root, we need to change owenership to running user
-  // const { error: chownConfigDirError } = await serviceHelper.runCommand('chown', {
-  //   runAsRoot: true,
-  //   logError: false,
-  //   params: [owner, configDir],
-  // });
+  const { error: chownConfigDirError } = await serviceHelper.runCommand('chown', {
+    runAsRoot: true,
+    logError: false,
+    params: [owner, configDir],
+  });
 
-  // if (chownConfigDirError) return null;
+  if (chownConfigDirError) return null;
 
-  // const { error: chownSyncthingError } = await serviceHelper.runCommand('chown', {
-  //   runAsRoot: true,
-  //   logError: false,
-  //   params: [owner, syncthingDir],
-  // });
+  const { error: chownSyncthingError } = await serviceHelper.runCommand('chown', {
+    runAsRoot: true,
+    logError: false,
+    params: [owner, syncthingDir],
+  });
 
-  // if (chownSyncthingError) return null;
+  if (chownSyncthingError) return null;
 
-  // const { error: chmodError } = await serviceHelper.runCommand('chmod', {
-  //   runAsRoot: true,
-  //   logError: false,
-  //   params: ['644', configFile],
-  // });
+  const { error: chmodError } = await serviceHelper.runCommand('chmod', {
+    runAsRoot: true,
+    logError: false,
+    params: ['644', configFile],
+  });
 
-  // if (chmodError) return null;
+  if (chmodError) return null;
 
   let result = null;
   // this should never reject as chown would error first but just in case
@@ -2495,11 +2494,10 @@ async function runSyncthingSentinel() {
       log.error('Unable to get syncthing deviceId. Reconfiguring syncthing.');
       await stopSyncthing();
       await installSyncthingIdempotently();
-      // await configureDirectories();
+      await configureDirectories();
 
-      // const homedir = os.homedir();
-      // const syncthingHome = path.join(homedir, '.config/syncthing');
-      const syncthingHome = '/dat/usr/lib/syncthing';
+      const homedir = os.homedir();
+      const syncthingHome = path.join(homedir, '.config/syncthing');
       const logFile = path.join(syncthingHome, 'syncthing.log');
 
       if (stc.aborted) return 0;
@@ -2517,25 +2515,31 @@ async function runSyncthingSentinel() {
       // adding old spawn with shell in the interim.
 
       childProcess.spawn(
-        'nohup',
-        [
-          'syncthing',
-          '--logfile',
-          logFile,
-          '--logflags=3',
-          '--log-max-old-files=2',
-          '--log-max-size=26214400',
-          '--allow-newer-config',
-          '--no-browser',
-          '--home',
-          syncthingHome,
-        ],
-        {
-          detached: true,
-          stdio: 'ignore',
-          env: { HOME: syncthingHome },
-        },
+        `sudo nohup syncthing --logfile ${logFile} --logflags=3 --log-max-old-files=2 --log-max-size=26214400 --allow-newer-config --no-browser --home ${syncthingHome} >/dev/null 2>&1 </dev/null &`,
+        { shell: true },
       ).unref();
+
+      // childProcess.spawn(
+      //   'sudo',
+      //   [
+      //     'nohup',
+      //     'syncthing',
+      //     '--logfile',
+      //     logFile,
+      //     '--logflags=3',
+      //     '--log-max-old-files=2',
+      //     '--log-max-size=26214400',
+      //     '--allow-newer-config',
+      //     '--no-browser',
+      //     '--home',
+      //     syncthingHome,
+      //   ],
+      //   {
+      //     detached: true,
+      //     stdio: 'ignore',
+      //     // uid: 0,
+      //   },
+      // ).unref();
 
       // let syncthing set itself up
       await stc.sleep(5 * 1000);
