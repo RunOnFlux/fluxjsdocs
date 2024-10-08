@@ -1041,9 +1041,6 @@ async function appStats(req, res) {
     const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       const response = await dockerService.dockerContainerStats(appname);
-      // eslint-disable-next-line no-use-before-define
-      const containerStorageInfo = await getContainerStorage(appname);
-      response.disk_stats = containerStorageInfo;
       const appResponse = messageHelper.createDataMessage(response);
       res.json(appResponse);
     } else {
@@ -1080,7 +1077,11 @@ async function appMonitor(req, res) {
     const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       if (appsMonitored[appname]) {
-        const response = appsMonitored[appname].statsStore;
+        const response = {
+          lastHour: appsMonitored[appname].oneMinuteStatsStore,
+          lastDay: appsMonitored[appname].fifteenMinStatsStore,
+        };
+
         const appResponse = messageHelper.createDataMessage(response);
         res.json(appResponse);
       } else throw new Error('No data available');
@@ -1153,70 +1154,35 @@ async function getAppFolderSize(appName) {
 }
 
 /**
- * Retrieves the storage usage of a specified Docker container, including bind mounts and volume mounts.
- * @param {string} appName The name of the Docker container to inspect.
- * @returns {Promise<object>} An object containing the sizes of bind mounts, volume mounts, root filesystem, total used storage, and status.
- *   - bind: Size of bind mounts in bytes.
- *   - volume: Size of volume mounts in bytes.
- *   - rootfs: Size of the container's root filesystem in bytes.
- *   - used: Total used size (sum of bind, volume, and rootfs sizes) in bytes.
- *   - status: 'success' if the operation succeeded, 'error' otherwise.
- *   - message: An error message if the operation failed.
+ * Returns total app container storage in bytes
+ * @param {string} appName - name or id of the container
+ * @returns {Promise<number>}
  */
 async function getContainerStorage(appName) {
   try {
     const containerInfo = await dockerService.dockerContainerInspect(appName, { size: true });
-    let bindMountsSize = 0;
-    let volumeMountsSize = 0;
-    const containerRootFsSize = serviceHelper.ensureNumber(containerInfo.SizeRootFs) || 0;
+    let containerTotalSize = serviceHelper.ensureNumber(containerInfo.SizeRootFs) || 0;
+    // traverse mounts/volumes to find size used on host
     if (containerInfo?.Mounts?.length) {
       await Promise.all(containerInfo.Mounts.map(async (mount) => {
         let source = mount?.Source;
-        const mountType = mount?.Type;
         if (source) {
-          if (mountType === 'bind') {
-            source = source.replace('/appdata', '');
-            const exec = `sudo du -sb ${source}`;
-            const mountInfo = await cmdAsync(exec);
-            if (mountInfo) {
-              const sizeNum = serviceHelper.ensureNumber(mountInfo.split('\t')[0]) || 0;
-              bindMountsSize += sizeNum;
-            } else {
-              log.warn(`No mount info returned for source: ${source}`);
-            }
-          } else if (mountType === 'volume') {
-            const exec = `sudo du -sb ${source}`;
-            const mountInfo = await cmdAsync(exec);
-            if (mountInfo) {
-              const sizeNum = serviceHelper.ensureNumber(mountInfo.split('\t')[0]) || 0;
-              volumeMountsSize += sizeNum;
-            } else {
-              log.warn(`No mount info returned for source: ${source}`);
-            }
-          } else {
-            log.warn(`Unsupported mount type or source: Type: ${mountType}, Source: ${source}`);
+          // remove /appdata to get true size of the app folder
+          source = source.replace('/appdata', '');
+          const exec = `sudo du -sb ${source}`;
+          const mountInfo = await cmdAsync(exec);
+          const mountSize = serviceHelper.ensureNumber(mountInfo?.split(source)[0]) || 0;
+          if (typeof mountSize === 'number' && !Number.isNaN(mountSize)) {
+            containerTotalSize += mountSize;
           }
         }
       }));
+      return containerTotalSize;
     }
-    const usedSize = bindMountsSize + volumeMountsSize + containerRootFsSize;
-    return {
-      bind: bindMountsSize,
-      volume: volumeMountsSize,
-      rootfs: containerRootFsSize,
-      used: usedSize,
-      status: 'success',
-    };
+    return containerTotalSize;
   } catch (error) {
-    log.error(`Error fetching container storage: ${error.message}`);
-    return {
-      bind: 0,
-      volume: 0,
-      rootfs: 0,
-      used: 0,
-      status: 'error',
-      message: error.message,
-    };
+    log.error(error);
+    return 0;
   }
 }
 
@@ -1228,12 +1194,13 @@ function startAppMonitoring(appName) {
   if (!appName) {
     throw new Error('No App specified');
   } else {
-    log.info('Initialize Monitoring...');
-    appsMonitored[appName] = {}; // Initialize the app's monitoring object
-    if (!appsMonitored[appName].statsStore) {
-      appsMonitored[appName].statsStore = [];
+    appsMonitored[appName] = {}; // oneMinuteInterval, fifteenMinInterval, oneMinuteStatsStore, fifteenMinStatsStore
+    if (!appsMonitored[appName].fifteenMinStatsStore) {
+      appsMonitored[appName].fifteenMinStatsStore = [];
     }
-    // Clear previous interval for this app to prevent multiple intervals
+    if (!appsMonitored[appName].oneMinuteStatsStore) {
+      appsMonitored[appName].oneMinuteStatsStore = [];
+    }
     clearInterval(appsMonitored[appName].oneMinuteInterval);
     appsMonitored[appName].oneMinuteInterval = setInterval(async () => {
       try {
@@ -1250,20 +1217,52 @@ function startAppMonitoring(appName) {
           return;
         }
         const statsNow = await dockerService.dockerContainerStats(appName);
-        const containerStorageInfo = await getContainerStorage(appName);
-        statsNow.disk_stats = containerStorageInfo;
-        const now = Date.now();
-        appsMonitored[appName].statsStore.push({ timestamp: now, data: statsNow });
-        const statsStoreSizeInBytes = new TextEncoder().encode(JSON.stringify(appsMonitored[appName].statsStore)).length;
-        const estimatedSizeInMB = statsStoreSizeInBytes / (1024 * 1024);
-        log.info(`Size of stats for ${appName}: ${estimatedSizeInMB.toFixed(2)} MB`);
-        appsMonitored[appName].statsStore = appsMonitored[appName].statsStore.filter(
-          (stat) => now - stat.timestamp <= 7 * 24 * 60 * 60 * 1000,
-        );
+        const containerTotalSize = await getContainerStorage(appName);
+
+        // const appFolderName = dockerService.getAppDockerNameIdentifier(appName).substring(1);
+        // const folderSize = await getAppFolderSize(appFolderName);
+        statsNow.disk_stats = {
+          used: containerTotalSize ?? 0,
+        };
+        appsMonitored[appName].oneMinuteStatsStore.unshift({ timestamp: Date.now(), data: statsNow }); // Most recent stats object is at position 0 in the array
+        if (appsMonitored[appName].oneMinuteStatsStore.length > 60) {
+          appsMonitored[appName].oneMinuteStatsStore.length = 60; // Store stats every 1 min for the last hour only
+        }
       } catch (error) {
         log.error(error);
       }
-    }, 3 * 60 * 1000);
+    }, 1 * 60 * 1000);
+    clearInterval(appsMonitored[appName].fifteenMinInterval);
+    appsMonitored[appName].fifteenMinInterval = setInterval(async () => {
+      try {
+        if (!appsMonitored[appName]) {
+          log.error(`Monitoring of ${appName} already stopped`);
+          clearInterval(appsMonitored[appName].fifteenMinInterval);
+          return;
+        }
+        const dockerContainer = await dockerService.getDockerContainerOnly(appName);
+        if (!dockerContainer) {
+          log.error(`Monitoring of ${appName} not possible. App does not exist. Forcing stopping of monitoring`);
+          // eslint-disable-next-line no-use-before-define
+          stopAppMonitoring(appName, true);
+          return;
+        }
+        const statsNow = await dockerService.dockerContainerStats(appName);
+        const containerTotalSize = await getContainerStorage(appName);
+
+        // const appFolderName = dockerService.getAppDockerNameIdentifier(appName).substring(1);
+        // const folderSize = await getAppFolderSize(appFolderName);
+        statsNow.disk_stats = {
+          used: containerTotalSize ?? 0,
+        };
+        appsMonitored[appName].fifteenMinStatsStore.unshift({ timestamp: Date.now(), data: statsNow }); // Most recent stats object is at position 0 in the array
+        if (appsMonitored[appName].oneMinuteStatsStore.length > 96) {
+          appsMonitored[appName].fifteenMinStatsStore.length = 96; // Store stats every 15 mins for the last day only
+        }
+      } catch (error) {
+        log.error(error);
+      }
+    }, 15 * 60 * 1000);
   }
 }
 
@@ -1276,51 +1275,11 @@ function startAppMonitoring(appName) {
 function stopAppMonitoring(appName, deleteData) {
   if (appsMonitored[appName]) {
     clearInterval(appsMonitored[appName].oneMinuteInterval);
+    clearInterval(appsMonitored[appName].fifteenMinInterval);
   }
   if (deleteData) {
     delete appsMonitored[appName];
   }
-}
-
-/**
- * Calculates the average CPU usage for a monitored app over the last 1 hour.
- * @param {string} appName The name of the app for which to calculate CPU usage.
- * @returns {object|null} An object containing the average CPU usage difference and average system CPU usage difference, or null if the app is not monitored or has no stats data.
- */
-function getAverageCpuUsage(appName) {
-  const now = Date.now();
-
-  if (!appsMonitored[appName] || !appsMonitored[appName].statsStore) {
-    log.error(`App ${appName} is not being monitored or has no stats data.`);
-    return null;
-  }
-
-  const stats = appsMonitored[appName].statsStore.filter(
-    (stat) => now - stat.timestamp <= 60 * 60 * 1000,
-  );
-
-  if (stats.length === 0) {
-    return null;
-  }
-
-  let totalCpuUsageDiff = 0;
-  let totalSystemCpuUsageDiff = 0;
-
-  stats.forEach((stat) => {
-    const cpuUsageDiff = stat.data.cpu_stats.cpu_usage.total_usage - stat.data.precpu_stats.cpu_usage.total_usage;
-    const systemCpuUsageDiff = stat.data.cpu_stats.system_cpu_usage - stat.data.precpu_stats.system_cpu_usage;
-
-    totalCpuUsageDiff += cpuUsageDiff;
-    totalSystemCpuUsageDiff += systemCpuUsageDiff;
-  });
-
-  const avgCpuUsageDiff = totalCpuUsageDiff / stats.length;
-  const avgSystemCpuUsageDiff = totalSystemCpuUsageDiff / stats.length;
-  log.info(`${avgCpuUsageDiff}, ${avgSystemCpuUsageDiff}`);
-  return {
-    avgCpuUsageDiff,
-    avgSystemCpuUsageDiff,
-  };
 }
 
 /**
@@ -9660,21 +9619,23 @@ async function checkApplicationsCpuUSage() {
     // eslint-disable-next-line no-restricted-syntax
     for (const app of appsInstalled) {
       if (app.version <= 3) {
-        const averageStats = getAverageCpuUsage(app.name);
-        stats = appsMonitored[app.name].statsStore;
+        stats = appsMonitored[app.name].oneMinuteStatsStore;
         // eslint-disable-next-line no-await-in-loop
         const inspect = await dockerService.dockerContainerInspect(app.name);
-        if (inspect && stats.length > 19) {
+        if (inspect && stats.length > 55) {
           const nanoCpus = inspect.HostConfig.NanoCpus;
           let cpuThrottling = true;
-          const cpuUsage = averageStats.avgCpuUsageDiff;
-          const systemCpuUsage = averageStats.avgSystemCpuUsageDiff;
-          const cpu = ((cpuUsage / systemCpuUsage) * stats[0].data.cpu_stats.online_cpus * 100) / app.cpu || 0;
-          const realCpu = cpu / (nanoCpus / app.cpu / 1e9);
-          if (realCpu < 92) {
-            cpuThrottling = false;
+          // eslint-disable-next-line no-restricted-syntax
+          for (const stat of stats) {
+            const cpuUsage = stat.data.cpu_stats.cpu_usage.total_usage - stat.data.precpu_stats.cpu_usage.total_usage;
+            const systemCpuUsage = stat.data.cpu_stats.system_cpu_usage - stat.data.precpu_stats.system_cpu_usage;
+            const cpu = ((cpuUsage / systemCpuUsage) * stat.data.cpu_stats.online_cpus * 100) / app.cpu || 0;
+            const realCpu = cpu / (nanoCpus / app.cpu / 1e9);
+            if (realCpu < 92) {
+              cpuThrottling = false;
+              break;
+            }
           }
-          log.info(`CPU usage: ${realCpu.toFixed(2)}%`);
           log.info(`checkApplicationsCpuUSage ${app.name} cpu high load: : ${cpuThrottling}`);
           if (cpuThrottling && app.cpu > 1) {
             if (nanoCpus / app.cpu / 1e9 === 1) {
@@ -9696,21 +9657,23 @@ async function checkApplicationsCpuUSage() {
       } else {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of app.compose) {
-          stats = appsMonitored[`${appComponent.name}_${app.name}`].statsStore;
-          const averageStats = getAverageCpuUsage(`${appComponent.name}_${app.name}`);
+          stats = appsMonitored[`${appComponent.name}_${app.name}`].oneMinuteStatsStore;
           // eslint-disable-next-line no-await-in-loop
           const inspect = await dockerService.dockerContainerInspect(`${appComponent.name}_${app.name}`);
-          if (inspect && stats.length > 19) {
+          if (inspect && stats.length > 55) {
             const nanoCpus = inspect.HostConfig.NanoCpus;
             let cpuThrottling = true;
-            const cpuUsage = averageStats.avgCpuUsageDiff;
-            const systemCpuUsage = averageStats.avgSystemCpuUsageDiff;
-            const cpu = ((cpuUsage / systemCpuUsage) * stats[0].data.cpu_stats.online_cpus * 100) / appComponent.cpu || 0;
-            const realCpu = cpu / (nanoCpus / appComponent.cpu / 1e9);
-            if (realCpu < 92) {
-              cpuThrottling = false;
+            // eslint-disable-next-line no-restricted-syntax
+            for (const stat of stats) {
+              const cpuUsage = stat.data.cpu_stats.cpu_usage.total_usage - stat.data.precpu_stats.cpu_usage.total_usage;
+              const systemCpuUsage = stat.data.cpu_stats.system_cpu_usage - stat.data.precpu_stats.system_cpu_usage;
+              const cpu = ((cpuUsage / systemCpuUsage) * 100 * stat.data.cpu_stats.online_cpus) / appComponent.cpu || 0;
+              const realCpu = cpu / (nanoCpus / appComponent.cpu / 1e9);
+              if (realCpu < 92) {
+                cpuThrottling = false;
+                break;
+              }
             }
-            log.info(`CPU usage: ${realCpu.toFixed(2)}%`);
             log.info(`checkApplicationsCpuUSage ${appComponent.name}_${app.name} cpu high load: : ${cpuThrottling}`);
             if (cpuThrottling && appComponent.cpu > 1) {
               if (nanoCpus / appComponent.cpu / 1e9 === 1) {
@@ -13304,7 +13267,6 @@ module.exports = {
   getAppFolderSize,
   startAppMonitoring,
   stopMonitoringOfApps,
-  getAverageCpuUsage,
   getNodeSpecs,
   setNodeSpecs,
   returnNodeSpecs,

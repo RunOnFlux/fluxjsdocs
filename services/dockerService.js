@@ -409,11 +409,15 @@ async function dockerContainerLogs(idOrName, lines) {
 
 async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, callback) {
   try {
+    console.log('Starting dockerContainerLogsPolling');
     const dockerContainer = await getDockerContainerByIdOrName(idOrName);
+    console.log(`Retrieved container: ${idOrName}`);
+
     const logStream = new stream.PassThrough();
     let logBuffer = '';
 
     logStream.on('data', (chunk) => {
+      console.log('Received chunk of data');
       logBuffer += chunk.toString('utf8');
       const lines = logBuffer.split('\n');
       logBuffer = lines.pop();
@@ -428,13 +432,14 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
     });
 
     logStream.on('error', (error) => {
-      log.error('Log stream encountered an error:', error);
+      console.error('Log stream encountered an error:', error);
       if (callback) {
         callback(error);
       }
     });
 
     logStream.on('end', () => {
+      console.log('logStream ended');
       if (callback) {
         callback(null, 'Stream ended'); // Notify end of logs
       }
@@ -455,7 +460,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
       // eslint-disable-next-line consistent-return
       dockerContainer.logs(logOptions, (err, mystream) => {
         if (err) {
-          log.error('Error fetching logs:', err);
+          console.error('Error fetching logs:', err);
           if (callback) {
             callback(err);
           }
@@ -467,12 +472,13 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
             logStream.end();
           }, 1500);
           mystream.on('end', () => {
+            console.log('mystream ended');
             logStream.end();
             resolve();
           });
 
           mystream.on('error', (error) => {
-            log.error('Stream error:', error);
+            console.error('Stream error:', error);
             logStream.end();
             if (callback) {
               callback(error);
@@ -480,7 +486,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
             reject(error);
           });
         } catch (error) {
-          log.error('Error during stream processing:', error);
+          console.error('Error during stream processing:', error);
           if (callback) {
             callback(new Error('An error occurred while processing the log stream'));
           }
@@ -489,7 +495,7 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
       });
     });
   } catch (error) {
-    log.error('Error in dockerContainerLogsPolling:', error);
+    console.error('Error in dockerContainerLogsPolling:', error);
     if (callback) {
       callback(error);
     }
