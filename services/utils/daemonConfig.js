@@ -5,8 +5,8 @@ const os = require('node:os');
 class DaemonConfig {
   static daemonConfigPaths = {
     linux: {
-      zelPath: 'flux.conf',
-      fluxPath: 'flux.conf',
+      zelPath: '.zelcash/zelcash.conf',
+      fluxPath: '.flux/flux.conf',
     },
     darwin: {
       zelPath: 'Zelcash/zelcash.conf',
@@ -24,6 +24,8 @@ class DaemonConfig {
 
   platform = process.platform;
 
+  homedir = os.homedir();
+
   raw = '';
 
   configElements = {};
@@ -31,7 +33,7 @@ class DaemonConfig {
   constructor() {
     switch (this.platform) {
       case 'linux':
-        this.baseDir = '/dat/var/lib/fluxd';
+        this.baseDir = os.homedir();
         break;
       case 'darwin':
         this.baseDir = path.join(os.homedir(), 'Library/Application Support');
