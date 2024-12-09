@@ -46,7 +46,9 @@ const { invalidMessages } = require('./invalidMessages');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 
 const fluxDirPath = path.join(__dirname, '../../../');
-const appsFolder = `${fluxDirPath}ZelApps/`;
+// ToDo: Fix all the string concatenation in this file and use path.join()
+const appsFolderPath = process.env.FLUX_APPS_FOLDER || path.join(fluxDirPath, 'ZelApps');
+const appsFolder = `${appsFolderPath}/`;
 
 const cmdAsync = util.promisify(nodecmd.get);
 const crontabLoad = util.promisify(systemcrontab.load);
@@ -4551,10 +4553,10 @@ async function getGlobalAppsSpecifications(req, res) {
       query.hash = hash;
     }
     if (owner) {
-      query.owner = owner;
+      query['appSpecifications.owner'] = owner;
     }
     if (appname) {
-      query.name = appname;
+      query['appSpecifications.name'] = appname;
     }
     const projection = { projection: { _id: 0 } };
     const results = await dbHelper.findInDatabase(database, globalAppsInformation, query, projection);
