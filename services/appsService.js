@@ -4553,10 +4553,10 @@ async function getGlobalAppsSpecifications(req, res) {
       query.hash = hash;
     }
     if (owner) {
-      query['appSpecifications.owner'] = owner;
+      query.owner = owner;
     }
     if (appname) {
-      query['appSpecifications.name'] = appname;
+      query.name = appname;
     }
     const projection = { projection: { _id: 0 } };
     const results = await dbHelper.findInDatabase(database, globalAppsInformation, query, projection);
