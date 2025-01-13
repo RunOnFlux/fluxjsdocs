@@ -1625,6 +1625,7 @@ async function streamChainPreparation(req, res) {
     if (blockCountStatus !== 'success') {
       res.statusMessage = 'Error getting blockCount from local Flux Daemon.';
       res.status(503).end();
+      return;
     }
 
     const explorerResponse = await Promise.race([
@@ -1640,6 +1641,26 @@ async function streamChainPreparation(req, res) {
 
     if (blockCount + 5 < explorerResponse.data.info.blocks) {
       res.statusMessage = 'Error local Daemon is not synced.';
+      res.status(503).end();
+      return;
+    }
+
+    const daemonNodeStatusRes = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
+    if (daemonNodeStatusRes.status === 'error') {
+      throw daemonNodeStatusRes.data;
+    }
+    const { status: fluxNodeStatus, data: fluxNodeInfo } = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
+
+    if (fluxNodeStatus !== 'success') {
+      res.statusMessage = 'Error getting fluxNodeStatus from local Flux Daemon.';
+      res.status(503).end();
+      return;
+    }
+
+    // check if it is outside maintenance window
+    if (fluxNodeInfo.status === 'CONFIRMED' && fluxNodeInfo.last_confirmed_height > 0 && (120 - (blockCount - fluxNodeInfo.last_confirmed_height)) < 5) {
+      // fluxnodes needs to confirm between 120 and 150 blocks, if it is 4 blocks remaining to enter confirmation window we already consider outside maintenance window.
+      res.statusMessage = 'Error Fluxnode is not in maintenance window.';
       res.status(503).end();
       return;
     }
