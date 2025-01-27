@@ -1072,11 +1072,19 @@ async function appStats(req, res) {
  */
 async function appMonitor(req, res) {
   try {
-    let { appname } = req.params;
+    let { appname, range } = req.params;
     appname = appname || req.query.appname;
+    range = range || req.query.range || null;
 
     if (!appname) {
       throw new Error('No Flux App specified');
+    }
+
+    if (range !== null) {
+      range = parseInt(range, 10);
+      if (!Number.isInteger(range) || range <= 0) {
+        throw new Error('Invalid range value. It must be a positive integer or null.');
+      }
     }
 
     const mainAppName = appname.split('_')[1] || appname;
@@ -1084,8 +1092,17 @@ async function appMonitor(req, res) {
     const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       if (appsMonitored[appname]) {
-        const response = appsMonitored[appname].statsStore;
-        const appResponse = messageHelper.createDataMessage(response);
+        let appStatsMonitoring = appsMonitored[appname].statsStore;
+        if (range) {
+          const now = Date.now();
+          const cutoffTimestamp = now - range;
+          const hoursInMs = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+          appStatsMonitoring = appStatsMonitoring.filter((stats) => stats.timestamp >= cutoffTimestamp);
+          if (range > hoursInMs) {
+            appStatsMonitoring = appStatsMonitoring.filter((_, index, array) => index % 20 === 0 || index === array.length - 1); // keep always last entry
+          }
+        }
+        const appResponse = messageHelper.createDataMessage(appStatsMonitoring);
         res.json(appResponse);
       } else throw new Error('No data available');
     } else {
@@ -6650,6 +6667,20 @@ async function storeAppRunningMessage(message) {
     // eslint-disable-next-line no-await-in-loop
     await dbHelper.updateOneInDatabase(database, globalAppsLocations, queryUpdate, update, options);
   }
+
+  if (message.version === 2 && appsMessages.length === 0) {
+    const queryFind = { ip: message.ip };
+    const projection = { _id: 0, runningSince: 1 };
+    // we already have the exact same data
+    // eslint-disable-next-line no-await-in-loop
+    const result = await dbHelper.findInDatabase(database, globalAppsLocations, queryFind, projection);
+    if (result.length > 0) {
+      await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, queryFind);
+    } else {
+      return false;
+    }
+  }
+
   if (messageNotOk) {
     return false;
   }
@@ -9434,6 +9465,7 @@ async function trySpawningGlobalApplication() {
 /**
  * To check and notify peers of running apps. Checks if apps are installed, stopped or running.
  */
+let checkAndNotifyPeersOfRunningAppsFirstRun = true;
 async function checkAndNotifyPeersOfRunningApps() {
   try {
     let isNodeConfirmed = false;
@@ -9621,6 +9653,28 @@ async function checkAndNotifyPeersOfRunningApps() {
         await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
         // broadcast messages about running apps to all peers
         log.info(`App Running Message broadcasted ${JSON.stringify(newAppRunningMessageV2)}`);
+      } else if (installedAndRunning.length === 0 && checkAndNotifyPeersOfRunningAppsFirstRun) {
+        checkAndNotifyPeersOfRunningAppsFirstRun = false;
+        // we will broadcast a message that we are not running any app
+        // if multitoolbox option to reinstall fluxos or fix mongodb is executed all apps are removed from the node, once the node starts and it's confirmed
+        // should broadcast to the network what is running or not
+        // the nodes who receive the message will only rebroadcast if they had information about a app running on this node
+        const newAppRunningMessageV2 = {
+          type: 'fluxapprunning',
+          version: 2,
+          apps,
+          ip: myIP,
+          broadcastedAt: Date.now(),
+          osUptime: os.uptime(),
+        };
+        // eslint-disable-next-line no-await-in-loop
+        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessageV2);
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(500);
+        // eslint-disable-next-line no-await-in-loop
+        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessageV2);
+        // broadcast messages about running apps to all peers
+        log.info(`No Apps Running Message broadcasted ${JSON.stringify(newAppRunningMessageV2)}`);
       }
     } catch (err) {
       log.error(err);
