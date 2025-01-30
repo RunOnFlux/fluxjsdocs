@@ -647,6 +647,34 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       adjustedCommands.push(command);
     }
   });
+
+  // Identify apps with LOG=SEND
+  const isRemoteLog = envParams?.some((env) => env.startsWith('LOG=SEND'));
+  // Find target app with LOG=COLLECT
+  let syslogTarget = null;
+  if (fullAppSpecs && fullAppSpecs.compose) {
+    syslogTarget = fullAppSpecs.compose.find((app) => app.environmentParameters?.some((env) => env.startsWith('LOG=COLLECT')))?.name;
+  }
+
+  log.info(`isRemoteLog=${isRemoteLog}, syslogTarget=${syslogTarget}`);
+
+  const logConfig = isRemoteLog && syslogTarget
+    ? {
+      Type: 'syslog',
+      Config: {
+        'syslog-address': `udp://${syslogTarget}:514`,
+        'syslog-facility': 'local0',
+        tag: `${appSpecifications.name}`,
+      },
+    }
+    : {
+      Type: 'json-file',
+      Config: {
+        'max-file': '1',
+        'max-size': '20m',
+      },
+    };
+
   const options = {
     Image: appSpecifications.repotag,
     name: getAppIdentifier(identifier),
@@ -676,13 +704,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
         Name: restartPolicy,
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
-      LogConfig: {
-        Type: 'json-file',
-        Config: {
-          'max-file': '1',
-          'max-size': '20m',
-        },
-      },
+      LogConfig: logConfig,
       ExtraHosts: [`fluxnode.service:${config.server.fluxNodeServiceAddress}`],
     },
   };
