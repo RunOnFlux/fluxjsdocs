@@ -527,36 +527,6 @@ async function obtainPayloadFromStorage(url, appName) {
 }
 
 /**
- * Retrieves the IP address of a running Docker container.
- *
- * @param {string} containerName - The name of the container.
- * @returns {Promise<string|null>} - The container's IP address, or null if not found.
- * @throws {Error} - If the container has no network or IP address.
- */
-const getContainerIP = async (containerName) => {
-  try {
-    const container = await docker.getContainer(containerName).inspect();
-    const networks = Object.keys(container.NetworkSettings.Networks);
-
-    if (!Array.isArray(networks) || networks.length === 0) {
-      throw new Error('No networks found for container');
-    }
-
-    const networkName = networks[0]; // Automatically selects the first network
-    const ipAddressOfContainer = container.NetworkSettings.Networks[networkName].IPAddress ?? null;
-
-    if (!ipAddressOfContainer) {
-      throw new Error('No IPAddress found for container');
-    }
-
-    return ipAddressOfContainer;
-  } catch (error) {
-    log.error(`Failed to retrieve IP for ${containerName}: ${error.message}`);
-    return null;
-  }
-};
-
-/**
  * Creates an app container.
  *
  * @param {object} appSpecifications
@@ -677,40 +647,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       adjustedCommands.push(command);
     }
   });
-
-  const isSender = envParams?.some((env) => env.startsWith('LOG=SEND'));
-  const isCollector = envParams?.some((env) => env.startsWith('LOG=COLLECT'));
-
-  let syslogTarget = null;
-  let syslogIP = null;
-
-  if (fullAppSpecs && fullAppSpecs?.compose) {
-    syslogTarget = fullAppSpecs.compose.find((app) => app.environmentParameters?.some((env) => env.startsWith('LOG=COLLECT')))?.name;
-  }
-
-  if (syslogTarget && !isCollector) {
-    syslogIP = await getContainerIP(`flux${syslogTarget}_${appName}`);
-  }
-
-  log.info(`isSender=${isSender}, syslogTarget=${syslogTarget}, syslogCollectorIP=${syslogIP}`);
-
-  const logConfig = isSender && syslogTarget && syslogIP
-    ? {
-      Type: 'syslog',
-      Config: {
-        'syslog-address': `udp://${syslogIP}:514`,
-        'syslog-facility': 'local0',
-        tag: `${appSpecifications.name}`,
-      },
-    }
-    : {
-      Type: 'json-file',
-      Config: {
-        'max-file': '1',
-        'max-size': '20m',
-      },
-    };
-
   const options = {
     Image: appSpecifications.repotag,
     name: getAppIdentifier(identifier),
@@ -740,7 +676,13 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
         Name: restartPolicy,
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
-      LogConfig: logConfig,
+      LogConfig: {
+        Type: 'json-file',
+        Config: {
+          'max-file': '1',
+          'max-size': '20m',
+        },
+      },
       ExtraHosts: [`fluxnode.service:${config.server.fluxNodeServiceAddress}`],
     },
   };
