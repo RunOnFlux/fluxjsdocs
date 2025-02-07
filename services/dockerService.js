@@ -568,6 +568,7 @@ async function getNextAvailableIPForApp(appName) {
       if (candidateLong === gatewayLong) continue; // Skip the gateway.
       const candidateIP = ipLib.fromLong(candidateLong);
       if (!allocatedIPs.has(candidateIP)) {
+        log.info(`Assigned IP for ${appName}: ${candidateIP}`);
         return candidateIP;
       }
     }
@@ -763,11 +764,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
         'max-size': '20m',
       },
     };
-
-  // *** Automatic IP Assignment for the Container ***
   const autoAssignedIP = await getNextAvailableIPForApp(appName);
-  log.info(`Auto-assigned IP for ${appName}: ${autoAssignedIP}`);
-
   const options = {
     Image: appSpecifications.repotag,
     name: getAppIdentifier(identifier),
