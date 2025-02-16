@@ -1654,7 +1654,7 @@ async function streamChainPreparation(req, res) {
       return;
     }
 
-    const explorerResponse = await Promise.any([
+    const explorerResponse = await Promise.race([
       serviceHelper.axiosGet(urlExplorerA, axiosConfig),
       serviceHelper.axiosGet(urlExplorerB, axiosConfig),
     ]).catch(() => null);
