@@ -605,36 +605,8 @@ async function getNextAvailableIPForApp(appName) {
     const { firstAddress, lastAddress } = parseCidrSubnet(Subnet);
     log.info(`First usable IP: ${firstAddress}, Last usable IP: ${lastAddress}`);
 
-    const allocatedIPs = new Set();
-    if (Containers) {
-      Object.values(Containers).forEach((containerInfo) => {
-        const containerIP = containerInfo.IPv4Address.split('/')[0];
-        if (containerIP) {
-          allocatedIPs.add(containerIP);
-        }
-      });
-    }
-
-    const allContainers = await docker.listContainers({ all: true });
-    const filteredContainers = allContainers.filter((container) => container.Names.some((name) => name.endsWith(`_${appName}`)));
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const container of filteredContainers) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        const containerInfo = await docker.getContainer(container.Id).inspect();
-        const containerIP = containerInfo.NetworkSettings.Networks[`fluxDockerNetwork_${appName}`]?.IPAMConfig?.IPv4Address;
-        if (containerIP && !allocatedIPs.has(containerIP)) {
-          allocatedIPs.add(containerIP);
-        }
-      } catch (error) {
-        log.error(`Error inspecting container ${container.Id}: ${error.message}`);
-      }
-    }
-
-    if (allocatedIPs?.size) {
-      log.info(`Allocated IPs: ${Array.from(allocatedIPs)}`);
-    }
+    const allocatedIPs = new Set(Object.values(Containers || {}).map((c) => c.IPv4Address.split('/')[0]));
+    log.info('Allocated IPs:', allocatedIPs);
 
     const gatewayLong = ipToLong(Gateway);
 
@@ -869,21 +841,15 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
         Name: restartPolicy,
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
-      LogConfig: logConfig,
-      ExtraHosts: [`fluxnode.service:${config.server.fluxNodeServiceAddress}`],
-    },
-    // Conditionally include NetworkingConfig only if a static IP was determined.
-    ...(autoAssignedIP && {
-      NetworkingConfig: {
-        EndpointsConfig: {
-          [`fluxDockerNetwork_${appName}`]: {
-            IPAMConfig: {
-              IPv4Address: autoAssignedIP,
-            },
-          },
+      LogConfig: {
+        Type: 'json-file',
+        Config: {
+          'max-file': '1',
+          'max-size': '20m',
         },
       },
-    }),
+      ExtraHosts: [`fluxnode.service:${config.server.fluxNodeServiceAddress}`],
+    },
   };
 
   // get docker info about Backing Filesystem
