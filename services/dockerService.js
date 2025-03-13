@@ -817,24 +817,19 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     syslogTarget = fullAppSpecs.compose.find((app) => app.environmentParameters?.some((env) => env.startsWith('LOG=COLLECT')))?.name;
   }
 
-  if (syslogTarget && isSender) {
+  if (syslogTarget && !isCollector) {
     syslogIP = await getContainerIP(`flux${syslogTarget}_${appName}`);
   }
 
-  if (syslogTarget && isCollector) {
-    syslogIP = await getNextAvailableIPForApp(appName);
-  }
+  log.info(`isSender=${isSender}, syslogTarget=${syslogTarget}, syslogCollectorIP=${syslogIP}`);
 
-  log.info(`syslogTarget=${syslogTarget}, syslogIP=${syslogIP}`);
-
-  const logConfig = syslogTarget && syslogIP
+  const logConfig = isSender && syslogTarget && syslogIP
     ? {
       Type: 'syslog',
       Config: {
         'syslog-address': `udp://${syslogIP}:514`,
         'syslog-facility': 'local0',
         tag: `${appSpecifications.name}`,
-        'syslog-format': 'rfc5424',
       },
     }
     : {
