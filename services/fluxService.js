@@ -4,7 +4,6 @@ const os = require('node:os');
 const { promisify } = require('node:util');
 
 const config = require('config');
-const configDefault = require('../../config/default');
 
 const log = require('../lib/log');
 const packageJson = require('../../../package.json');
@@ -675,22 +674,6 @@ async function getFluxIP(req, res) {
 function getFluxZelID(req, res) {
   const zelID = userconfig.initial.zelid;
   const message = messageHelper.createDataMessage(zelID);
-  return res ? res.json(message) : message;
-}
-
-/**
- * Returns Flux Team and Support Team Flux IDs.
- * @param {object} req Request object
- * @param {object} res Response object
- * @returns {object} JSON response with team IDs
- */
-function getFluxIds(req, res) {
-  const fluxConfig = {
-    fluxTeamFluxID: configDefault.fluxTeamFluxID,
-    fluxSupportTeamFluxID: configDefault.fluxSupportTeamFluxID,
-  };
-
-  const message = messageHelper.createDataMessage(fluxConfig);
   return res ? res.json(message) : message;
 }
 
@@ -2051,7 +2034,6 @@ module.exports = {
   getFluxTimezone,
   getFluxVersion,
   getFluxZelID,
-  getFluxIds,
   getMarketplaceURL,
   getNodeJsVersions,
   getNodeTier,
