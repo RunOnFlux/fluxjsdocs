@@ -20,10 +20,7 @@ async function getFluxNodeStatus(req, res) {
 }
 
 /**
- * To list nodes. Optional filter can be included as a parameter for RPC call. We
- * also allow a `limit` query parameter, so the node list response can be limited
- * in size. The full list is currently 6.9MiB. Sometimes, you might just want the
- * first x ranked nodes etc.
+ * To list nodes. Optional filter can be included as a parameter for RPC call.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message.
@@ -31,26 +28,13 @@ async function getFluxNodeStatus(req, res) {
 async function listFluxNodes(req, res) {
   let { filter } = req.params;
   filter = filter || req.query.filter;
-  const { limit = null } = req.query;
-
-  const rpccall = 'listfluxnodes';
+  const rpccall = 'listzelnodes'; // listfluxnodes
   const rpcparameters = [];
-
   if (filter) {
     rpcparameters.push(filter);
   }
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
-
-  // we allow a 7 digit limit (zero is not allowed)
-  const limitResponse = limit
-    && response.status === 'success'
-    && /^[1-9]\d{0,6}$/.test(limit);
-
-  if (limitResponse) {
-    // slice works with string numbers so we don't need to convert
-    response.data = response.data.slice(0, limit);
-  }
 
   return res ? res.json(response) : response;
 }
