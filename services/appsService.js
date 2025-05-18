@@ -5491,9 +5491,6 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       }
     });
   } else { // v8+
-    if (typeof enterprise !== 'boolean') {
-      throw new Error('Missing enteprise flag parameter.');
-    } 
     if (typeof originalOwner !== 'string') {
       throw new Error('Missing originalOwner property');
     }
@@ -11092,6 +11089,18 @@ async function verifyAppRegistrationParameters(req, res) {
         }
       }
 
+      if (appSpecFormatted.version >= 8) {
+        appSpecFormatted.originalOwner = appSpecFormatted.owner;
+        appSpecFormatted.cpuSum = 0;
+        appSpecFormatted.ramSum = 0;
+        appSpecFormatted.hddSum = 0;
+        for (const component of appSpecFormatted.compose){
+          appSpecFormatted.cpuSum += component.cpu;
+          appSpecFormatted.ramSum += component.ram;
+          appSpecFormatted.hddSum += component.hdd;
+        }
+      }
+
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
@@ -11167,6 +11176,17 @@ async function verifyAppUpdateParameters(req, res) {
           appSpecFormatted.contacts = enterprise.contacts;
         } else {
           throw new Error('Error decrypting applications specifications.');
+        }
+      }
+
+      if (appSpecFormatted.version >= 8) {
+        appSpecFormatted.cpuSum = 0;
+        appSpecFormatted.ramSum = 0;
+        appSpecFormatted.hddSum = 0;
+        for (const component of appSpecFormatted.compose){
+          appSpecFormatted.cpuSum += component.cpu;
+          appSpecFormatted.ramSum += component.ram;
+          appSpecFormatted.hddSum += component.hdd;
         }
       }
 
