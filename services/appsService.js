@@ -66,6 +66,8 @@ const globalAppsLocations = config.database.appsglobal.collections.appsLocations
 
 const supportedArchitectures = ['amd64', 'arm64'];
 
+const isArcane = Boolean(process.env.FLUXOS_PATH);
+
 const testingAppExpress = express();
 let testingAppserver = http.createServer(testingAppExpress);
 testingAppserver = httpShutdown(testingAppserver);
@@ -3150,7 +3152,7 @@ function checkAppStaticIpRequirements(appSpecs) {
  * @returns {boolean} True if all checks passed.
  */
 async function checkAppNodesRequirements(appSpecs) {
-  if (appSpecs.version >= 7 && appSpecs.nodes && appSpecs.nodes.length) {
+  if (appSpecs.version === 7 && appSpecs.nodes && appSpecs.nodes.length) {
     const myCollateral = await generalService.obtainNodeCollateralInformation();
     const benchmarkResponse = await benchmarkService.getBenchmarks();
     if (benchmarkResponse.status === 'error') {
@@ -4805,7 +4807,7 @@ async function verifyAppMessageUpdateSignature(type, version, appSpec, timestamp
       const intervals = teamSupportAddresses.filter((interval) => interval.height <= daemonHeight);
       if (intervals) {
         const addressInfo = intervals[intervals.length - 1];
-        if (daemonHeight >= addressInfo.height) {
+        if (addressInfo.height >= daemonHeight) {
           fluxSupportTeamFluxID = addressInfo.address;
           const numbersOnAppName = appSpec.name.match(/\d+/g);
           if (numbersOnAppName && numbersOnAppName.length > 0) {
@@ -5168,6 +5170,11 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     expire,
     nodes,
     staticip,
+    originalOwner,
+    enterprise,
+    cpuSum,
+    ramSum,
+    hddSum
   } = appSpecification;
 
   if (!version) {
@@ -5366,7 +5373,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         throw new Error('Invalid tiered HW specifications');
       }
     }
-  } else { // v4+
+  } else if (version <= 7) { // v4 to v7
     if (!compose) {
       throw new Error('Missing Flux App specification parameter');
     }
@@ -5483,6 +5490,105 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
         }
       }
     });
+  } else { // v8+
+    if (typeof enterprise !== 'boolean') {
+      throw new Error('Missing enteprise flag parameter.');
+    } 
+    if (typeof originalOwner !== 'string') {
+      throw new Error('Missing originalOwner property');
+    }
+    if (typeof cpuSum !== 'number' || typeof ramSum !== 'number' || typeof hddSum !== 'number') {
+      throw new Error('Invalid HW specifications');
+    }
+    if (!serviceHelper.isDecimalLimit(cpuSum) || !serviceHelper.isDecimalLimit(ramSum) || !serviceHelper.isDecimalLimit(hddSum)) {
+      throw new Error('Invalid HW specifications decimal limits');
+    }
+    if (!compose) {
+      throw new Error('Missing Flux App specification parameter');
+    }
+    if (typeof compose !== 'object') {
+      throw new Error('Invalid Flux App Specifications');
+    }
+    if (!Array.isArray(compose)) {
+      throw new Error('Invalid Flux App Specifications');
+    }
+    compose.forEach((appComponent) => {
+      if (Array.isArray(appComponent)) {
+        throw new Error('Invalid Flux App Specifications');
+      }
+      if (typeof appComponent.name !== 'string') {
+        throw new Error('Invalid Flux App component name');
+      }
+      if (typeof appComponent.description !== 'string') {
+        throw new Error(`Invalid Flux App component ${appComponent.name} description`);
+      }
+      if (Array.isArray(appComponent.ports)) {
+        appComponent.ports.forEach((parameter) => {
+          if (typeof parameter !== 'number') {
+            throw new Error(`Ports for Flux App component ${appComponent.name} are invalid`);
+          }
+          if (!serviceHelper.isDecimalLimit(parameter, 0)) {
+            throw new Error(`Ports for Flux App component ${appComponent.name} are invalid decimals`);
+          }
+        });
+      } else {
+        throw new Error(`Ports for Flux App component ${appComponent.name} are invalid`);
+      }
+      if (Array.isArray(appComponent.domains)) {
+        appComponent.domains.forEach((parameter) => {
+          if (typeof parameter !== 'string') {
+            throw new Error(`Domains for Flux App component ${appComponent.name} are invalid`);
+          }
+        });
+      } else {
+        throw new Error(`Domains for Flux App component ${appComponent.name} are invalid`);
+      }
+      if (Array.isArray(appComponent.environmentParameters)) {
+        appComponent.environmentParameters.forEach((parameter) => {
+          if (typeof parameter !== 'string') {
+            throw new Error(`Environment parameters for Flux App component ${appComponent.name} are invalid`);
+          }
+        });
+      } else {
+        throw new Error(`Environment parameters for Flux App component ${appComponent.name} are invalid`);
+      }
+      if (Array.isArray(appComponent.commands)) {
+        appComponent.commands.forEach((command) => {
+          if (typeof command !== 'string') {
+            throw new Error(`Flux App component ${appComponent.name} commands are invalid`);
+          }
+        });
+      } else {
+        throw new Error(`Flux App component ${appComponent.name} commands are invalid`);
+      }
+      if (Array.isArray(appComponent.containerPorts)) {
+        appComponent.containerPorts.forEach((parameter) => {
+          if (typeof parameter !== 'number') {
+            throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid`);
+          }
+          if (!serviceHelper.isDecimalLimit(parameter, 0)) {
+            throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid decimals`);
+          }
+        });
+      } else {
+        throw new Error(`Container Ports for Flux App component ${appComponent.name} are invalid`);
+      }
+
+      const cpuB = appComponent.cpu;
+      const ramB = appComponent.ram;
+      const hddB = appComponent.hdd;
+      if (typeof cpuB !== 'number' || typeof ramB !== 'number' || typeof hddB !== 'number') {
+        throw new Error('Invalid HW specifications');
+      }
+      if (!serviceHelper.isDecimalLimit(cpuB) || !serviceHelper.isDecimalLimit(ramB) || !serviceHelper.isDecimalLimit(hddB)) {
+        throw new Error('Invalid HW specifications decimal limits');
+      }
+
+      if (typeof appComponent.repoauth !== 'string') {
+        throw new Error(`Repository Authentication for Flux App component ${appComponent.name} are invalid`);
+      }
+
+    });
   }
 
   if (version >= 3) {
@@ -5566,7 +5672,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   const minPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
   const maxPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
-  if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6 && appSpecifications.version !== 7) {
+  if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6 && appSpecifications.version !== 7 && appSpecifications.version !== 8) {
     throw new Error('Flux App message version specification is invalid');
   }
   if (appSpecifications.name.length > 32) {
@@ -5765,7 +5871,7 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
         throw new Error(`Flux App container data folder not specified in in ${appComponent.name}. If no data folder is whished, use /tmp`);
       }
 
-      if (appSpecifications.version >= 7) {
+      if (appSpecifications.version === 7) {
         if (!appSpecifications.nodes.length) { // this is NOT an enterprise app, no nodes scoping
           if (appComponent.secrets.length) { // pgp encrypted message. Every signature encryption of node is about 100 characters. For 100 selected nodes, this gives ~5k chars limit
             throw new Error('Secrets can not be defined for non Enterprise Applications');
@@ -5777,6 +5883,17 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
           if (appComponent.secrets.length > 15000) { // pgp encrypted message. Every signature encryption of node is about 100 characters. For 100 selected nodes, this gives ~5k chars limit
             throw new Error('Maximum length of secrets is 15000. Consider uploading to Flux Storage for bigger payload.');
           }
+          if (appComponent.repoauth.length > 15000) { // pgp encrypted message.
+            throw new Error('Maximum length of repoauth is 15000.');
+          }
+        }
+      }
+      if (appSpecifications.version >= 8) {
+        if (!appSpecifications.enterpise) { // this is NOT an enterprise app
+          if (appComponent.repoauth.length) { // pgp encrypted message.
+            throw new Error('Private repositories are only allowed for Enterprise Applications');
+          }
+        } else {
           if (appComponent.repoauth.length > 15000) { // pgp encrypted message.
             throw new Error('Maximum length of repoauth is 15000.');
           }
@@ -5996,6 +6113,28 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
       specsKeysComponent.forEach((sKey) => {
         if (!componentSpecifications.includes((sKey))) {
           throw new Error('Unsupported parameter for v7 app specifications');
+        }
+      });
+    });
+  } else if (appSpecifications.version === 8) {
+    const specifications = [
+      'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts', 'geolocation', 'expire', 'nodes', 'staticip', 'originalOwner,', 'enterprise', 'cpuSum', 'ramSum', 'hddSum', 
+    ];
+    const componentSpecifications = [
+      'name', 'description', 'repotag', 'ports', 'containerPorts', 'environmentParameters', 'commands', 'containerData', 'domains', 'repoauth',
+      'cpu', 'ram', 'hdd',
+    ];
+    const specsKeys = Object.keys(appSpecifications);
+    specsKeys.forEach((sKey) => {
+      if (!specifications.includes((sKey))) {
+        throw new Error('Unsupported parameter for v8 app specifications');
+      }
+    });
+    appSpecifications.compose.forEach((appComponent) => {
+      const specsKeysComponent = Object.keys(appComponent);
+      specsKeysComponent.forEach((sKey) => {
+        if (!componentSpecifications.includes((sKey))) {
+          throw new Error('Unsupported parameter for v8 app specifications');
         }
       });
     });
@@ -6601,18 +6740,26 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
     if (message.type === 'zelappregister' || message.type === 'fluxappregister') {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
-      await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        log.info(`App ${appSpecFormatted.name} specs are not going to be validated as it is a enterprise encrypted app`);
+      } else {
+        await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+        await checkApplicationRegistrationNameConflicts(appSpecFormatted, message.hash);
+      }
       await verifyAppHash(message);
-      await checkApplicationRegistrationNameConflicts(appSpecFormatted, message.hash);
       await verifyAppMessageSignature(message.type, messageVersion, appSpecFormatted, messageTimestamp, message.signature);
     } else if (message.type === 'zelappupdate' || message.type === 'fluxappupdate') {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height;
       // stadard verifications
-      await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        log.info(`App ${appSpecFormatted.name} specs are not going to be validated as it is a enterprise encrypted app`);
+      } else {
+        await verifyAppSpecifications(appSpecFormatted, daemonHeight);
+        // verify that app exists, does not change repotag (for v1-v3), does not change name and does not change component names
+        await checkApplicationUpdateNameRepositoryConflicts(appSpecFormatted, messageTimestamp);
+      }
       await verifyAppHash(message);
-      // verify that app exists, does not change repotag (for v1-v3), does not change name and does not change component names
-      await checkApplicationUpdateNameRepositoryConflicts(appSpecFormatted, messageTimestamp);
       // get previousAppSpecifications as we need previous owner
       const previousAppSpecs = await getPreviousAppSpecifications(appSpecFormatted, messageTimestamp);
       const { owner } = previousAppSpecs;
@@ -7456,10 +7603,31 @@ async function registerAppGlobalyApi(req, res) {
       }
       const daemonHeight = syncStatus.data.height;
 
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        if(!isArcane) {
+          throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
+        }
+        const inputData = {
+          fluxID: appSpecFormatted.originalOwner,
+          appName: appSpecFormatted.name,
+          message: appSpecFormatted.enterprise,
+          blockHeight: daemonHeight
+        }
+        const dataReturned = await benchmarkService.decryptMessage(inputData);
+        const { status, data } = dataReturned;
+        const enterprise = status === 'success' && data.status === 'ok' ? JSON.parse(data.message) : null;
+        if (enterprise) {
+          appSpecFormatted.compose = enterprise.compose;
+          appSpecFormatted.contacts = enterprise.contacts;
+        } else {
+          throw new Error('Error decrypting applications specifications.');
+        }
+      }
+
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
-      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+      if (appSpecFormatted.version === 7 && appSpecFormatted.nodes.length > 0) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
@@ -7588,10 +7756,31 @@ async function updateAppGlobalyApi(req, res) {
       }
       const daemonHeight = syncStatus.data.height;
 
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        if(!isArcane) {
+          throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
+        }
+        const inputData = {
+          fluxID: appSpecFormatted.originalOwner,
+          appName: appSpecFormatted.name,
+          message: appSpecFormatted.enterprise,
+          blockHeight: daemonHeight
+        }
+        const dataReturned = await benchmarkService.decryptMessage(inputData);
+        const { status, data } = dataReturned;
+        const enterprise = status === 'success' && data.status === 'ok' ? JSON.parse(data.message) : null;
+        if (enterprise) {
+          appSpecFormatted.compose = enterprise.compose;
+          appSpecFormatted.contacts = enterprise.contacts;
+        } else {
+          throw new Error('Error decrypting applications specifications.');
+        }
+      }
+
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
-      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+      if (appSpecFormatted.version === 7 && appSpecFormatted.nodes.length > 0) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
@@ -10882,10 +11071,31 @@ async function verifyAppRegistrationParameters(req, res) {
       }
       const daemonHeight = syncStatus.data.height;
 
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        if(!isArcane) {
+          throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
+        }
+        const inputData = {
+          fluxID: appSpecFormatted.originalOwner,
+          appName: appSpecFormatted.name,
+          message: appSpecFormatted.enterprise,
+          blockHeight: daemonHeight
+        }
+        const dataReturned = await benchmarkService.decryptMessage(inputData);
+        const { status, data } = dataReturned;
+        const enterprise = status === 'success' && data.status === 'ok' ? JSON.parse(data.message) : null;
+        if (enterprise) {
+          appSpecFormatted.compose = enterprise.compose;
+          appSpecFormatted.contacts = enterprise.contacts;
+        } else {
+          throw new Error('Error decrypting applications specifications.');
+        }
+      }
+
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
-      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+      if (appSpecFormatted.version === 7 && appSpecFormatted.nodes.length > 0) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
@@ -10939,10 +11149,31 @@ async function verifyAppUpdateParameters(req, res) {
       }
       const daemonHeight = syncStatus.data.height;
 
+      if (appSpecFormatted.version >= 8 && appSpecFormatted.enterprise) {
+        if(!isArcane) {
+          throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
+        }
+        const inputData = {
+          fluxID: appSpecFormatted.originalOwner,
+          appName: appSpecFormatted.name,
+          message: appSpecFormatted.enterprise,
+          blockHeight: daemonHeight
+        }
+        const dataReturned = await benchmarkService.decryptMessage(inputData);
+        const { status, data } = dataReturned;
+        const enterprise = status === 'success' && data.status === 'ok' ? JSON.parse(data.message) : null;
+        if (enterprise) {
+          appSpecFormatted.compose = enterprise.compose;
+          appSpecFormatted.contacts = enterprise.contacts;
+        } else {
+          throw new Error('Error decrypting applications specifications.');
+        }
+      }
+
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
 
-      if (appSpecFormatted.version >= 7 && appSpecFormatted.nodes.length > 0) {
+      if (appSpecFormatted.version === 7 && appSpecFormatted.nodes.length > 0) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
@@ -12185,102 +12416,6 @@ async function signCheckAppData(message) {
   const privKey = await fluxNetworkHelper.getFluxNodePrivateKey();
   const signature = await verificationHelper.signMessage(message, privKey);
   return signature;
-}
-
-/**
- * Periodically call other nodes to stablish a connection with the ports I have open on UPNP to remain OPEN
-*/
-async function callOtherNodeToKeepUpnpPortsOpen() {
-  try {
-    const apiPort = userconfig.initial.apiport || config.server.apiport;
-    let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
-    if (!myIP) {
-      return;
-    }
-    myIP = myIP.split(':')[0];
-
-    let askingIP = await fluxNetworkHelper.getRandomConnection();
-    if (!askingIP) {
-      return;
-    }
-    let askingIpPort = config.server.apiport;
-    if (askingIP.includes(':')) { // has port specification
-      // it has port specification
-      const splittedIP = askingIP.split(':');
-      askingIP = splittedIP[0];
-      askingIpPort = splittedIP[1];
-    }
-    if (myIP === askingIP) {
-      callOtherNodeToKeepUpnpPortsOpen();
-      return;
-    }
-    if (failedNodesTestPortsCache.has(askingIP)) {
-      callOtherNodeToKeepUpnpPortsOpen();
-      return;
-    }
-
-    const installedAppsRes = await installedApps();
-    if (installedAppsRes.status !== 'success') {
-      return;
-    }
-    const apps = installedAppsRes.data;
-    const pubKey = await fluxNetworkHelper.getFluxNodePublicKey();
-    const ports = [];
-    // eslint-disable-next-line no-restricted-syntax
-    for (const app of apps) {
-      if (app.version === 1) {
-        ports.push(+app.port);
-      } else if (app.version <= 3) {
-        app.ports.forEach((port) => {
-          ports.push(+port);
-        });
-      } else {
-        app.compose.forEach((component) => {
-          component.ports.forEach((port) => {
-            ports.push(+port);
-          });
-        });
-      }
-    }
-
-    // We don't add the api port, as the remote node will callback to our
-    // api port to make sure it can connect before testing any other ports
-    // this is so that we know the remote end can reach us.
-    ports.push(apiPort - 1);
-    ports.push(apiPort - 2);
-    ports.push(apiPort - 3);
-    ports.push(apiPort - 4);
-    ports.push(apiPort - 5);
-    ports.push(apiPort + 1);
-    ports.push(apiPort + 2);
-    ports.push(apiPort + 3);
-
-    const axiosConfig = {
-      timeout: 5_000,
-    };
-
-    const dataUPNP = {
-      ip: myIP,
-      apiPort,
-      ports,
-      pubKey,
-      timestamp: Math.floor(Date.now() / 1000),
-    };
-
-    const stringData = JSON.stringify(dataUPNP);
-    const signature = await signCheckAppData(stringData);
-    dataUPNP.signature = signature;
-
-    const logMsg = `callOtherNodeToKeepUpnpPortsOpen - calling ${askingIP}:${askingIpPort} to test ports: ${ports}`;
-    log.info(logMsg);
-
-    const url = `http://${askingIP}:${askingIpPort}/flux/keepupnpportsopen`;
-    axios.post(url, dataUPNP, axiosConfig).catch(() => {
-      // callOtherNodeToKeepUpnpPortsOpen();
-    });
-  } catch (error) {
-    log.error(error);
-  }
 }
 
 /**
@@ -13618,7 +13753,6 @@ async function downloadAppsFile(req, res) {
       // beautify name
       const fileNameArray = filepath.split('/');
       const fileName = fileNameArray[fileNameArray.length - 1];
-      res.setHeader('Cache-Control: no-transform');
       res.download(filepath, fileName);
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
@@ -13648,10 +13782,10 @@ async function downloadAppsFile(req, res) {
  */
 async function getAppSpecsUSDPrice(req, res) {
   try {
-    const resMessage = messageHelper.createDataMessage(config.fluxapps.usdprice);
+    const resMessage = serviceHelper.createDataMessage(config.fluxapps.usdprice);
     res.json(resMessage);
   } catch (error) {
-    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    const errMessage = serviceHelper.createErrorMessage(error.message, error.name, error.code);
     res.json(errMessage);
     log.error(error);
   }
@@ -13752,6 +13886,67 @@ async function monitorNodeStatus() {
     await serviceHelper.delay(2 * 60 * 1000); // 2m delay before next check
     monitorNodeStatus();
   }
+}
+
+/**
+ * To get Public Key to Encrypt Enterprise Content. On applications updates originalOwner shoul be passed
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {string} Key.
+ */
+async function getPublicKey(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const authorized = await verificationHelper.verifyPrivilege('user', req);
+      if (!authorized) {
+        const errMessage = messageHelper.errUnauthorizedMessage();
+        return res.json(errMessage);
+      }
+
+      const processedBody = serviceHelper.ensureObject(body);
+      let appSpecification = processedBody;
+      appSpecification = serviceHelper.ensureObject(appSpecification);
+      const owner = appSpecification.originalOwner || appSpecification.owner; // on registration owner on updates originalOwner
+      if(!owner || appSpecification.name) {
+        throw new Error('Input parameters missing.');
+      }
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      if (!syncStatus.data.synced) {
+        throw new Error('Daemon not yet synced.');
+      }
+      const daemonHeight = syncStatus.data.height;
+
+      if(!isArcane) {
+        throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
+      }
+      const inputData = {
+        fluxID: owner,
+        appName: appSpecification.name,
+        blockHeight: daemonHeight
+      }
+      const dataReturned = await benchmarkService.getPublicKey(inputData);
+      const { status, data } = dataReturned;
+      const publicKey = status === 'success' && data.status === 'ok' ? data.message : null;
+      if (!publicKey) {
+        throw new Error('Error getting public key to encrypt app enterprise content.');
+      }
+      // respond with formatted specifications
+      const response = messageHelper.createDataMessage(publicKey);
+      return res.json(response);
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(
+        error.message || error,
+        error.name,
+        error.code,
+      );
+      return res.json(errorResponse);
+    }
+  });
 }
 
 module.exports = {
@@ -13893,5 +14088,5 @@ module.exports = {
   checkApplicationsCpuUSage,
   monitorNodeStatus,
   monitorSharedDBApps,
-  callOtherNodeToKeepUpnpPortsOpen,
+  getPublicKey,
 };
