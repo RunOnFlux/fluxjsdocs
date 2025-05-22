@@ -5487,7 +5487,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       }
     });
   } else { // v8+
-    if (enterprise === null) { // enterprise can be false or a encrypted string with a object with contacts and components
+    if (enterprise === null || enterprise === undefined) { // enterprise can be false or a encrypted string with a object with contacts and components
       throw new Error('Missing enterprise property');
     }
     if (!enterprise && nodes && nodes.length > 0) {
@@ -11920,7 +11920,7 @@ async function appDockerRestart(appname) {
     } else {
       // ask for restarting entire composed application
       // eslint-disable-next-line no-use-before-define
-      const appSpecs = await getApplicationSpecifications(mainAppName, true);
+      const appSpecs = await getApplicationSpecifications(mainAppName);
       if (!appSpecs) {
         throw new Error('Application not found');
       }
@@ -11955,7 +11955,7 @@ async function appDockerStart(appname) {
     } else {
       // ask for restarting entire composed application
       // eslint-disable-next-line no-use-before-define
-      const appSpecs = await getApplicationSpecifications(mainAppName, true);
+      const appSpecs = await getApplicationSpecifications(mainAppName);
       if (!appSpecs) {
         throw new Error('Application not found');
       }
@@ -11991,7 +11991,7 @@ async function appDockerStop(appname) {
     } else {
       // ask for restarting entire composed application
       // eslint-disable-next-line no-use-before-define
-      const appSpecs = await getApplicationSpecifications(mainAppName, true);
+      const appSpecs = await getApplicationSpecifications(mainAppName);
       if (!appSpecs) {
         throw new Error('Application not found');
       }
