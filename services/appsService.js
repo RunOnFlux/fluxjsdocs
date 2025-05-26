@@ -8852,6 +8852,8 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
@@ -8881,18 +8883,24 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          const appMessageInformation = {
-            hash: result.hash,
-            txid: result.txid,
-            height: result.height,
-            value: result.value,
-          };
-          appsMessagesMissing.push(appMessageInformation);
-          if (appsMessagesMissing.length === 500) {
-            checkAndRequestMultipleApps(appsMessagesMissing);
+          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
+            const appMessageInformation = {
+              hash: result.hash,
+              txid: result.txid,
+              height: result.height,
+              value: result.value,
+            };
+            appsMessagesMissing.push(appMessageInformation);
+            if (appsMessagesMissing.length === 500) {
+              checkAndRequestMultipleApps(appsMessagesMissing);
+              // eslint-disable-next-line no-await-in-loop
+              await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
+              appsMessagesMissing = [];
+            }
+          } else {
+            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
             // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
-            appsMessagesMissing = [];
+            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
           }
         } else {
           // eslint-disable-next-line no-await-in-loop
@@ -14471,34 +14479,6 @@ async function getPublicKey(req, res) {
   });
 }
 
-/**
- * Method responsable to sync permenant app messages from node running arcane OS (api.runonflux.io only have ArcaneOS nodes)
- */
-async function syncAppsMessages() {
-  try {
-    const axiosConfig = {
-      timeout: 120000,
-    };
-    log.info('syncAppsMessages - Getting permanentmessages from api.runonflux.io');
-    const response = await serviceHelper.axiosGet('https://api.runonflux.io/apps/permanentmessages', axiosConfig).catch((error) => log.error(error));
-    if (!response || !response.data || response.data.status !== 'success' || !response.data.data) {
-      log.info('Failed to get permanentappmessages from api.runonflux.io');
-      return;
-    }
-    log.info('syncAppsMessages - api response received');
-    const options = {
-      ordered: false, // If false, continue with remaining inserts when one fails.
-    };
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    log.info(`syncAppsMessages - Inserting ${response.data.data.length} permanentappmessages on db.`);
-    await dbHelper.insertManyToDatabase(database, globalAppsMessages, response.data.data, options);
-    log.info('syncAppsMessages - Finished.');
-  } catch (error) {
-    log.error(error);
-  }
-}
-
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -14641,5 +14621,4 @@ module.exports = {
   callOtherNodeToKeepUpnpPortsOpen,
   getPublicKey,
   getApplicationOriginalOwner,
-  syncAppsMessages,
 };
