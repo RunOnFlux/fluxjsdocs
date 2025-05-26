@@ -3509,10 +3509,9 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
- * @param {boolean} sendAppRunningMessage indicates if it should send the appRunningMessage after complete the install.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendAppRunningMessage = true) {
+async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
@@ -3806,7 +3805,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
     } else {
       await installApplicationHard(specificationsToInstall, appName, isComponent, res, appSpecifications, test);
     }
-    if (!test && sendAppRunningMessage) {
+    if (!test) {
       const broadcastedAt = Date.now();
       const newAppRunningMessage = {
         type: 'fluxapprunning',
@@ -4379,7 +4378,7 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
   const ramPrice = (ramTotalCount * priceSpecifications.ram) / 100;
   const hddPrice = hddTotalCount * priceSpecifications.hdd;
   let totalPrice = cpuPrice + ramPrice + hddPrice;
-  if (dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) { // v7+ enterprise app scoped to nodes
+  if ((dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) || dataForAppRegistration.enterprise) { // v7+ enterprise apps
     totalPrice += priceSpecifications.scope;
   }
   if (dataForAppRegistration.staticip) { // v7+ staticip option
@@ -10159,80 +10158,11 @@ async function trySpawningGlobalApplication() {
     }
 
     // an application was selected and checked that it can run on this node. try to install and run it locally
-    // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
-    const broadcastedAt = Date.now();
-    const newAppRunningMessage = {
-      type: 'fluxapprunning',
-      version: 1,
-      name: appSpecifications.name,
-      hash: appSpecifications.hash, // hash of application specifics that are running
-      ip: myIP,
-      broadcastedAt,
-      runningSince: broadcastedAt,
-      osUptime: os.uptime(),
-      staticIp: geolocationService.isStaticIP(),
-    };
-
-    // store it in local database first
-    // eslint-disable-next-line no-await-in-loop, no-use-before-define
-    await storeAppRunningMessage(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
-    await serviceHelper.delay(500);
-    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-
-    await serviceHelper.delay(30 * 1000); // give it time so messages are propagated on the network
-
-    // double check if app is installed in more of the instances requested
-    runningAppList = await getRunningAppList(appToRun);
-    if (runningAppList.length > minInstances) {
-      runningAppList.sort((a, b) => {
-        if (!a.runningSince && b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince && !b.runningSince) {
-          return 1;
-        }
-        if (a.runningSince < b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince > b.runningSince) {
-          return 1;
-        }
-        return 0;
-      });
-      const index = runningAppList.findIndex((x) => x.ip.split(':')[0] === myIP.split(':')[0]);
-      log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length} instances, my instance is number ${index + 1}`);
-      if (index + 1 > minInstances) {
-        const appRemovedMessage = {
-          type: 'fluxappremoved',
-          version: 1,
-          appName: appSpecifications.name,
-          ip: myIP,
-          broadcastedAt,
-        };
-        log.info('trySpawningGlobalApplication - Broadcasting appremoved message to the network');
-        // broadcast messages about app removed to all peers
-        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage);
-        await serviceHelper.delay(500);
-        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage);
-        await serviceHelper.delay(30 * 60 * 1000);
-        trySpawningGlobalApplication();
-        return;
-      }
-    }
-
     // install the app
-    let registerOk = false;
-    try {
-      registerOk = await registerAppLocally(appSpecifications, null, null, false, false); // can throw
-    } catch (error) {
-      log.error(error);
-      registerOk = false;
-    }
+    const registerOk = await registerAppLocally(appSpecifications); // can throw
     if (!registerOk) {
       log.info('trySpawningGlobalApplication - Error on registerAppLocally');
+      const broadcastedAt = Date.now();
       const appRemovedMessage = {
         type: 'fluxappremoved',
         version: 1,
