@@ -4378,7 +4378,7 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
   const ramPrice = (ramTotalCount * priceSpecifications.ram) / 100;
   const hddPrice = hddTotalCount * priceSpecifications.hdd;
   let totalPrice = cpuPrice + ramPrice + hddPrice;
-  if ((dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) || dataForAppRegistration.enterprise) { // v7+ enterprise apps
+  if (dataForAppRegistration.nodes && dataForAppRegistration.nodes.length) { // v7+ enterprise app scoped to nodes
     totalPrice += priceSpecifications.scope;
   }
   if (dataForAppRegistration.staticip) { // v7+ staticip option
@@ -7538,9 +7538,6 @@ async function checkAndDecryptAppSpecs(appSpec, daemonHeight = null, owner = nul
   const appSpecs = appSpec;
   let block = daemonHeight;
   let appOwner = owner;
-
-  if (!appSpecs) return appSpecs;
-
   if (appSpec.version >= 8 && appSpec.enterprise) {
     if (!isArcane) {
       throw new Error('Application Specifications can only be validated on a node running Arcane OS.');
@@ -8855,8 +8852,6 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
@@ -8886,24 +8881,18 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
-            const appMessageInformation = {
-              hash: result.hash,
-              txid: result.txid,
-              height: result.height,
-              value: result.value,
-            };
-            appsMessagesMissing.push(appMessageInformation);
-            if (appsMessagesMissing.length === 500) {
-              checkAndRequestMultipleApps(appsMessagesMissing);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
-              appsMessagesMissing = [];
-            }
-          } else {
-            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+          const appMessageInformation = {
+            hash: result.hash,
+            txid: result.txid,
+            height: result.height,
+            value: result.value,
+          };
+          appsMessagesMissing.push(appMessageInformation);
+          if (appsMessagesMissing.length === 500) {
+            checkAndRequestMultipleApps(appsMessagesMissing);
             // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
+            await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
+            appsMessagesMissing = [];
           }
         } else {
           // eslint-disable-next-line no-await-in-loop
@@ -9215,7 +9204,6 @@ async function getApplicationSpecifications(appName) {
     const allApps = await availableApps();
     appInfo = allApps.find((app) => app.name.toLowerCase() === appName.toLowerCase());
   }
-
   appInfo = await checkAndDecryptAppSpecs(appInfo);
   return appInfo;
 }
