@@ -3509,10 +3509,9 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
- * @param {boolean} sendAppRunningMessage indicates if it should send the appRunningMessage after complete the install.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendAppRunningMessage = true) {
+async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
@@ -3806,7 +3805,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
     } else {
       await installApplicationHard(specificationsToInstall, appName, isComponent, res, appSpecifications, test);
     }
-    if (!test && sendAppRunningMessage) {
+    if (!test) {
       const broadcastedAt = Date.now();
       const newAppRunningMessage = {
         type: 'fluxapprunning',
@@ -8853,8 +8852,6 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
@@ -8884,24 +8881,18 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
-            const appMessageInformation = {
-              hash: result.hash,
-              txid: result.txid,
-              height: result.height,
-              value: result.value,
-            };
-            appsMessagesMissing.push(appMessageInformation);
-            if (appsMessagesMissing.length === 500) {
-              checkAndRequestMultipleApps(appsMessagesMissing);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
-              appsMessagesMissing = [];
-            }
-          } else {
-            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+          const appMessageInformation = {
+            hash: result.hash,
+            txid: result.txid,
+            height: result.height,
+            value: result.value,
+          };
+          appsMessagesMissing.push(appMessageInformation);
+          if (appsMessagesMissing.length === 500) {
+            checkAndRequestMultipleApps(appsMessagesMissing);
             // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
+            await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
+            appsMessagesMissing = [];
           }
         } else {
           // eslint-disable-next-line no-await-in-loop
@@ -10159,87 +10150,16 @@ async function trySpawningGlobalApplication() {
     }
 
     // an application was selected and checked that it can run on this node. try to install and run it locally
-    // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
-    const broadcastedAt = Date.now();
-    const newAppRunningMessage = {
-      type: 'fluxapprunning',
-      version: 1,
-      name: appSpecifications.name,
-      hash: appSpecifications.hash, // hash of application specifics that are running
-      ip: myIP,
-      broadcastedAt,
-      runningSince: broadcastedAt,
-      osUptime: os.uptime(),
-      staticIp: geolocationService.isStaticIP(),
-    };
-
-    // store it in local database first
-    // eslint-disable-next-line no-await-in-loop, no-use-before-define
-    await storeAppRunningMessage(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
-    await serviceHelper.delay(500);
-    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-
-    await serviceHelper.delay(30 * 1000); // give it time so messages are propagated on the network
-
-    // double check if app is installed in more of the instances requested
-    runningAppList = await getRunningAppList(appToRun);
-    if (runningAppList.length > minInstances) {
-      runningAppList.sort((a, b) => {
-        if (!a.runningSince && b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince && !b.runningSince) {
-          return 1;
-        }
-        if (a.runningSince < b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince > b.runningSince) {
-          return 1;
-        }
-        return 0;
-      });
-      const index = runningAppList.findIndex((x) => x.ip === myIP);
-      log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length} instances, my instance is number ${index + 1}`);
-      if (index + 1 > minInstances) {
-        const appRemovedMessage = {
-          type: 'fluxappremoved',
-          version: 1,
-          cancel: 1,
-          appName: appSpecifications.name,
-          ip: myIP,
-          broadcastedAt,
-        };
-        log.info('trySpawningGlobalApplication - Broadcasting appremoved message to the network');
-        // broadcast messages about app removed to all peers
-        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage);
-        await serviceHelper.delay(500);
-        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage);
-        await serviceHelper.delay(30 * 60 * 1000);
-        trySpawningGlobalApplication();
-        return;
-      }
-    }
-
     // install the app
-    let registerOk = false;
-    try {
-      registerOk = await registerAppLocally(appSpecifications, null, null, false, false); // can throw
-    } catch (error) {
-      log.error(error);
-      registerOk = false;
-    }
+    const registerOk = await registerAppLocally(appSpecifications); // can throw
     if (!registerOk) {
       log.info('trySpawningGlobalApplication - Error on registerAppLocally');
+      const broadcastedAt = Date.now();
       const appRemovedMessage = {
         type: 'fluxappremoved',
         version: 1,
         appName: appSpecifications.name,
         ip: myIP,
-        cancel: 2,
         broadcastedAt,
       };
       log.info('trySpawningGlobalApplication - Broadcasting appremoved message to the network');
@@ -10271,7 +10191,7 @@ async function trySpawningGlobalApplication() {
         }
         return 0;
       });
-      const index = runningAppList.findIndex((x) => x.ip === myIP);
+      const index = runningAppList.findIndex((x) => x.ip.split(':')[0] === myIP.split(':')[0]);
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances, my instance is number ${index + 1}`);
       if (index + 1 > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is going to be removed as already passed the instances required.`);
@@ -14551,6 +14471,37 @@ async function getPublicKey(req, res) {
   });
 }
 
+/**
+ * Method responsable to sync permenant app messages from node running arcane OS (api.runonflux.io only have ArcaneOS nodes)
+ * @returns {boolean} If sync was finished ok.
+ */
+async function syncAppsMessages() {
+  try {
+    const axiosConfig = {
+      timeout: 120000,
+    };
+    log.info('syncAppsMessages - Getting permanentmessages from api.runonflux.io');
+    const response = await serviceHelper.axiosGet('https://api.runonflux.io/apps/permanentmessages', axiosConfig).catch((error) => log.error(error));
+    if (!response || !response.data || response.data.status !== 'success' || !response.data.data) {
+      log.info('Failed to get permanentappmessages from api.runonflux.io');
+      return;
+    }
+    log.info('syncAppsMessages - api response received');
+    const options = {
+      ordered: false, // If false, continue with remaining inserts when one fails.
+    };
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    log.info(`syncAppsMessages - Inserting ${response.data.data.length} permanentappmessages on db.`);
+    await dbHelper.insertManyToDatabase(database, globalAppsMessages, response.data.data, options);
+    log.info('syncAppsMessages - Finished.');
+    return true
+  } catch (error) {
+    log.error(error);
+    return false;
+  }
+}
+
 module.exports = {
   listRunningApps,
   listAllApps,
@@ -14693,4 +14644,5 @@ module.exports = {
   callOtherNodeToKeepUpnpPortsOpen,
   getPublicKey,
   getApplicationOriginalOwner,
+  syncAppsMessages,
 };
