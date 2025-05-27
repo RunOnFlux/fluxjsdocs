@@ -113,10 +113,6 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
   const { signature } = dataObj;
   const { version } = dataObj;
 
-  const appregisterOrUpdate = dataObj.data && (dataObj.data.type === 'fluxappregister' || dataObj.data.type === 'fluxappupdate');
-  if (appregisterOrUpdate) {
-    log.info(`verifyFluxBroadcast - ${JSON.stringify(dataObj.data)}`);
-  }
   // only version 1 is active
   if (version !== 1) {
     return false;
