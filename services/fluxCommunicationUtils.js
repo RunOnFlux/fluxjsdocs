@@ -112,6 +112,7 @@ async function verifyFluxBroadcast(data, obtainedFluxNodesList, currentTimeStamp
   const { timestamp } = dataObj; // ms
   const { signature } = dataObj;
   const { version } = dataObj;
+
   // only version 1 is active
   if (version !== 1) {
     return false;
