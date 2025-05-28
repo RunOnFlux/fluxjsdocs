@@ -211,6 +211,7 @@ async function sendToRandomIncomingConnections(data) {
           client.ping(); // do ping instead
         } else {
           client.send(data);
+          log.info(`Message Sent to ${client.ip}:${client.port}`);
         }
       } else {
         throw new Error(`Connection to ${client.ip} is not open`);
@@ -318,6 +319,8 @@ async function respondWithAppMessage(msgObj, ws) {
     }
 
     const message = msgObj.data;
+    log.info('respondWithAppMessage - New Flux App Request received');
+    log.info(`respondWithAppMessage - ${JSON.stringify(message)}`);
 
     if (message.version !== 1 && message.version !== 2) {
       throw new Error(`Invalid Flux App Request message, version ${message.version} not supported`);
@@ -348,13 +351,17 @@ async function respondWithAppMessage(msgObj, ws) {
         const tempMesResponse = myMessageCache.get(hash);
         if (tempMesResponse) {
           sendMessageToWS(tempMesResponse, ws);
+          log.info('respondWithAppMessage - Flux App Request found on cache');
+          log.info(`respondWithAppMessage - temporaryAppMessage -  ${JSON.stringify(tempMesResponse)}`);
+          // eslint-disable-next-line no-continue
+          continue;
         }
-        return;
       }
       let temporaryAppMessage = null;
       // eslint-disable-next-line no-await-in-loop
       const appMessage = await appsService.checkAppMessageExistence(hash) || await appsService.checkAppTemporaryMessageExistence(hash);
       if (appMessage) {
+        log.info('respondWithAppMessage - Flux App Request found on database');
         temporaryAppMessage = { // specification of temp message
           type: appMessage.type,
           version: appMessage.version,
@@ -363,7 +370,10 @@ async function respondWithAppMessage(msgObj, ws) {
           timestamp: appMessage.timestamp,
           signature: appMessage.signature,
         };
+        log.info(`respondWithAppMessage - temporaryAppMessage -  ${JSON.stringify(temporaryAppMessage)}`);
         sendMessageToWS(temporaryAppMessage, ws);
+      } else {
+        log.info('respondWithAppMessage - Flux App Request not found on database');
       }
       myMessageCache.set(hash, temporaryAppMessage);
       // eslint-disable-next-line no-await-in-loop

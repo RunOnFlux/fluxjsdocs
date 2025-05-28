@@ -70,7 +70,10 @@ async function handleAppMessages(message, fromIP, port) {
     // do furtherVerification of message
     // eslint-disable-next-line global-require
     const appsService = require('./appsService');
+    log.info('handleAppMessages - New Flux App Register/Update message received.');
+    log.info(`handleAppMessages - ${JSON.stringify(message.data)}`);
     const rebroadcastToPeers = await appsService.storeAppTemporaryMessage(message.data, true);
+    log.info(`handleAppMessages - rebroadcastToPeers: ${rebroadcastToPeers}`);
     if (rebroadcastToPeers === true) {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height || 0;
@@ -395,7 +398,7 @@ function handleIncomingConnection(websocket, optionalPort) {
         messageNumber = 0;
       } */
       // check rate limit
-      const rateOK = fluxNetworkHelper.lruRateLimit(`${ipv4Peer}:${port}`, 90);
+      const rateOK = fluxNetworkHelper.lruRateLimit(`${ipv4Peer}:${port}`, 300);
       if (!rateOK) {
         return; // do not react to the message
       }
@@ -756,7 +759,7 @@ async function initiateAndHandleConnection(connection) {
         messageNumber = 0;
       } */
       // check rate limit
-      const rateOK = fluxNetworkHelper.lruRateLimit(`${ip}:${port}`, 90);
+      const rateOK = fluxNetworkHelper.lruRateLimit(`${ip}:${port}`, 300);
       if (!rateOK) {
         return; // do not react to the message
       }
@@ -822,20 +825,23 @@ async function initiateAndHandleConnection(connection) {
         }
         return;
       }
-      const messageOK = await fluxCommunicationUtils.verifyOriginalFluxBroadcast(msgObj, undefined, currentTimeStamp);
+      const messageOK = await fluxCommunicationUtils.verifyFluxBroadcast(msgObj, undefined, currentTimeStamp);
       if (messageOK === true) {
-        if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
-          handleAppMessages(msgObj, ip, port);
-        } else if (msgObj.data.type === 'fluxapprequest') {
-          fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, websocket);
-        } else if (msgObj.data.type === 'fluxapprunning') {
-          handleAppRunningMessage(msgObj, ip, port);
-        } else if (msgObj.data.type === 'fluxipchanged') {
-          handleIPChangedMessage(msgObj, ip, port);
-        } else if (msgObj.data.type === 'fluxappremoved') {
-          handleAppRemovedMessage(msgObj, ip, port);
-        } else {
-          log.warn(`Unrecognised message type of ${msgObj.data.type}`);
+        const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(msgObj, currentTimeStamp);
+        if (timestampOK === true) {
+          if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
+            handleAppMessages(msgObj, ip, port);
+          } else if (msgObj.data.type === 'fluxapprequest') {
+            fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, websocket);
+          } else if (msgObj.data.type === 'fluxapprunning') {
+            handleAppRunningMessage(msgObj, ip, port);
+          } else if (msgObj.data.type === 'fluxipchanged') {
+            handleIPChangedMessage(msgObj, ip, port);
+          } else if (msgObj.data.type === 'fluxappremoved') {
+            handleAppRemovedMessage(msgObj, ip, port);
+          } else {
+            log.warn(`Unrecognised message type of ${msgObj.data.type}`);
+          }
         }
       } else {
         // we dont like this peer as it sent wrong message (wrong, or message belonging to node no longer on network). Lets close the connection

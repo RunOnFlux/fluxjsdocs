@@ -25,6 +25,7 @@ let isInInitiationOfBP = false;
 let operationBlocked = false;
 let initBPfromNoBlockTimeout;
 let initBPfromErrorTimeout;
+let appsTransactions = [];
 
 // updateFluxAppsPeriod can be between every 4 to 9 blocks
 const updateFluxAppsPeriod = Math.floor(Math.random() * 6 + 4);
@@ -266,7 +267,6 @@ async function processSoftFork(txid, height, message) {
 async function processInsight(blockDataVerbose, database) {
   // get Block Deltas information
   const txs = blockDataVerbose.tx;
-  const appsTransactions = [];
   // go through each transaction in deltas
   // eslint-disable-next-line no-restricted-syntax
   for (const tx of txs) {
@@ -346,29 +346,46 @@ async function processInsight(blockDataVerbose, database) {
       }
     }
   }
-  if (appsTransactions.length > 0) {
+}
+
+/**
+ * To process transactions inserts on database and calling app messages.
+ * @param {array} apps array with appstransactions to be processed.
+ * @param {string} database Database.
+ * @param {boolean} checkIfMessageExists says if we should check if message exist before asking it to peers.
+ */
+async function processTransactions(apps, database, checkIfMessageExists) {
+  log.info(`processTransactions - Processing ${apps.length} transactions`);
+  if (apps.length > 0) {
     const options = {
-      ordered: false, // If false, continue with remaining inserts when one fails.
+      ordered: true, // If false, continue with remaining inserts when one fails.
     };
-    await dbHelper.insertManyToDatabase(database, appsHashesCollection, appsTransactions, options);
-    if (blockDataVerbose.height >= config.fluxapps.fluxAppRequestV2) {
-      while (appsTransactions.length > 500) {
-        appsService.checkAndRequestMultipleApps(appsTransactions.splice(0, 500));
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay((5 + (Math.random() * 5)) * 1000); // delay random from 5 to up 10 seconds
-      }
-      if (appsTransactions.length > 0) {
-        appsService.checkAndRequestMultipleApps(appsTransactions);
-      }
-    } else {
+    await dbHelper.insertManyToDatabase(database, appsHashesCollection, apps, options);
+    if (checkIfMessageExists) {
+      const appsToRemove = [];
+      log.info('processTransactions - Checking if message(s) exist(s) on database');
       // eslint-disable-next-line no-restricted-syntax
-      for (const tx of appsTransactions) {
-        appsService.checkAndRequestApp(tx.hash, tx.txid, tx.height, tx.value);
+      for (const app of apps) {
+      // eslint-disable-next-line no-await-in-loop
+        const messageReceived = await appsService.checkAndRequestApp(app.hash, app.txid, app.height, app.value, 2);
+        if (messageReceived) {
+          appsToRemove.push(app);
+        }
       }
+      apps.filter((item) => !appsToRemove.includes(item));
+    }
+    while (apps.length > 500) {
+      log.info(`processTransactions - Will ask peers for ${apps.length} aplications messages`);
+      appsService.checkAndRequestMultipleApps(apps.splice(0, 500));
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay((5 + (Math.random() * 5)) * 1000); // delay random from 5 to up 10 seconds
+    }
+    if (apps.length > 0) {
+      log.info(`processTransactions - Will ask peers for ${apps.length} aplications messages`);
+      appsService.checkAndRequestMultipleApps(apps);
     }
   }
 }
-
 /**
  * To process verbose block data for entry to database.
  * @param {object} blockDataVerbose Verbose block data.
@@ -377,7 +394,6 @@ async function processInsight(blockDataVerbose, database) {
 async function processStandard(blockDataVerbose, database) {
   // get Block transactions information
   const transactions = await processBlockTransactions(blockDataVerbose.tx, blockDataVerbose.height);
-  const appsTransactions = [];
   // now we have verbose transactions of the block extended for senders - object of
   // utxoDetail = { txid, vout, height, address, satoshis, scriptPubKey )
   // and can create addressTransactionIndex.
@@ -470,27 +486,6 @@ async function processStandard(blockDataVerbose, database) {
       }
     }
   }));
-  if (appsTransactions.length > 0) {
-    const options = {
-      ordered: false, // If false, continue with remaining inserts when one fails.
-    };
-    await dbHelper.insertManyToDatabase(database, appsHashesCollection, appsTransactions, options);
-    if (blockDataVerbose.height >= config.fluxapps.fluxAppRequestV2) {
-      while (appsTransactions.length > 500) {
-        appsService.checkAndRequestMultipleApps(appsTransactions.splice(0, 500));
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay((5 + (Math.random() * 5)) * 1000); // delay random from 5 to up 10 seconds
-      }
-      if (appsTransactions.length > 0) {
-        appsService.checkAndRequestMultipleApps(appsTransactions);
-      }
-    } else {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const tx of appsTransactions) {
-        appsService.checkAndRequestApp(tx.hash, tx.txid, tx.height, tx.value);
-      }
-    }
-  }
 }
 
 /**
@@ -517,6 +512,11 @@ async function processBlock(blockHeight, isInsightExplorer) {
     if (blockDataVerbose.height % 50 === 0) {
       log.info(`Processing Explorer Block Height: ${blockDataVerbose.height}`);
     }
+    if (isInsightExplorer && blockDataVerbose.height > 699420 && blockDataVerbose.height < 862002) {
+      // speed up sync as there were no app messages between these two blocks
+      processBlock(862002, isInsightExplorer);
+      return;
+    }
     if (isInsightExplorer) {
       // only process Flux transactions
       await processInsight(blockDataVerbose, database);
@@ -533,6 +533,14 @@ async function processBlock(blockHeight, isInsightExplorer) {
         log.info(`Fusion documents: ${resultFusion.size}, ${resultFusion.count}, ${resultFusion.avgObjSize}`);
       }
     }
+
+    const scannedHeight = blockDataVerbose.height;
+    // update scanned Height in scannedBlockHeightCollection
+    const query = { generalScannedHeight: { $gte: 0 } };
+    const update = { $set: { generalScannedHeight: scannedHeight } };
+    const options = {
+      upsert: true,
+    };
     // this should run only when node is synced
     const isSynced = !(blockDataVerbose.confirmations >= 2);
     if (isSynced) {
@@ -566,15 +574,15 @@ async function processBlock(blockHeight, isInsightExplorer) {
           log.error(error);
         }
       }
+      await processTransactions(appsTransactions, database, true);
+      appsTransactions = [];
+      await dbHelper.updateOneInDatabase(database, scannedHeightCollection, query, update, options);
+    } else if (appsTransactions.length >= 5) {
+      // if explorer is syncing, we only insert data every 500 blocks
+      await processTransactions(appsTransactions, database, false);
+      appsTransactions = [];
+      await dbHelper.updateOneInDatabase(database, scannedHeightCollection, query, update, options);
     }
-    const scannedHeight = blockDataVerbose.height;
-    // update scanned Height in scannedBlockHeightCollection
-    const query = { generalScannedHeight: { $gte: 0 } };
-    const update = { $set: { generalScannedHeight: scannedHeight } };
-    const options = {
-      upsert: true,
-    };
-    await dbHelper.updateOneInDatabase(database, scannedHeightCollection, query, update, options);
     someBlockIsProcessing = false;
     if (blockProccessingCanContinue) {
       if (blockDataVerbose.confirmations > 1) {

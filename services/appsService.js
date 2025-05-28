@@ -3509,7 +3509,6 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
- * @param {boolean} sendAppRunningMessage indicates if it should send the appRunningMessage after complete the install.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
@@ -4726,10 +4725,37 @@ async function verifyAppHash(message) {
   * @param timestamp number
   * @param signature string
   */
-  const messToHash = message.type + message.version + JSON.stringify(message.appSpecifications || message.zelAppSpecifications) + message.timestamp + message.signature;
-  const messageHASH = await generalService.messageHash(messToHash);
+  const specifications = message.appSpecifications || message.zelAppSpecifications;
+  let messToHash = message.type + message.version + JSON.stringify(specifications) + message.timestamp + message.signature;
+  let messageHASH = await generalService.messageHash(messToHash);
   if (messageHASH !== message.hash) {
-    throw new Error('Invalid Flux App hash received!');
+    if (specifications.version <= 3) {
+      // as of specification changes, adjust our appSpecs order of owner and repotag
+      // in new scheme it is always version, name, description, owner, repotag... Old format was version, name, description, repotag, owner
+      const appSpecsCopy = JSON.parse(JSON.stringify(specifications));
+      delete appSpecsCopy.version;
+      delete appSpecsCopy.name;
+      delete appSpecsCopy.description;
+      delete appSpecsCopy.repotag;
+      delete appSpecsCopy.owner;
+      const appSpecOld = {
+        version: specifications.version,
+        name: specifications.name,
+        description: specifications.description,
+        repotag: specifications.repotag,
+        owner: specifications.owner,
+        ...appSpecsCopy,
+      };
+      messToHash = message.type + message.version + JSON.stringify(appSpecOld) + message.timestamp + message.signature;
+      messageHASH = await generalService.messageHash(messToHash);
+      if (messageHASH !== message.hash) {
+        log.error(`Hashes dont match - expected - ${message.hash} - calculated - ${messageHASH} for the message ${JSON.stringify(message)}`);
+        throw new Error('Invalid Flux App hash received');
+      }
+      return true;
+    }
+    log.error(`Hashes dont match - expected - ${message.hash} - calculated - ${messageHASH} for the message ${JSON.stringify(message)}`);
+    throw new Error('Invalid Flux App hash received');
   }
   return true;
 }
@@ -6772,11 +6798,24 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
     expireAt: new Date(validTill),
   };
   const value = newMessage;
-  // message does not exist anywhere and is ok, store it
   const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
+  let database = db.db(config.database.daemon.database);
+  const query = { hash: message.hash };
+  const projection = {
+    projection: {
+      _id: 0,
+      message: 1,
+    },
+  };
+  const result = await dbHelper.findOneInDatabase(database, appsHashesCollection, query, projection);
+  database = db.db(config.database.appsglobal.database);
+  // message does not exist anywhere and is ok, store it
   await dbHelper.insertOneToDatabase(database, globalAppsTempMessages, value);
   // it is stored and rebroadcasted
+  if (result && !result.message) {
+    // node received the message after was inserted by the explorer, so it is coming from a requestappmessage we should not rebroadcast to all peers
+    return false;
+  }
   return true;
 }
 
@@ -6847,7 +6886,6 @@ async function storeAppRunningMessage(message) {
       ip: message.ip,
       broadcastedAt: new Date(message.broadcastedAt),
       expireAt: new Date(validTill),
-      installingAt: message.installing ? new Date(message.broadcastedAt) : null,
       osUptime: message.osUptime,
       staticIp: message.staticIp,
     };
@@ -7028,6 +7066,7 @@ async function requestAppsMessage(apps, incoming) {
     version: 2,
     hashes: apps.map((a) => a.hash),
   };
+  log.info(JSON.stringify(message));
   if (incoming) {
     await fluxCommunicationMessagesSender.broadcastMessageToRandomIncoming(message);
   } else {
@@ -8375,7 +8414,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
             // eslint-disable-next-line no-use-before-define
             await expireGlobalApplications();
           } else {
-            log.warn(`Apps message ${permanentAppMessage.hash} is underpaid`);
+            log.warn(`Apps message ${permanentAppMessage.hash} is underpaid ${valueSat} < ${appPrice * 1e8} - priceSpecs ${priceSpecifications}`);
           }
         } else if (tempMessage.type === 'zelappupdate' || tempMessage.type === 'fluxappupdate') {
           // appSpecifications.name as identifier
@@ -8461,7 +8500,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
             // do not await this
             updateAppSpecifications(updateForSpecifications);
           } else {
-            log.warn(`Apps message ${permanentAppMessage.hash} is underpaid`);
+            log.warn(`Apps message ${permanentAppMessage.hash} is underpaid ${valueSat} < ${appPrice * 1e8}`);
           }
         }
         return true;
@@ -8506,6 +8545,7 @@ async function checkAndRequestMultipleApps(apps, incoming = false, i = 1) {
       // eslint-disable-next-line no-await-in-loop
       const messageReceived = await checkAndRequestApp(app.hash, app.txid, app.height, app.value, 2);
       if (messageReceived) {
+        log.info(`Message requested received with hash: ${app.hash}`);
         appsToRemove.push(app);
       }
     }
@@ -8854,8 +8894,6 @@ async function continuousFluxAppHashesCheck(force = false) {
         messageNotFound: 1,
       },
     };
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const daemonHeight = syncStatus.data.height;
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
     // sort it by height, so we request oldest messages first
     results.sort((a, b) => a.height - b.height);
@@ -8885,24 +8923,18 @@ async function continuousFluxAppHashesCheck(force = false) {
         log.info('Requesting missing Flux App message:');
         log.info(`${result.hash}, ${result.txid}, ${result.height}`);
         if (numberOfSearches <= 20) { // up to 10 searches
-          if (daemonHeight >= config.fluxapps.fluxAppRequestV2 && numberOfSearches + 2 <= 20) {
-            const appMessageInformation = {
-              hash: result.hash,
-              txid: result.txid,
-              height: result.height,
-              value: result.value,
-            };
-            appsMessagesMissing.push(appMessageInformation);
-            if (appsMessagesMissing.length === 500) {
-              checkAndRequestMultipleApps(appsMessagesMissing);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
-              appsMessagesMissing = [];
-            }
-          } else {
-            checkAndRequestApp(result.hash, result.txid, result.height, result.value);
+          const appMessageInformation = {
+            hash: result.hash,
+            txid: result.txid,
+            height: result.height,
+            value: result.value,
+          };
+          appsMessagesMissing.push(appMessageInformation);
+          if (appsMessagesMissing.length === 500) {
+            checkAndRequestMultipleApps(appsMessagesMissing);
             // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay((Math.random() + 1) * 1000); // delay between 1 and 2 seconds max
+            await serviceHelper.delay((60 + (Math.random() * 15)) * 1000); // delay 60 and 75 seconds
+            appsMessagesMissing = [];
           }
         } else {
           // eslint-disable-next-line no-await-in-loop
@@ -8986,24 +9018,13 @@ async function getAppHashes(req, res) {
 /**
  * To get app locations or a location of an app
  * @param {string} appname Application Name.
- * @param {boolean} showInstalling Show instances installing.
  */
-async function appLocation(appname, showInstalling = false) {
+async function appLocation(appname) {
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
   let query = {};
   if (appname) {
     query = { name: new RegExp(`^${appname}$`, 'i') }; // case insensitive
-    if (!showInstalling) {
-      query = {
-        $and: [
-          { name: new RegExp(`^${appname}$`, 'i') },
-          { installingAt: null },
-        ],
-      };
-    }
-  } else if (!showInstalling) {
-    query = { installingAt: null }; // case insensitive
   }
   const projection = {
     projection: {
@@ -9016,7 +9037,6 @@ async function appLocation(appname, showInstalling = false) {
       runningSince: 1,
       osUptime: 1,
       staticIp: 1,
-      installingAt: 1,
     },
   };
   const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
@@ -9030,9 +9050,7 @@ async function appLocation(appname, showInstalling = false) {
  */
 async function getAppsLocations(req, res) {
   try {
-    let { installing } = req.params;
-    installing = installing || req.query.installing || false;
-    const results = await appLocation(null, installing);
+    const results = await appLocation();
     const resultsResponse = messageHelper.createDataMessage(results);
     res.json(resultsResponse);
   } catch (error) {
@@ -9058,9 +9076,7 @@ async function getAppsLocation(req, res) {
     if (!appname) {
       throw new Error('No Flux App name specified');
     }
-    let { installing } = req.params;
-    installing = installing || req.query.installing || false;
-    const results = await appLocation(appname, installing);
+    const results = await appLocation(appname);
     const resultsResponse = messageHelper.createDataMessage(results);
     res.json(resultsResponse);
   } catch (error) {
@@ -9119,7 +9135,32 @@ async function getRunningAppIpList(ip) { // returns all apps running on this ip
       runningSince: 1,
       osUptime: 1,
       staticIp: 1,
-      installingAt: 1,
+    },
+  };
+  const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
+  return results;
+}
+
+/**
+ * To get a list of running instances of a specific app.
+ * @param {string} appName App name.
+ * @returns {object[]} Array of running apps.
+ */
+async function getRunningAppList(appName) {
+  const dbopen = dbHelper.databaseConnection();
+  const database = dbopen.db(config.database.appsglobal.database);
+  const query = { name: appName };
+  const projection = {
+    projection: {
+      _id: 0,
+      name: 1,
+      hash: 1,
+      ip: 1,
+      broadcastedAt: 1,
+      expireAt: 1,
+      runningSince: 1,
+      osUptime: 1,
+      staticIp: 1,
     },
   };
   const results = await dbHelper.findInDatabase(database, globalAppsLocations, query, projection);
@@ -9899,7 +9940,7 @@ async function trySpawningGlobalApplication() {
     trySpawningGlobalAppCache.set(appHash, appHash);
     log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
 
-    let runningAppList = await appLocation(appToRun, true);
+    let runningAppList = await getRunningAppList(appToRun);
 
     const adjustedIP = myIP.split(':')[0]; // just IP address
     // check if app not running on this device
@@ -9989,7 +10030,7 @@ async function trySpawningGlobalApplication() {
     }
 
     // double check if app is installed on the number of instances requested
-    runningAppList = await appLocation(appToRun, true);
+    runningAppList = await getRunningAppList(appToRun);
     if (runningAppList.length >= minInstances) {
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances`);
       trySpawningGlobalAppCache.delete(appHash);
@@ -10141,7 +10182,7 @@ async function trySpawningGlobalApplication() {
     }
 
     // triple check if app is installed on the number of instances requested
-    runningAppList = await appLocation(appToRun, true);
+    runningAppList = await getRunningAppList(appToRun);
     if (runningAppList.length >= minInstances) {
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances`);
       trySpawningGlobalAppCache.delete(appHash);
@@ -10151,88 +10192,16 @@ async function trySpawningGlobalApplication() {
     }
 
     // an application was selected and checked that it can run on this node. try to install and run it locally
-    // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
-    const broadcastedAt = Date.now();
-    const newAppRunningMessage = {
-      type: 'fluxapprunning',
-      version: 1,
-      name: appSpecifications.name,
-      hash: appSpecifications.hash, // hash of application specifics that are running
-      ip: myIP,
-      broadcastedAt,
-      installing: 1,
-      runningSince: broadcastedAt,
-      osUptime: os.uptime(),
-      staticIp: geolocationService.isStaticIP(),
-    };
-
-    // store it in local database first
-    // eslint-disable-next-line no-await-in-loop, no-use-before-define
-    await storeAppRunningMessage(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-    await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(newAppRunningMessage);
-    await serviceHelper.delay(500);
-    await fluxCommunicationMessagesSender.broadcastMessageToIncoming(newAppRunningMessage);
-    // broadcast messages about running apps to all peers
-
-    await serviceHelper.delay(30 * 1000); // give it time so messages are propagated on the network
-
-    // double check if app is installed in more of the instances requested
-    runningAppList = await appLocation(appToRun, true);
-    if (runningAppList.length > minInstances) {
-      runningAppList.sort((a, b) => {
-        if (!a.runningSince && b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince && !b.runningSince) {
-          return 1;
-        }
-        if (a.runningSince < b.runningSince) {
-          return -1;
-        }
-        if (a.runningSince > b.runningSince) {
-          return 1;
-        }
-        return 0;
-      });
-      const index = runningAppList.findIndex((x) => x.ip === myIP);
-      log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length} instances, my instance is number ${index + 1}`);
-      if (index + 1 > minInstances) {
-        const appRemovedMessage = {
-          type: 'fluxappremoved',
-          version: 1,
-          cancel: 1,
-          appName: appSpecifications.name,
-          ip: myIP,
-          broadcastedAt,
-        };
-        log.info('trySpawningGlobalApplication - Broadcasting appremoved message to the network');
-        // broadcast messages about app removed to all peers
-        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage);
-        await serviceHelper.delay(500);
-        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage);
-        await serviceHelper.delay(30 * 60 * 1000);
-        trySpawningGlobalApplication();
-        return;
-      }
-    }
-
     // install the app
-    let registerOk = false;
-    try {
-      registerOk = await registerAppLocally(appSpecifications, null, null, false); // can throw
-    } catch (error) {
-      log.error(error);
-      registerOk = false;
-    }
+    const registerOk = await registerAppLocally(appSpecifications); // can throw
     if (!registerOk) {
       log.info('trySpawningGlobalApplication - Error on registerAppLocally');
+      const broadcastedAt = Date.now();
       const appRemovedMessage = {
         type: 'fluxappremoved',
         version: 1,
         appName: appSpecifications.name,
         ip: myIP,
-        cancel: 2,
         broadcastedAt,
       };
       log.info('trySpawningGlobalApplication - Broadcasting appremoved message to the network');
@@ -10247,7 +10216,7 @@ async function trySpawningGlobalApplication() {
 
     await serviceHelper.delay(1 * 60 * 1000); // await 1 minute to give time for messages to be propagated on the network
     // double check if app is installed in more of the instances requested
-    runningAppList = await appLocation(appToRun, true);
+    runningAppList = await getRunningAppList(appToRun);
     if (runningAppList.length > minInstances) {
       runningAppList.sort((a, b) => {
         if (!a.runningSince && b.runningSince) {
@@ -10264,7 +10233,7 @@ async function trySpawningGlobalApplication() {
         }
         return 0;
       });
-      const index = runningAppList.findIndex((x) => x.ip === myIP);
+      const index = runningAppList.findIndex((x) => x.ip.split(':')[0] === myIP.split(':')[0]);
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances, my instance is number ${index + 1}`);
       if (index + 1 > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is going to be removed as already passed the instances required.`);
@@ -10812,7 +10781,7 @@ async function checkAndRemoveApplicationInstance() {
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled) {
       // eslint-disable-next-line no-await-in-loop
-      const runningAppList = await appLocation(installedApp.name);
+      const runningAppList = await getRunningAppList(installedApp.name);
       const minInstances = installedApp.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
       if (runningAppList.length > minInstances) {
         // eslint-disable-next-line no-await-in-loop
@@ -12240,7 +12209,7 @@ async function syncthingApps() {
                 const cache = receiveOnlySyncthingAppsCache.get(appId);
 
                 // eslint-disable-next-line no-await-in-loop
-                const runningAppList = await appLocation(installedApp.name);
+                const runningAppList = await getRunningAppList(installedApp.name);
                 runningAppList.sort((a, b) => {
                   if (!a.runningSince && b.runningSince) {
                     return -1;
@@ -12436,7 +12405,7 @@ async function syncthingApps() {
                 } else if (receiveOnlySyncthingAppsCache.has(appId) && !receiveOnlySyncthingAppsCache.get(appId).restarted) {
                   const cache = receiveOnlySyncthingAppsCache.get(appId);
                   // eslint-disable-next-line no-await-in-loop
-                  const runningAppList = await appLocation(installedApp.name);
+                  const runningAppList = await getRunningAppList(installedApp.name);
                   log.info(`SyncthingApps appIdentifier ${appId} is running on nodes ${JSON.stringify(runningAppList)}`);
                   runningAppList.sort((a, b) => {
                     if (!a.runningSince && b.runningSince) {
@@ -12741,7 +12710,7 @@ async function masterSlaveApps() {
               log.info(`masterSlaveApps: app:${installedApp.name} has currently no primary set`);
               if (!runningAppsNames.includes(identifier)) {
                 // eslint-disable-next-line no-await-in-loop
-                const runningAppList = await appLocation(installedApp.name);
+                const runningAppList = await getRunningAppList(installedApp.name);
                 runningAppList.sort((a, b) => {
                   if (!a.runningSince && b.runningSince) {
                     return -1;
@@ -14602,6 +14571,7 @@ module.exports = {
   storeAppRemovedMessage,
   reindexGlobalAppsLocation,
   getRunningAppIpList,
+  getRunningAppList,
   trySpawningGlobalApplication,
   getApplicationSpecifications,
   getStrictApplicationSpecifications,
