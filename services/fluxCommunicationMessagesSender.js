@@ -211,7 +211,6 @@ async function sendToRandomIncomingConnections(data) {
           client.ping(); // do ping instead
         } else {
           client.send(data);
-          log.info(`Message Sent to ${client.ip}:${client.port}`);
         }
       } else {
         throw new Error(`Connection to ${client.ip} is not open`);
@@ -349,9 +348,8 @@ async function respondWithAppMessage(msgObj, ws) {
         const tempMesResponse = myMessageCache.get(hash);
         if (tempMesResponse) {
           sendMessageToWS(tempMesResponse, ws);
-          // eslint-disable-next-line no-continue
-          continue;
         }
+        return;
       }
       let temporaryAppMessage = null;
       // eslint-disable-next-line no-await-in-loop
