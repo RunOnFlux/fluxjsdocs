@@ -350,6 +350,8 @@ async function respondWithAppMessage(msgObj, ws) {
         const tempMesResponse = myMessageCache.get(hash);
         if (tempMesResponse) {
           sendMessageToWS(tempMesResponse, ws);
+          log.info('respondWithAppMessage - Flux App Request found on cache');
+          log.info(`respondWithAppMessage - temporaryAppMessage -  ${JSON.stringify(tempMesResponse)}`);
           // eslint-disable-next-line no-continue
           continue;
         }
@@ -374,7 +376,7 @@ async function respondWithAppMessage(msgObj, ws) {
       }
       myMessageCache.set(hash, temporaryAppMessage);
       // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(150);
+      await serviceHelper.delay(250);
     }
     // else do nothing. We do not have this message. And this Flux would be requesting it from other peers soon too.
   } catch (error) {
