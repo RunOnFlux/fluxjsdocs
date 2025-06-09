@@ -10117,8 +10117,8 @@ function updateToLatestAppSpecifications(appSpec) {
 
 /**
  * To get app specifications for a specific app (global or local) via API.
- * @param {express.Request} req Request.
- * @param {express.Response} res Response.
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
 // eslint-disable-next-line consistent-return
 async function getApplicationSpecificationAPI(req, res) {
@@ -10192,12 +10192,11 @@ async function getApplicationSpecificationAPI(req, res) {
       authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
       if (!authorized) {
         const errMessage = messageHelper.errUnauthorizedMessage();
-        res.json(errMessage);
-        return null;
+        return res.json(errMessage);
       }
       updatedSpecifications = updateToLatestAppSpecifications(specifications);
       const specResponse = messageHelper.createDataMessage(updatedSpecifications);
-      res.json(specResponse);
+      return res.json(specResponse);
     }
     const specResponse = messageHelper.createDataMessage(updatedSpecifications);
     res.json(specResponse);
