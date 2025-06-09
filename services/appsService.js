@@ -1,11 +1,14 @@
 const config = require('config');
+
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+
 const https = require('https');
 const axios = require('axios');
 const express = require('express');
 const http = require('http');
 // eslint-disable-next-line import/no-extraneous-dependencies
-const os = require('os');
-const path = require('path');
 const nodecmd = require('node-cmd');
 const archiver = require('archiver');
 const df = require('node-df');
@@ -7787,8 +7790,11 @@ async function checkAndDecryptAppSpecs(appSpec, daemonHeight = null, owner = nul
     const { status, data } = dataReturned;
     if (status === 'success') {
       const dataParsed = JSON.parse(data);
-      const enterprise = status === 'success' && dataParsed.status === 'ok' ? JSON.parse(dataParsed.message) : null;
-      if (enterprise) {
+      const base64JsonEnterprise = status === 'success' && dataParsed.status === 'ok' ? dataParsed.message : null;
+
+      if (base64JsonEnterprise) {
+        const jsonEnterprise = Buffer.from(base64JsonEnterprise, 'base64').toString('utf-8');
+        const enterprise = JSON.parse(jsonEnterprise);
         appSpecs.compose = enterprise.compose;
         appSpecs.contacts = enterprise.contacts;
       } else {
@@ -7843,17 +7849,21 @@ async function encryptEnterpriseWithAes(enterprise, appName, daemonHeight = null
     const lastUpdate = allPermanentAppMessage[allPermanentAppMessage.length - 1];
     block = lastUpdate.height;
   }
+
+  const jsonEnterprise = JSON.stringify(enterprise);
+  const base64JsonEnterprise = Buffer.from(jsonEnterprise).toString('base64');
+
   const inputData = JSON.stringify({
     fluxID: appOwner,
     appName,
-    message: JSON.stringify(enterprise),
+    message: base64JsonEnterprise,
     blockHeight: block,
   });
   const dataReturned = await benchmarkService.encryptMessage(inputData);
   const { status, data } = dataReturned;
   if (status === 'success') {
     const dataParsed = JSON.parse(data);
-    const newEnterprise = status === 'success' && dataParsed.status === 'ok' ? JSON.parse(dataParsed.message) : null;
+    const newEnterprise = status === 'success' && dataParsed.status === 'ok' ? dataParsed.message : null;
     if (newEnterprise) {
       return newEnterprise;
     }
@@ -7935,12 +7945,12 @@ async function decryptAesKeyWithRsaKey(appName, daemonHeight, enterpriseKey, own
  *
  * We base64 encode the key so that were not passing around raw bytes
  *
- * @param {object} encrypted enterprise encrypted content
+ * @param {object} encrypted enterprise encrypted content (decrypted is a JSON string)
  * @param {string} appName application name
  * @param {integer} daemonHeight daemon block height
  * @param {string} owner original owner of the application
  * @param {string} enterpriseKey RSA encrypted AES key use to encrypt the enterprise field
- * @returns {<Promise<object>} Return enterprise object decrypted.
+ * @returns {Promise<object>} Return enterprise object decrypted.
  */
 async function decryptEnterpriseFromSession(encrypted, appName, daemonHeight, enterpriseKey, owner = null) {
   if (!isArcane) {
@@ -7950,8 +7960,7 @@ async function decryptEnterpriseFromSession(encrypted, appName, daemonHeight, en
     throw new Error('enterpriseKey is mandatory for enterprise Apps.');
   }
   const base64AesKey = await decryptAesKeyWithRsaKey(appName, daemonHeight, enterpriseKey, owner);
-  const base64JsonEnterprise = decryptWithAesSession(appName, encrypted, base64AesKey);
-  const jsonEnterprise = Buffer.fromString(base64JsonEnterprise, 'base64').toString('utf-8');
+  const jsonEnterprise = decryptWithAesSession(appName, encrypted, base64AesKey);
   const decryptedEnterprise = JSON.parse(jsonEnterprise);
 
   if (decryptedEnterprise) {
@@ -7985,295 +7994,283 @@ async function encryptEnterpriseFromSession(enterprise, appName, daemonHeight, e
 
 /**
  * To register an app globally via API. Performs various checks before the app can be registered. Only accessible by users.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
+ * @param {express.Request} req Request.
+ * @param {express.Response} res Response.
+ * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function registerAppGlobalyApi(req, res) {
-  let body = '';
-  req.on('data', (data) => {
-    body += data;
-  });
-  req.on('end', async () => {
-    try {
-      const authorized = await verificationHelper.verifyPrivilege('user', req);
-      if (!authorized) {
-        const errMessage = messageHelper.errUnauthorizedMessage();
-        res.json(errMessage);
-        return;
-      }
-      // first check if this node is available for application registration
-      if (outgoingPeers.length < config.fluxapps.minOutgoing) {
-        throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application registration');
-      }
-      if (incomingPeers.length < config.fluxapps.minIncoming) {
-        throw new Error('Sorry, This Flux does not have enough incoming peers for safe application registration');
-      }
-      const processedBody = serviceHelper.ensureObject(body);
-      // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
-      // name and port HAVE to be unique for application. Check if they don't exist in global database
-      // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification, timestamp, signature } = processedBody;
-      let messageType = processedBody.type; // determines how data is treated in the future
-      let typeVersion = processedBody.version; // further determines how data is treated in the future
-      if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
-        throw new Error('Incomplete message received. Check if appSpecification, type, version, timestamp and signature are provided.');
-      }
-      if (messageType !== 'zelappregister' && messageType !== 'fluxappregister') {
-        throw new Error('Invalid type of message');
-      }
-      if (typeVersion !== 1) {
-        throw new Error('Invalid version of message');
-      }
-      appSpecification = serviceHelper.ensureObject(appSpecification);
-      timestamp = serviceHelper.ensureNumber(timestamp);
-      signature = serviceHelper.ensureString(signature);
-      messageType = serviceHelper.ensureString(messageType);
-      typeVersion = serviceHelper.ensureNumber(typeVersion);
-
-      const timestampNow = Date.now();
-      if (timestamp < timestampNow - 1000 * 3600) {
-        throw new Error('Message timestamp is over 1 hour old, not valid. Check if your computer clock is synced and restart the registration process.');
-      } else if (timestamp > timestampNow + 1000 * 60 * 5) {
-        throw new Error('Message timestamp from future, not valid. Check if your computer clock is synced and restart the registration process.');
-      }
-
-      const appSpecFormatted = specificationFormatter(appSpecification);
-
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-      if (!syncStatus.data.synced) {
-        throw new Error('Daemon not yet synced.');
-      }
-      const daemonHeight = syncStatus.data.height;
-
-      const appSpecFormattedDecrypted = await checkAndDecryptAppSpecs(appSpecFormatted, daemonHeight, appSpecFormatted.owner);
-
-      // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
-      await verifyAppSpecifications(appSpecFormattedDecrypted, daemonHeight, true);
-
-      if (appSpecFormattedDecrypted.version === 7 && appSpecFormattedDecrypted.nodes.length > 0) {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appComponent of appSpecFormattedDecrypted.compose) {
-          if (appComponent.secrets) {
-            // eslint-disable-next-line no-await-in-loop
-            await checkAppSecrets(appSpecFormattedDecrypted.name, appComponent, appSpecFormattedDecrypted.owner);
-          }
-        }
-      }
-
-      // check if name is not yet registered
-      await checkApplicationRegistrationNameConflicts(appSpecFormattedDecrypted);
-
-      // check if zelid owner is correct ( done in message verification )
-      // if signature is not correct, then specifications are not correct type or bad message received. Respond with 'Received message is invalid';
-      await verifyAppMessageSignature(messageType, typeVersion, appSpecFormatted, timestamp, signature);
-
-      // if all ok, then sha256 hash of entire message = message + timestamp + signature. We are hashing all to have always unique value.
-      // If hashing just specificiations, if application goes back to previous specifications, it may pose some issues if we have indeed correct state
-      // We respond with a hash that is supposed to go to transaction.
-      const message = messageType + typeVersion + JSON.stringify(appSpecFormatted) + timestamp + signature;
-      const messageHASH = await generalService.messageHash(message);
-
-      const isEnterpriseApp = !!(appSpecFormattedDecrypted.version >= 8 && appSpecFormattedDecrypted.enterprise);
-
-      // now all is great. Store appSpecFormatted, timestamp, signature and hash in appsTemporaryMessages. with 1 hours expiration time. Broadcast this message to all outgoing connections.
-      const temporaryAppMessage = { // specification of temp message
-        type: messageType,
-        version: typeVersion,
-        appSpecifications: appSpecFormatted,
-        hash: messageHASH,
-        timestamp,
-        signature,
-        arcaneSender: isEnterpriseApp,
-      };
-
-      await fluxCommunicationMessagesSender.broadcastTemporaryAppMessage(temporaryAppMessage);
-      // above takes 2-3 seconds
-      await serviceHelper.delay(1200); // it takes receiving node at least 1 second to process the message. Add 1200 ms mas for processing
-      // this operations takes 2.5-3.5 seconds and is heavy, message gets verified again.
-      await requestAppMessage(messageHASH); // this itself verifies that Peers received our message broadcast AND peers send us the message back. By peers sending the message back we finally store it to our temporary message storage and rebroadcast it again
-      // request app message is quite slow and from performance testing message will appear roughly 5 seconds after ask
-      await serviceHelper.delay(1200); // 1200 ms mas for processing - peer sends message back to us
-      // check temporary message storage
-      let tempMessage = await checkAppTemporaryMessageExistence(messageHASH); // Cumulus measurement: after roughly 8 seconds here
-      for (let i = 0; i < 20; i += 1) { // ask for up to 20 times - 10 seconds. Must have been processed by that time or it failed. Cumulus measurement: Approx 5-6 seconds
-        if (!tempMessage) {
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(500);
-          // eslint-disable-next-line no-await-in-loop
-          tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
-        }
-      }
-      if (tempMessage && typeof tempMessage === 'object' && !Array.isArray(tempMessage)) {
-        const responseHash = messageHelper.createDataMessage(tempMessage.hash);
-        res.json(responseHash); // all ok
-        return;
-      }
-      throw new Error('Unable to register application on the network. Try again later.');
-    } catch (error) {
-      log.warn(error);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      res.json(errorResponse);
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    if (!authorized) {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+      return;
     }
-  });
+    // first check if this node is available for application registration
+    if (outgoingPeers.length < config.fluxapps.minOutgoing) {
+      throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application registration');
+    }
+    if (incomingPeers.length < config.fluxapps.minIncoming) {
+      throw new Error('Sorry, This Flux does not have enough incoming peers for safe application registration');
+    }
+    const processedBody = serviceHelper.ensureObject(req.body);
+    // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
+    // name and port HAVE to be unique for application. Check if they don't exist in global database
+    // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
+    let { appSpecification, timestamp, signature } = processedBody;
+    let messageType = processedBody.type; // determines how data is treated in the future
+    let typeVersion = processedBody.version; // further determines how data is treated in the future
+    if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
+      throw new Error('Incomplete message received. Check if appSpecification, type, version, timestamp and signature are provided.');
+    }
+    if (messageType !== 'zelappregister' && messageType !== 'fluxappregister') {
+      throw new Error('Invalid type of message');
+    }
+    if (typeVersion !== 1) {
+      throw new Error('Invalid version of message');
+    }
+    appSpecification = serviceHelper.ensureObject(appSpecification);
+    timestamp = serviceHelper.ensureNumber(timestamp);
+    signature = serviceHelper.ensureString(signature);
+    messageType = serviceHelper.ensureString(messageType);
+    typeVersion = serviceHelper.ensureNumber(typeVersion);
+
+    const timestampNow = Date.now();
+    if (timestamp < timestampNow - 1000 * 3600) {
+      throw new Error('Message timestamp is over 1 hour old, not valid. Check if your computer clock is synced and restart the registration process.');
+    } else if (timestamp > timestampNow + 1000 * 60 * 5) {
+      throw new Error('Message timestamp from future, not valid. Check if your computer clock is synced and restart the registration process.');
+    }
+
+    const appSpecFormatted = specificationFormatter(appSpecification);
+
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    if (!syncStatus.data.synced) {
+      throw new Error('Daemon not yet synced.');
+    }
+    const daemonHeight = syncStatus.data.height;
+
+    const appSpecFormattedDecrypted = await checkAndDecryptAppSpecs(appSpecFormatted, daemonHeight, appSpecFormatted.owner);
+
+    // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
+    await verifyAppSpecifications(appSpecFormattedDecrypted, daemonHeight, true);
+
+    if (appSpecFormattedDecrypted.version === 7 && appSpecFormattedDecrypted.nodes.length > 0) {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const appComponent of appSpecFormattedDecrypted.compose) {
+        if (appComponent.secrets) {
+          // eslint-disable-next-line no-await-in-loop
+          await checkAppSecrets(appSpecFormattedDecrypted.name, appComponent, appSpecFormattedDecrypted.owner);
+        }
+      }
+    }
+
+    // check if name is not yet registered
+    await checkApplicationRegistrationNameConflicts(appSpecFormattedDecrypted);
+
+    // check if zelid owner is correct ( done in message verification )
+    // if signature is not correct, then specifications are not correct type or bad message received. Respond with 'Received message is invalid';
+    await verifyAppMessageSignature(messageType, typeVersion, appSpecFormatted, timestamp, signature);
+
+    // if all ok, then sha256 hash of entire message = message + timestamp + signature. We are hashing all to have always unique value.
+    // If hashing just specificiations, if application goes back to previous specifications, it may pose some issues if we have indeed correct state
+    // We respond with a hash that is supposed to go to transaction.
+    const message = messageType + typeVersion + JSON.stringify(appSpecFormatted) + timestamp + signature;
+    const messageHASH = await generalService.messageHash(message);
+
+    const isEnterpriseApp = !!(appSpecFormattedDecrypted.version >= 8 && appSpecFormattedDecrypted.enterprise);
+
+    // now all is great. Store appSpecFormatted, timestamp, signature and hash in appsTemporaryMessages. with 1 hours expiration time. Broadcast this message to all outgoing connections.
+    const temporaryAppMessage = { // specification of temp message
+      type: messageType,
+      version: typeVersion,
+      appSpecifications: appSpecFormatted,
+      hash: messageHASH,
+      timestamp,
+      signature,
+      arcaneSender: isEnterpriseApp,
+    };
+
+    await fluxCommunicationMessagesSender.broadcastTemporaryAppMessage(temporaryAppMessage);
+    // above takes 2-3 seconds
+    await serviceHelper.delay(1200); // it takes receiving node at least 1 second to process the message. Add 1200 ms mas for processing
+    // this operations takes 2.5-3.5 seconds and is heavy, message gets verified again.
+    await requestAppMessage(messageHASH); // this itself verifies that Peers received our message broadcast AND peers send us the message back. By peers sending the message back we finally store it to our temporary message storage and rebroadcast it again
+    // request app message is quite slow and from performance testing message will appear roughly 5 seconds after ask
+    await serviceHelper.delay(1200); // 1200 ms mas for processing - peer sends message back to us
+    // check temporary message storage
+    let tempMessage = await checkAppTemporaryMessageExistence(messageHASH); // Cumulus measurement: after roughly 8 seconds here
+    for (let i = 0; i < 20; i += 1) { // ask for up to 20 times - 10 seconds. Must have been processed by that time or it failed. Cumulus measurement: Approx 5-6 seconds
+      if (!tempMessage) {
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(500);
+        // eslint-disable-next-line no-await-in-loop
+        tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
+      }
+    }
+    if (tempMessage && typeof tempMessage === 'object' && !Array.isArray(tempMessage)) {
+      const responseHash = messageHelper.createDataMessage(tempMessage.hash);
+      res.json(responseHash); // all ok
+      return;
+    }
+    throw new Error('Unable to register application on the network. Try again later.');
+  } catch (error) {
+    log.warn(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
 }
 
 /**
  * To update an app globally via API. Performs various checks before the app can be updated. Price handled in UI and available in API. Only accessible by users.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
+ * @param {express.Request} req Request.
+ * @param {express.Response} res Response.
+ * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function updateAppGlobalyApi(req, res) {
-  let body = '';
-  req.on('data', (data) => {
-    body += data;
-  });
-  req.on('end', async () => {
-    try {
-      const authorized = await verificationHelper.verifyPrivilege('user', req);
-      if (!authorized) {
-        const errMessage = messageHelper.errUnauthorizedMessage();
-        res.json(errMessage);
-        return;
-      }
-      // first check if this node is available for application update
-      if (outgoingPeers.length < config.fluxapps.minOutgoing) {
-        throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application update');
-      }
-      if (incomingPeers.length < config.fluxapps.minIncoming) {
-        throw new Error('Sorry, This Flux does not have enough incoming peers for safe application update');
-      }
-      const processedBody = serviceHelper.ensureObject(body);
-      // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
-      // name and ports HAVE to be unique for application. Check if they don't exist in global database
-      // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
-      let { appSpecification, timestamp, signature } = processedBody;
-      let messageType = processedBody.type; // determines how data is treated in the future
-      let typeVersion = processedBody.version; // further determines how data is treated in the future
-      if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
-        throw new Error('Incomplete message received. Check if appSpecification, timestamp, type, version and signature are provided.');
-      }
-      if (messageType !== 'zelappupdate' && messageType !== 'fluxappupdate') {
-        throw new Error('Invalid type of message');
-      }
-      if (typeVersion !== 1) {
-        throw new Error('Invalid version of message');
-      }
-      appSpecification = serviceHelper.ensureObject(appSpecification);
-      timestamp = serviceHelper.ensureNumber(timestamp);
-      signature = serviceHelper.ensureString(signature);
-      messageType = serviceHelper.ensureString(messageType);
-      typeVersion = serviceHelper.ensureNumber(typeVersion);
-
-      const timestampNow = Date.now();
-      if (timestamp < timestampNow - 1000 * 3600) {
-        throw new Error('Message timestamp is over 1 hour old, not valid. Check if your computer clock is synced and restart the registration process.');
-      } else if (timestamp > timestampNow + 1000 * 60 * 5) {
-        throw new Error('Message timestamp from future, not valid. Check if your computer clock is synced and restart the registration process.');
-      }
-
-      const appSpecFormatted = specificationFormatter(appSpecification);
-
-      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-      if (!syncStatus.data.synced) {
-        throw new Error('Daemon not yet synced.');
-      }
-      const daemonHeight = syncStatus.data.height;
-
-      const appSpecFormattedDecrypted = await checkAndDecryptAppSpecs(appSpecFormatted, daemonHeight);
-
-      // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
-      await verifyAppSpecifications(appSpecFormattedDecrypted, daemonHeight, true);
-
-      if (appSpecFormattedDecrypted.version === 7 && appSpecFormattedDecrypted.nodes.length > 0) {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appComponent of appSpecFormattedDecrypted.compose) {
-          if (appComponent.secrets) {
-            // eslint-disable-next-line no-await-in-loop
-            await checkAppSecrets(appSpecFormattedDecrypted.name, appComponent, appSpecFormattedDecrypted.owner);
-          }
-        }
-      }
-
-      // verify that app exists, does not change repotag and is signed by app owner.
-      const db = dbHelper.databaseConnection();
-      const database = db.db(config.database.appsglobal.database);
-      // may throw
-      const query = { name: appSpecFormatted.name };
-      const projection = {
-        projection: {
-          _id: 0,
-        },
-      };
-      const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-      if (!appInfo) {
-        throw new Error('Flux App update received but application to update does not exist!');
-      }
-      if (appInfo.repotag !== appSpecFormatted.repotag) { // this is OK. <= v3 cannot change, v4 can but does not have this in specifications as its compose
-        throw new Error('Flux App update of repotag is not allowed');
-      }
-      const appOwner = appInfo.owner; // ensure previous app owner is signing this message
-      // here signature is checked against PREVIOUS app owner
-      await verifyAppMessageUpdateSignature(messageType, typeVersion, appSpecFormatted, timestamp, signature, appOwner, daemonHeight);
-
-      // verify that app exists, does not change repotag (for v1-v3), does not change name and does not change component names
-      await checkApplicationUpdateNameRepositoryConflicts(appSpecFormattedDecrypted, timestamp);
-
-      // if all ok, then sha256 hash of entire message = message + timestamp + signature. We are hashing all to have always unique value.
-      // If hashing just specificiations, if application goes back to previous specifications, it may pose some issues if we have indeed correct state
-      // We respond with a hash that is supposed to go to transaction.
-      const message = messageType + typeVersion + JSON.stringify(appSpecFormatted) + timestamp + signature;
-      const messageHASH = await generalService.messageHash(message);
-
-      const isEnterpriseApp = !!(appSpecFormattedDecrypted.version >= 8 && appSpecFormattedDecrypted.enterprise);
-
-      // now all is great. Store appSpecFormatted, timestamp, signature and hash in appsTemporaryMessages. with 1 hours expiration time. Broadcast this message to all outgoing connections.
-      const temporaryAppMessage = { // specification of temp message
-        type: messageType,
-        version: typeVersion,
-        appSpecifications: appSpecFormatted,
-        hash: messageHASH,
-        timestamp,
-        signature,
-        arcaneSender: isEnterpriseApp,
-      };
-      await fluxCommunicationMessagesSender.broadcastTemporaryAppMessage(temporaryAppMessage);
-      // above takes 2-3 seconds
-      await serviceHelper.delay(1200); // it takes receiving node at least 1 second to process the message. Add 1200 ms mas for processing
-      // this operations takes 2.5-3.5 seconds and is heavy, message gets verified again.
-      await requestAppMessage(messageHASH); // this itself verifies that Peers received our message broadcast AND peers send us the message back. By peers sending the message back we finally store it to our temporary message storage and rebroadcast it again
-      await serviceHelper.delay(1200); // 1200 ms mas for processing - peer sends message back to us
-      // check temporary message storage
-      let tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
-      for (let i = 0; i < 20; i += 1) { // ask for up to 20 times - 10 seconds. Must have been processed by that time or it failed.
-        if (!tempMessage) {
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(500);
-          // eslint-disable-next-line no-await-in-loop
-          tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
-        }
-      }
-      if (tempMessage && typeof tempMessage === 'object' && !Array.isArray(tempMessage)) {
-        const responseHash = messageHelper.createDataMessage(tempMessage.hash);
-        res.json(responseHash); // all ok
-        return;
-      }
-      throw new Error('Unable to update application on the network. Try again later.');
-    } catch (error) {
-      log.warn(error);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      res.json(errorResponse);
+  try {
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    if (!authorized) {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      res.json(errMessage);
+      return;
     }
-  });
+    // first check if this node is available for application update
+    if (outgoingPeers.length < config.fluxapps.minOutgoing) {
+      throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application update');
+    }
+    if (incomingPeers.length < config.fluxapps.minIncoming) {
+      throw new Error('Sorry, This Flux does not have enough incoming peers for safe application update');
+    }
+    const processedBody = serviceHelper.ensureObject(req.body);
+    // Note. Actually signature, timestamp is not needed. But we require it only to verify that user indeed has access to the private key of the owner zelid.
+    // name and ports HAVE to be unique for application. Check if they don't exist in global database
+    // first let's check if all fields are present and have proper format except tiered and tiered specifications and those can be omitted
+    let { appSpecification, timestamp, signature } = processedBody;
+    let messageType = processedBody.type; // determines how data is treated in the future
+    let typeVersion = processedBody.version; // further determines how data is treated in the future
+    if (!appSpecification || !timestamp || !signature || !messageType || !typeVersion) {
+      throw new Error('Incomplete message received. Check if appSpecification, timestamp, type, version and signature are provided.');
+    }
+    if (messageType !== 'zelappupdate' && messageType !== 'fluxappupdate') {
+      throw new Error('Invalid type of message');
+    }
+    if (typeVersion !== 1) {
+      throw new Error('Invalid version of message');
+    }
+    appSpecification = serviceHelper.ensureObject(appSpecification);
+    timestamp = serviceHelper.ensureNumber(timestamp);
+    signature = serviceHelper.ensureString(signature);
+    messageType = serviceHelper.ensureString(messageType);
+    typeVersion = serviceHelper.ensureNumber(typeVersion);
+
+    const timestampNow = Date.now();
+    if (timestamp < timestampNow - 1000 * 3600) {
+      throw new Error('Message timestamp is over 1 hour old, not valid. Check if your computer clock is synced and restart the registration process.');
+    } else if (timestamp > timestampNow + 1000 * 60 * 5) {
+      throw new Error('Message timestamp from future, not valid. Check if your computer clock is synced and restart the registration process.');
+    }
+
+    const appSpecFormatted = specificationFormatter(appSpecification);
+
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    if (!syncStatus.data.synced) {
+      throw new Error('Daemon not yet synced.');
+    }
+    const daemonHeight = syncStatus.data.height;
+
+    const appSpecFormattedDecrypted = await checkAndDecryptAppSpecs(appSpecFormatted, daemonHeight);
+
+    // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
+    await verifyAppSpecifications(appSpecFormattedDecrypted, daemonHeight, true);
+
+    if (appSpecFormattedDecrypted.version === 7 && appSpecFormattedDecrypted.nodes.length > 0) {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const appComponent of appSpecFormattedDecrypted.compose) {
+        if (appComponent.secrets) {
+          // eslint-disable-next-line no-await-in-loop
+          await checkAppSecrets(appSpecFormattedDecrypted.name, appComponent, appSpecFormattedDecrypted.owner);
+        }
+      }
+    }
+
+    // verify that app exists, does not change repotag and is signed by app owner.
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    // may throw
+    const query = { name: appSpecFormatted.name };
+    const projection = {
+      projection: {
+        _id: 0,
+      },
+    };
+    const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
+    if (!appInfo) {
+      throw new Error('Flux App update received but application to update does not exist!');
+    }
+    if (appInfo.repotag !== appSpecFormatted.repotag) { // this is OK. <= v3 cannot change, v4 can but does not have this in specifications as its compose
+      throw new Error('Flux App update of repotag is not allowed');
+    }
+    const appOwner = appInfo.owner; // ensure previous app owner is signing this message
+    // here signature is checked against PREVIOUS app owner
+    await verifyAppMessageUpdateSignature(messageType, typeVersion, appSpecFormatted, timestamp, signature, appOwner, daemonHeight);
+
+    // verify that app exists, does not change repotag (for v1-v3), does not change name and does not change component names
+    await checkApplicationUpdateNameRepositoryConflicts(appSpecFormattedDecrypted, timestamp);
+
+    // if all ok, then sha256 hash of entire message = message + timestamp + signature. We are hashing all to have always unique value.
+    // If hashing just specificiations, if application goes back to previous specifications, it may pose some issues if we have indeed correct state
+    // We respond with a hash that is supposed to go to transaction.
+    const message = messageType + typeVersion + JSON.stringify(appSpecFormatted) + timestamp + signature;
+    const messageHASH = await generalService.messageHash(message);
+
+    const isEnterpriseApp = !!(appSpecFormattedDecrypted.version >= 8 && appSpecFormattedDecrypted.enterprise);
+
+    // now all is great. Store appSpecFormatted, timestamp, signature and hash in appsTemporaryMessages. with 1 hours expiration time. Broadcast this message to all outgoing connections.
+    const temporaryAppMessage = { // specification of temp message
+      type: messageType,
+      version: typeVersion,
+      appSpecifications: appSpecFormatted,
+      hash: messageHASH,
+      timestamp,
+      signature,
+      arcaneSender: isEnterpriseApp,
+    };
+    await fluxCommunicationMessagesSender.broadcastTemporaryAppMessage(temporaryAppMessage);
+    // above takes 2-3 seconds
+    await serviceHelper.delay(1200); // it takes receiving node at least 1 second to process the message. Add 1200 ms mas for processing
+    // this operations takes 2.5-3.5 seconds and is heavy, message gets verified again.
+    await requestAppMessage(messageHASH); // this itself verifies that Peers received our message broadcast AND peers send us the message back. By peers sending the message back we finally store it to our temporary message storage and rebroadcast it again
+    await serviceHelper.delay(1200); // 1200 ms mas for processing - peer sends message back to us
+    // check temporary message storage
+    let tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
+    for (let i = 0; i < 20; i += 1) { // ask for up to 20 times - 10 seconds. Must have been processed by that time or it failed.
+      if (!tempMessage) {
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(500);
+        // eslint-disable-next-line no-await-in-loop
+        tempMessage = await checkAppTemporaryMessageExistence(messageHASH);
+      }
+    }
+    if (tempMessage && typeof tempMessage === 'object' && !Array.isArray(tempMessage)) {
+      const responseHash = messageHelper.createDataMessage(tempMessage.hash);
+      res.json(responseHash); // all ok
+      return;
+    }
+    throw new Error('Unable to update application on the network. Try again later.');
+  } catch (error) {
+    log.warn(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
 }
 
 /**
@@ -12180,9 +12177,7 @@ async function redeployAPI(req, res) {
  */
 async function verifyAppRegistrationParameters(req, res) {
   try {
-    const processedBody = serviceHelper.ensureObject(req.body);
-    let appSpecification = processedBody;
-    appSpecification = serviceHelper.ensureObject(appSpecification);
+    const appSpecification = serviceHelper.ensureObject(req.body);
 
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
     if (!syncStatus.data.synced) {
@@ -12190,7 +12185,7 @@ async function verifyAppRegistrationParameters(req, res) {
     }
     const daemonHeight = syncStatus.data.height;
 
-    const encryptedEnterpriseKey = req.headers.enterpriseKey;
+    const encryptedEnterpriseKey = req.headers['enterprise-key'];
     let enterprise = null;
     let newEnterpriseEncrypted = null;
     if (appSpecification.version >= 8 && appSpecification.enterprise) {
