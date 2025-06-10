@@ -192,8 +192,6 @@ class FluxRpc {
       ['getinfo', null],
       ['decryptmessage', null],
       ['getpublickey', null],
-      ['decryptrsamessage', null],
-      ['encryptmessage', null],
     ]),
   };
 
