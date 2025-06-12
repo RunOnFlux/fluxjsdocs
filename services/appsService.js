@@ -10173,8 +10173,7 @@ function updateToLatestAppSpecifications(appSpec) {
 /**
  * To get app specifications for a specific app (global or local) via API. If it's
  * a v8+ app, can request the specs with the original encryption, or reencrypted with
- * a session key provided by the client in the Enterprise-Key header. If the client
- * is flux support, we allow a partial decryption of the app specs.
+ * a session key provided by the client in the Enterprise-Key header
  * @param {express.Request} req Request.
  * @param {express.Response} res Response.
  * @returns {Promise<void>}
@@ -10224,32 +10223,16 @@ async function getApplicationSpecificationAPI(req, res) {
       throw new Error('Header with enterpriseKey is mandatory for enterprise Apps.');
     }
 
-    const ownerAuthorized = await verificationHelper.verifyPrivilege(
+    const authorized = await verificationHelper.verifyPrivilege(
       'appowner',
       req,
       mainAppName,
     );
 
-    const fluxTeamAuthorized = ownerAuthorized === true
-      ? false
-      : await verificationHelper.verifyPrivilege(
-        'appownerabove',
-        req,
-        mainAppName,
-      );
-
-    if (!ownerAuthorized || !fluxTeamAuthorized) {
+    if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return null;
-    }
-
-    if (fluxTeamAuthorized) {
-      specifications.compose.forEach((component) => {
-        const comp = component;
-        comp.environmentParameters = [];
-        comp.repoauth = '';
-      });
     }
 
     // this seems a bit weird, but the client can ask for the specs encrypted or decrypted.
