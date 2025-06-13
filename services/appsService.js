@@ -5223,12 +5223,12 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
   } = appSpecification;
 
   if (!version) {
-    throw new Error('Missing Flux App specification parameter version');
+    throw new Error('Missing Flux App specification parameter');
   }
 
   // commons
   if (!version || !name || !description || !owner) {
-    throw new Error('Missing Flux App specification parameter name and/or description and/or owner');
+    throw new Error('Missing Flux App specification parameter');
   }
 
   if (typeof version !== 'number') {
@@ -5252,17 +5252,17 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 
   if (version === 1) {
     if (!port || !containerPort) {
-      throw new Error('Missing Flux App specification parameter port and/or containerPort');
+      throw new Error('Missing Flux App specification parameter');
     }
   } else if (version >= 2 && version <= 3) {
     if (!ports || !domains || !containerPorts) {
-      throw new Error('Missing Flux App specification parameter port and/or containerPort and/or domains');
+      throw new Error('Missing Flux App specification parameter');
     }
   }
 
   if (version === 1) {
     if (!repotag || !enviromentParameters || !commands || !containerData || !cpu || !ram || !hdd) {
-      throw new Error('Missing Flux App specification parameter repotag and/or enviromentParameters and/or commands and/or containerData and/or cpu and/or ram and/or hdd');
+      throw new Error('Missing Flux App specification parameter');
     }
 
     if (typeof port !== 'number') {
@@ -5331,7 +5331,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
   } else if (version <= 3) {
     if (!repotag || !enviromentParameters || !commands || !containerData || !cpu || !ram || !hdd) {
-      throw new Error('Missing Flux App specification parameter repotag and/or enviromentParameters and/or commands and/or containerData and/or cpu and/or ram and/or hdd');
+      throw new Error('Missing Flux App specification parameter');
     }
 
     if (Array.isArray(ports)) {
@@ -5420,7 +5420,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     }
   } else if (version <= 7) { // v4 to v7
     if (!compose) {
-      throw new Error('Missing Flux App specification parameter compose');
+      throw new Error('Missing Flux App specification parameter');
     }
     if (typeof compose !== 'object') {
       throw new Error('Invalid Flux App Specifications');
@@ -5543,7 +5543,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
       throw new Error('Nodes can only be used in enterprise apps');
     }
     if (!compose) {
-      throw new Error('Missing Flux App specification parameter compose');
+      throw new Error('Missing Flux App specification parameter');
     }
     if (typeof compose !== 'object') {
       throw new Error('Invalid Flux App Specifications');
@@ -5631,7 +5631,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 
   if (version >= 3) {
     if (!instances) {
-      throw new Error('Missing Flux App specification parameter instances');
+      throw new Error('Missing Flux App specification parameter');
     }
     if (typeof instances !== 'number') {
       throw new Error('Invalid instances specification');
@@ -5667,7 +5667,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 
   if (version >= 6) {
     if (!expire) {
-      throw new Error('Missing Flux App specification parameter expire');
+      throw new Error('Missing Flux App specification parameter');
     }
     if (typeof expire !== 'number') {
       throw new Error('Invalid expire specification');
@@ -5682,7 +5682,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 
   if (version >= 7) {
     if (!nodes) {
-      throw new Error('Missing Flux App specification parameter nodes');
+      throw new Error('Missing Flux App specification parameter');
     }
     if (Array.isArray(nodes)) {
       nodes.forEach((parameter) => {
@@ -7247,13 +7247,13 @@ function specificationFormatter(appSpecification) {
   } = appSpecification;
 
   if (!version) {
-    throw new Error('Missing Flux App specification parameter version');
+    throw new Error('Missing Flux App specification parameter');
   }
   version = serviceHelper.ensureNumber(version);
 
   // commons
   if (!name || !description || !owner) {
-    throw new Error('Missing Flux App specification parameter name and/or description and/or owner');
+    throw new Error('Missing Flux App specification parameter');
   }
   name = serviceHelper.ensureString(name);
   description = serviceHelper.ensureString(description);
@@ -7271,7 +7271,7 @@ function specificationFormatter(appSpecification) {
 
   if (version === 1) {
     if (!repotag || !port || !enviromentParameters || !commands || !containerPort || !containerData || !cpu || !ram || !hdd) {
-      throw new Error('Missing Flux App specification parameter repotag and/or port and/or enviromentParameters and/or commands and/or containerData and/or cpu and/or ram and/or hdd');
+      throw new Error('Missing Flux App specification parameter');
     }
 
     repotag = serviceHelper.ensureString(repotag);
@@ -7354,7 +7354,7 @@ function specificationFormatter(appSpecification) {
     }
   } else if (version <= 3) {
     if (!repotag || !ports || !domains || !enviromentParameters || !commands || !containerPorts || !containerData || !cpu || !ram || !hdd) {
-      throw new Error('Missing Flux App specification parameter repotag and/or port and/or domains and/or enviromentParameters and/or commands and/or containerData and/or cpu and/or ram and/or hdd');
+      throw new Error('Missing Flux App specification parameter');
     }
 
     repotag = serviceHelper.ensureString(repotag);
@@ -7467,7 +7467,7 @@ function specificationFormatter(appSpecification) {
     }
   } else { // v4+
     if (!compose) {
-      throw new Error('Missing Flux App specification parameter compose');
+      throw new Error('Missing Flux App specification parameter');
     }
     compose = serviceHelper.ensureObject(compose);
     if (!Array.isArray(compose)) {
@@ -7592,7 +7592,7 @@ function specificationFormatter(appSpecification) {
 
   if (version >= 3) {
     if (!instances) {
-      throw new Error('Missing Flux App specification parameter instances');
+      throw new Error('Missing Flux App specification parameter');
     }
     instances = serviceHelper.ensureNumber(instances);
     if (typeof instances !== 'number') {
@@ -7612,7 +7612,7 @@ function specificationFormatter(appSpecification) {
 
   if (version >= 5) {
     if (!contacts || !geolocation) { // can be empty array for no contact or no geolocation requirements
-      throw new Error('Missing Flux App specification parameter contacts and/or geolocation');
+      throw new Error('Missing Flux App specification parameter');
     }
     contacts = serviceHelper.ensureObject(contacts);
     const contactsCorrect = [];
@@ -7641,7 +7641,7 @@ function specificationFormatter(appSpecification) {
 
   if (version >= 6) {
     if (!expire) {
-      throw new Error('Missing Flux App specification parameter expire');
+      throw new Error('Missing Flux App specification parameter');
     }
     expire = serviceHelper.ensureNumber(expire);
     if (typeof expire !== 'number') {
@@ -7658,7 +7658,7 @@ function specificationFormatter(appSpecification) {
 
   if (version >= 7) {
     if (!nodes) { // can be empty array for no nodes set
-      throw new Error('Missing Flux App specification parameter nodes');
+      throw new Error('Missing Flux App specification parameter');
     }
     nodes = serviceHelper.ensureObject(nodes);
     const nodesCorrect = [];
@@ -7815,7 +7815,7 @@ async function decryptAesKeyWithRsaKey(appName, daemonHeight, enterpriseKey, own
  * encrypted with the RSA public key received via prior api call.
  *
  * The enterpise field is in this format:
- * base64(rsa encrypted aes key + nonce + aes-256-gcm(base64(json(enterprise specs))) + authTag)
+ * base64(nonce + aes-256-gcm(base64(json(enterprise specs))) + authTag)
  *
  * We do this so that we don't have to double JSON encode, and we have the
  * nonce + cyphertext + tag all in one entry
@@ -7829,6 +7829,7 @@ async function decryptAesKeyWithRsaKey(appName, daemonHeight, enterpriseKey, own
  * @param {string} appName application name
  * @param {integer} daemonHeight daemon block height
  * @param {string} owner original owner of the application
+ * @param {string} enterpriseKey RSA encrypted AES key use to encrypt the enterprise field
  * @returns {Promise<object>} Return enterprise object decrypted.
  */
 async function decryptEnterpriseFromSession(base64Encrypted, appName, daemonHeight, owner = null) {
@@ -9907,7 +9908,7 @@ function updateToLatestAppSpecifications(appSpec) {
       owner: appSpec.owner,
       staticip: false,
       compose: [component],
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -9944,7 +9945,7 @@ function updateToLatestAppSpecifications(appSpec) {
       owner: appSpec.owner,
       staticip: false,
       compose: [component],
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -9982,7 +9983,7 @@ function updateToLatestAppSpecifications(appSpec) {
       owner: appSpec.owner,
       staticip: false,
       compose: [component],
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -10005,7 +10006,7 @@ function updateToLatestAppSpecifications(appSpec) {
       istances: appSpec.instances,
       nodes: [],
       staticip: false,
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -10049,7 +10050,7 @@ function updateToLatestAppSpecifications(appSpec) {
       istances: appSpec.instances,
       nodes: [],
       staticip: false,
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -10093,7 +10094,7 @@ function updateToLatestAppSpecifications(appSpec) {
       istances: appSpec.instances,
       nodes: [],
       staticip: false,
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -10137,7 +10138,7 @@ function updateToLatestAppSpecifications(appSpec) {
       istances: appSpec.instances,
       nodes: [], // we don't fill the nodes as they were used for different thing.
       staticip: appSpec.staticip,
-      enterprise: '',
+      enterprise: "",
       hash: appSpec.hash,
       height: appSpec.height,
     };
@@ -10172,8 +10173,7 @@ function updateToLatestAppSpecifications(appSpec) {
 /**
  * To get app specifications for a specific app (global or local) via API. If it's
  * a v8+ app, can request the specs with the original encryption, or reencrypted with
- * a session key provided by the client in the Enterprise-Key header. If the client
- * is flux support, we allow a partial decryption of the app specs.
+ * a session key provided by the client in the Enterprise-Key header
  * @param {express.Request} req Request.
  * @param {express.Response} res Response.
  * @returns {Promise<void>}
@@ -10223,32 +10223,16 @@ async function getApplicationSpecificationAPI(req, res) {
       throw new Error('Header with enterpriseKey is mandatory for enterprise Apps.');
     }
 
-    const ownerAuthorized = await verificationHelper.verifyPrivilege(
+    const authorized = await verificationHelper.verifyPrivilege(
       'appowner',
       req,
       mainAppName,
     );
 
-    const fluxTeamAuthorized = ownerAuthorized === true
-      ? false
-      : await verificationHelper.verifyPrivilege(
-        'appownerabove',
-        req,
-        mainAppName,
-      );
-
-    if (!ownerAuthorized === true || !fluxTeamAuthorized === true) {
+    if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return null;
-    }
-
-    if (fluxTeamAuthorized) {
-      specifications.compose.forEach((component) => {
-        const comp = component;
-        comp.environmentParameters = [];
-        comp.repoauth = '';
-      });
     }
 
     // this seems a bit weird, but the client can ask for the specs encrypted or decrypted.
@@ -10286,17 +10270,13 @@ async function getApplicationSpecificationAPI(req, res) {
  */
 async function updateApplicationSpecificationAPI(req, res) {
   try {
-    const { appname } = req.params;
-    if (!appname) {
-      throw new Error('appname parameter is mandatory');
-    }
-
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
     if (!syncStatus.data.synced) {
       throw new Error('Daemon not yet synced.');
     }
 
     const { data: { daemonHeight } } = syncStatus;
+    const { appname } = req.params;
 
     const specifications = await getApplicationSpecifications(appname);
     if (!specifications) {
@@ -11746,17 +11726,15 @@ async function reinstallOldApplications() {
           delete auxInstalledApp.owner;
 
           if (JSON.stringify(auxAppSpecifications) === JSON.stringify(auxInstalledApp)) {
-            log.info(`Application ${installedApp.name} was updated without any change on the specifications, updating localAppsInformation db information.`);
+            log.warn(`Application ${installedApp.name} was updated without any change on the specifications, updating localAppsInformation db information.`);
             // connect to mongodb
             const dbopen = dbHelper.databaseConnection();
             const appsDatabase = dbopen.db(config.database.appslocal.database);
             const appsQuery = { name: appSpecifications.name };
-            const options = {
-              upsert: true,
-            };
+            const appsProjection = {};
             // eslint-disable-next-line no-await-in-loop
-            await dbHelper.updateOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appSpecifications, options);
-            log.info(`Application ${installedApp.name} Database updated`);
+            await dbHelper.findOneAndUpdateInDatabase(appsDatabase, localAppsInformation, appsQuery, appSpecifications, appsProjection);
+            log.warn('Database updated');
             // eslint-disable-next-line no-continue
             continue;
           }
@@ -14134,6 +14112,19 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       });
     }
     await serviceHelper.delay(10 * 1000);
+    // eslint-disable-next-line no-await-in-loop
+    let askingIP = await fluxNetworkHelper.getRandomConnection();
+    while (!askingIP || askingIP.split(':')[0] === myIP) {
+      // eslint-disable-next-line no-await-in-loop
+      askingIP = await fluxNetworkHelper.getRandomConnection();
+    }
+    let askingIpPort = config.server.apiport;
+    if (askingIP.includes(':')) { // has port specification
+      // it has port specification
+      const splittedIP = askingIP.split(':');
+      askingIP = splittedIP[0];
+      askingIpPort = splittedIP[1];
+    }
     const timeout = 30000;
     const axiosConfig = {
       timeout,
@@ -14149,43 +14140,24 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
     // eslint-disable-next-line no-await-in-loop
     const signature = await signCheckAppData(stringData);
     data.signature = signature;
-    let i = 0;
-    let finished = false;
-    while (!finished && i < 5) {
-      i += 1;
-      // eslint-disable-next-line no-await-in-loop
-      let askingIP = await fluxNetworkHelper.getRandomConnection();
-      while (!askingIP || askingIP.split(':')[0] === myIP) {
-      // eslint-disable-next-line no-await-in-loop
-        askingIP = await fluxNetworkHelper.getRandomConnection();
-      }
-      let askingIpPort = config.server.apiport;
-      if (askingIP.includes(':')) { // has port specification
-      // it has port specification
-        const splittedIP = askingIP.split(':');
-        askingIP = splittedIP[0];
-        askingIpPort = splittedIP[1];
-      }
-      // first check against our IP address
-      // eslint-disable-next-line no-await-in-loop
-      const resMyAppAvailability = await axios.post(`http://${askingIP}:${askingIpPort}/flux/checkappavailability`, JSON.stringify(data), axiosConfig).catch((error) => {
-        log.error(`${askingIP} for app availability is not reachable`);
-        log.error(error);
-      });
-      if (resMyAppAvailability && resMyAppAvailability.data.status === 'error') {
-        if (resMyAppAvailability.data.data && resMyAppAvailability.data.data.message && resMyAppAvailability.data.data.message.includes('Failed port: ')) {
-          const portToRetest = serviceHelper.ensureNumber(resMyAppAvailability.data.data.message.split('Failed port: ')[1]);
-          if (portToRetest > 0) {
-            failedPort = portsNotWorking.push(portToRetest);
-          }
+    // first check against our IP address
+    // eslint-disable-next-line no-await-in-loop
+    const resMyAppAvailability = await axios.post(`http://${askingIP}:${askingIpPort}/flux/checkappavailability`, JSON.stringify(data), axiosConfig).catch((error) => {
+      log.error(`${askingIP} for app availability is not reachable`);
+      log.error(error);
+    });
+    if (resMyAppAvailability && resMyAppAvailability.data.status === 'error') {
+      if (resMyAppAvailability.data.data && resMyAppAvailability.data.data.message && resMyAppAvailability.data.data.message.includes('Failed port: ')) {
+        const portToRetest = serviceHelper.ensureNumber(resMyAppAvailability.data.data.message.split('Failed port: ')[1]);
+        if (portToRetest > 0) {
+          failedPort = portToRetest;
         }
-        portsStatus = false;
-        finished = true;
-      } else if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-        portsStatus = true;
-        finished = true;
       }
+      portsStatus = false;
+    } else if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
+      portsStatus = true;
     }
+
     // stop listening on the port, close the port
     // eslint-disable-next-line no-restricted-syntax
     for (const portToTest of portsToTest) {
