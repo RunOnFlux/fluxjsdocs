@@ -10,8 +10,6 @@ const generalService = require('./generalService');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const log = require('../lib/log');
 
-const isArcane = Boolean(process.env.FLUXOS_PATH);
-
 const fluxDirPath = path.join(__dirname, '../../../');
 // ToDo: Fix all the string concatenation in this file and use path.join()
 const appsFolderPath = process.env.FLUX_APPS_FOLDER || path.join(fluxDirPath, 'ZelApps');
@@ -922,9 +920,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   if (backingFs && backingFs[1] === 'xfs') {
     // check that we have quota
 
-    const mountTarget = isArcane ? '/dat/var/lib/docker' : '/var/lib/docker';
-
-    const hasQuotaPossibility = await deviceHelper.hasQuotaOptionForMountTarget(mountTarget);
+    const hasQuotaPossibility = await deviceHelper.hasQuotaOptionForMountTarget('/var/lib/docker');
 
     if (hasQuotaPossibility) {
       options.HostConfig.StorageOpt = { size: `${config.fluxapps.hddFileSystemMinimum}G` }; // must also have 'pquota' mount option
