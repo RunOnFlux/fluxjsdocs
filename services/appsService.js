@@ -6077,12 +6077,8 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
       if (appSpecifications.expire < config.fluxapps.minBlocksAllowance) {
         throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 1 week`);
       }
-    } else if (height < config.fluxapps.cancel1BlockMinBlocksAllowanceBlock) {
-      if (appSpecifications.expire < config.fluxapps.newMinBlocksAllowance) {
-        throw new Error(`Minimum expiration of application is ${config.fluxapps.newMinBlocksAllowance} blocks ~ 3 hours`);
-      }
-    } else if (appSpecifications.expire < config.fluxapps.cancel1BlockMinBlocksAllowance) {
-      throw new Error(`Minimum expiration of application is ${config.fluxapps.cancel1BlockMinBlocksAllowance} blocks`);
+    } else if (appSpecifications.expire < config.fluxapps.newMinBlocksAllowance) {
+      throw new Error(`Minimum expiration of application is ${config.fluxapps.minBlocksAllowance} blocks ~ 3 hours`);
     }
     if (appSpecifications.expire > config.fluxapps.maxBlocksAllowance) {
       throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
