@@ -1,4 +1,5 @@
 /* eslint-disable no-underscore-dangle */
+const { LRUCache } = require('lru-cache');
 const WebSocket = require('ws');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
@@ -8,9 +9,17 @@ const messageHelper = require('./messageHelper');
 const {
   outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
 } = require('./utils/establishedConnections');
-const cacheManager = require('./utils/cacheManager').default;
 
-const myMessageCache = cacheManager.tempMessageCache;
+// default cache
+const LRUoptions = {
+  max: 1000,
+  ttl: 1000 * 60 * 20, // 20 minutes
+  maxAge: 1000 * 60 * 20, // 20 minutes
+};
+
+const myMessageCache = new LRUCache(LRUoptions);
+
+let response = messageHelper.createErrorMessage();
 
 /**
  * To send to all peers.
@@ -42,8 +51,7 @@ async function sendToAllPeers(data, wsList) {
           throw new Error(`Connection to ${client.ip} is not open`);
         }
       } catch (e) {
-        // removed this, we log anyway when the websocket is shut, no need to spam here
-        // log.error(e);
+        log.error(e);
         removals.push(client);
         try {
           const { ip } = client;
@@ -239,7 +247,7 @@ async function sendToRandomIncomingConnections(data) {
  * To get Flux message signature.
  * @param {object} message Message.
  * @param {string} privatekey Private key.
- * @returns {Promise<string>} Signature.
+ * @returns {string} Signature.
  */
 async function getFluxMessageSignature(message, privatekey) {
   const privKey = await fluxNetworkHelper.getFluxNodePrivateKey(privatekey);
@@ -418,16 +426,14 @@ async function broadcastMessageToOutgoingFromUser(req, res) {
       throw new Error('No message to broadcast attached.');
     }
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-
-    let message;
-
     if (authorized === true) {
       await broadcastMessageToOutgoing(data);
-      message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      response = message;
     } else {
-      message = messageHelper.errUnauthorizedMessage();
+      response = messageHelper.errUnauthorizedMessage();
     }
-    res.json(message);
+    res.json(response);
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(
@@ -456,16 +462,14 @@ async function broadcastMessageToOutgoingFromUserPost(req, res) {
       }
       const processedBody = serviceHelper.ensureObject(body);
       const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-
-      let message;
-
       if (authorized === true) {
         await broadcastMessageToOutgoing(processedBody);
-        message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        response = message;
       } else {
-        message = messageHelper.errUnauthorizedMessage();
+        response = messageHelper.errUnauthorizedMessage();
       }
-      res.json(message);
+      res.json(response);
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(
@@ -492,14 +496,14 @@ async function broadcastMessageToIncomingFromUser(req, res) {
     }
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
-    let message;
     if (authorized === true) {
       await broadcastMessageToIncoming(data);
-      message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      response = message;
     } else {
-      message = messageHelper.errUnauthorizedMessage();
+      response = messageHelper.errUnauthorizedMessage();
     }
-    res.json(message);
+    res.json(response);
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(
@@ -528,16 +532,14 @@ async function broadcastMessageToIncomingFromUserPost(req, res) {
       }
       const processedBody = serviceHelper.ensureObject(body);
       const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-
-      let message;
-
       if (authorized === true) {
         await broadcastMessageToIncoming(processedBody);
-        message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        response = message;
       } else {
-        message = messageHelper.errUnauthorizedMessage();
+        response = messageHelper.errUnauthorizedMessage();
       }
-      res.json(message);
+      res.json(response);
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(
@@ -564,16 +566,15 @@ async function broadcastMessageFromUser(req, res) {
     }
     const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
-    let message;
-
     if (authorized === true) {
       await broadcastMessageToOutgoing(data);
       await broadcastMessageToIncoming(data);
-      message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      response = message;
     } else {
-      message = messageHelper.errUnauthorizedMessage();
+      response = messageHelper.errUnauthorizedMessage();
     }
-    res.json(message);
+    res.json(response);
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(
@@ -602,17 +603,15 @@ async function broadcastMessageFromUserPost(req, res) {
       }
       const processedBody = serviceHelper.ensureObject(body);
       const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-
-      let message;
-
       if (authorized === true) {
         await broadcastMessageToOutgoing(processedBody);
         await broadcastMessageToIncoming(processedBody);
-        message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        const message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+        response = message;
       } else {
-        message = messageHelper.errUnauthorizedMessage();
+        response = messageHelper.errUnauthorizedMessage();
       }
-      res.json(message);
+      res.json(response);
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(

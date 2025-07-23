@@ -1,13 +1,10 @@
 const config = require('config');
-
-// we import this first so the caches are instantiated before any other modules
-// are imported
-const cacheManager = require('./utils/cacheManager').default;
 const log = require('../lib/log');
+
 const dbHelper = require('./dbHelper');
 const explorerService = require('./explorerService');
 const fluxCommunication = require('./fluxCommunication');
-const networkStateService = require('./networkStateService');
+const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const appsService = require('./appsService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
@@ -21,7 +18,6 @@ const dockerService = require('./dockerService');
 const backupRestoreService = require('./backupRestoreService');
 const systemService = require('./systemService');
 const fluxNodeService = require('./fluxNodeService');
-// const throughputLogger = require('./utils/throughputLogger');
 
 const apiPort = userconfig.initial.apiport || config.server.apiport;
 const development = userconfig.initial.development || false;
@@ -134,22 +130,9 @@ async function startFluxFunctions() {
     });
     log.info('Mongodb zelnodetransactions dropped');
 
-    networkStateService.start(
-      { stateEmitter: explorerService.getBlockEmitter() },
-    );
-    cacheManager.logCacheSizesEvery(600_000);
-    fluxCommunication.logSocketsEvery(600_000);
-
-    // Uncomment for network interface debug traffic stats. Will move this
-    // to part of the 'debug' setting in a future pull (and auto fetch the interface)
-
-    // const throughput = new throughputLogger.ThroughputLogger(
-    //   (result) => console.log(result),
-    //   { intervalMs: 60_000, matchInterfaces: ['ens18'] },
-    // );
-
-    // await throughput.start();
-
+    setTimeout(() => {
+      fluxCommunicationUtils.constantlyUpdateDeterministicFluxList(); // updates deterministic flux list for communication every 2 minutes, so we always trigger cache and have up to date value
+    }, 15 * 1000);
     setTimeout(async () => {
       const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
       await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
