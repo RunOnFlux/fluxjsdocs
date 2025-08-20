@@ -5,6 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const https = require('https');
 const axios = require('axios');
+const express = require('express');
+const http = require('http');
 // eslint-disable-next-line import/no-extraneous-dependencies
 const nodecmd = require('node-cmd');
 const archiver = require('archiver');
@@ -14,6 +16,7 @@ const systemcrontab = require('crontab');
 const util = require('util');
 const fs = require('fs').promises;
 const execShell = util.promisify(require('child_process').exec);
+const httpShutdown = require('http-shutdown');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const {
@@ -43,14 +46,13 @@ const { invalidMessages } = require('./invalidMessages');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
-const fluxHttpTestServer = require('./utils/fluxHttpTestServer');
 
 const fluxDirPath = path.join(__dirname, '../../../');
 // ToDo: Fix all the string concatenation in this file and use path.join()
 const appsFolderPath = process.env.FLUX_APPS_FOLDER || path.join(fluxDirPath, 'ZelApps');
 const appsFolder = `${appsFolderPath}/`;
 
-const cmdAsync = util.promisify(nodecmd.run);
+const cmdAsync = util.promisify(nodecmd.get);
 const crontabLoad = util.promisify(systemcrontab.load);
 const dockerPullStreamPromise = util.promisify(dockerService.dockerPullStream);
 const dockerStatsStreamPromise = util.promisify(dockerService.dockerContainerStatsStream);
@@ -69,6 +71,10 @@ const globalAppsInstallingErrorsLocations = config.database.appsglobal.collectio
 const supportedArchitectures = ['amd64', 'arm64'];
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
+
+const testingAppExpress = express();
+let testingAppserver = http.createServer(testingAppExpress);
+testingAppserver = httpShutdown(testingAppserver);
 
 const spawnErrorsLongerAppCache = cacheManager.appSpawnErrorCache;
 const trySpawningGlobalAppCache = cacheManager.appSpawnCache;
@@ -3821,7 +3827,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
         hash: appSpecifications.hash, // hash of application specifics that are running
         ip: myIP,
         broadcastedAt,
-        runningSince: new Date(broadcastedAt).toISOString(),
+        runningSince: broadcastedAt,
         osUptime: os.uptime(),
         staticIp: geolocationService.isStaticIP(),
       };
@@ -5774,8 +5780,8 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
  * @returns {boolean} True if no errors are thrown.
  */
 function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
-  const minPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMin : config.fluxapps.portMinLegacy;
-  const maxPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMax : config.fluxapps.portMaxLegacy;
+  const minPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
+  const maxPort = height >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
   if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6 && appSpecifications.version !== 7 && appSpecifications.version !== 8) {
     throw new Error('Flux App message version specification is invalid');
   }
@@ -6759,7 +6765,13 @@ async function getPreviousAppSpecifications(specifications, verificationTimestam
   if (!appSpecs) {
     throw new Error(`Previous specifications for ${specifications.name} update message does not exists! This should not happen.`);
   }
-  return appSpecs;
+  const heightForDecrypt = latestPermanentRegistrationMessage.height;
+  // eslint-disable-next-line no-use-before-define
+  const decryptedPrev = await checkAndDecryptAppSpecs(appSpecs, { daemonHeight: heightForDecrypt });
+  // eslint-disable-next-line no-use-before-define
+  const formattedPrev = specificationFormatter(decryptedPrev);
+  
+  return formattedPrev;
 }
 
 /**
@@ -10795,11 +10807,8 @@ async function getPeerAppsInstallingErrorMessages() {
       }));
       const dbopen = dbHelper.databaseConnection();
       const database = dbopen.db(config.database.appsglobal.database);
-      // Only perform bulk write if there are operations to execute
-      if (operations.length > 0) {
-        // eslint-disable-next-line no-await-in-loop
-        await dbHelper.bulkWriteInDatabase(database, globalAppsInstallingErrorsLocations, operations);
-      }
+      // eslint-disable-next-line no-await-in-loop
+      await dbHelper.bulkWriteInDatabase(database, globalAppsInstallingErrorsLocations, operations);
       finished = true;
     }
   } catch (error) {
@@ -11504,7 +11513,7 @@ async function checkAndNotifyPeersOfRunningApps() {
       for (const application of applicationsToBroadcast) {
         const queryFind = { name: application.name, ip: myIP };
         const projection = { _id: 0, runningSince: 1 };
-        let runningOnMyNodeSince = new Date().toISOString();
+        let runningOnMyNodeSince = Date.now();
         // we already have the exact same data
         // eslint-disable-next-line no-await-in-loop
         const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
@@ -12374,16 +12383,7 @@ async function getAppFluxOnChainPrice(appSpecification) {
  */
 async function checkFreeAppUpdate(appSpecFormatted, daemonHeight) {
   // check if it's a free app update offered by the network
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  // may throw
-  let query = { name: appSpecFormatted.name };
-  const projection = {
-    projection: {
-      _id: 0,
-    },
-  };
-  const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
+  const appInfo = await getApplicationGlobalSpecifications(appSpecFormatted.name);
   if (appInfo && appInfo.expire && appInfo.height && appSpecFormatted.expire) {
     const blocksToExtend = (appSpecFormatted.expire + Number(daemonHeight)) - appInfo.height - appInfo.expire;
     if (((!appSpecFormatted.nodes && !appInfo.nodes) || (appSpecFormatted.nodes && appInfo.nodes && appSpecFormatted.nodes.length === appInfo.nodes.length))
@@ -12399,7 +12399,14 @@ async function checkFreeAppUpdate(appSpecFormatted, daemonHeight) {
           }
         }
         if (!changes) {
+          const db = dbHelper.databaseConnection();
+          const database = db.db(config.database.appsglobal.database);
           query = { 'appSpecifications.name': appSpecFormatted.name };
+          const projection = {
+            projection: {
+              _id: 0,
+            },
+          };
           const permanentAppMessage = await dbHelper.findInDatabase(database, globalAppsMessages, query, projection);
           let messagesInLasDays = permanentAppMessage.filter((message) => (message.type === 'fluxappupdate' || message.type === 'zelappupdate') && message.height > daemonHeight - 3600);
           // we will give a maximum of 10 free updates in 5 days, 8 in two days, 5 in one day
@@ -12847,7 +12854,8 @@ async function deploymentInformation(req, res) {
     }
     // search in chainparams db for chainmessages of p version
     const appPrices = await getChainParamsPriceUpdates();
-    const { fluxapps: { minPort, maxPort } } = config;
+    const minPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMinNew : config.fluxapps.portMin;
+    const maxPort = daemonHeight >= config.fluxapps.portBlockheightChange ? config.fluxapps.portMaxNew : config.fluxapps.portMax;
     const information = {
       price: appPrices,
       appSpecsEnforcementHeights: config.fluxapps.appSpecsEnforcementHeights,
@@ -14146,19 +14154,21 @@ async function callOtherNodeToKeepUpnpPortsOpen() {
 /**
  *
  * @param {Number} testingPort The target port
- * @param {http.Server} testHttpServer The test http server
  * @param {{skipFirewall?: Boolean, skipUpnp?: Boolean, skipHttpServer?: Boolean}} options Options
  */
-async function handleTestShutdown(testingPort, testHttpServer, options = {}) {
+async function handleTestShutdown(testingPort, options = {}) {
   const skipFirewall = options.skipFirewall || false;
   const skipUpnp = options.skipUpnp || false;
   const skipHttpServer = options.skipHttpServer || false;
 
-  // fail open on the firewall check
-  const updateFirewall = skipFirewall
-    ? false
-    : isArcane
-    || await fluxNetworkHelper.isFirewallActive().catch(() => true);
+  const updateFirewall = skipFirewall ? false : await fluxNetworkHelper
+    .isFirewallActive()
+    .catch((e) => {
+      log.error(e);
+      // if we can't determine if the firewall is active or not, we just try
+      // to remove it anyway
+      return true;
+    });
 
   if (updateFirewall) {
     await fluxNetworkHelper
@@ -14173,100 +14183,80 @@ async function handleTestShutdown(testingPort, testHttpServer, options = {}) {
   }
 
   if (!skipHttpServer) {
-    testHttpServer.close((err) => {
+    testingAppserver.removeAllListeners();
+    testingAppserver.shutdown((err) => {
       if (err) {
-        log.error(`testHttpServer shutdown failed: ${err.message}`);
+        log.error(`testingAppserver shutdown failed: ${err.message}`);
       }
     });
   }
 }
 
-let testingPort = null;
-let originalPortFailed = null;
-let lastUPNPMapFailed = false;
-let nextTestingPort = Math.floor(Math.random() * (25000 - 10000 + 1)) + 10000;
-const portsNotWorking = new Set();
+// any function that uses module level globals to keep state should be moved to
+//  a class.
 
 /**
- * Periodically check that our applications port range is usable. I.e, we open
- * the firewall, map the port (if UPnP) and set up a TCP listener on the port.
- * We then request another node validate that we respond with a SYN-ACK when
- * they send a SYN.
- * @returns {Promise<void>}
+ * Periodically check for our applications port range is available
  */
+// changed this to a set. Means we don't have to worry about duplicates etc
+const portsNotWorking = new Set();
+let testingPort = null;
+let originalPortFailed = false;
+let lastUPNPMapFailed = false;
+let setPortToTest = Math.floor(Math.random() * (25000 - 10000 + 1)) + 10000;
 async function checkMyAppsAvailability() {
-  /**
-   * default timeout = 1h     - Normal state  \
-   * error timeout = 60s      - Something unexpected happened  \
-   * failure timeout = 15s    - Our port testing failed  \
-   * dos timeout = 5m         - We're DOS  \
-   * app error = 4m           - Something on the fluxNode is broken
-   */
-  const timeouts = {
-    default: 3_600_000,
-    error: 60_000,
-    failure: 15_000,
-    dos: 300_000,
-    appError: 240_000,
-  };
-
-  /**
-   * dos              - Dos is a number between 0-100. The threshold is the upper limit
-   * ports high edge  - The upper limit after which the dos counter will increment
-   * ports low edge   - The lower limit after which the node can resume normal state
-   */
-  const thresholds = {
-    dos: 100,
-    portsHighEdge: 100,
-    portsLowEdge: 80,
-  };
-
-  if (dosMountMessage || dosDuplicateAppMessage) {
-    dosMessage = dosMountMessage || dosDuplicateAppMessage;
-    dosState = thresholds.dos;
-
-    await serviceHelper.delay(timeouts.appError);
-    setImmediate(checkMyAppsAvailability);
-    return;
-  }
-
   const isUpnp = upnpService.isUPNP();
-  const testHttpServer = new fluxHttpTestServer.FluxHttpTestServer();
 
-  /**
-   * Sets the next port if we come across a port that is banned or excluded etc
-   *
-   * @returns {void}
-   */
   const setNextPort = () => {
     if (originalPortFailed && testingPort > originalPortFailed) {
-      nextTestingPort = originalPortFailed - 1;
-    } else {
-      nextTestingPort = null;
+      setPortToTest = originalPortFailed - 1;
+    } else if (originalPortFailed) {
+      setPortToTest = null;
       originalPortFailed = null;
     }
   };
 
-  /**
-   * Picks a random port from the existing set of not working ports
-   *
-   * @returns {Array} The array of not working ports. Just so any caller
-   * doesn't have to convert to an Array
-   */
-  const setRandomPort = () => {
-    const ports = Array.from(portsNotWorking);
-    const randomIndex = Math.floor(Math.random() * ports.length);
-    nextTestingPort = ports[randomIndex];
-
-    return ports;
-  };
-
   try {
+    const dbopen = dbHelper.databaseConnection();
+    const database = dbopen.db(config.database.daemon.database);
+    const query = { generalScannedHeight: { $gte: 0 } };
+    const projection = {
+      projection: {
+        _id: 0,
+        generalScannedHeight: 1,
+      },
+    };
+
+    const currentHeight = await dbHelper.findOneInDatabase(
+      database,
+      scannedHeightCollection,
+      query,
+      projection,
+    );
+
+    if (!currentHeight) {
+      // removed the throw here. Just keep the control flow in the loop
+      log.error('No scanned height found');
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
+
+    if (dosMountMessage || dosDuplicateAppMessage) {
+      dosMessage = dosMountMessage || dosDuplicateAppMessage;
+      dosState = 100;
+      // added a sleep and recurse here, I assume it's possible for the DOS level to get
+      // remove elsewhere, so we should check this again.
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
+
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
     if (!syncStatus.data.synced) {
       log.info('Flux Node daemon not synced. Application checks are disabled');
-      await serviceHelper.delay(timeouts.appError);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
@@ -14275,29 +14265,32 @@ async function checkMyAppsAvailability() {
 
     if (!isNodeConfirmed) {
       log.info('Flux Node not Confirmed. Application checks are disabled');
-      await serviceHelper.delay(timeouts.appError);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
     const localSocketAddress = await fluxNetworkHelper.getMyFluxIPandPort();
     if (!localSocketAddress) {
       log.info('No Public IP found. Application checks are disabled');
-      await serviceHelper.delay(timeouts.appError);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
+    const [myIP, myPort = '16127'] = localSocketAddress.split(':');
+
     const installedAppsRes = await installedApps();
     if (installedAppsRes.status !== 'success') {
+      // removed the throw here. Keep the control flow local.
       log.error('Failed to get installed Apps');
-
-      await serviceHelper.delay(timeouts.appError);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
     const apps = installedAppsRes.data;
+    const pubKey = await fluxNetworkHelper.getFluxNodePublicKey();
     const appPorts = [];
 
     apps.forEach((app) => {
@@ -14316,89 +14309,74 @@ async function checkMyAppsAvailability() {
       }
     });
 
-    if (nextTestingPort) {
-      testingPort = nextTestingPort;
+    if (setPortToTest) {
+      testingPort = setPortToTest;
     } else {
-      const { fluxapps: { portMin, portMax } } = config;
+      const minPort = currentHeight.generalScannedHeight
+        >= config.fluxapps.portBlockheightChange
+        ? config.fluxapps.portMinNew
+        : config.fluxapps.portMin - 1000;
 
-      testingPort = Math.floor(Math.random() * (portMax - portMin) + portMin);
+      const maxPort = currentHeight.generalScannedHeight
+        >= config.fluxapps.portBlockheightChange
+        ? config.fluxapps.portMaxNew
+        : config.fluxapps.portMax;
+
+      testingPort = Math.floor(Math.random() * (maxPort - minPort) + minPort);
     }
 
-    log.info(`checkMyAppsAvailability - Testing port ${testingPort}`);
+    log.info(`checkMyAppsAvailability - Testing port ${testingPort}.`);
+    let iBP = fluxNetworkHelper.isPortBanned(testingPort);
 
-    const isPortBanned = fluxNetworkHelper.isPortBanned(testingPort);
-
-    if (isPortBanned) {
+    if (iBP) {
       log.info(
-        `checkMyAppsAvailability - Testing port ${testingPort} is banned`,
+        `checkMyAppsAvailability - Testing port ${testingPort} is banned.`,
       );
 
       setNextPort();
-      await serviceHelper.delay(timeouts.failure);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
     if (isUpnp) {
-      const isPortUpnpBanned = fluxNetworkHelper.isPortUPNPBanned(testingPort);
-
-      if (isPortUpnpBanned) {
+      iBP = fluxNetworkHelper.isPortUPNPBanned(testingPort);
+      if (iBP) {
         log.info(
-          `checkMyAppsAvailability - Testing port ${testingPort} is UPNP banned`,
+          `checkMyAppsAvailability - Testing port ${testingPort} is UPNP banned.`,
         );
 
         setNextPort();
-        await serviceHelper.delay(timeouts.failure);
-        setImmediate(checkMyAppsAvailability);
+        await serviceHelper.delay(15 * 1000);
+        checkMyAppsAvailability();
         return;
       }
     }
 
     const isPortUserBlocked = fluxNetworkHelper.isPortUserBlocked(testingPort);
-
     if (isPortUserBlocked) {
       log.info(
-        `checkMyAppsAvailability - Testing port ${testingPort} is user blocked`,
+        `checkMyAppsAvailability - Testing port ${testingPort} is user blocked.`,
       );
 
       setNextPort();
-      await serviceHelper.delay(timeouts.failure);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
     if (appPorts.includes(testingPort)) {
       log.info(
-        `checkMyAppsAvailability - Skipped checking ${testingPort} - in use`,
+        `checkMyAppsAvailability - Skipped checking ${testingPort} - in use.`,
       );
 
       setNextPort();
-      await serviceHelper.delay(timeouts.failure);
-      setImmediate(checkMyAppsAvailability);
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
-    const remoteSocketAddress = await networkStateService.getRandomSocketAddress(
-      localSocketAddress,
-    );
-
-    if (!remoteSocketAddress) {
-      await serviceHelper.delay(timeouts.appError);
-      setImmediate(checkMyAppsAvailability);
-      return;
-    }
-
-    if (failedNodesTestPortsCache.has(remoteSocketAddress)) {
-      // same as above. This is unlikley, just wait the 15 seconds
-      await serviceHelper.delay(timeouts.failure);
-      setImmediate(checkMyAppsAvailability);
-      return;
-    }
-
-    const firewallActive = isArcane
-      ? true
-      : await fluxNetworkHelper.isFirewallActive();
-
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
       await fluxNetworkHelper.allowPort(testingPort);
     }
@@ -14409,271 +14387,258 @@ async function checkMyAppsAvailability() {
         'Flux_Test_App',
       );
 
-      // upnp dos takes precedence over both port dos and others
       if (!upnpMapResult) {
         if (lastUPNPMapFailed) {
-          dosState += 4;
-          if (dosState >= thresholds.dos) {
-            dosMessage = 'Not possible to run applications on the node, '
-              + 'router returning exceptions when creating UPNP ports mappings';
+          dosState += 0.4;
+          if (dosState > 10) {
+            dosMessage = 'Not possible to run applications on the node, router returning exceptions when creating UPNP ports mappings.';
           }
         }
         lastUPNPMapFailed = true;
         log.info(
-          `checkMyAppsAvailability - Testing port ${testingPort} `
-          + 'failed to create UPnP mapping',
+          `checkMyAppsAvailability - Testing port ${testingPort} failed to create on UPnP mappings`,
         );
 
         setNextPort();
 
-        await handleTestShutdown(testingPort, testHttpServer, {
+        await handleTestShutdown(testingPort, {
           skipFirewall: !firewallActive,
           skipUpnp: true,
           skipHttpServer: true,
         });
 
+        // changed this to two minutes if we are not DOS (and 15 minutes otherwise).
         // If we are failing mappings, we still need o fail 25 times before we go DOS.
-        const upnpDelay = dosMessage ? timeouts.dos : timeouts.error;
+        const upnpDelay = dosMessage ? 15 * 60 * 1000 : 2 * 60 * 1000;
         await serviceHelper.delay(upnpDelay);
-        setImmediate(checkMyAppsAvailability);
+        checkMyAppsAvailability();
         return;
       }
-
       lastUPNPMapFailed = false;
     }
 
-    // Tested: This catches EADDRINUSE. Previously, this was crashing the entire app
-    // note - if you kill the port with:
-    //    ss --kill state listening src :<the port>
-    // nodeJS does not raise an error.
-    const listening = new Promise((resolve, reject) => {
-      testHttpServer
-        .once('error', (err) => {
-          testHttpServer.removeAllListeners('listening');
-          reject(err.message);
-        })
-        .once('listening', () => {
-          testHttpServer.removeAllListeners('error');
-          resolve(null);
-        });
-      testHttpServer.listen(testingPort);
-    });
+    await serviceHelper.delay(5 * 1000);
 
-    const error = await listening.catch((err) => err);
-
-    if (error) {
-      log.warn(`Unable to listen on port: ${testingPort}.Error: ${error}`);
-
-      setNextPort();
-
-      await handleTestShutdown(testingPort, testHttpServer, {
-        skipFirewall: !firewallActive,
-        skipUpnp: !isUpnp,
-        skipHttpServer: true,
+    // these event listeners need to be removed on every iteration to prevent a
+    // memory leak
+    testingAppserver
+      .listen(testingPort)
+      .on('error', (err) => {
+        throw err.message;
+      })
+      .on('uncaughtException', (err) => {
+        throw err.message;
       });
 
-      await serviceHelper.delay(timeouts.error);
-      setImmediate(checkMyAppsAvailability);
+    await serviceHelper.delay(10 * 1000);
+
+    const randomSocketAddress = await networkStateService.getRandomSocketAddress(localSocketAddress);
+
+    if (!randomSocketAddress) {
+      await handleTestShutdown(testingPort, {
+        skipFirewall: !firewallActive,
+        skipUpnp: !isUpnp,
+      });
+      // changed this to 4 minutes. If we can't get a random connection, we have
+      // other problems. (i.e. it's an error state, or node just started)
+      await serviceHelper.delay(4 * 60 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
-    // The other end only waits 5 seconds anyway
-    const timeout = 10_000;
-    // we set an empty content-type header here. This is for when we fix
-    // the api, that the checkappavailability call will work will old and new
-    // nodes while we transition
+    const [askingIP, askingIpPort = '16127'] = randomSocketAddress.split(':');
+
+    if (myIP === askingIP) {
+      await handleTestShutdown(testingPort, {
+        skipFirewall: !firewallActive,
+        skipUpnp: !isUpnp,
+      });
+      // safer just to wait here, no harm in waiiting 15 seconds in unlikely event
+      // that we pull ourselves from the list (or we should just remove it first)
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
+
+    if (failedNodesTestPortsCache.has(askingIP)) {
+      await handleTestShutdown(testingPort, {
+        skipFirewall: !firewallActive,
+        skipUpnp: !isUpnp,
+      });
+      // same as above. This is unlikley, just wait the 15 seconds
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
+      return;
+    }
+
+    const timeout = 30000;
     const axiosConfig = {
       timeout,
-      headers: {
-        'content-type': '',
-      },
     };
 
-    const pubKey = await fluxNetworkHelper.getFluxNodePublicKey();
-    const [localIp, localPort = '16127'] = localSocketAddress.split(':');
-    const [remoteIp, remotePort = '16127'] = remoteSocketAddress.split(':');
-
     const data = {
-      ip: localIp,
-      port: localPort,
+      ip: myIP,
+      port: myPort,
       appname: 'appPortsTest',
       ports: [testingPort],
       pubKey,
     };
-
-    const signature = await signCheckAppData(JSON.stringify(data));
+    const stringData = JSON.stringify(data);
+    const signature = await signCheckAppData(stringData);
     data.signature = signature;
 
+    // this will be problematic in the future (when we fix the api to respect
+    // content-type headers). As we are stringifying the data, axios doesn't
+    // add the appropriate header. (i.e. stop stringifying)
     const resMyAppAvailability = await axios
       .post(
-        `http://${remoteIp}:${remotePort}/flux/checkappavailability`,
+        `http://${askingIP}:${askingIpPort}/flux/checkappavailability`,
         JSON.stringify(data),
         axiosConfig,
       )
       .catch(() => {
         log.error(
-          `checkMyAppsAvailability - ${remoteSocketAddress} `
-          + 'for app availability is not reachable',
+          `checkMyAppsAvailability - ${askingIP} for app availability is not reachable`,
         );
-        nextTestingPort = testingPort;
-        failedNodesTestPortsCache.set(remoteSocketAddress, '');
+        setPortToTest = testingPort;
+        failedNodesTestPortsCache.set(askingIP, '');
         return null;
       });
 
-    await handleTestShutdown(testingPort, testHttpServer, {
-      skipFirewall: !firewallActive,
-      skipUpnp: !isUpnp,
-    });
-
     if (!resMyAppAvailability) {
-      await serviceHelper.delay(timeouts.failure);
-      setImmediate(checkMyAppsAvailability);
+      await handleTestShutdown(testingPort, {
+        skipFirewall: !firewallActive,
+        skipUpnp: !isUpnp,
+      });
+      await serviceHelper.delay(15 * 1000);
+      checkMyAppsAvailability();
       return;
     }
 
-    // at this point - testing is complete. Analyze the result and set up the
-    // next test (if applicable)
+    let portTestFailed = false;
+    if (resMyAppAvailability.data.status === 'error') {
+      log.warn(
+        `checkMyAppsAvailability - Applications port range unavailability detected from ${askingIP}:${askingIpPort} on ${testingPort}`,
+      );
 
-    const {
-      data: {
-        status: responseStatus = null,
-        data: { message: responseMessasge = 'No response' } = {
-          message: 'No response',
-        },
-      },
-    } = resMyAppAvailability;
+      log.warn(JSON.stringify(data));
 
-    if (!['success', 'error'].includes(responseStatus)) {
-      // we retry the same port but with another node
-      log.warning('checkMyAppsAvailability - Unexpected response '
-        + `status: ${responseStatus}`);
+      portTestFailed = true;
+      dosState += 0.4;
 
-      await serviceHelper.delay(timeouts.error);
-      setImmediate(checkMyAppsAvailability);
-      return;
-    }
-
-    /**
-     * States
-     *
-     * Normal
-     *   No broken ports, or broken ports less than 80 and a "good" port test
-     * Normal - Rising edge
-     *   I.e. broken ports increasing but threshold not reached. This state could
-     *   also be considered normal, and could take many many hours to cross the threshold
-     * Failed - Rising edge
-     *   Threshold crossed. There are 100 ports in portsNotWorking. At this time the
-     *   dosState starts rising 4 per fail. (takes 25 ports once in this state to DOS)
-     * Failed - DOS
-     *    There are 100 ports in the portsNotWorking array. 25 of those ports
-     *   have failed a second time. Node is in DOS state.
-     * Failed - Lowering edge
-     *   Same as failed, however the node is now considered "working" and is removing
-     *   ports from the portsNotWorking array. It will remain in this state until 20 ports
-     *   have been removed from the portsNotWorking array. (hysteresis) Once this happens, the node
-     *   is then considered in the "normal" state - and the portsNotWorking array is cleared
-     */
-
-    const portTestFailed = responseStatus === 'error';
-    let waitMs = 0;
-
-    if (portTestFailed && portsNotWorking.size < thresholds.portsHighEdge) {
-      // Normal - Rising edge
-      portsNotWorking.add(testingPort);
-
+      // this is what actually sets the port to test on the next iteration (if
+      // no broken ports have been found)
       if (!originalPortFailed) {
         originalPortFailed = testingPort;
-        nextTestingPort = testingPort < 65535 ? testingPort + 1 : testingPort - 1;
+        setPortToTest = testingPort < 65535 ? testingPort + 1 : testingPort - 1;
       } else if (
         testingPort >= originalPortFailed
         && testingPort + 1 <= 65535
       ) {
-        nextTestingPort = testingPort + 1;
+        setPortToTest = testingPort + 1;
       } else if (testingPort - 1 > 0) {
-        nextTestingPort = testingPort - 1;
+        setPortToTest = testingPort - 1;
       } else {
-        nextTestingPort = null;
+        setPortToTest = null;
         originalPortFailed = null;
       }
-
-      waitMs = timeouts.failure;
-    } else if (portTestFailed && dosState < thresholds.dos) {
-      // Failed - Rising edge (by default takes 25 of these to get to 100)
-      dosState += 4;
-      setRandomPort();
-
-      waitMs = timeouts.failure;
-    } else if (portTestFailed && dosState >= thresholds.dos) {
-      // Failed - DOS. At this point - all apps will be removed off node
-      // by monitorNodeStatus
-      const failedPorts = setRandomPort();
-
-      // this dosMessage takes priority over dosMountMessage or dosDuplicateAppMessage
-      dosMessage = 'Ports tested not reachable from outside, DMZ or UPNP '
-        + `required! All ports that have failed: ${JSON.stringify(
-          failedPorts,
-        )}`;
-
-      waitMs = timeouts.dos;
-    } else if (!portTestFailed && portsNotWorking.size > thresholds.portsLowEdge) {
-      // Failed - Lowering edge, the hysteresis stops bouncing between states
-      portsNotWorking.delete(testingPort);
-      setRandomPort();
-
-      waitMs = timeouts.failure;
-    } else {
-      // Normal. This means that if we have less than 80 ports failed
-      // (and we haven't gone DOS), and we get a good port, it will reset
-      // the not working list
-      portsNotWorking.clear();
-      nextTestingPort = null;
-      originalPortFailed = null;
-      // we have to set this here. As the mount or duplicate messages could be set
-      // in between when we last checked and now
-      dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
-      dosState = dosMessage ? thresholds.dos : 0;
-
-      waitMs = timeouts.default;
-    }
-
-    if (portTestFailed) {
-      log.error(
-        `checkMyAppsAvailability - Port ${testingPort} unreachable. `
-        + `Detected from ${remoteIp}:${remotePort}. DosState: ${dosState}`,
-      );
-    } else {
+    } else if (
+      resMyAppAvailability.data.status === 'success'
+    ) {
       log.info(
-        `${responseMessasge} Detected from ${remoteIp}:${remotePort} on `
-        + `port ${testingPort}. DosState: ${dosState}`,
+        `${resMyAppAvailability.data.data.message} Detected from ${askingIP}:${askingIpPort} on ${testingPort}`,
       );
+
+      // We have found a good working port. So we start iterating downwards to either
+      // find more broken ports, or a good port, where we reset
+      if (
+        originalPortFailed
+        && originalPortFailed >= testingPort
+        && originalPortFailed - 1 > 0
+      ) {
+        setPortToTest = originalPortFailed - 1;
+      } else {
+        setPortToTest = null;
+        originalPortFailed = null;
+      }
+    } else {
+      // we shouldn't get here, but just in case we clean up and retry
+      await handleTestShutdown(testingPort, {
+        skipFirewall: !firewallActive,
+        skipUpnp: !isUpnp,
+      });
+      await serviceHelper.delay(2 * 60 * 1000);
+      checkMyAppsAvailability();
     }
 
-    if (portsNotWorking.size) {
-      log.error(
-        `checkMyAppsAvailability - Count: ${portsNotWorking.size}. `
-        + `portsNotWorking: ${JSON.stringify(
-          Array.from(portsNotWorking),
-        )}`,
-      );
+    if (dosState > 10) {
+      dosMessage = `Ports tested not reachable from outside, DMZ or UPNP required! All ports that have failed: ${JSON.stringify(
+        Array.from(portsNotWorking),
+      )}`;
     }
 
-    await serviceHelper.delay(waitMs);
-    setImmediate(checkMyAppsAvailability);
+    await handleTestShutdown(testingPort, {
+      skipFirewall: !firewallActive,
+      skipUpnp: !isUpnp,
+    });
+
+    if (!portTestFailed) {
+      dosState = 0;
+      dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
+
+      portsNotWorking.delete(testingPort);
+
+      // this was based off the setPortToTest. However, what was happening, if we
+      // are selecting random ports from the list, there is a good chance that the
+      // port is below the original port, and it would go back to 1 hour checks
+      // even if a single port passed. So changed this to allow for 20 not working
+      // ports, before going back to 1 hour
+      const waitMs = portsNotWorking.size > 20 ? 1 * 60 * 1000 : 60 * 60 * 1000;
+      await serviceHelper.delay(waitMs);
+      checkMyAppsAvailability();
+      return;
+    }
+
+    // we use this to get the index and for logging
+    const ports = Array.from(portsNotWorking);
+
+    if (portsNotWorking.size < 100) {
+      portsNotWorking.add(testingPort);
+      // we just append this so the error logging is correct
+      ports.push(testingPort);
+      dosState = 0;
+      dosMessage = dosMountMessage || dosDuplicateAppMessage || null;
+      await serviceHelper.delay(15 * 1000);
+    } else {
+      // Moved the port add / slice to the success state. Having it here was mutating
+      // the portsNotWorking array on each iteration (i.e. bouncing 100 / 101 items)
+      const randomIndex = Math.floor(Math.random() * ports.length);
+      setPortToTest = ports[randomIndex];
+      await serviceHelper.delay(1 * 60 * 1000);
+    }
+
+    log.error(
+      `checkMyAppsAvailability - portsNotWorking ${JSON.stringify(
+        ports,
+      )}.`,
+    );
+
+    checkMyAppsAvailability();
   } catch (error) {
     // this whole catch block is problematic. We are assuming that the rules have been
     // allowed, the rule has been mapped, and that the testing server has been
     // started. While all of these are then caught, we're logging errors that
     // aren't necessary. We should only remove stuff if it's been added. (and just
     // catch the errors as they are happening instead of using a catch all block)
-    if (!dosMessage && (dosMountMessage || dosDuplicateAppMessage)) {
+    if (dosMountMessage || dosDuplicateAppMessage) {
       dosMessage = dosMountMessage || dosDuplicateAppMessage;
     }
 
-    await handleTestShutdown(testingPort, testHttpServer, { skipUpnp: !isUpnp });
+    await handleTestShutdown(testingPort, { skipUpnp: !isUpnp });
 
     log.error(`checkMyAppsAvailability - Error: ${error}`);
-    await serviceHelper.delay(timeouts.appError);
-    setImmediate(checkMyAppsAvailability);
+    await serviceHelper.delay(4 * 60 * 1000);
+    checkMyAppsAvailability();
   }
 }
 
@@ -14682,8 +14647,9 @@ async function checkMyAppsAvailability() {
  * @param {array} portsToTest array of ports we will be testing
  * @returns boolean if ports are publicly available. So app installation can proceed
  */
+let beforeAppInstallTestingServers = [];
 async function checkInstallingAppPortAvailable(portsToTest = []) {
-  const beforeAppInstallTestingServers = [];
+  beforeAppInstallTestingServers = [];
   const isUPNP = upnpService.isUPNP();
   let portsStatus = false;
   try {
@@ -14731,36 +14697,18 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
           throw new Error('Failed to create map UPNP port');
         }
       }
-      const testHttpServer = new fluxHttpTestServer.FluxHttpTestServer();
-
+      const beforeAppInstallTestingExpress = express();
+      let beforeAppInstallTestingServer = http.createServer(beforeAppInstallTestingExpress);
+      beforeAppInstallTestingServer = httpShutdown(beforeAppInstallTestingServer);
       // eslint-disable-next-line no-await-in-loop
       await serviceHelper.delay(5 * 1000);
-
-      beforeAppInstallTestingServers.push(testHttpServer);
-
-      // Tested: This catches EADDRINUSE. Previously, this was crashing the entire app
-      // note - if you kill the port with:
-      //    ss --kill state listening src :<the port>
-      // nodeJS does not raise an error.
-      const listening = new Promise((resolve, reject) => {
-        testHttpServer
-          .once('error', (err) => {
-            testHttpServer.removeAllListeners('listening');
-            reject(err.message);
-          })
-          .once('listening', () => {
-            testHttpServer.removeAllListeners('error');
-            resolve(null);
-          });
-        testHttpServer.listen(portToTest);
+      beforeAppInstallTestingServers.push(beforeAppInstallTestingServer);
+      beforeAppInstallTestingServer.listen(portToTest).on('error', (err) => {
+        throw err.message;
+      }).on('uncaughtException', (err) => {
+        throw err.message;
       });
-
-      // eslint-disable-next-line no-await-in-loop
-      const error = await listening.catch((err) => err);
-
-      if (error) throw error;
     }
-
     await serviceHelper.delay(10 * 1000);
     const timeout = 30000;
     const axiosConfig = {
@@ -14782,9 +14730,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
     while (!finished && i < 5) {
       i += 1;
       // eslint-disable-next-line no-await-in-loop
-      const randomSocketAddress = await networkStateService.getRandomSocketAddress(
-        localSocketAddress,
-      );
+      const randomSocketAddress = await networkStateService.getRandomSocketAddress(localSocketAddress);
 
       // this should never happen as the list should be populated here
       if (!randomSocketAddress) {
@@ -14807,7 +14753,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
             // if we aren't already testing ports, we set it here, otherwise, just continue
             if (!originalPortFailed) {
               originalPortFailed = portToRetest;
-              nextTestingPort = portToRetest < 65535 ? testingPort + 1 : testingPort - 1;
+              setPortToTest = portToRetest < 65535 ? testingPort + 1 : testingPort - 1;
             }
           }
         }
@@ -14831,7 +14777,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       }
     }
     beforeAppInstallTestingServers.forEach((beforeAppInstallTestingServer) => {
-      beforeAppInstallTestingServer.close((err) => {
+      beforeAppInstallTestingServer.shutdown((err) => {
         if (err) {
           log.error(`beforeAppInstallTestingServer Shutdown failed: ${err.message}`);
         }
