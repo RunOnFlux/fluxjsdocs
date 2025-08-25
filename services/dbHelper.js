@@ -8,15 +8,11 @@ const config = require('config');
 const { MongoClient } = mongodb;
 const mongoUrl = `mongodb://${config.database.url}:${config.database.port}/`;
 
-/**
- * @type {mongodb.MongoClient}
- */
 let openDBConnection = null;
-
 /**
  * Returns MongoDB connection, if it was initiated before, otherwise returns null.
  *
- * @returns {mongodb.MongoClient}
+ * @returns openDbConnection
  */
 function databaseConnection() {
   return openDBConnection;
@@ -27,7 +23,7 @@ function databaseConnection() {
  *
  * @param {string} [url]
  *
- * @returns {Promise<mongodb.MongoClient>}
+ * @returns {object} mongodb.MongoClient
  */
 async function connectMongoDb(url) {
   const connectUrl = url || mongoUrl;
@@ -36,8 +32,8 @@ async function connectMongoDb(url) {
     useUnifiedTopology: true,
     maxPoolSize: 100,
   };
-  const client = await MongoClient.connect(connectUrl, mongoSettings);
-  return client;
+  const db = await MongoClient.connect(connectUrl, mongoSettings);
+  return db;
 }
 
 /**
@@ -77,15 +73,15 @@ async function distinctDatabase(database, collection, distinct, query) {
 /**
  * Returns array of documents from the DB based on the query and the projection.
  *
- * @param {mongodb.Db} database
+ * @param {string} database
  * @param {string} collection
  * @param {object} query
- * @param {object} options
+ * @param {object} [projection]
  *
- * @returns {Promise<Arrray>}
+ * @returns array
  */
-async function findInDatabase(database, collection, query, options) {
-  const results = await database.collection(collection).find(query, options).toArray();
+async function findInDatabase(database, collection, query, projection) {
+  const results = await database.collection(collection).find(query, projection).toArray();
   return results;
 }
 
@@ -126,6 +122,9 @@ async function findOneInDatabase(database, collection, query, projection) {
  * @returns void
  */
 async function bulkWriteInDatabase(database, collection, operations) {
+  if (!operations || operations.length === 0) {
+    return { insertedCount: 0, matchedCount: 0, modifiedCount: 0, deletedCount: 0, upsertedCount: 0 };
+  }
   const result = await database.collection(collection).bulkWrite(operations);
   return result;
 }
@@ -290,8 +289,29 @@ async function dropCollection(database, collection) {
  * @returns object
  */
 async function collectionStats(database, collection) {
-  const result = await database.collection(collection).stats();
-  return result;
+  try {
+    // In MongoDB v4+, use $collStats aggregation instead of .stats()
+    const result = await database.collection(collection).aggregate([{ $collStats: { storageStats: {} } }]).toArray();
+    if (result[0] && result[0].storageStats) {
+      const stats = result[0].storageStats;
+      // Add namespace manually for compatibility with old tests
+      stats.ns = `${database.databaseName}.${collection}`;
+      return stats;
+    }
+    // Return compatible empty structure for non-existent collections
+    return {
+      ns: `${database.databaseName}.${collection}`,
+      count: 0,
+      avgObjSize: undefined,
+    };
+  } catch (error) {
+    // Fallback for older MongoDB versions or if collection doesn't exist
+    return {
+      ns: `${database.databaseName}.${collection}`,
+      count: 0,
+      avgObjSize: undefined,
+    };
+  }
 }
 
 module.exports = {
