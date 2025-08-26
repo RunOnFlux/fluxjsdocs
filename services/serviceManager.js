@@ -91,7 +91,18 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsTemporaryMessages).createIndex({ receivedAt: 1 }, { expireAfterSeconds: 3600 }); // todo longer time? dropIndexes()
     log.info('Temporary database prepared');
     log.info('Preparing Flux Apps locations');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).dropIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash' }).catch(() => { console.log('Welcome to FluxOS'); }); // drop old index or display message for new installations
+
+    // ToDo: Fix all these broken database drops / index creations / removals all over the place. The prior dropIndex was removing the
+    // index entirely so there was no index at all!
+
+    // The below index is created in the Explorer Service. We need to remove all the database indexing from the Explorer Service.
+    // It's not the explorer service's responsibility, and other services need these indexes before Explorer Service creates them.
+
+    // It should be the dbService's responsibility that the db is in a state fit for use.
+
+    // we have to create this index again here, as we need it to repair the db. As we were deleting this on every reboot (and it was only created when scannedHeight was 0)
+    // Creating an index that already exists is a no-op
+    await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.version': 1 }, { name: 'query for getting app message based on version' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.nodes': 1 }, { name: 'query for getting app message based on nodes' });
     // more than 2 hours and 5m. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
@@ -108,6 +119,26 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1 }, { name: 'query for getting flux app install errors location based on specs name' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1, ip: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash and node ip' });
+
+    // This fixes an issue where the appsMessage db has NaN for valueSat. Once db is repaired on all nodes,
+    // we can remove this.
+    await dbHelper.repairNanInAppsMessagesDb();
+
+    const { appsToRemove } = await dbHelper.validateAppsInformation();
+
+    const appRemover = async () => {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const appName of appsToRemove) {
+        log.warning(`Application ${appName} is expired, removing`);
+        // eslint-disable-next-line no-await-in-loop
+        await appsService.removeAppLocally(appName, null, false, true, true);
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((r) => { setTimeout(r, 60_000); });
+      }
+    };
+
+    if (appsToRemove.length) setImmediate(appRemover);
+
     log.info('Flux Apps installing locations prepared');
     fluxNetworkHelper.adjustFirewall();
     log.info('Firewalls checked');
