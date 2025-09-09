@@ -132,9 +132,6 @@ async function findOneInDatabase(database, collection, query = {}, projection = 
  * @returns void
  */
 async function bulkWriteInDatabase(database, collection, operations) {
-  if (!operations || operations.length === 0) {
-    return { insertedCount: 0, matchedCount: 0, modifiedCount: 0, deletedCount: 0, upsertedCount: 0 };
-  }
   const result = await database.collection(collection).bulkWrite(operations);
   return result;
 }
@@ -299,29 +296,8 @@ async function dropCollection(database, collection) {
  * @returns object
  */
 async function collectionStats(database, collection) {
-  try {
-    // In MongoDB v4+, use $collStats aggregation instead of .stats()
-    const result = await database.collection(collection).aggregate([{ $collStats: { storageStats: {} } }]).toArray();
-    if (result[0] && result[0].storageStats) {
-      const stats = result[0].storageStats;
-      // Add namespace manually for compatibility with old tests
-      stats.ns = `${database.databaseName}.${collection}`;
-      return stats;
-    }
-    // Return compatible empty structure for non-existent collections
-    return {
-      ns: `${database.databaseName}.${collection}`,
-      count: 0,
-      avgObjSize: undefined,
-    };
-  } catch (error) {
-    // Fallback for older MongoDB versions or if collection doesn't exist
-    return {
-      ns: `${database.databaseName}.${collection}`,
-      count: 0,
-      avgObjSize: undefined,
-    };
-  }
+  const result = await database.collection(collection).stats();
+  return result;
 }
 
 async function findValueSatNanInAppsMessages() {
