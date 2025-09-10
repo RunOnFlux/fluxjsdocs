@@ -375,7 +375,7 @@ async function removeDirectory(rpath, directory = false) {
     if (directory === false) {
       execFinal = `sudo rm -rf "${rpath}"`;
     } else {
-      execFinal = `sudo find "${rpath}" -mindepth 1 -exec rm -rf {} +`;
+      execFinal = `sudo rm -rf "${rpath}/*"`;
     }
     await exec(execFinal, { maxBuffer: 1024 * 1024 * 10 });
     return true;
