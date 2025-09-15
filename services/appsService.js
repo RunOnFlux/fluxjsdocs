@@ -38,7 +38,6 @@ const imageVerifier = require('./utils/imageVerifier');
 const backupRestoreService = require('./backupRestoreService');
 const IOUtils = require('./IOUtils');
 const log = require('../lib/log');
-const serviceRegistry = require('./serviceRegistry');
 const { PassThrough } = require('stream');
 const { invalidMessages } = require('./invalidMessages');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
@@ -6918,7 +6917,8 @@ async function storeAppTemporaryMessage(message, furtherVerification = false) {
       if (!message.arcaneSender) {
         return new Error('Invalid Flux App message for storing, enterprise app where original sender was not arcane node');
       }
-      const fluxService = serviceRegistry.get('fluxService');
+      // eslint-disable-next-line global-require
+      const fluxService = require('./fluxService');
       if (await fluxService.isSystemSecure()) {
         // eslint-disable-next-line no-use-before-define
         const appSpecDecrypted = await checkAndDecryptAppSpecs(
