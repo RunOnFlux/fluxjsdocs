@@ -3,6 +3,8 @@ const config = require('config');
 const generalService = require('../generalService');
 const geolocationService = require('../geolocationService');
 const daemonServiceBenchmarkRpcs = require('../daemonService/daemonServiceBenchmarkRpcs');
+// For compatibility with original, alias as benchmarkService
+const benchmarkService = daemonServiceBenchmarkRpcs;
 const log = require('../../lib/log');
 
 // Node specifications (shared state)
@@ -107,17 +109,10 @@ function totalAppHWRequirements(appSpecifications, myNodeTier) {
  * @param {object} appSpecs - Application specifications
  * @returns {Promise<boolean>} True if requirements are met
  */
-async function checkAppHWRequirements(appSpecs, appsResources) {
+async function checkAppHWRequirements(appSpecs) {
   // appSpecs has hdd, cpu and ram assigned to correct tier
   const tier = await generalService.nodeTier();
-
-  // Use appsResources if provided, otherwise get them
-  let resourcesLocked;
-  if (appsResources) {
-    resourcesLocked = appsResources;
-  } else {
-    resourcesLocked = await getAppsResources();
-  }
+  const resourcesLocked = await appsResources();
 
   if (resourcesLocked.status !== 'success') {
     throw new Error('Unable to obtain locked system resources by Flux Apps. Aborting.');
@@ -163,24 +158,12 @@ async function checkAppHWRequirements(appSpecs, appsResources) {
  * @returns {Promise<boolean>} True if all requirements are met
  */
 async function checkAppRequirements(appSpecs) {
-  // Hardware requirements
+  // appSpecs has hdd, cpu and ram assigned to correct tier
   await checkAppHWRequirements(appSpecs);
-
-  // Geolocation requirements
-  if (appSpecs.version >= 5) {
-    checkAppGeolocationRequirements(appSpecs);
-  }
-
-  // Static IP requirements
-  if (appSpecs.version >= 7) {
-    checkAppStaticIpRequirements(appSpecs);
-  }
-
-  // Node-specific requirements
-  if (appSpecs.version === 7 && appSpecs.nodes) {
-    await checkAppNodesRequirements(appSpecs);
-  }
-
+  // check geolocation
+  checkAppStaticIpRequirements(appSpecs);
+  await checkAppNodesRequirements(appSpecs);
+  checkAppGeolocationRequirements(appSpecs);
   return true;
 }
 
@@ -229,42 +212,32 @@ function checkAppGeolocationRequirements(appSpecs) {
     const geoCForbidden = appSpecs.geolocation.filter((x) => x.startsWith('a!c'));
 
     const myNodeLocationContinent = nodeGeo.continentCode;
-    const myNodeLocationCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
+    const myNodeLocationContCountry = `${nodeGeo.continentCode}_${nodeGeo.countryCode}`;
     const myNodeLocationFull = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_${nodeGeo.regionName}`;
-
-    // Check forbidden locations first
-    for (const forbiddenGeo of geoCForbidden) {
-      const cleanForbiddenGeo = forbiddenGeo.replace('a!c', '');
-      if (myNodeLocationFull.startsWith(cleanForbiddenGeo) ||
-          myNodeLocationCountry.startsWith(cleanForbiddenGeo) ||
-          myNodeLocationContinent.startsWith(cleanForbiddenGeo)) {
-        throw new Error(`Application ${appSpecs.name} is forbidden to run in this geographical location. Aborting.`);
+    const myNodeLocationContinentALL = 'ALL';
+    const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
+    const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
+    if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
+      if (appContinent.slice(1) !== nodeGeo.continentCode) {
+        throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
       }
     }
-
-    // Check allowed locations
-    if (geoC.length > 0) {
-      let locationAllowed = false;
-      for (const allowedGeo of geoC) {
-        const cleanGeo = allowedGeo.replace('ac', '');
-        if (myNodeLocationFull.startsWith(cleanGeo) ||
-            myNodeLocationCountry.startsWith(cleanGeo) ||
-            myNodeLocationContinent.startsWith(cleanGeo)) {
-          locationAllowed = true;
-          break;
-        }
-      }
-      if (!locationAllowed) {
-        throw new Error(`Application ${appSpecs.name} is not allowed to run in this geographical location. Aborting.`);
+    if (appCountry) {
+      if (appCountry.slice(1) !== nodeGeo.countryCode) {
+        throw new Error('App specs with countries geolocation set not matching node geolocation. Aborting.');
       }
     }
-
-    // Legacy continent/country checks
-    if (appContinent && !appContinent.substring(1).includes(myNodeLocationContinent)) {
-      throw new Error(`Application ${appSpecs.name} is not available for this continent. Aborting.`);
-    }
-    if (appCountry && !appCountry.substring(1).includes(nodeGeo.countryCode)) {
-      throw new Error(`Application ${appSpecs.name} is not available for this country. Aborting.`);
+    geoCForbidden.forEach((locationNotAllowed) => {
+      if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
+        throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
+      }
+    });
+    if (geoC.length) {
+      const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
+        || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL);
+      if (!nodeLocationOK) {
+        throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
+      }
     }
   }
 
@@ -279,7 +252,7 @@ function checkAppGeolocationRequirements(appSpecs) {
 async function checkAppNodesRequirements(appSpecs) {
   if (appSpecs.version === 7 && appSpecs.nodes && appSpecs.nodes.length) {
     const myCollateral = await generalService.obtainNodeCollateralInformation();
-    const benchmarkResponse = await daemonServiceBenchmarkRpcs.getBenchmarks();
+    const benchmarkResponse = await benchmarkService.getBenchmarks();
 
     if (benchmarkResponse.status === 'error') {
       throw new Error('Unable to detect Flux IP address');
@@ -295,12 +268,147 @@ async function checkAppNodesRequirements(appSpecs) {
       throw new Error('Unable to detect Flux IP address');
     }
 
-    // Check if this node is in the allowed nodes list
-    const myNodeInfo = `${myIP}:${myCollateral.txhash}:${myCollateral.outidx}`;
-    const isNodeAllowed = appSpecs.nodes.includes(myNodeInfo);
+    if (appSpecs.nodes.includes(myIP) || appSpecs.nodes.includes(`${myCollateral.txhash}:${myCollateral.txindex}`)) {
+      return true;
+    }
+    throw new Error(`Application ${appSpecs.name} is not allowed to run on this node. Aborting.`);
+  }
 
-    if (!isNodeAllowed) {
-      throw new Error(`Application ${appSpecs.name} is restricted to specific nodes. This node is not authorized.`);
+  return true;
+}
+
+/**
+ * Check if a node's hardware is suitable for running the assigned app
+ * @param {object} appSpecs - App specifications
+ * @returns {boolean} True if no errors are thrown
+ */
+function checkHWParameters(appSpecs) {
+  // check specs parameters. JS precision
+  if ((appSpecs.cpu * 10) % 1 !== 0 || (appSpecs.cpu * 10) > (config.fluxSpecifics.cpu.stratus - config.lockedSystemResources.cpu) || appSpecs.cpu < 0.1) {
+    throw new Error(`CPU badly assigned for ${appSpecs.name}`);
+  }
+  if (appSpecs.ram % 100 !== 0 || appSpecs.ram > (config.fluxSpecifics.ram.stratus - config.lockedSystemResources.ram) || appSpecs.ram < 100) {
+    throw new Error(`RAM badly assigned for ${appSpecs.name}`);
+  }
+  if (appSpecs.hdd % 1 !== 0 || appSpecs.hdd > (config.fluxSpecifics.hdd.stratus - config.lockedSystemResources.hdd) || appSpecs.hdd < 1) {
+    throw new Error(`SSD badly assigned for ${appSpecs.name}`);
+  }
+  if (appSpecs.tiered) {
+    if ((appSpecs.cpubasic * 10) % 1 !== 0 || (appSpecs.cpubasic * 10) > (config.fluxSpecifics.cpu.cumulus - config.lockedSystemResources.cpu) || appSpecs.cpubasic < 0.1) {
+      throw new Error(`CPU for Cumulus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.rambasic % 100 !== 0 || appSpecs.rambasic > (config.fluxSpecifics.ram.cumulus - config.lockedSystemResources.ram) || appSpecs.rambasic < 100) {
+      throw new Error(`RAM for Cumulus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.hddbasic % 1 !== 0 || appSpecs.hddbasic > (config.fluxSpecifics.hdd.cumulus - config.lockedSystemResources.hdd) || appSpecs.hddbasic < 1) {
+      throw new Error(`SSD for Cumulus badly assigned for ${appSpecs.name}`);
+    }
+    if ((appSpecs.cpusuper * 10) % 1 !== 0 || (appSpecs.cpusuper * 10) > (config.fluxSpecifics.cpu.nimbus - config.lockedSystemResources.cpu) || appSpecs.cpusuper < 0.1) {
+      throw new Error(`CPU for Nimbus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.ramsuper % 100 !== 0 || appSpecs.ramsuper > (config.fluxSpecifics.ram.nimbus - config.lockedSystemResources.ram) || appSpecs.ramsuper < 100) {
+      throw new Error(`RAM for Nimbus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.hddsuper % 1 !== 0 || appSpecs.hddsuper > (config.fluxSpecifics.hdd.nimbus - config.lockedSystemResources.hdd) || appSpecs.hddsuper < 1) {
+      throw new Error(`SSD for Nimbus badly assigned for ${appSpecs.name}`);
+    }
+    if ((appSpecs.cpubamf * 10) % 1 !== 0 || (appSpecs.cpubamf * 10) > (config.fluxSpecifics.cpu.stratus - config.lockedSystemResources.cpu) || appSpecs.cpubamf < 0.1) {
+      throw new Error(`CPU for Stratus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.rambamf % 100 !== 0 || appSpecs.rambamf > (config.fluxSpecifics.ram.stratus - config.lockedSystemResources.ram) || appSpecs.rambamf < 100) {
+      throw new Error(`RAM for Stratus badly assigned for ${appSpecs.name}`);
+    }
+    if (appSpecs.hddbamf % 1 !== 0 || appSpecs.hddbamf > (config.fluxSpecifics.hdd.stratus - config.lockedSystemResources.hdd) || appSpecs.hddbamf < 1) {
+      throw new Error(`SSD for Stratus badly assigned for ${appSpecs.name}`);
+    }
+  }
+  return true;
+}
+
+/**
+ * Check if a node's hardware is suitable for running the assigned Docker Compose app
+ * @param {object} appSpecsComposed - App specifications composed
+ * @returns {boolean} True if no errors are thrown
+ */
+function checkComposeHWParameters(appSpecsComposed) {
+  // calculate total HW assigned
+  let totalCpu = 0;
+  let totalRam = 0;
+  let totalHdd = 0;
+  let totalCpuBasic = 0;
+  let totalCpuSuper = 0;
+  let totalCpuBamf = 0;
+  let totalRamBasic = 0;
+  let totalRamSuper = 0;
+  let totalRamBamf = 0;
+  let totalHddBasic = 0;
+  let totalHddSuper = 0;
+  let totalHddBamf = 0;
+  appSpecsComposed.compose.forEach((appComponent) => {
+    if (appComponent.tiered) {
+      totalCpuBasic += appComponent.cpubasic;
+      totalCpuSuper += appComponent.cpusuper;
+      totalCpuBamf += appComponent.cpubamf;
+      totalRamBasic += appComponent.rambasic;
+      totalRamSuper += appComponent.ramsuper;
+      totalRamBamf += appComponent.rambamf;
+      totalHddBasic += appComponent.hddbasic;
+      totalHddSuper += appComponent.hddsuper;
+      totalHddBamf += appComponent.hddbamf;
+    } else {
+      totalCpu += appComponent.cpu;
+      totalRam += appComponent.ram;
+      totalHdd += appComponent.hdd;
+    }
+  });
+
+  // Check total resources
+  if (totalCpu > 0) {
+    if ((totalCpu * 10) % 1 !== 0 || (totalCpu * 10) > (config.fluxSpecifics.cpu.stratus - config.lockedSystemResources.cpu) || totalCpu < 0.1) {
+      throw new Error(`Total CPU badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalRam % 100 !== 0 || totalRam > (config.fluxSpecifics.ram.stratus - config.lockedSystemResources.ram) || totalRam < 100) {
+      throw new Error(`Total RAM badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalHdd % 1 !== 0 || totalHdd > (config.fluxSpecifics.hdd.stratus - config.lockedSystemResources.hdd) || totalHdd < 1) {
+      throw new Error(`Total SSD badly assigned for ${appSpecsComposed.name}`);
+    }
+  }
+
+  // Check tiered resources
+  if (totalCpuBasic > 0) {
+    if ((totalCpuBasic * 10) % 1 !== 0 || (totalCpuBasic * 10) > (config.fluxSpecifics.cpu.cumulus - config.lockedSystemResources.cpu) || totalCpuBasic < 0.1) {
+      throw new Error(`Total CPU for Cumulus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalRamBasic % 100 !== 0 || totalRamBasic > (config.fluxSpecifics.ram.cumulus - config.lockedSystemResources.ram) || totalRamBasic < 100) {
+      throw new Error(`Total RAM for Cumulus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalHddBasic % 1 !== 0 || totalHddBasic > (config.fluxSpecifics.hdd.cumulus - config.lockedSystemResources.hdd) || totalHddBasic < 1) {
+      throw new Error(`Total SSD for Cumulus badly assigned for ${appSpecsComposed.name}`);
+    }
+  }
+
+  if (totalCpuSuper > 0) {
+    if ((totalCpuSuper * 10) % 1 !== 0 || (totalCpuSuper * 10) > (config.fluxSpecifics.cpu.nimbus - config.lockedSystemResources.cpu) || totalCpuSuper < 0.1) {
+      throw new Error(`Total CPU for Nimbus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalRamSuper % 100 !== 0 || totalRamSuper > (config.fluxSpecifics.ram.nimbus - config.lockedSystemResources.ram) || totalRamSuper < 100) {
+      throw new Error(`Total RAM for Nimbus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalHddSuper % 1 !== 0 || totalHddSuper > (config.fluxSpecifics.hdd.nimbus - config.lockedSystemResources.hdd) || totalHddSuper < 1) {
+      throw new Error(`Total SSD for Nimbus badly assigned for ${appSpecsComposed.name}`);
+    }
+  }
+
+  if (totalCpuBamf > 0) {
+    if ((totalCpuBamf * 10) % 1 !== 0 || (totalCpuBamf * 10) > (config.fluxSpecifics.cpu.stratus - config.lockedSystemResources.cpu) || totalCpuBamf < 0.1) {
+      throw new Error(`Total CPU for Stratus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalRamBamf % 100 !== 0 || totalRamBamf > (config.fluxSpecifics.ram.stratus - config.lockedSystemResources.ram) || totalRamBamf < 100) {
+      throw new Error(`Total RAM for Stratus badly assigned for ${appSpecsComposed.name}`);
+    }
+    if (totalHddBamf % 1 !== 0 || totalHddBamf > (config.fluxSpecifics.hdd.stratus - config.lockedSystemResources.hdd) || totalHddBamf < 1) {
+      throw new Error(`Total SSD for Stratus badly assigned for ${appSpecsComposed.name}`);
     }
   }
 
@@ -308,13 +416,13 @@ async function checkAppNodesRequirements(appSpecs) {
 }
 
 /**
- * Get apps resource usage - this should be passed in from appsService to avoid circular dependency
+ * Get apps resource usage - placeholder for original appsResources function
  * @returns {Promise<object>} Resource usage information
  */
-async function getAppsResources() {
-  // This function should not be used directly - appsResources should be passed from appsService
-  // to avoid circular dependencies
-  throw new Error('getAppsResources should not be called directly - pass appsResources from appsService');
+async function appsResources() {
+  // Import locally to avoid circular dependency
+  const appController = require('../appManagement/appController');
+  return appController.appsResources();
 }
 
 module.exports = {
@@ -328,4 +436,7 @@ module.exports = {
   checkAppStaticIpRequirements,
   checkAppGeolocationRequirements,
   checkAppNodesRequirements,
+  checkHWParameters,
+  checkComposeHWParameters,
+  appsResources,
 };
