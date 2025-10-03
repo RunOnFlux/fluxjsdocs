@@ -92,7 +92,7 @@ globalState.initializeCaches(cacheManager);
 const myShortCache = cacheManager.fluxRatesCache;
 const myLongCache = cacheManager.appPriceBlockedRepoCache;
 const failedNodesTestPortsCache = cacheManager.testPortsCache;
-const receiveOnlySyncthingAppsCache = new Map();
+const receiveOnlySyncthingAppsCache = globalState.receiveOnlySyncthingAppsCache;
 const appsStopedCache = cacheManager.stoppedAppsCache;
 const syncthingDevicesIDCache = cacheManager.syncthingDevicesCache;
 
@@ -1211,6 +1211,7 @@ async function syncthingApps() {
     getGlobalState();
     // do not run if installationInProgress or removalInProgress
     if (installationInProgress || removalInProgress || updateSyncthingRunning) {
+      log.info(`syncthingApps - installationInProgress: ${installationInProgress}, removalInProgress: ${removalInProgress}, updateSyncthingRunning: ${updateSyncthingRunning}`);
       return;
     }
     updateSyncthingRunning = true;
