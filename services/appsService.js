@@ -3427,16 +3427,12 @@ module.exports = {
       let globalAppNamesLocation = await dbHelper.aggregateInDatabase(database, globalAppsInformation, pipeline);
       const numberOfGlobalApps = globalAppNamesLocation.length;
       if (!numberOfGlobalApps) {
-        log.info('trySpawningGlobalApplication - No installable application found');
+        log.info('No installable application found');
         await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
       log.info(`trySpawningGlobalApplication - Found ${numberOfGlobalApps} apps that are missing instances on the network.`);
-
-      // If there are multiple apps to process, use shorter delays
-      const delayTime = numberOfGlobalApps > 1 ? 60 * 1000 : 30 * 60 * 1000;
-      const shortDelayTime = numberOfGlobalApps > 1 ? 60 * 1000 : 5 * 60 * 1000;
 
       let appToRun = null;
       let appToRunAux = null;
@@ -3506,7 +3502,7 @@ module.exports = {
         installingAppList = await registryManager.appInstallingLocation(appToRun);
         if (runningAppList.length + installingAppList.length > minInstances) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3514,7 +3510,7 @@ module.exports = {
         if (appToRunAux.enterprise && !isArcane) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} can only install on ArcaneOS`);
           globalState.spawnErrorsLongerAppCache.set(appHash, '');
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3523,11 +3519,11 @@ module.exports = {
       globalState.trySpawningGlobalAppCache.set(appHash, '');
       log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
 
-      /* const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
+      const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
       if (installingAppErrorsList.find((app) => !app.expireAt && app.hash === appHash)) {
         globalState.spawnErrorsLongerAppCache.set(appHash, '');
         throw new Error(`trySpawningGlobalApplication - App ${appToRun} is marked as having errors on app installing errors locations.`);
-      }*/
+      }
 
       runningAppList = await registryManager.appLocation(appToRun);
 
@@ -3535,13 +3531,13 @@ module.exports = {
       // check if app not running on this device
       if (runningAppList.find((document) => document.ip.includes(adjustedIP))) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is reported as already running on this Flux IP`);
-        await serviceHelper.delay(delayTime);
+        await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
       if (installingAppList.find((document) => document.ip.includes(adjustedIP))) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is reported as already being installed on this Flux IP`);
-        await serviceHelper.delay(delayTime);
+        await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3570,7 +3566,7 @@ module.exports = {
       const appExists = apps.find((app) => app.name === appSpecifications.name);
       if (appExists) { // double checked in installation process.
         log.info(`trySpawningGlobalApplication - Application ${appSpecifications.name} is already installed`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3609,7 +3605,7 @@ module.exports = {
       const portsPubliclyAvailable = await portManager.checkInstallingAppPortAvailable(appPorts);
       if (portsPubliclyAvailable === false) {
         log.error(`trySpawningGlobalApplication - Some of application ports of ${appSpecifications.name} are not available publicly. Installation aborted.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3619,7 +3615,7 @@ module.exports = {
       installingAppList = await registryManager.appInstallingLocation(appToRun);
       if (runningAppList.length + installingAppList.length > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3638,7 +3634,7 @@ module.exports = {
         const sameIpRangeNode = runningAppList.find((location) => location.ip.includes(myIpWithoutPort.substring(0, secondLastIndex)));
         if (sameIpRangeNode) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} uses syncthing and it is already spawned on Fluxnode with same ip range`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3661,7 +3657,7 @@ module.exports = {
               };
               globalState.appsSyncthingToBeCheckedLater.push(appToCheck);
               // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay(shortDelayTime);
+              await serviceHelper.delay(5 * 60 * 1000);
               globalState.trySpawningGlobalAppCache.delete(appHash);
               module.exports.trySpawningGlobalApplication();
               return;
@@ -3732,7 +3728,7 @@ module.exports = {
           delay = true;
         }
         if (delay) {
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3758,7 +3754,7 @@ module.exports = {
       installingAppList = await registryManager.appInstallingLocation(appToRun);
       if (runningAppList.length + installingAppList.length > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3801,7 +3797,7 @@ module.exports = {
         const index = installingAppList.findIndex((x) => x.ip === myIP);
         if (runningAppList.length + index + 1 > minInstances) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances, my instance is number ${runningAppList.length + index + 1}`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3817,7 +3813,7 @@ module.exports = {
       }
       if (!registerOk) {
         log.info('trySpawningGlobalApplication - Error on registerAppLocally');
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3850,12 +3846,12 @@ module.exports = {
         }
       }
 
-      await serviceHelper.delay(delayTime);
+      await serviceHelper.delay(30 * 60 * 1000);
       log.info('trySpawningGlobalApplication - Reinitiating possible app installation');
       module.exports.trySpawningGlobalApplication();
     } catch (error) {
       log.error(error);
-      await serviceHelper.delay(shortDelayTime || 5 * 60 * 1000);
+      await serviceHelper.delay(5 * 60 * 1000);
       module.exports.trySpawningGlobalApplication();
     }
   },
