@@ -278,9 +278,9 @@ function getAppPorts(appSpecs) {
 /**
  * Format app specifications to standard format
  * @param {object} appSpecification - Raw app specifications
- * @returns {Promise<object>} Formatted app specifications
+ * @returns {object} Formatted app specifications
  */
-async function specificationFormatter(appSpecification) {
+function specificationFormatter(appSpecification) {
   let {
     version,
     name,
@@ -713,26 +713,8 @@ async function specificationFormatter(appSpecification) {
     if (Number.isInteger(expire) !== true) {
       throw new Error('Invalid instances specified');
     }
-
-    // Determine the correct maxBlocksAllowance based on current blockchain height
-    let maxAllowance = config.fluxapps.maxBlocksAllowance;
-    try {
-      // eslint-disable-next-line global-require
-      const daemonServiceBlockchainRpcs = require('../daemonService/daemonServiceBlockchainRpcs');
-      const blockchainInfo = await daemonServiceBlockchainRpcs.getBlockchainInfo();
-      if (blockchainInfo.status === 'success' && blockchainInfo.data && blockchainInfo.data.blocks) {
-        const currentHeight = blockchainInfo.data.blocks;
-        if (currentHeight >= config.fluxapps.daemonPONFork) {
-          maxAllowance = config.fluxapps.newMaxBlocksAllowance;
-        }
-      }
-    } catch (error) {
-      log.warn(`Unable to fetch blockchain height for maxBlocksAllowance validation: ${error.message}. Using default value.`);
-      // If we can't get the height, default to the original maxBlocksAllowance for safety
-    }
-
-    if (expire > maxAllowance) {
-      throw new Error(`Maximum expiration of application is ${maxAllowance} blocks ~ 1 year`);
+    if (expire > config.fluxapps.maxBlocksAllowance) {
+      throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
     }
     appSpecFormatted.expire = expire;
   }

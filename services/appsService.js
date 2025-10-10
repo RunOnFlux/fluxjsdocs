@@ -2123,10 +2123,6 @@ async function deploymentInformation(req, res) {
     // search in chainparams db for chainmessages of p version
     const appPrices = await chainUtilities.getChainParamsPriceUpdates();
     const { fluxapps: { portMin, portMax } } = config;
-    // After fork block, chain works 4x faster, so we use the new max blocks allowance
-    const maxAllowance = daemonHeight >= config.fluxapps.daemonPONFork
-      ? config.fluxapps.newMaxBlocksAllowance
-      : config.fluxapps.maxBlocksAllowance;
     const information = {
       price: appPrices,
       appSpecsEnforcementHeights: config.fluxapps.appSpecsEnforcementHeights,
@@ -2140,7 +2136,7 @@ async function deploymentInformation(req, res) {
       maximumInstances: config.fluxapps.maximumInstances,
       blocksLasting: config.fluxapps.blocksLasting,
       minBlocksAllowance: config.fluxapps.minBlocksAllowance,
-      maxBlocksAllowance: maxAllowance,
+      maxBlocksAllowance: config.fluxapps.maxBlocksAllowance,
       blocksAllowanceInterval: config.fluxapps.blocksAllowanceInterval,
     };
     const respondPrice = messageHelper.createDataMessage(information);
@@ -2255,7 +2251,7 @@ async function registerAppGlobalyApi(req, res) {
         },
       );
 
-      const appSpecFormatted = await appUtilities.specificationFormatter(appSpecDecrypted);
+      const appSpecFormatted = appUtilities.specificationFormatter(appSpecDecrypted);
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await appValidator.verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
@@ -2278,7 +2274,7 @@ async function registerAppGlobalyApi(req, res) {
       );
 
       const toVerify = isEnterprise
-        ? await appUtilities.specificationFormatter(appSpecification)
+        ? appUtilities.specificationFormatter(appSpecification)
         : appSpecFormatted;
 
       // check if zelid owner is correct ( done in message verification )
