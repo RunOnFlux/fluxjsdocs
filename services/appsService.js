@@ -1368,7 +1368,7 @@ async function syncthingApps() {
                     cache.restarted = false;
                     cache.numberOfExecutions = 1;
                     receiveOnlySyncthingAppsCache.set(appId, cache);
-                  } else if (!containerRunning && containerDataFlags.includes('r')) {
+                  } else if (!containerRunning) {
                     log.info(`syncthingApps - Container not running, starting app ${appId}`);
                     try {
                       // eslint-disable-next-line no-await-in-loop
@@ -1457,7 +1457,7 @@ async function syncthingApps() {
               } else {
                 try {
                   const containerInspect = await dockerService.dockerContainerInspect(id);
-                  if (!containerInspect.State.Running && containerDataFlags.includes('r')) {
+                  if (!containerInspect.State.Running) {
                     log.info(`syncthingApps - App ${appId} is not running, starting it`);
                     // eslint-disable-next-line no-await-in-loop
                     await dockerService.appDockerStart(id);
@@ -1596,7 +1596,7 @@ async function syncthingApps() {
                       cache.restarted = false;
                       cache.numberOfExecutions = 1;
                       receiveOnlySyncthingAppsCache.set(appId, cache);
-                    } else if (!containerRunning && containerDataFlags.includes('r')) {
+                    } else if (!containerRunning) {
                       log.info(`syncthingApps - Container not running, starting component ${appId}`);
                       try {
                         // eslint-disable-next-line no-await-in-loop
@@ -1686,7 +1686,7 @@ async function syncthingApps() {
                 } else {
                   try {
                     const containerInspect = await dockerService.dockerContainerInspect(id);
-                    if (!containerInspect.State.Running && containerDataFlags.includes('r')) {
+                    if (!containerInspect.State.Running) {
                       log.info(`syncthingApps - Component ${appId} is not running, starting it`);
                       // eslint-disable-next-line no-await-in-loop
                       await dockerService.appDockerStart(id);
@@ -2123,6 +2123,10 @@ async function deploymentInformation(req, res) {
     // search in chainparams db for chainmessages of p version
     const appPrices = await chainUtilities.getChainParamsPriceUpdates();
     const { fluxapps: { portMin, portMax } } = config;
+    // After fork block, chain works 4x faster, so we use the new max blocks allowance
+    const maxAllowance = daemonHeight >= config.fluxapps.daemonPONFork
+      ? config.fluxapps.newMaxBlocksAllowance
+      : config.fluxapps.maxBlocksAllowance;
     const information = {
       price: appPrices,
       appSpecsEnforcementHeights: config.fluxapps.appSpecsEnforcementHeights,
@@ -2136,7 +2140,7 @@ async function deploymentInformation(req, res) {
       maximumInstances: config.fluxapps.maximumInstances,
       blocksLasting: config.fluxapps.blocksLasting,
       minBlocksAllowance: config.fluxapps.minBlocksAllowance,
-      maxBlocksAllowance: config.fluxapps.maxBlocksAllowance,
+      maxBlocksAllowance: maxAllowance,
       blocksAllowanceInterval: config.fluxapps.blocksAllowanceInterval,
     };
     const respondPrice = messageHelper.createDataMessage(information);
@@ -2251,7 +2255,7 @@ async function registerAppGlobalyApi(req, res) {
         },
       );
 
-      const appSpecFormatted = appUtilities.specificationFormatter(appSpecDecrypted);
+      const appSpecFormatted = await appUtilities.specificationFormatter(appSpecDecrypted);
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await appValidator.verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
@@ -2274,7 +2278,7 @@ async function registerAppGlobalyApi(req, res) {
       );
 
       const toVerify = isEnterprise
-        ? appUtilities.specificationFormatter(appSpecification)
+        ? await appUtilities.specificationFormatter(appSpecification)
         : appSpecFormatted;
 
       // check if zelid owner is correct ( done in message verification )
@@ -3313,7 +3317,6 @@ module.exports = {
     return advancedWorkflows.masterSlaveApps(getGlobalState(), installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgress, globalState.restoreInProgress, https);
   },
   trySpawningGlobalApplication: async () => {
-    let shortDelayTime = 5 * 60 * 1000; // Default 5 minutes
     try {
       // how do we continue with this function?
       // we have globalapplication specifics list
@@ -3428,16 +3431,12 @@ module.exports = {
       let globalAppNamesLocation = await dbHelper.aggregateInDatabase(database, globalAppsInformation, pipeline);
       const numberOfGlobalApps = globalAppNamesLocation.length;
       if (!numberOfGlobalApps) {
-        log.info('trySpawningGlobalApplication - No installable application found');
+        log.info('No installable application found');
         await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
       log.info(`trySpawningGlobalApplication - Found ${numberOfGlobalApps} apps that are missing instances on the network.`);
-
-      // If there are multiple apps to process, use shorter delays
-      const delayTime = numberOfGlobalApps > 1 ? 60 * 1000 : 30 * 60 * 1000;
-      shortDelayTime = numberOfGlobalApps > 1 ? 60 * 1000 : 5 * 60 * 1000;
 
       let appToRun = null;
       let appToRunAux = null;
@@ -3507,7 +3506,7 @@ module.exports = {
         installingAppList = await registryManager.appInstallingLocation(appToRun);
         if (runningAppList.length + installingAppList.length > minInstances) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3515,7 +3514,7 @@ module.exports = {
         if (appToRunAux.enterprise && !isArcane) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} can only install on ArcaneOS`);
           globalState.spawnErrorsLongerAppCache.set(appHash, '');
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3524,11 +3523,11 @@ module.exports = {
       globalState.trySpawningGlobalAppCache.set(appHash, '');
       log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
 
-      /* const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
+      const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
       if (installingAppErrorsList.find((app) => !app.expireAt && app.hash === appHash)) {
         globalState.spawnErrorsLongerAppCache.set(appHash, '');
         throw new Error(`trySpawningGlobalApplication - App ${appToRun} is marked as having errors on app installing errors locations.`);
-      }*/
+      }
 
       runningAppList = await registryManager.appLocation(appToRun);
 
@@ -3536,13 +3535,13 @@ module.exports = {
       // check if app not running on this device
       if (runningAppList.find((document) => document.ip.includes(adjustedIP))) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is reported as already running on this Flux IP`);
-        await serviceHelper.delay(delayTime);
+        await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
       if (installingAppList.find((document) => document.ip.includes(adjustedIP))) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is reported as already being installed on this Flux IP`);
-        await serviceHelper.delay(delayTime);
+        await serviceHelper.delay(30 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3571,7 +3570,7 @@ module.exports = {
       const appExists = apps.find((app) => app.name === appSpecifications.name);
       if (appExists) { // double checked in installation process.
         log.info(`trySpawningGlobalApplication - Application ${appSpecifications.name} is already installed`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3610,7 +3609,7 @@ module.exports = {
       const portsPubliclyAvailable = await portManager.checkInstallingAppPortAvailable(appPorts);
       if (portsPubliclyAvailable === false) {
         log.error(`trySpawningGlobalApplication - Some of application ports of ${appSpecifications.name} are not available publicly. Installation aborted.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3620,7 +3619,7 @@ module.exports = {
       installingAppList = await registryManager.appInstallingLocation(appToRun);
       if (runningAppList.length + installingAppList.length > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3639,7 +3638,7 @@ module.exports = {
         const sameIpRangeNode = runningAppList.find((location) => location.ip.includes(myIpWithoutPort.substring(0, secondLastIndex)));
         if (sameIpRangeNode) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} uses syncthing and it is already spawned on Fluxnode with same ip range`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3662,7 +3661,7 @@ module.exports = {
               };
               globalState.appsSyncthingToBeCheckedLater.push(appToCheck);
               // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay(shortDelayTime);
+              await serviceHelper.delay(5 * 60 * 1000);
               globalState.trySpawningGlobalAppCache.delete(appHash);
               module.exports.trySpawningGlobalApplication();
               return;
@@ -3733,7 +3732,7 @@ module.exports = {
           delay = true;
         }
         if (delay) {
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3759,7 +3758,7 @@ module.exports = {
       installingAppList = await registryManager.appInstallingLocation(appToRun);
       if (runningAppList.length + installingAppList.length > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3802,7 +3801,7 @@ module.exports = {
         const index = installingAppList.findIndex((x) => x.ip === myIP);
         if (runningAppList.length + index + 1 > minInstances) {
           log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances, my instance is number ${runningAppList.length + index + 1}`);
-          await serviceHelper.delay(shortDelayTime);
+          await serviceHelper.delay(5 * 60 * 1000);
           module.exports.trySpawningGlobalApplication();
           return;
         }
@@ -3818,7 +3817,7 @@ module.exports = {
       }
       if (!registerOk) {
         log.info('trySpawningGlobalApplication - Error on registerAppLocally');
-        await serviceHelper.delay(shortDelayTime);
+        await serviceHelper.delay(5 * 60 * 1000);
         module.exports.trySpawningGlobalApplication();
         return;
       }
@@ -3851,12 +3850,12 @@ module.exports = {
         }
       }
 
-      await serviceHelper.delay(delayTime);
+      await serviceHelper.delay(30 * 60 * 1000);
       log.info('trySpawningGlobalApplication - Reinitiating possible app installation');
       module.exports.trySpawningGlobalApplication();
     } catch (error) {
       log.error(error);
-      await serviceHelper.delay(shortDelayTime || 5 * 60 * 1000);
+      await serviceHelper.delay(5 * 60 * 1000);
       module.exports.trySpawningGlobalApplication();
     }
   },
