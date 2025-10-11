@@ -814,12 +814,8 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
     } else if (appSpecifications.expire < config.fluxapps.cancel1BlockMinBlocksAllowance) {
       throw new Error(`Minimum expiration of application is ${config.fluxapps.cancel1BlockMinBlocksAllowance} blocks`);
     }
-    // After fork block, chain works 4x faster, so we allow 4x more blocks for the same time period
-    const maxAllowance = height >= config.fluxapps.daemonPONFork
-      ? config.fluxapps.newMaxBlocksAllowance
-      : config.fluxapps.maxBlocksAllowance;
-    if (appSpecifications.expire > maxAllowance) {
-      throw new Error(`Maximum expiration of application is ${maxAllowance} blocks ~ 1 year`);
+    if (appSpecifications.expire > config.fluxapps.maxBlocksAllowance) {
+      throw new Error(`Maximum expiration of application is ${config.fluxapps.maxBlocksAllowance} blocks ~ 1 year`);
     }
     if (height < config.fluxapps.removeBlocksAllowanceIntervalBlock) {
       if (appSpecifications.expire % config.fluxapps.blocksAllowanceInterval !== 0) {
@@ -1279,7 +1275,7 @@ async function verifyAppRegistrationParameters(req, res) {
         },
       );
 
-      const appSpecFormatted = await specificationFormatter(appSpecDecrypted);
+      const appSpecFormatted = specificationFormatter(appSpecDecrypted);
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
@@ -1347,7 +1343,7 @@ async function verifyAppUpdateParameters(req, res) {
 
       const decryptedSpecs = await checkAndDecryptAppSpecs(appSpecification, { daemonHeight });
 
-      const appSpecFormatted = await specificationFormatter(decryptedSpecs);
+      const appSpecFormatted = specificationFormatter(decryptedSpecs);
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
@@ -1463,7 +1459,7 @@ async function registerAppGlobalyApi(req, res) {
         },
       );
 
-      const appSpecFormatted = await specificationFormatter(appSpecDecrypted);
+      const appSpecFormatted = specificationFormatter(appSpecDecrypted);
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
@@ -1486,7 +1482,7 @@ async function registerAppGlobalyApi(req, res) {
       );
 
       const toVerify = isEnterprise
-        ? await specificationFormatter(appSpecification)
+        ? specificationFormatter(appSpecification)
         : appSpecFormatted;
 
       // check if zelid owner is correct ( done in message verification )
