@@ -74,7 +74,7 @@ function daemonBlockchainInfoService() {
   fluxDaemonBlockchainInfo();
   setInterval(() => {
     fluxDaemonBlockchainInfo();
-  }, 30 * 1000);
+  }, 60 * 1000);
 }
 
 function getIsDaemonInsightExplorer() {
