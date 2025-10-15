@@ -38,7 +38,7 @@ const timeTostartNewMasterApp = new Map();
 // Promisified functions
 const cmdAsync = util.promisify(nodecmd.run);
 const crontabLoad = util.promisify(systemcrontab.load);
-const fluxDirPath = process.env.FLUXOS_PATH || path.join(process.env.HOME, 'zelflux')
+const fluxDirPath = path.join(process.env.FLUX_APPS_FOLDER || path.join(__dirname, '../../../../'), 'flux/');
 const appsFolderPath = process.env.FLUX_APPS_FOLDER || path.join(fluxDirPath, 'ZelApps');
 const appsFolder = `${appsFolderPath}/`;
 
@@ -1184,9 +1184,9 @@ async function verifyAppUpdateParameters(req, res) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
-            const appSecurity = require('../appSecurity/imageManager');
+            const appSecurity = require('../appSecurity/appSecrets');
             // eslint-disable-next-line no-await-in-loop
-            await appSecurity.checkAppSecrets(appSpecFormatted.name, appComponent, appSpecFormatted.owner, false);
+            await appSecurity.checkAppSecrets(appSpecFormatted.name, appComponent, appSpecFormatted.owner);
           }
         }
       }
@@ -2007,9 +2007,9 @@ async function updateAppGlobalyApi(req, res) {
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponent of appSpecFormatted.compose) {
           if (appComponent.secrets) {
-            const appSecurity = require('../appSecurity/imageManager');
+            const appSecurity = require('../appSecurity/appSecrets');
             // eslint-disable-next-line no-await-in-loop
-            await appSecurity.checkAppSecrets(appSpecFormatted.name, appComponent, appSpecFormatted.owner, false);
+            await appSecurity.checkAppSecrets(appSpecFormatted.name, appComponent, appSpecFormatted.owner);
           }
         }
       }
