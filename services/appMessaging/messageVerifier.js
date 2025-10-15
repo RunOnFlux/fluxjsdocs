@@ -541,23 +541,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
         const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
         const daemonHeight = syncStatus.data.height;
         const expire = specifications.expire || 22000;
-        let actualExpirationHeight = height + expire;
-
-        // If app was registered before fork block and we are past fork block
-        // the chain moves 4x faster, so we need to adjust the expiration
-        if (height < config.fluxapps.daemonPONFork && daemonHeight >= config.fluxapps.daemonPONFork) {
-          const originalExpirationHeight = height + expire;
-          if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
-            // Calculate blocks that were supposed to live after fork block
-            const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
-            // Multiply by 4 to account for 4x faster chain
-            const adjustedBlocksAfterFork = blocksAfterFork * 4;
-            // New expiration = fork block + adjusted blocks
-            actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
-          }
-        }
-
-        if (actualExpirationHeight > daemonHeight) {
+        if (height + expire > daemonHeight) {
           // we only do this validations if the app can still be currently running to insert it or update it in globalappspecifications
           const appPrices = await getChainParamsPriceUpdates();
           const intervals = appPrices.filter((interval) => interval.height < height);
