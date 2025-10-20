@@ -763,9 +763,9 @@ async function continuousFluxAppHashesCheck(force = false) {
     }
 
     if (firstContinuousFluxAppHashesCheckRun && !globalState.checkAndSyncAppHashesWasEverExecuted) {
-      // Import checkAndSyncAppHashes from appHashSyncService
-      const appHashSyncService = require('./appHashSyncService');
-      await appHashSyncService.checkAndSyncAppHashes();
+      // Import checkAndSyncAppHashes from appsService - this function should be available there
+      const appsService = require('../appsService');
+      await appsService.checkAndSyncAppHashes();
     }
 
     const dbopen = dbHelper.databaseConnection();

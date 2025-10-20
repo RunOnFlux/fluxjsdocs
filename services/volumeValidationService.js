@@ -194,9 +194,9 @@ async function getAppSpecifications(appName) {
   try {
     // Import here to avoid circular dependency
     // eslint-disable-next-line global-require
-    const registryManager = require('./appDatabase/registryManager');
+    const appsService = require('./appsService');
 
-    const specifications = await registryManager.getApplicationSpecifications(appName);
+    const specifications = await appsService.getApplicationSpecifications(appName);
     return specifications;
   } catch (error) {
     log.error(`Error getting app specifications for ${appName}: ${error.message}`);
