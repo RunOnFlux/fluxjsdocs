@@ -3,7 +3,6 @@ const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const pgpService = require('../pgpService');
-const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
@@ -31,7 +30,6 @@ async function verifyRepository(repotag, options = {}) {
   const repoauth = options.repoauth || null;
   const skipVerification = options.skipVerification || false;
   const architecture = options.architecture || null;
-  const appVersion = options.appVersion || 7; // Default to v7 for backward compatibility
 
   const imgVerifier = new imageVerifier.ImageVerifier(
     repotag,
@@ -44,17 +42,17 @@ async function verifyRepository(repotag, options = {}) {
   }
 
   if (repoauth) {
-    // Use credential helper to handle version-aware decryption and cloud providers
-    const credentials = await registryCredentialHelper.getCredentials(
-      repotag,
-      repoauth,
-      appVersion,
-    );
+    const authToken = await pgpService.decryptMessage(repoauth);
 
-    if (credentials) {
-      const authToken = `${credentials.username}:${credentials.password}`;
-      imgVerifier.addCredentials(authToken);
+    if (!authToken) {
+      throw new Error('Unable to decrypt provided credentials');
     }
+
+    if (!authToken.includes(':')) {
+      throw new Error('Provided credentials not in the correct username:token format');
+    }
+
+    imgVerifier.addCredentials(authToken);
   }
 
   await imgVerifier.verifyImage();
