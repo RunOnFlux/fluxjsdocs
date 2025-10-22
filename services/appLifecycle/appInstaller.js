@@ -18,6 +18,7 @@ const { checkApplicationImagesComplience } = require('../appSecurity/imageManage
 const { startAppMonitoring } = require('../appManagement/appInspector');
 const imageVerifier = require('../utils/imageVerifier');
 const pgpService = require('../pgpService');
+const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const upnpService = require('../upnpService');
 const globalState = require('../utils/globalState');
 const log = require('../../lib/log');
@@ -503,11 +504,19 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   let authToken = null;
 
   if (appSpecifications.repoauth) {
-    authToken = await pgpService.decryptMessage(appSpecifications.repoauth);
+    // Use credential helper to handle version-aware decryption and cloud providers
+    const credentials = await registryCredentialHelper.getCredentials(
+      appSpecifications.repotag,
+      appSpecifications.repoauth,
+      fullAppSpecs.version, // Pass parent spec version for v7/v8 handling
+    );
 
-    if (!authToken) {
-      throw new Error('Unable to decrypt provided credentials');
+    if (!credentials) {
+      throw new Error('Unable to get credentials');
     }
+
+    // Convert to username:password format for ImageVerifier
+    authToken = `${credentials.username}:${credentials.password}`;
 
     if (!authToken.includes(':')) {
       throw new Error('Provided credentials not in the correct username:token format');
@@ -719,11 +728,19 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   let authToken = null;
 
   if (appSpecifications.repoauth) {
-    authToken = await pgpService.decryptMessage(appSpecifications.repoauth);
+    // Use credential helper to handle version-aware decryption and cloud providers
+    const credentials = await registryCredentialHelper.getCredentials(
+      appSpecifications.repotag,
+      appSpecifications.repoauth,
+      fullAppSpecs.version, // Pass parent spec version for v7/v8 handling
+    );
 
-    if (!authToken) {
-      throw new Error('Unable to decrypt provided credentials');
+    if (!credentials) {
+      throw new Error('Unable to get credentials');
     }
+
+    // Convert to username:password format for ImageVerifier
+    authToken = `${credentials.username}:${credentials.password}`;
 
     if (!authToken.includes(':')) {
       throw new Error('Provided credentials not in the correct username:token format');

@@ -1916,10 +1916,10 @@ async function checkApplicationUpdateNameRepositoryConflicts(specifications, ver
         // v4 allows for changes of repotag
       });
     } else { // update is v4+ and current app have v1,2,3
-      // node will perform hard redeploy of the app;
+      throw new Error(`Flux App ${specifications.name} on update to different specifications is not possible`);
     }
   } else if (appSpecs.version >= 4) {
-    throw new Error(`Flux App ${specifications.name} cannot be rolled back to older version`);
+    throw new Error(`Flux App ${specifications.name} update to different specifications is not possible`);
   } else { // bot update and current app have v1,2,3
     // eslint-disable-next-line no-lonely-if
     if (appSpecs.repotag !== specifications.repotag) { // v1,2,3 does not allow repotag change
@@ -2360,6 +2360,19 @@ async function reinstallOldApplications() {
             const appUninstaller = require('./appUninstaller');
             // eslint-disable-next-line no-await-in-loop
             await appUninstaller.removeAppLocally(appSpecifications.name, null, true, false);
+            // connect to mongodb
+            const dbopen = dbHelper.databaseConnection();
+            const appsDatabase = dbopen.db(config.database.appslocal.database);
+            const appsQuery = { name: appSpecifications.name };
+            const appsProjection = {};
+            log.warn('Cleaning up database...');
+            // eslint-disable-next-line no-await-in-loop
+            await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
+            const databaseStatus2 = {
+              status: 'Database cleaned',
+            };
+            log.warn('Database cleaned');
+            log.warn(databaseStatus2);
             log.warn(`Compositions of application ${appSpecifications.name} uninstalled. Continuing with installation...`);
             // composition removal done. Remove from installed apps and being installation
             // eslint-disable-next-line no-await-in-loop
