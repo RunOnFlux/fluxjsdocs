@@ -742,13 +742,7 @@ function getFluxPGPidentity(req, res) {
 function getFluxKadena(req, res) {
   const kadena = userconfig.initial.kadena || null;
   const message = messageHelper.createDataMessage(kadena);
-  if (res) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.json(message);
-  }
-  return message;
+  return res ? res.json(message) : message;
 }
 
 /**
@@ -760,13 +754,7 @@ function getFluxKadena(req, res) {
 function getRouterIP(req, res) {
   const routerIP = userconfig.initial.routerIP || '';
   const message = messageHelper.createDataMessage(routerIP);
-  if (res) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.json(message);
-  }
-  return message;
+  return res ? res.json(message) : message;
 }
 
 /**
@@ -778,13 +766,7 @@ function getRouterIP(req, res) {
 function getBlockedPorts(req, res) {
   const blockedPorts = userconfig.initial.blockedPorts || [];
   const message = messageHelper.createDataMessage(blockedPorts);
-  if (res) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.json(message);
-  }
-  return message;
+  return res ? res.json(message) : message;
 }
 
 /**
@@ -796,13 +778,7 @@ function getBlockedPorts(req, res) {
 function getAPIPort(req, res) {
   const routerIP = userconfig.initial.apiport || '16127';
   const message = messageHelper.createDataMessage(routerIP);
-  if (res) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.json(message);
-  }
-  return message;
+  return res ? res.json(message) : message;
 }
 
 /**
@@ -814,13 +790,7 @@ function getAPIPort(req, res) {
 function getBlockedRepositories(req, res) {
   const blockedPorts = userconfig.initial.blockedRepositories || [];
   const message = messageHelper.createDataMessage(blockedPorts);
-  if (res) {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    return res.json(message);
-  }
-  return message;
+  return res ? res.json(message) : message;
 }
 
 /**
@@ -1427,9 +1397,6 @@ async function adjustKadenaAccount(req, res) {
 
       await fs.writeFile(fluxDirPath, dataToWrite);
 
-      // Hot reload userconfig to apply changes immediately
-      serviceHelper.reloadUserConfig();
-
       const successMessage = messageHelper.createSuccessMessage('Kadena account adjusted');
       res.json(successMessage);
     } else {
@@ -1472,9 +1439,6 @@ async function adjustRouterIP(req, res) {
       }`;
       const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
       await fs.writeFile(fluxDirPath, dataToWrite);
-
-      // Hot reload userconfig to apply changes immediately
-      serviceHelper.reloadUserConfig();
 
       const successMessage = messageHelper.createSuccessMessage('Router IP adjusted');
       res.json(successMessage);
@@ -1530,10 +1494,6 @@ async function adjustBlockedPorts(req, res) {
           }`;
     const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
     await fs.writeFile(fluxDirPath, dataToWrite);
-
-    // Hot reload userconfig to apply changes immediately
-    serviceHelper.reloadUserConfig();
-
     const successMessage = messageHelper.createSuccessMessage('User Blocked Ports adjusted');
     res.json(successMessage);
   } catch (error) {
@@ -1583,9 +1543,6 @@ async function adjustAPIPort(req, res) {
       }`;
       const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
       await fs.writeFile(fluxDirPath, dataToWrite);
-
-      // Hot reload userconfig to apply changes immediately
-      serviceHelper.reloadUserConfig();
 
       const successMessage = messageHelper.createSuccessMessage('API Port adjusted. A restart of FluxOS is necessary');
       res.json(successMessage);
@@ -1649,10 +1606,6 @@ async function adjustBlockedRepositories(req, res) {
           }`;
     const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
     await fs.writeFile(fluxDirPath, dataToWrite);
-
-    // Hot reload userconfig to apply changes immediately
-    serviceHelper.reloadUserConfig();
-
     const successMessage = messageHelper.createSuccessMessage('User Blocked Repositories adjusted');
     res.json(successMessage);
   } catch (error) {
