@@ -303,7 +303,7 @@ async function trySpawningGlobalApplication() {
     }
 
     // verify app compliance
-    await imageManager.checkApplicationImagesCompliance(appSpecifications).catch((error) => {
+    await imageManager.checkApplicationImagesComplience(appSpecifications).catch((error) => {
       if (error.message !== 'Unable to communicate with Flux Services! Try again later.') {
         globalState.spawnErrorsLongerAppCache.set(appHash, '');
       }
@@ -472,7 +472,11 @@ async function trySpawningGlobalApplication() {
     for (const componentToInstall of compositedSpecification) {
       // check image is whitelisted and repotag is available for download
       // eslint-disable-next-line no-await-in-loop
-      await imageManager.verifyRepository(componentToInstall.repotag, { repoauth: componentToInstall.repoauth, architecture }).catch((error) => {
+      await imageManager.verifyRepository(componentToInstall.repotag, {
+        repoauth: componentToInstall.repoauth,
+        architecture,
+        appVersion: appSpecifications.version // Pass version for credential handling
+      }).catch((error) => {
         globalState.spawnErrorsLongerAppCache.set(appHash, '');
         throw error;
       });

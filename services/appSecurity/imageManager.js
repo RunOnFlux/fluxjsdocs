@@ -3,6 +3,7 @@ const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const pgpService = require('../pgpService');
+const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
@@ -30,6 +31,7 @@ async function verifyRepository(repotag, options = {}) {
   const repoauth = options.repoauth || null;
   const skipVerification = options.skipVerification || false;
   const architecture = options.architecture || null;
+  const appVersion = options.appVersion || 7; // Default to v7 for backward compatibility
 
   const imgVerifier = new imageVerifier.ImageVerifier(
     repotag,
@@ -42,17 +44,17 @@ async function verifyRepository(repotag, options = {}) {
   }
 
   if (repoauth) {
-    const authToken = await pgpService.decryptMessage(repoauth);
+    // Use credential helper to handle version-aware decryption and cloud providers
+    const credentials = await registryCredentialHelper.getCredentials(
+      repotag,
+      repoauth,
+      appVersion,
+    );
 
-    if (!authToken) {
-      throw new Error('Unable to decrypt provided credentials');
+    if (credentials) {
+      // Pass credentials object directly - no need to convert to string
+      imgVerifier.addCredentials(credentials);
     }
-
-    if (!authToken.includes(':')) {
-      throw new Error('Provided credentials not in the correct username:token format');
-    }
-
-    imgVerifier.addCredentials(authToken);
   }
 
   await imgVerifier.verifyImage();
@@ -227,7 +229,7 @@ async function checkAppSecrets(appName, appComponentSpecs, appOwner, registratio
  * @param {object} appSpecs - Application specifications
  * @returns {Promise<boolean>} True if images are compliant
  */
-async function checkApplicationImagesCompliance(appSpecs) {
+async function checkApplicationImagesComplience(appSpecs) {
   const repos = await getBlockedRepositores();
   const userBlockedRepos = await getUserBlockedRepositores();
 
@@ -271,24 +273,24 @@ async function checkApplicationImagesCompliance(appSpecs) {
 
   images.forEach((image) => {
     if (pureImagesOrOrganisationsRepos.includes(image)) {
-      throw new Error(`Image ${image} is blocked. Application ${appSpecs.name} cannot be spawned.`);
+      throw new Error(`Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`);
     }
   });
   organisations.forEach((org) => {
     if (pureImagesOrOrganisationsRepos.includes(org)) {
-      throw new Error(`Organisation ${org} is blocked. Application ${appSpecs.name} cannot be spawned.`);
+      throw new Error(`Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`);
     }
   });
   if (userBlockedRepos) {
     log.info(`userBlockedRepos: ${JSON.stringify(userBlockedRepos)}`);
     organisations.forEach((org) => {
       if (userBlockedRepos.includes(org.toLowerCase())) {
-        throw new Error(`Organisation ${org} is user blocked. Application ${appSpecs.name} cannot be spawned.`);
+        throw new Error(`Organisation ${org} is user blocked. Application ${appSpecs.name} connot be spawned.`);
       }
     });
     images.forEach((image) => {
       if (userBlockedRepos.includes(image.toLowerCase())) {
-        throw new Error(`Image ${image} is user blocked. Application ${appSpecs.name} cannot be spawned.`);
+        throw new Error(`Image ${image} is user blocked. Application ${appSpecs.name} connot be spawned.`);
       }
     });
   }
@@ -339,12 +341,12 @@ async function checkApplicationImagesBlocked(appSpecs) {
 
     images.forEach((image) => {
       if (pureImagesOrOrganisationsRepos.includes(image)) {
-        isBlocked = `Image ${image} is blocked. Application ${appSpecs.name} cannot be spawned.`;
+        isBlocked = `Image ${image} is blocked. Application ${appSpecs.name} connot be spawned.`;
       }
     });
     organisations.forEach((org) => {
       if (pureImagesOrOrganisationsRepos.includes(org)) {
-        isBlocked = `Organisation ${org} is blocked. Application ${appSpecs.name} cannot be spawned.`;
+        isBlocked = `Organisation ${org} is blocked. Application ${appSpecs.name} connot be spawned.`;
       }
     });
   }
@@ -353,13 +355,13 @@ async function checkApplicationImagesBlocked(appSpecs) {
     log.info(`userBlockedRepos: ${JSON.stringify(userBlockedRepos)}`);
     organisations.forEach((org) => {
       if (userBlockedRepos.includes(org.toLowerCase())) {
-        isBlocked = `Organisation ${org} is user blocked. Application ${appSpecs.name} cannot be spawned.`;
+        isBlocked = `Organisation ${org} is user blocked. Application ${appSpecs.name} connot be spawned.`;
       }
     });
     if (!isBlocked) {
       images.forEach((image) => {
         if (userBlockedRepos.includes(image.toLowerCase())) {
-          isBlocked = `Image ${image} is user blocked. Application ${appSpecs.name} cannot be spawned.`;
+          isBlocked = `Image ${image} is user blocked. Application ${appSpecs.name} connot be spawned.`;
         }
       });
     }
@@ -454,7 +456,7 @@ module.exports = {
   getBlockedRepositores,
   getUserBlockedRepositores,
   checkAppSecrets,
-  checkApplicationImagesCompliance,
+  checkApplicationImagesComplience,
   checkApplicationImagesBlocked,
   checkDockerAccessibility,
   checkApplicationsCompliance,
