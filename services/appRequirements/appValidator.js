@@ -548,24 +548,15 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
   if (appSpecifications.version !== 1 && appSpecifications.version !== 2 && appSpecifications.version !== 3 && appSpecifications.version !== 4 && appSpecifications.version !== 5 && appSpecifications.version !== 6 && appSpecifications.version !== 7 && appSpecifications.version !== 8) {
     throw new Error('Flux App message version specification is invalid');
   }
-  // Version 8+ allows up to 63 characters to align with FQDN label standards (RFC 1035)
-  const maxNameLength = appSpecifications.version >= 8 ? 63 : 32;
-  if (appSpecifications.name.length > maxNameLength) {
-    throw new Error(`Flux App name is too long. Maximum ${maxNameLength} characters allowed`);
+  if (appSpecifications.name.length > 32) {
+    throw new Error('Flux App name is too long');
   }
   // furthermore name cannot contain any special character
   if (!appSpecifications.name) {
     throw new Error('Please provide a valid Flux App name');
   }
-  // Version 8+ allows hyphens in app names (but not as first or last character)
-  if (appSpecifications.version >= 8) {
-    if (!appSpecifications.name.match(/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/)) {
-      throw new Error('Flux App name contains special characters. Only a-z, A-Z, 0-9 and hyphens are allowed (hyphens cannot be first or last character)');
-    }
-  } else {
-    if (!appSpecifications.name.match(/^[a-zA-Z0-9]+$/)) {
-      throw new Error('Flux App name contains special characters. Only a-z, A-Z and 0-9 are allowed');
-    }
+  if (!appSpecifications.name.match(/^[a-zA-Z0-9]+$/)) {
+    throw new Error('Flux App name contains special characters. Only a-z, A-Z and 0-9 are allowed');
   }
   if (appSpecifications.name.startsWith('zel')) {
     throw new Error('Flux App name can not start with zel');
@@ -677,10 +668,8 @@ function verifyRestrictionCorrectnessOfApp(appSpecifications, height) {
       if (!appComponent.name) {
         throw new Error('Please provide a valid Flux App Component name');
       }
-      // Version 8+ allows up to 63 characters to align with FQDN label standards (RFC 1035)
-      const maxComponentNameLength = appSpecifications.version >= 8 ? 63 : 32;
-      if (appComponent.name.length > maxComponentNameLength) {
-        throw new Error(`Flux App component name is too long. Maximum ${maxComponentNameLength} characters allowed`);
+      if (appComponent.name.length > 32) {
+        throw new Error('Flux App name is too long');
       }
       if (appComponent.name.startsWith('zel')) {
         throw new Error('Flux App Component name can not start with zel');
@@ -1238,17 +1227,33 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
   // Whitelist, repository checks
   if (checkDockerAndWhitelist) {
     // check blacklist
-    await imageManager.checkApplicationImagesCompliance(appSpecifications);
+    await imageManager.checkApplicationImagesComplience(appSpecifications);
+
+    // For v7 enterprise apps, skip verification because repoauth is PGP-encrypted
+    // and only selected nodes have the private keys to decrypt it.
+    // For v8+, repoauth is plain text (already decrypted from enterprise blob),
+    // so we can and should verify the repository.
+    const shouldSkipVerification = appSpecifications.version === 7
+      && appSpecifications.nodes
+      && appSpecifications.nodes.length > 0;
 
     if (appSpecifications.version <= 3) {
       // check repository whitelisted and repotag is available for download
-      await imageManager.verifyRepository(appSpecifications.repotag, { repoauth: appSpecifications.repoauth, skipVerification: true });
+      await imageManager.verifyRepository(appSpecifications.repotag, {
+        repoauth: appSpecifications.repoauth,
+        skipVerification: shouldSkipVerification,
+        appVersion: appSpecifications.version,
+      });
     } else {
       // eslint-disable-next-line no-restricted-syntax
       for (const appComponent of appSpecifications.compose) {
         // check repository whitelisted and repotag is available for download
         // eslint-disable-next-line no-await-in-loop
-        await imageManager.verifyRepository(appComponent.repotag, { repoauth: appComponent.repoauth, skipVerification: true });
+        await imageManager.verifyRepository(appComponent.repotag, {
+          repoauth: appComponent.repoauth,
+          skipVerification: shouldSkipVerification,
+          appVersion: appSpecifications.version,
+        });
       }
     }
   }
@@ -1373,11 +1378,11 @@ async function verifyAppUpdateParameters(req, res) {
         }
       }
 
-      // Validate update compatibility with previous version
+      // check if name is not yet registered
       const timestamp = Date.now();
       // Dynamic require to avoid circular dependency
       const advancedWorkflows = require('../appLifecycle/advancedWorkflows');
-      await advancedWorkflows.validateApplicationUpdateCompatibility(appSpecFormatted, timestamp);
+      await advancedWorkflows.checkApplicationUpdateNameRepositoryConflicts(appSpecFormatted, timestamp);
 
       if (isEnterprise) {
         appSpecFormatted.contacts = [];
