@@ -12,7 +12,6 @@ const hash = require('object-hash');
 
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
-const syncthingService = require('./syncthingService');
 const fifoQueue = require('./utils/fifoQueue');
 const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 
@@ -58,21 +57,9 @@ async function aptRunner(options = {}) {
   // https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1053726
   // This might affect arm, but I don't have an arm to test with.
 
-  // any apt after 1.9.11 has the DPkg::Lock::Timeout option.
-  const params = [
-    '-y', // Auto-answer yes to prompts
-    '-o', `DPkg::Lock::Timeout=${timeout}`, // How long to wait for a lock
-    '-o', 'Dpkg::Options::=--force-confdef', // Use default for new config files
-    '-o', 'Dpkg::Options::=--force-confold', // Keep old config files on conflict
-    ...userParams,
-  ];
-
-  // Use env command to pass DEBIAN_FRONTEND through sudo (sudo strips env vars by default)
-  const envParams = ['DEBIAN_FRONTEND=noninteractive', 'apt-get', ...params];
-  const { error } = await serviceHelper.runCommand('env', {
-    runAsRoot: true,
-    params: envParams,
-  });
+  // any apt after 1.9.11 has this option.
+  const params = ['-o', `DPkg::Lock::Timeout=${timeout}`, ...userParams];
+  const { error } = await serviceHelper.runCommand('apt-get', { runAsRoot: true, params });
 
   // this is so this command can be retried by the worker runner
   if (error) throw error;
@@ -322,7 +309,7 @@ async function addSyncthingRepository() {
   // syncthing does this weird
   const dist = 'syncthing';
   const sourceUrl = 'https://apt.syncthing.net/';
-  const components = ['stable-v2'];
+  const components = ['stable'];
   const sourceOptions = ['signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg'];
 
   // keyring vars
@@ -344,156 +331,31 @@ async function addSyncthingRepository() {
 }
 
 /**
- * Updates syncthing apt source component from 'stable' to 'stable-v2'
- * Supports both legacy (one-line) and deb822 format
- * @param {string} sourceContent The content of the apt source file
- * @returns {string|null} Updated content or null if update failed/not needed
- */
-function updateSyncthingSourceComponent(sourceContent) {
-  if (!sourceContent || typeof sourceContent !== 'string') {
-    return null;
-  }
-
-  // Already migrated?
-  if (sourceContent.includes('stable-v2')) {
-    return null;
-  }
-
-  // Detect format: deb822 has "Types:", "URIs:", or "Components:" fields
-  const isDeb822 = /^(?:Types|URIs|Components):/m.test(sourceContent);
-
-  let newContent;
-  if (isDeb822) {
-    // deb822 format: "Components: stable" -> "Components: stable-v2"
-    // Pattern explanation:
-    // ^Components:(?<spacing>\s*) - match "Components:" and capture whitespace after
-    // (?<prefix>.*?) - non-greedy match of any characters before stable
-    // \bstable\b(?!-v2) - match word "stable" but not "stable-v2" (negative lookahead)
-    // (?<suffix>.*?)$ - non-greedy match of everything after stable to end of line
-    newContent = sourceContent.replace(
-      /^Components:(?<spacing>\s*)(?<prefix>.*?)\bstable\b(?!-v2)(?<suffix>.*?)$/m,
-      'Components:$<spacing>$<prefix>stable-v2$<suffix>',
-    );
-  } else {
-    // Legacy format: "deb [...] url suite stable" -> "deb [...] url suite stable-v2"
-    // Pattern explanation:
-    // ^(?<prefix>deb(?:-src)?\s+(?:\[.*?\]\s+)?\S+\s+\S+\s+) - capture everything before stable:
-    //   - deb(?:-src)? - match "deb" or "deb-src" (non-capturing group for -src)
-    //   - \s+ - match one or more whitespace
-    //   - (?:\[.*?\]\s+)? - optionally match options like [signed-by=...] (non-capturing)
-    //   - \S+\s+\S+\s+ - match URL and suite with whitespace
-    // stable\b(?!-v2) - match word "stable" but not "stable-v2" (negative lookahead)
-    // (?<suffix>\s*)$ - capture optional trailing whitespace to end of line
-    newContent = sourceContent.replace(
-      /^(?<prefix>deb(?:-src)?\s+(?:\[.*?\]\s+)?\S+\s+\S+\s+)stable\b(?!-v2)(?<suffix>\s*)$/m,
-      '$<prefix>stable-v2$<suffix>',
-    );
-  }
-
-  // Validate that the replacement actually worked
-  if (newContent === sourceContent) {
-    log.error('Failed to update syncthing source: pattern did not match');
-    return null;
-  }
-
-  if (!newContent.includes('stable-v2')) {
-    log.error('Failed to update syncthing source: stable-v2 not found in result');
-    return null;
-  }
-
-  return newContent;
-}
-
-/**
- * Updates the syncthing apt source from v1 to v2
- * @returns {Promise<boolean>} True if sources are ready for v2 (updated or already on v2), false on failure
- */
-async function updateSyncthingRepository() {
-  const sourcePath = '/etc/apt/sources.list.d/syncthing.list';
-
-  // Securely read the file as root (file may only be root-readable)
-  const { stdout: sourceContent } = await serviceHelper
-    .runCommand('cat', { runAsRoot: true, params: [sourcePath], logError: false });
-
-  if (!sourceContent) {
-    log.warn('Unable to read syncthing sources, unable to update syncthing');
-    return false;
-  }
-
-  const newContent = updateSyncthingSourceComponent(sourceContent);
-
-  if (!newContent) {
-    // Already on v2 or failed to parse - function logs errors
-    if (sourceContent.includes('stable-v2')) {
-      log.info('Syncthing sources already on v2, nothing to do');
-      return true; // Sources are ready for v2 upgrade
-    }
-    return false; // Failed to parse
-  }
-
-  log.info('Switching syncthing apt source from stable to stable-v2...');
-
-  // Securely write the file: write to temp, then move as root
-  // (file may only be root-writeable)
-  const tempFile = './syncthing.list.tmp';
-  const writeError = await fs
-    .writeFile(tempFile, newContent, 'utf8')
-    .catch(() => true);
-
-  if (writeError) {
-    log.warn('Unable to write to current directory, unable to update syncthing');
-    return false;
-  }
-
-  const { error: moveError } = await serviceHelper.runCommand('mv', {
-    runAsRoot: true,
-    params: [tempFile, sourcePath],
-  });
-
-  if (moveError) {
-    log.error('Failed to write syncthing apt source');
-    await fs.rm(tempFile, { force: true }).catch(() => { });
-    return false;
-  }
-
-  await updateAptCache({ force: true });
-  log.info('Apt source updated to stable-v2');
-  await fs.rm(tempFile, { force: true }).catch(() => { });
-  return true;
-}
-
-/**
  *  Makes sure the package version is above the minimum version provided
  * @param {string} systemPackage The package version to check
- * @param {string} requiredVersion The minimum acceptable version of package
- * @param {string?} currentVersion Optional current version of package
- * @returns {Promise<boolean>} True if package was upgraded, false otherwise
+ * @param {string} version The minimum acceptable version
+ * @returns {Promise<void>}
  */
-async function ensurePackageVersion(systemPackage, requiredVersion, currentVersion = null) {
+async function ensurePackageVersion(systemPackage, version) {
   try {
-    log.info(`Checking package ${systemPackage} is updated to version ${requiredVersion}`);
-
-    const actualVersion = currentVersion || await getPackageVersion(systemPackage);
-
-    if (!actualVersion) {
+    log.info(`Checking package ${systemPackage} is updated to version ${version}`);
+    const currentVersion = await getPackageVersion(systemPackage);
+    if (!currentVersion) {
       log.info(`Package ${systemPackage} not found on system`);
       await upgradePackage(systemPackage);
-      return true; // Package was installed/upgraded
+      return;
     }
+    log.info(`Package ${systemPackage} version ${currentVersion} found`);
+    const versionOk = serviceHelper.minVersionSatisfy(currentVersion, version);
 
-    log.info(`Package ${systemPackage} version ${actualVersion} found`);
-    const versionOk = serviceHelper.minVersionSatisfy(actualVersion, requiredVersion);
-
-    if (versionOk) return false; // Already at correct version, no upgrade
+    if (versionOk) return;
 
     const upgradeError = await upgradePackage(systemPackage);
     if (!upgradeError) {
       log.info(`${systemPackage} is on the latest version`);
     }
-    return !upgradeError; // True if upgrade succeeded, false if it failed
   } catch (error) {
     log.error(error);
-    return false; // Error occurred, no upgrade
   }
 }
 
@@ -523,45 +385,43 @@ async function monitorSyncthingPackage() {
 
       const minSyncthingVersion =
         data.syncthing || config.minimumSyncthingAllowedVersion;
+      // const dockerVersion = data.docker || config.minimumDockerAllowedVersion;
 
-      const currentSyncthingVersion = await getPackageVersion('syncthing');
+      // Handle Syncthing v1 -> v2 upgrade by switching apt source when needed
+      if (serviceHelper.minVersionSatisfy(minSyncthingVersion, '2.0.0')) {
+        const currentSyncthingVersion = await getPackageVersion('syncthing');
 
-      // We only check if the package / sources are up to date if it's installed
-      if (currentSyncthingVersion) {
-        const upToDate = serviceHelper.minVersionSatisfy(
-          currentSyncthingVersion,
-          minSyncthingVersion,
-        );
+        if (
+          currentSyncthingVersion &&
+          !serviceHelper.minVersionSatisfy(currentSyncthingVersion, '2.0.0')
+        ) {
+          const sourcePath = '/etc/apt/sources.list.d/syncthing.list';
+          const sourceContent = await fs
+            .readFile(sourcePath, 'utf8')
+            .catch(() => null);
 
-        if (upToDate) return;
+          // Source still on 'stable' component?
+          if (sourceContent && !sourceContent.includes('stable-v2')) {
+            log.info(
+              'Switching syncthing apt source from stable to stable-v2...',
+            );
 
-        // The sources changed at version 2.0.0 from stable, to stable-v2
-        const hasNewSources = serviceHelper.minVersionSatisfy(
-          currentSyncthingVersion,
-          '2.0.0',
-        );
+            // Update source from stable to stable-v2
+            const newContent = sourceContent.replace(
+              /\sstable\s*$/,
+              ' stable-v2\n',
+            );
+            await fs.writeFile(sourcePath, newContent, 'utf8');
 
-        if (!hasNewSources) {
-          const updated = await updateSyncthingRepository();
-          if (!updated) {
-            log.warn('Failed to update syncthing repository sources, skipping syncthing upgrade');
-            return;
+            await updateAptCache({ force: true });
+            log.info('Apt source updated to stable-v2');
           }
         }
       }
 
-      const upgraded = await ensurePackageVersion(
-        'syncthing',
-        minSyncthingVersion,
-        currentSyncthingVersion,
-      );
-
-      // we only restart if the package was installed (and running) in the first place
-      if (currentSyncthingVersion && upgraded) {
-        log.info('Syncthing upgraded, restarting to load new binary...');
-        await syncthingService.systemRestart(null, null).catch(() => { });
-      }
-    }
+      await ensurePackageVersion('syncthing', minSyncthingVersion);
+      // await ensurePackageVersion('docker', dockerVersion); commented as it needs extra love to work
+    };
 
     await versionChecker();
 
@@ -680,13 +540,13 @@ async function monitorSystem() {
     // don't await these, let the queue deal with it
 
     // ubuntu 18.04 -> 24.04 all share this package
-    setImmediate(() => ensurePackageVersion('ca-certificates', '20230311'));
+    ensurePackageVersion('ca-certificates', '20230311');
     // 18.04 == 1.187
     // 20.04 == 1.206
     // 22.04 == 1.218
     // Debian 12 = 1.219
-    setImmediate(() => ensurePackageVersion('netcat-openbsd', '1.187'));
-    setImmediate(() => monitorSyncthingPackage());
+    ensurePackageVersion('netcat-openbsd', '1.187');
+    monitorSyncthingPackage();
   } catch (error) {
     log.error(error);
   }
@@ -929,8 +789,6 @@ module.exports = {
   queueAptGetCommand,
   resetTimers,
   updateAptCache,
-  updateSyncthingRepository,
-  updateSyncthingSourceComponent,
   upgradePackage,
   mongoDBConfig,
   mongodGpgKeyVeryfity,
