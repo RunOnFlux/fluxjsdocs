@@ -16,7 +16,6 @@ const portManager = require('../appNetwork/portManager');
 const appUtilities = require('../utils/appUtilities');
 const systemIntegration = require('../appSystem/systemIntegration');
 const globalState = require('../utils/globalState');
-const { FluxCacheManager } = require('../utils/cacheManager');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 
 let appInstaller; // Will be initialized to avoid circular dependency
@@ -30,10 +29,6 @@ function initialize(deps) {
   appInstaller = deps.appInstaller;
   appUninstaller = deps.appUninstaller;
 }
-
-// Note: Docker Hub error classification and caching is now handled by imageManager.js
-// which uses structured error metadata from imageVerifier.js for accurate classification
-// This spawner cache serves as an additional layer to prevent repeated spawn attempts
 
 /**
  * Try spawning a global application that needs more instances
@@ -307,22 +302,6 @@ async function trySpawningGlobalApplication() {
       return;
     }
 
-    // EARLY CHECK: Verify app doesn't use user-blocked ports before expensive Docker Hub operations
-    const appPorts = appUtilities.getAppPorts(appSpecifications);
-    // eslint-disable-next-line no-restricted-syntax
-    for (let i = 0; i < appPorts.length; i += 1) {
-      const port = appPorts[i];
-      const isUserBlocked = fluxNetworkHelper.isPortUserBlocked(port);
-      if (isUserBlocked) {
-        log.info(`trySpawningGlobalApplication - App ${appSpecifications.name} uses user-blocked port ${port}. Adding to error cache.`);
-        globalState.spawnErrorsLongerAppCache.set(appHash, '');
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(shortDelayTime);
-        trySpawningGlobalApplication();
-        return;
-      }
-    }
-
     // verify app compliance
     await imageManager.checkApplicationImagesCompliance(appSpecifications).catch((error) => {
       if (error.message !== 'Unable to communicate with Flux Services! Try again later.') {
@@ -342,7 +321,16 @@ async function trySpawningGlobalApplication() {
 
     await portManager.ensureApplicationPortsNotUsed(appSpecifications, runningAppsNames);
 
-    // Note: User-blocked port check happens earlier (line ~353) before Docker Hub calls
+    const appPorts = appUtilities.getAppPorts(appSpecifications);
+    // check port is not user blocked
+    appPorts.forEach((port) => {
+      const isUserBlocked = fluxNetworkHelper.isPortUserBlocked(port);
+      if (isUserBlocked) {
+        globalState.spawnErrorsLongerAppCache.set(appHash, '');
+        throw new Error(`trySpawningGlobalApplication - Port ${port} is blocked by user. Installation aborted.`);
+      }
+    });
+
     // Check if ports are publicly available - critical for proper Flux network operation
     const portsPubliclyAvailable = await portManager.checkInstallingAppPortAvailable(appPorts);
     if (portsPubliclyAvailable === false) {
@@ -485,11 +473,7 @@ async function trySpawningGlobalApplication() {
       // check image is whitelisted and repotag is available for download
       // eslint-disable-next-line no-await-in-loop
       await imageManager.verifyRepository(componentToInstall.repotag, { repoauth: componentToInstall.repoauth, architecture }).catch((error) => {
-        // imageManager already handles error classification and caching with intelligent TTLs (1h-7d)
-        // Add to spawn cache with 1-hour TTL to allow retry sooner than default 12h
-        // This lets temporary Docker Hub issues (network, rate limit) be retried faster
-        log.warn(`trySpawningGlobalApplication - Docker Hub verification failed for ${appToRun}: ${error.message}`);
-        globalState.trySpawningGlobalAppCache.set(appHash, '', { ttl: FluxCacheManager.oneHour });
+        globalState.spawnErrorsLongerAppCache.set(appHash, '');
         throw error;
       });
     }

@@ -123,10 +123,6 @@ class FluxCacheManager {
       max: 50,
       ttl: 5 * FluxCacheManager.oneMinute,
     },
-    dockerHubVerificationCache: {
-      max: 200,
-      ttl: FluxCacheManager.oneHour,
-    },
     // fluxCommunicationMessageSender
     tempMessageCache: {
       max: 250,
@@ -210,4 +206,4 @@ class FluxCacheManager {
 
 const fluxCaching = new FluxCacheManager();
 
-module.exports = { default: fluxCaching, FluxTTLCache, FluxCacheManager };
+module.exports = { default: fluxCaching, FluxTTLCache };
