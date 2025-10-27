@@ -540,9 +540,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
 
         const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
         const daemonHeight = syncStatus.data.height;
-        // Determine default expire based on whether app was registered after PON fork
-        const defaultExpire = height >= config.fluxapps.daemonPONFork ? 88000 : 22000;
-        const expire = specifications.expire || defaultExpire;
+        const expire = specifications.expire || 22000;
         let actualExpirationHeight = height + expire;
 
         // If app was registered before fork block and we are past fork block
