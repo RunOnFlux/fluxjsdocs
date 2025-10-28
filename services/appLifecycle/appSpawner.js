@@ -484,11 +484,7 @@ async function trySpawningGlobalApplication() {
     for (const componentToInstall of compositedSpecification) {
       // check image is whitelisted and repotag is available for download
       // eslint-disable-next-line no-await-in-loop
-      await imageManager.verifyRepository(componentToInstall.repotag, {
-        repoauth: componentToInstall.repoauth,
-        architecture,
-        appVersion: appSpecifications.version // Pass version for credential handling
-      }).catch((error) => {
+      await imageManager.verifyRepository(componentToInstall.repotag, { repoauth: componentToInstall.repoauth, architecture }).catch((error) => {
         // imageManager already handles error classification and caching with intelligent TTLs (1h-7d)
         // Add to spawn cache with 1-hour TTL to allow retry sooner than default 12h
         // This lets temporary Docker Hub issues (network, rate limit) be retried faster
@@ -527,7 +523,7 @@ async function trySpawningGlobalApplication() {
     await serviceHelper.delay(500);
     await fluxCommMessagesSender.broadcastMessageToIncoming(newAppInstallingMessage);
 
-    await serviceHelper.delay(30 * 1000); // give it time so messages are propagated on the network
+    await serviceHelper.delay(90 * 1000); // give it 1.5m so messages are propagated on the network
 
     // double check if app is installed in more of the instances requested
     runningAppList = await registryManager.appLocation(appToRun);
