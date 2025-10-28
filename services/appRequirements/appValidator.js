@@ -1240,15 +1240,31 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
     // check blacklist
     await imageManager.checkApplicationImagesCompliance(appSpecifications);
 
+    // For v7 enterprise apps, skip verification because repoauth is PGP-encrypted
+    // and only selected nodes have the private keys to decrypt it.
+    // For v8+, repoauth is plain text (already decrypted from enterprise blob),
+    // so we can and should verify the repository.
+    const shouldSkipVerification = appSpecifications.version === 7
+      && appSpecifications.nodes
+      && appSpecifications.nodes.length > 0;
+
     if (appSpecifications.version <= 3) {
       // check repository whitelisted and repotag is available for download
-      await imageManager.verifyRepository(appSpecifications.repotag, { repoauth: appSpecifications.repoauth, skipVerification: true });
+      await imageManager.verifyRepository(appSpecifications.repotag, {
+        repoauth: appSpecifications.repoauth,
+        skipVerification: shouldSkipVerification,
+        appVersion: appSpecifications.version,
+      });
     } else {
       // eslint-disable-next-line no-restricted-syntax
       for (const appComponent of appSpecifications.compose) {
         // check repository whitelisted and repotag is available for download
         // eslint-disable-next-line no-await-in-loop
-        await imageManager.verifyRepository(appComponent.repotag, { repoauth: appComponent.repoauth, skipVerification: true });
+        await imageManager.verifyRepository(appComponent.repotag, {
+          repoauth: appComponent.repoauth,
+          skipVerification: shouldSkipVerification,
+          appVersion: appSpecifications.version,
+        });
       }
     }
   }

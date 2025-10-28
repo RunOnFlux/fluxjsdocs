@@ -3,6 +3,7 @@ const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const pgpService = require('../pgpService');
+const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
@@ -85,6 +86,7 @@ async function verifyRepository(repotag, options = {}) {
   const repoauth = options.repoauth || null;
   const skipVerification = options.skipVerification || false;
   const architecture = options.architecture || null;
+  const appVersion = options.appVersion || 7; // Default to v7 for backward compatibility
 
   // Check cache first to avoid redundant Docker Hub API calls
   // Cache key includes architecture since same image may have different arch support
@@ -111,17 +113,17 @@ async function verifyRepository(repotag, options = {}) {
   }
 
   if (repoauth) {
-    const authToken = await pgpService.decryptMessage(repoauth);
+    // Use credential helper to handle version-aware decryption and cloud providers
+    const credentials = await registryCredentialHelper.getCredentials(
+      repotag,
+      repoauth,
+      appVersion,
+    );
 
-    if (!authToken) {
-      throw new Error('Unable to decrypt provided credentials');
+    if (credentials) {
+      // Pass credentials object directly - no need to convert to string
+      imgVerifier.addCredentials(credentials);
     }
-
-    if (!authToken.includes(':')) {
-      throw new Error('Provided credentials not in the correct username:token format');
-    }
-
-    imgVerifier.addCredentials(authToken);
   }
 
   try {

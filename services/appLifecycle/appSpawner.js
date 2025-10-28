@@ -484,7 +484,11 @@ async function trySpawningGlobalApplication() {
     for (const componentToInstall of compositedSpecification) {
       // check image is whitelisted and repotag is available for download
       // eslint-disable-next-line no-await-in-loop
-      await imageManager.verifyRepository(componentToInstall.repotag, { repoauth: componentToInstall.repoauth, architecture }).catch((error) => {
+      await imageManager.verifyRepository(componentToInstall.repotag, {
+        repoauth: componentToInstall.repoauth,
+        architecture,
+        appVersion: appSpecifications.version // Pass version for credential handling
+      }).catch((error) => {
         // imageManager already handles error classification and caching with intelligent TTLs (1h-7d)
         // Add to spawn cache with 1-hour TTL to allow retry sooner than default 12h
         // This lets temporary Docker Hub issues (network, rate limit) be retried faster
