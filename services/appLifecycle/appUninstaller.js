@@ -34,10 +34,9 @@ const crontabLoad = util.promisify(systemcrontab.load);
  * @param {boolean} isComponent - Whether this is a component
  * @param {object} res - Response object for streaming
  * @param {function} stopAppMonitoring - Function to stop monitoring
- * @param {boolean} force - Use aggressive removal (kill + force remove) for stuck containers
  * @returns {Promise<object>} Uninstallation result
  */
-async function appUninstallHard(appName, appId, appSpecifications, isComponent, res, stopAppMonitoring, force = false) {
+async function appUninstallHard(appName, appId, appSpecifications, isComponent, res, stopAppMonitoring) {
   const stopStatus = {
     status: isComponent ? `Stopping Flux App Component ${appSpecifications.name}...` : `Stopping Flux App ${appName}...`,
   };
@@ -54,33 +53,17 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     stopAppMonitoring(monitoredName, true);
   }
 
-  // Use kill instead of stop for forced removals to ensure container terminates
-  if (force) {
-    await dockerService.appDockerKill(appId).catch((error) => {
-      log.warn(`Failed to kill container ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else {
-    await dockerService.appDockerStop(appId).catch((error) => {
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  }
+  await dockerService.appDockerStop(appId).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    if (res) {
+      res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
+    }
+  });
   const stopStatus2 = {
     status: isComponent ? `Flux App Component ${appSpecifications.name} stopped` : `Flux App ${appName} stopped`,
   };
@@ -114,59 +97,54 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
     res.write(serviceHelper.ensureString(removeStatus));
     if (res.flush) res.flush();
   }
-
-  // Use force remove for forced removals to ensure container is removed even if running
-  let containerRemoved = false;
-  if (force) {
-    await dockerService.appDockerForceRemove(appId).then(() => {
-      containerRemoved = true;
-    }).catch((error) => {
-      log.error(`Force remove failed for ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else {
-    await dockerService.appDockerRemove(appId).then(() => {
-      containerRemoved = true;
-    }).catch((error) => {
-      log.error(`Container remove failed for ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
+  await dockerService.appDockerRemove(appId).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    log.error(errorResponse);
+    if (res) {
+      res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
+    }
+  });
+  const removeStatus2 = {
+    status: isComponent ? `Flux App component ${appSpecifications.name} container removed` : `Flux App ${appName} container removed`,
+  };
+  log.info(removeStatus2);
+  if (res) {
+    res.write(serviceHelper.ensureString(removeStatus2));
+    if (res.flush) res.flush();
   }
 
-  if (containerRemoved) {
-    const removeStatus2 = {
-      status: isComponent ? `Flux App component ${appSpecifications.name} container removed` : `Flux App ${appName} container removed`,
-    };
-    log.info(removeStatus2);
+  const imageStatus = {
+    status: isComponent ? `Removing Flux App component ${appSpecifications.name} image...` : `Removing Flux App ${appName} image...`,
+  };
+  log.info(imageStatus);
+  if (res) {
+    res.write(serviceHelper.ensureString(imageStatus));
+    if (res.flush) res.flush();
+  }
+  await dockerService.appDockerImageRemove(appSpecifications.repotag).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    log.error(errorResponse);
     if (res) {
-      res.write(serviceHelper.ensureString(removeStatus2));
+      res.write(serviceHelper.ensureString(errorResponse));
       if (res.flush) res.flush();
     }
-  } else {
-    const removeStatusWarning = {
-      status: `WARNING: Container ${appId} may not have been fully removed. Network cleanup may fail.`,
-    };
-    log.warn(removeStatusWarning);
-    if (res) {
-      res.write(serviceHelper.ensureString(removeStatusWarning));
-      if (res.flush) res.flush();
-    }
+  });
+  const imageStatus2 = {
+    status: isComponent ? `Flux App component ${appSpecifications.name} image operations done` : `Flux App ${appName} image operations done`,
+  };
+  log.info(imageStatus2);
+  if (res) {
+    res.write(serviceHelper.ensureString(imageStatus2));
+    if (res.flush) res.flush();
   }
 
   const portStatus = {
@@ -381,42 +359,6 @@ async function appUninstallHard(appName, appId, appSpecifications, isComponent, 
       if (res.flush) res.flush();
     }
   }
-
-  // Image removal: done AFTER all filesystem cleanup to avoid conflicts
-  // Only attempt if container was successfully removed
-  if (containerRemoved) {
-    const imageStatus = {
-      status: isComponent ? `Removing Flux App component ${appSpecifications.name} image...` : `Removing Flux App ${appName} image...`,
-    };
-    log.info(imageStatus);
-    if (res) {
-      res.write(serviceHelper.ensureString(imageStatus));
-      if (res.flush) res.flush();
-    }
-    await dockerService.appDockerImageRemove(appSpecifications.repotag).catch((error) => {
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      log.error(errorResponse);
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-    const imageStatus2 = {
-      status: isComponent ? `Flux App component ${appSpecifications.name} image operations done` : `Flux App ${appName} image operations done`,
-    };
-    log.info(imageStatus2);
-    if (res) {
-      res.write(serviceHelper.ensureString(imageStatus2));
-      if (res.flush) res.flush();
-    }
-  } else {
-    log.warn(`Skipping image removal for ${appId} because container removal failed`);
-  }
-
   const appRemovalResponse = {
     status: isComponent ? `Flux App component ${appSpecifications.name} of ${appName} was successfuly removed` : `Flux App ${appName} was successfuly removed`,
   };
@@ -588,11 +530,6 @@ async function appUninstallSoft(appName, appId, appSpecifications, isComponent, 
  */
 async function removeAppLocally(app, res, force = false, endResponse = true, sendMessage = false) {
   try {
-    // Log removal trigger with stack trace to identify caller
-    const stack = new Error().stack;
-    const callerLine = stack.split('\n')[2]?.trim();
-    log.warn(`APP REMOVAL TRIGGERED: ${app} | force=${force} | sendMessage=${sendMessage} | caller: ${callerLine}`);
-
     if (!force) {
       if (globalState.removalInProgress) {
         const warnResponse = messageHelper.createWarningMessage('Another application is undergoing removal. Removal not possible.');
@@ -688,15 +625,14 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
         const appComponentSpecifications = appComposedComponent;
         // eslint-disable-next-line no-await-in-loop
-        await appUninstallHard(appName, appId, appComponentSpecifications, isComponent, res, stopAppMonitoring, force);
+        await appUninstallHard(appName, appId, appComponentSpecifications, isComponent, res, stopAppMonitoring);
       }
       isComponent = false;
     } else if (isComponent) {
       const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
-      appId = dockerService.getAppIdentifier(`${componentSpecifications.name}_${appSpecifications.name}`);
-      await appUninstallHard(appName, appId, componentSpecifications, isComponent, res, stopAppMonitoring, force);
+      await appUninstallHard(appName, appId, componentSpecifications, isComponent, res, stopAppMonitoring);
     } else {
-      await appUninstallHard(appName, appId, appSpecifications, isComponent, res, stopAppMonitoring, force);
+      await appUninstallHard(appName, appId, appSpecifications, isComponent, res, stopAppMonitoring);
     }
 
     if (sendMessage) {
@@ -727,65 +663,14 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         res.write(serviceHelper.ensureString(dockerNetworkStatus));
         if (res.flush) res.flush();
       }
-
-      let networkRemoved = false;
-      let networkError = null;
-
-      if (force) {
-        // For forced removals, give Docker a moment to clean up container endpoints
-        await serviceHelper.delay(2000);
-
-        // Use aggressive network removal that disconnects endpoints first
-        log.info(`Attempting force removal of network for ${appName}...`);
-        await dockerService.forceRemoveFluxAppDockerNetwork(appName).then(() => {
-          networkRemoved = true;
-          log.info(`Network ${appName} force removed successfully`);
-        }).catch((error) => {
-          networkError = error;
-          log.error(`Force network removal failed: ${error.message}`);
-
-          // Retry once more after additional delay
-          log.warn(`Retrying force network removal for ${appName} after delay...`);
-        });
-
-        // Retry if first attempt failed
-        if (!networkRemoved && networkError) {
-          await serviceHelper.delay(3000);
-          await dockerService.forceRemoveFluxAppDockerNetwork(appName).then(() => {
-            networkRemoved = true;
-            log.info(`Network ${appName} removed on retry`);
-          }).catch((error) => {
-            log.error(`Network removal retry failed: ${error.message}`);
-          });
-        }
-      } else {
-        // Standard removal for non-forced uninstalls
-        await dockerService.removeFluxAppDockerNetwork(appName).then(() => {
-          networkRemoved = true;
-        }).catch((error) => {
-          networkError = error;
-          log.error(`Network removal failed: ${error.message}`);
-        });
-      }
-
-      if (networkRemoved) {
-        const dockerNetworkStatus2 = {
-          status: 'Docker network cleaned',
-        };
-        log.info(dockerNetworkStatus2);
-        if (res) {
-          res.write(serviceHelper.ensureString(dockerNetworkStatus2));
-          if (res.flush) res.flush();
-        }
-      } else {
-        const dockerNetworkStatusWarning = {
-          status: `WARNING: Docker network for ${appName} may not have been fully removed`,
-        };
-        log.warn(dockerNetworkStatusWarning);
-        if (res) {
-          res.write(serviceHelper.ensureString(dockerNetworkStatusWarning));
-          if (res.flush) res.flush();
-        }
+      await dockerService.removeFluxAppDockerNetwork(appName).catch((error) => log.error(error));
+      const dockerNetworkStatus2 = {
+        status: 'Docker network cleaned',
+      };
+      log.info(dockerNetworkStatus2);
+      if (res) {
+        res.write(serviceHelper.ensureString(dockerNetworkStatus2));
+        if (res.flush) res.flush();
       }
       const databaseStatus = {
         status: 'Cleaning up database...',
@@ -894,7 +779,6 @@ async function softRemoveAppLocally(app, res, globalStateRef, stopAppMonitoring)
       isComponent = false;
     } else if (isComponent) {
       const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
-      appId = dockerService.getAppIdentifier(`${componentSpecifications.name}_${appSpecifications.name}`);
       await appUninstallSoft(appName, appId, componentSpecifications, isComponent, res, stopAppMonitoring);
     } else {
       await appUninstallSoft(appName, appId, appSpecifications, isComponent, res, stopAppMonitoring);

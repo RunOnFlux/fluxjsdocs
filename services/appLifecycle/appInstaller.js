@@ -309,6 +309,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
         }
         dockerNetworkAddrValue = Math.floor(Math.random() * 256);
       }
+      log.info(`Flux Network: ${fluxNet}`);
       if (!fluxNet) {
         throw new Error(`Flux App network of ${appName} failed to initiate. Not possible to create docker application network.`);
       }
@@ -477,7 +478,6 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     if (!test) {
       const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
       log.info(removeStatus);
-      log.warn(`REMOVAL REASON: Installation failure - ${appSpecs.name} failed to install: ${error.message} (appInstaller)`);
       if (res) {
         res.write(serviceHelper.ensureString(removeStatus));
         if (res.flush) res.flush();
