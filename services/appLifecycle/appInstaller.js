@@ -41,39 +41,6 @@ const dockerPullStreamPromise = util.promisify(dockerService.dockerPullStream);
 
 const supportedArchitectures = ['amd64', 'arm64'];
 
-
-/**
- *
- * @param {string} repoauth The docker repository authentication
- * @param {number} specVersion The app spec version (to determine decryption type)
- * @returns {Promise<null|string>}
- */
-async function handleRepoauthDecryption(repoauth, specVersion) {
-  if (!repoauth) return null;
-
-  if (specVersion < 7) {
-    throw new Error('Specifications less than v7 do not have repoauth')
-  }
-
-  let authToken = null;
-
-  if (specVersion === 7) {
-    authToken = await pgpService.decryptMessage(repoauth);
-
-    if (!authToken) {
-      throw new Error('Unable to decrypt provided credentials');
-    }
-  } else {
-    authToken = repoauth;
-  }
-
-  if (!authToken.includes(':')) {
-    throw new Error('Provided credentials not in the correct username:token format');
-  }
-
-  return authToken;
-}
-
 /**
  * Verify that the app volume is mounted
  * @param {string} appName - Application name
@@ -398,11 +365,10 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
       }
 
       const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
-      if (insertResult) {
-        log.info(`Database entry created for ${appSpecifications.name} BEFORE Docker container creation`);
-      } else {
-        log.error(`Failed to create database entry for ${appSpecifications.name} - installation may be inconsistent`);
+      if (!insertResult) {
+        throw new Error(`CRITICAL: Failed to create database entry for ${appSpecifications.name}. Database insert returned undefined - likely duplicate key error or database failure. Aborting installation to prevent orphaned Docker containers.`);
       }
+      log.info(`Database entry created for ${appSpecifications.name} BEFORE Docker container creation`);
       const hddTier = `hdd${tier}`;
       const ramTier = `ram${tier}`;
       const cpuTier = `cpu${tier}`;
@@ -420,6 +386,18 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
 
     const specificationsToInstall = isComponent ? appComponent : appSpecifications;
     try {
+      // Validate database entry exists before creating Docker containers (atomic transaction check)
+      // This prevents orphaned Docker containers if DB entry was deleted/corrupted between insert and Docker creation
+      if (!isComponent) {
+        const dbValidationQuery = { name: appSpecifications.name };
+        const dbValidationProjection = { projection: { _id: 0, name: 1 } };
+        const dbEntryExists = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, dbValidationQuery, dbValidationProjection);
+        if (!dbEntryExists) {
+          throw new Error(`Database entry validation failed for ${appSpecifications.name}. Entry was inserted but disappeared before Docker container creation. Possible race condition or database corruption detected.`);
+        }
+        log.info(`Database entry validated for ${appSpecifications.name} before Docker container creation`);
+      }
+
       if (specificationsToInstall.version >= 4) { // version is undefined for component
         // eslint-disable-next-line no-restricted-syntax
         for (const appComponentSpecs of specificationsToInstall.compose) {
@@ -518,7 +496,8 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
         res.write(serviceHelper.ensureString(removeStatus));
         if (res.flush) res.flush();
       }
-      appUninstaller.removeAppLocally(appSpecs.name, res, true, true, false);
+      await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, false);
+      log.info(`Cleanup completed for ${appSpecs.name} after installation failure`);
     }
     return false;
   }
@@ -545,19 +524,31 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   // check blacklist
   await checkApplicationImagesCompliance(fullAppSpecs);
 
-  const { repotag, repoauth } = appSpecifications;
-  const { version: specVersion } = fullAppSpecs;
-
   const imgVerifier = new imageVerifier.ImageVerifier(
-    repotag,
+    appSpecifications.repotag,
     { maxImageSize: config.fluxapps.maxImageSize, architecture, architectureSet: supportedArchitectures },
   );
 
-  const pullConfig = { repoTag: repotag };
+  const pullConfig = { repoTag: appSpecifications.repotag };
 
-  const authToken = await handleRepoauthDecryption(repoauth, specVersion);
+  if (appSpecifications.repoauth) {
+    let authToken = null;
 
-  if (authToken) {
+    if (appSpecifications.version === 7) {
+      authToken = await pgpService.decryptMessage(appSpecifications.repoauth);
+
+      if (!authToken) {
+        throw new Error('Unable to decrypt provided credentials');
+      }
+
+      if (!authToken.includes(':')) {
+        throw new Error('Provided credentials not in the correct username:token format');
+      }
+    } else {
+      // v8+ we use the decrypted repoauth
+      authToken = appSpecifications.repoauth;
+    }
+
     imgVerifier.addCredentials(authToken);
     pullConfig.authToken = authToken;
   }
@@ -754,19 +745,26 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   // check blacklist
   await checkApplicationImagesCompliance(fullAppSpecs);
 
-  const { repotag, repoauth } = appSpecifications;
-  const { version: specVersion } = fullAppSpecs;
-
   const imgVerifier = new imageVerifier.ImageVerifier(
-    repotag,
+    appSpecifications.repotag,
     { maxImageSize: config.fluxapps.maxImageSize, architecture, architectureSet: supportedArchitectures },
   );
 
-  const pullConfig = { repoTag: repotag };
+  const pullConfig = { repoTag: appSpecifications.repotag };
 
-  const authToken = await handleRepoauthDecryption(repoauth, specVersion);
+  let authToken = null;
 
-  if (authToken) {
+  if (appSpecifications.repoauth) {
+    authToken = await pgpService.decryptMessage(appSpecifications.repoauth);
+
+    if (!authToken) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+
+    if (!authToken.includes(':')) {
+      throw new Error('Provided credentials not in the correct username:token format');
+    }
+
     imgVerifier.addCredentials(authToken);
     pullConfig.authToken = authToken;
   }
