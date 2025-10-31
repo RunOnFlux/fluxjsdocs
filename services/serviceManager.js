@@ -420,10 +420,10 @@ async function startFluxFunctions() {
       imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, 60 * 60 * 1000); //  every hour
     setTimeout(() => {
-      advancedWorkflows.forceAppRemovals(); // force cleanup of apps every 2h
+      advancedWorkflows.forceAppRemovals(); // force cleanup of apps every day
       setInterval(() => {
         advancedWorkflows.forceAppRemovals();
-      }, 2 * 60 * 60 * 1000);
+      }, 24 * 60 * 60 * 1000);
     }, 30 * 60 * 1000);
     setTimeout(() => {
       appInspector.checkStorageSpaceForApps(

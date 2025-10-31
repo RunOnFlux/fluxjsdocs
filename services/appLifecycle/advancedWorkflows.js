@@ -689,11 +689,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
         dbSpecs.contacts = [];
       }
 
-      const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
-      if (!insertResult) {
-        throw new Error(`CRITICAL: Failed to create database entry for ${appSpecifications.name} in soft registration. Database insert returned undefined - likely duplicate key error or database failure. Aborting soft registration to prevent orphaned Docker containers.`);
-      }
-      log.info(`Database entry created for ${appSpecifications.name} BEFORE Docker container creation (soft registration)`);
+      await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
       const hddTier = `hdd${tier}`;
       const ramTier = `ram${tier}`;
       const cpuTier = `cpu${tier}`;
@@ -1099,8 +1095,7 @@ async function softRedeploy(appSpecs, res) {
     log.warn(`REMOVAL REASON: Soft redeploy failure - ${appSpecs.name} failed during soft redeploy: ${error.message} (softRedeploy)`);
     globalState.softRedeployInProgress = false;
     const appUninstaller = require('./appUninstaller');
-    await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
-    log.info(`Cleanup completed for ${appSpecs.name} after soft redeploy failure`);
+    appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
   }
 }
 
@@ -1169,8 +1164,7 @@ async function hardRedeploy(appSpecs, res) {
     log.error(error);
     log.warn(`REMOVAL REASON: Hard redeploy failure - ${appSpecs.name} failed during hard redeploy: ${error.message} (hardRedeploy)`);
     globalState.hardRedeployInProgress = false;
-    await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
-    log.info(`Cleanup completed for ${appSpecs.name} after hard redeploy failure`);
+    appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
   }
 }
 
@@ -2451,10 +2445,11 @@ async function reinstallOldApplications() {
 
             // eslint-disable-next-line no-await-in-loop
             const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
-            if (!insertResult) {
-              throw new Error(`CRITICAL: Failed to create database entry for ${appSpecifications.name} during version upgrade reinstallation. Database insert returned undefined - likely duplicate key error or database failure. Aborting reinstallation to prevent orphaned Docker containers.`);
+            if (insertResult) {
+              log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (version upgrade path)`);
+            } else {
+              log.error(`Failed to create database entry for ${appSpecifications.name} - reinstallation may be inconsistent`);
             }
-            log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (version upgrade path)`);
 
             // Now install components - containers will be created but app is already in DB
             // eslint-disable-next-line no-restricted-syntax
@@ -2617,10 +2612,11 @@ async function reinstallOldApplications() {
 
               // eslint-disable-next-line no-await-in-loop
               const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
-              if (!insertResult) {
-                throw new Error(`CRITICAL: Failed to create database entry for ${appSpecifications.name} during composed app redeployment. Database insert returned undefined - likely duplicate key error or database failure. Aborting redeployment to prevent orphaned Docker containers.`);
+              if (insertResult) {
+                log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (composed redeployment path)`);
+              } else {
+                log.error(`Failed to create database entry for ${appSpecifications.name} - redeployment may be inconsistent`);
               }
-              log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (composed redeployment path)`);
 
               // Now install components - containers will be created but app is already in DB
               // eslint-disable-next-line no-restricted-syntax
@@ -2681,29 +2677,6 @@ async function reinstallOldApplications() {
 async function forceAppRemovals() {
   try {
     log.info('Executing forceAppRemovals.');
-
-    // Skip if any installation or removal operations are in progress
-    if (globalState.removalInProgress) {
-      log.info('Skipping forceAppRemovals: Another application removal is in progress');
-      return;
-    }
-    if (globalState.installationInProgress) {
-      log.info('Skipping forceAppRemovals: Another application installation is in progress');
-      return;
-    }
-    if (globalState.softRedeployInProgress) {
-      log.info('Skipping forceAppRemovals: Soft redeploy is in progress');
-      return;
-    }
-    if (globalState.hardRedeployInProgress) {
-      log.info('Skipping forceAppRemovals: Hard redeploy is in progress');
-      return;
-    }
-    if (globalState.reinstallationOfOldAppsInProgress) {
-      log.info('Skipping forceAppRemovals: Reinstallation of old apps is in progress');
-      return;
-    }
-
     // Import services to match original business logic where everything was in the same file
     const appQueryService = require('../appQuery/appQueryService');
     const registryManager = require('../appDatabase/registryManager');
