@@ -18,9 +18,10 @@ const { checkApplicationImagesCompliance } = require('../appSecurity/imageManage
 const { startAppMonitoring } = require('../appManagement/appInspector');
 const imageVerifier = require('../utils/imageVerifier');
 const pgpService = require('../pgpService');
-const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const upnpService = require('../upnpService');
 const globalState = require('../utils/globalState');
+const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
+const { specificationFormatter } = require('../utils/appSpecHelpers');
 const log = require('../../lib/log');
 const { appsFolder, localAppsInformation, scannedHeightCollection } = require('../utils/appConstants');
 const { checkAppTemporaryMessageExistence, checkAppMessageExistence } = require('../appMessaging/messageVerifier');
@@ -31,7 +32,6 @@ const config = require('config');
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
 
-
 // Helper functions and constants for installApplicationHard
 const util = require('util');
 const { exec } = require('child_process');
@@ -40,6 +40,39 @@ const cmdAsync = util.promisify(exec);
 const dockerPullStreamPromise = util.promisify(dockerService.dockerPullStream);
 
 const supportedArchitectures = ['amd64', 'arm64'];
+
+
+/**
+ *
+ * @param {string} repoauth The docker repository authentication
+ * @param {number} specVersion The app spec version (to determine decryption type)
+ * @returns {Promise<null|string>}
+ */
+async function handleRepoauthDecryption(repoauth, specVersion) {
+  if (!repoauth) return null;
+
+  if (specVersion < 7) {
+    throw new Error('Specifications less than v7 do not have repoauth')
+  }
+
+  let authToken = null;
+
+  if (specVersion === 7) {
+    authToken = await pgpService.decryptMessage(repoauth);
+
+    if (!authToken) {
+      throw new Error('Unable to decrypt provided credentials');
+    }
+  } else {
+    authToken = repoauth;
+  }
+
+  if (!authToken.includes(':')) {
+    throw new Error('Provided credentials not in the correct username:token format');
+  }
+
+  return authToken;
+}
 
 /**
  * Verify that the app volume is mounted
@@ -444,6 +477,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
     }
 
     log.info(`Flux App: ${appName} is test install: ${test}`);
+
     if (!test) {
       const broadcastedAt = Date.now();
       const newAppRunningMessage = {
@@ -523,32 +557,20 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   // check blacklist
   await checkApplicationImagesCompliance(fullAppSpecs);
 
+  const { repotag, repoauth } = appSpecifications;
+  const { version: specVersion } = fullAppSpecs;
+
   const imgVerifier = new imageVerifier.ImageVerifier(
-    appSpecifications.repotag,
+    repotag,
     { maxImageSize: config.fluxapps.maxImageSize, architecture, architectureSet: supportedArchitectures },
   );
 
-  const pullConfig = { repoTag: appSpecifications.repotag };
+  const pullConfig = { repoTag: repotag };
 
-  let authToken = null;
+  const authToken = await handleRepoauthDecryption(repoauth, specVersion);
 
-  if (appSpecifications.repoauth) {
-    // Use credential helper to handle version-aware decryption and cloud providers
-    const credentials = await registryCredentialHelper.getCredentials(
-      appSpecifications.repotag,
-      appSpecifications.repoauth,
-      fullAppSpecs.version, // Pass parent spec version for v7/v8 handling
-    );
-
-    if (!credentials) {
-      throw new Error('Unable to get credentials');
-    }
-
-    // Pass credentials object directly to ImageVerifier (no string conversion needed)
-    imgVerifier.addCredentials(credentials);
-
-    // dockerService still expects string format - convert only for that
-    authToken = `${credentials.username}:${credentials.password}`;
+  if (authToken) {
+    imgVerifier.addCredentials(authToken);
     pullConfig.authToken = authToken;
   }
 
@@ -744,32 +766,20 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   // check blacklist
   await checkApplicationImagesCompliance(fullAppSpecs);
 
+  const { repotag, repoauth } = appSpecifications;
+  const { version: specVersion } = fullAppSpecs;
+
   const imgVerifier = new imageVerifier.ImageVerifier(
-    appSpecifications.repotag,
+    repotag,
     { maxImageSize: config.fluxapps.maxImageSize, architecture, architectureSet: supportedArchitectures },
   );
 
-  const pullConfig = { repoTag: appSpecifications.repotag };
+  const pullConfig = { repoTag: repotag };
 
-  let authToken = null;
+  const authToken = await handleRepoauthDecryption(repoauth, specVersion);
 
-  if (appSpecifications.repoauth) {
-    // Use credential helper to handle version-aware decryption and cloud providers
-    const credentials = await registryCredentialHelper.getCredentials(
-      appSpecifications.repotag,
-      appSpecifications.repoauth,
-      fullAppSpecs.version, // Pass parent spec version for v7/v8 handling
-    );
-
-    if (!credentials) {
-      throw new Error('Unable to get credentials');
-    }
-
-    // Pass credentials object directly to ImageVerifier (no string conversion needed)
-    imgVerifier.addCredentials(credentials);
-
-    // dockerService still expects string format - convert only for that
-    authToken = `${credentials.username}:${credentials.password}`;
+  if (authToken) {
+    imgVerifier.addCredentials(authToken);
     pullConfig.authToken = authToken;
   }
 
@@ -974,6 +984,18 @@ async function installAppLocally(req, res) {
       if (!appSpecifications) {
         throw new Error(`Application Specifications of ${appname} not found`);
       }
+
+      // we have to do this as not all paths above decrypt the app specs
+      // this is a bit of a hack until we tidy up the app spec mess (use classes)
+      if (
+        appSpecifications.version >= 8
+        && appSpecifications.enterprise
+        && !appSpecifications.compose.length
+      ) {
+        appSpecifications = await checkAndDecryptAppSpecs(appSpecifications);
+        appSpecifications = specificationFormatter(appSpecifications);
+      }
+
       // get current height
       const dbopen = dbHelper.databaseConnection();
       if (!appSpecifications.height && appSpecifications.height !== 0) {
@@ -1119,7 +1141,6 @@ async function testAppInstall(req, res) {
 
       // Run test installation (registerAppLocally with test=true)
       await registerAppLocally(appSpecifications, undefined, res, true);
-
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
