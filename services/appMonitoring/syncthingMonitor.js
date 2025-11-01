@@ -6,7 +6,6 @@ const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const syncthingService = require('../syncthingService');
-const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const {
   MONITOR_INTERVAL_MS,
@@ -262,9 +261,6 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn, appDo
       log.error('syncthingAppsCore - Failed to get installed apps');
       return;
     }
-
-    // Decrypt enterprise apps (version 8 with encrypted content)
-    appsInstalled.data = await decryptEnterpriseApps(appsInstalled.data);
 
     // Get required IDs and configurations
     const myDeviceId = await syncthingService.getDeviceId();
