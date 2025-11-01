@@ -25,7 +25,6 @@ const {
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
-const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -2662,7 +2661,8 @@ async function reinstallOldApplications() {
             } catch (error) {
               log.error(error);
               log.warn(`REMOVAL REASON: Redeployment error - ${appSpecifications.name} failed during redeployment: ${error.message}`);
-              appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
+              await appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
+              log.info(`Cleanup completed for ${appSpecifications.name} after redeployment failure`);
             }
           }
         }
@@ -2819,9 +2819,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
     if (appsInstalled.status === 'error') {
       return;
     }
-
-    // Decrypt enterprise apps (version 8 with encrypted content)
-    appsInstalled.data = await decryptEnterpriseApps(appsInstalled.data);
     const runningAppsNames = runningApps.map((app) => {
       if (app.Names[0].startsWith('/zel')) {
         return app.Names[0].slice(4);
