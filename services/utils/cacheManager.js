@@ -169,11 +169,6 @@ class FluxCacheManager {
       max: 150,
       ttl: FluxCacheManager.oneHour,
     },
-    // appQueryService
-    enterpriseAppDecryptionCache: {
-      max: 100,
-      ttl: 7 * FluxCacheManager.oneDay,
-    },
   };
 
   constructor() {
