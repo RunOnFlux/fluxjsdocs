@@ -10,7 +10,6 @@ const registryManager = require('../appDatabase/registryManager');
 const messageVerifier = require('../appMessaging/messageVerifier');
 const imageManager = require('../appSecurity/imageManager');
 // const advancedWorkflows = require('../appLifecycle/advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
-const { supportedArchitectures } = require('../utils/appConstants');
 const { specificationFormatter } = require('../utils/appUtilities');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const portManager = require('../appNetwork/portManager');
@@ -1242,23 +1241,18 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
       // check repository whitelisted and repotag is available for download
       await imageManager.verifyRepository(appSpecifications.repotag);
     } else {
+      // we have to skip this on v7 as we don't have the key
+      const skipVerification = appSpecifications.version === 7;
+
       // eslint-disable-next-line no-restricted-syntax
       for (const appComponent of appSpecifications.compose) {
-        // For v7 enterprise apps, skip verification because repoauth is PGP-encrypted
-        // and only selected nodes have the private keys to decrypt it.
-        // For v8+, repoauth is plain text (already decrypted from enterprise blob),
-        // so we can and should verify the repository.
-        const skipVerification =
-          appSpecifications.version === 7 && appComponent.repoauth;
-
-        // fail open
-        if (skipVerification) return true;
-
         // check repository whitelisted and repotag is available for download
+        // eslint-disable-next-line no-await-in-loop
+
         // eslint-disable-next-line no-await-in-loop
         await imageManager.verifyRepository(appComponent.repotag, {
           repoauth: appComponent.repoauth,
-          specVersion: appSpecifications.version,
+          skipVerification,
         });
       }
     }
@@ -1561,7 +1555,6 @@ async function registerAppGlobalyApi(req, res) {
         return;
       }
       throw new Error('Unable to register application on the network. Try again later.');
-
     } catch (error) {
       log.warn(error);
       const errorResponse = messageHelper.createErrorMessage(
