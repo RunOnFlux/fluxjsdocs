@@ -6,7 +6,6 @@ const pgpService = require('../pgpService');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
-const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const userconfig = require('../../../../config/userconfig');
 const { supportedArchitectures, globalAppsMessages, globalAppsInformation } = require('../utils/appConstants');
@@ -540,8 +539,6 @@ async function checkApplicationsCompliance(installedApps, removeAppLocally) {
     if (installedAppsRes.status !== 'success') {
       throw new Error('Failed to get installed Apps');
     }
-    // Decrypt enterprise apps (version 8 with encrypted content)
-    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
     const appsInstalled = installedAppsRes.data;
     const appsToRemoveNames = [];
     // eslint-disable-next-line no-restricted-syntax
