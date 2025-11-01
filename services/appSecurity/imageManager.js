@@ -3,10 +3,10 @@ const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const pgpService = require('../pgpService');
-const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
+const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const userconfig = require('../../../../config/userconfig');
 const { supportedArchitectures, globalAppsMessages, globalAppsInformation } = require('../utils/appConstants');
@@ -87,7 +87,6 @@ async function verifyRepository(repotag, options = {}) {
   const skipVerification = options.skipVerification || false;
   const usePgpDecrypt = options.usePgpDecrypt || false;
   const architecture = options.architecture || null;
-  const appVersion = options.appVersion || 7; // Default to v7 for backward compatibility
 
   // Check cache first to avoid redundant Docker Hub API calls
   // Cache key includes architecture since same image may have different arch support
@@ -125,17 +124,27 @@ async function verifyRepository(repotag, options = {}) {
       return true;
     }
 
-    // Use credential helper to handle version-aware decryption and cloud providers
-    const credentials = await registryCredentialHelper.getCredentials(
-      repotag,
-      repoauth,
-      appVersion,
-    );
+    let authToken;
 
-    if (credentials) {
-      // Pass credentials object directly - no need to convert to string
-      imgVerifier.addCredentials(credentials);
+    if (usePgpDecrypt) {
+      // v7 only, use pgp
+
+      authToken = await pgpService.decryptMessage(repoauth);
+
+      if (!authToken) {
+        throw new Error('Unable to decrypt provided credentials');
+      }
+
+    } else {
+      // v8+ specs repoauth is part of encrypted specs
+      authToken = repoauth;
     }
+
+    if (typeof authToken !== 'string' || !authToken.includes(':')) {
+      throw new Error('Provided credentials not in the correct username:token format');
+    }
+
+    imgVerifier.addCredentials(authToken);
   }
 
   try {
@@ -531,6 +540,8 @@ async function checkApplicationsCompliance(installedApps, removeAppLocally) {
     if (installedAppsRes.status !== 'success') {
       throw new Error('Failed to get installed Apps');
     }
+    // Decrypt enterprise apps (version 8 with encrypted content)
+    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
     const appsInstalled = installedAppsRes.data;
     const appsToRemoveNames = [];
     // eslint-disable-next-line no-restricted-syntax
