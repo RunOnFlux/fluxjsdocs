@@ -64,8 +64,6 @@ async function handleAppMessages(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -74,7 +72,11 @@ async function handleAppMessages(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
@@ -175,8 +177,6 @@ async function handleAppRunningMessage(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -185,7 +185,11 @@ async function handleAppRunningMessage(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
@@ -224,8 +228,6 @@ async function handleAppInstallingMessage(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -234,7 +236,11 @@ async function handleAppInstallingMessage(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
@@ -273,8 +279,6 @@ async function handleAppInstallingErrorMessage(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -283,7 +287,11 @@ async function handleAppInstallingErrorMessage(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
@@ -321,8 +329,6 @@ async function handleIPChangedMessage(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -331,7 +337,11 @@ async function handleIPChangedMessage(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
@@ -369,8 +379,6 @@ async function handleAppRemovedMessage(message, fromIP, port) {
           wsListOut.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut);
-      await serviceHelper.delay(500);
       const wsList = [];
       incomingConnections.forEach((client) => {
         if (client.ip === fromIP && client.port === port) {
@@ -379,7 +387,11 @@ async function handleAppRemovedMessage(message, fromIP, port) {
           wsList.push(client);
         }
       });
-      fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList);
+      // Broadcast to outgoing and incoming peers in parallel for faster propagation
+      await Promise.all([
+        fluxCommunicationMessagesSender.sendToAllPeers(messageString, wsListOut),
+        fluxCommunicationMessagesSender.sendToAllIncomingConnections(messageString, wsList),
+      ]);
     }
   } catch (error) {
     log.error(error);
