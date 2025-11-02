@@ -26,7 +26,7 @@ async function sendToAllPeers(data, wsList) {
     for (const client of outConList) {
       try {
         // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(10);
+        await serviceHelper.delay(25);
         if (client.readyState === WebSocket.OPEN) {
           if (!data) {
             const pingTime = Date.now();
@@ -86,7 +86,7 @@ async function sendToRandomPeer(data) {
     const client = outgoingConnections[Math.floor(Math.random() * outgoingConnections.length)];
     try {
       // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(10);
+      await serviceHelper.delay(25);
       if (client.readyState === WebSocket.OPEN) {
         if (!data) {
           const pingTime = Date.now();
@@ -145,7 +145,7 @@ async function sendToAllIncomingConnections(data, wsList) {
     for (const client of incConList) {
       try {
         // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(10);
+        await serviceHelper.delay(25);
         if (client.readyState === WebSocket.OPEN) {
           if (!data) {
             client.ping(); // do ping instead
@@ -197,7 +197,7 @@ async function sendToRandomIncomingConnections(data) {
     const client = incomingConnections[Math.floor(Math.random() * incomingConnections.length)];
     try {
       // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(10);
+      await serviceHelper.delay(25);
       if (client.readyState === WebSocket.OPEN) {
         if (!data) {
           client.ping(); // do ping instead
