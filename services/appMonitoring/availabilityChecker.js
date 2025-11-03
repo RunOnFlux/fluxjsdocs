@@ -9,7 +9,6 @@ const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const upnpService = require('../upnpService');
 const networkStateService = require('../networkStateService');
 const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
-const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 
 // Helper function to sign check app data
@@ -137,9 +136,6 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
-
-    // Decrypt enterprise apps (version 8 with encrypted content)
-    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
 
     const apps = installedAppsRes.data;
     const appPorts = [];
