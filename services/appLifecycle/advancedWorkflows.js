@@ -25,6 +25,7 @@ const {
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
+const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -365,109 +366,18 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       if (res.flush) res.flush();
     }
 
-    // Create the appdata directory first (required for all apps)
-    const makeAppDataDir = {
-      status: 'Creating appdata directory...',
-    };
-    log.info(makeAppDataDir);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeAppDataDir));
-      if (res.flush) res.flush();
-    }
-    const execAppdataDir = `sudo mkdir -p ${appsFolder + appId}/appdata`;
-    await cmdAsync(execAppdataDir);
-    const makeAppDataDir2 = {
-      status: 'Appdata directory created',
-    };
-    log.info(makeAppDataDir2);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeAppDataDir2));
-      if (res.flush) res.flush();
-    }
-
     const makeDirectoryB = {
-      status: 'Making application data directories and files...',
+      status: 'Making application data directory...',
     };
     log.info(makeDirectoryB);
     if (res) {
       res.write(serviceHelper.ensureString(makeDirectoryB));
       if (res.flush) res.flush();
     }
-
-    // Parse containerData to get all required local paths
-    const mountParser = require('../utils/mountParser');
-    let parsedMounts;
-    try {
-      parsedMounts = mountParser.parseContainerData(appSpecifications.containerData);
-    } catch (error) {
-      log.error(`Failed to parse containerData: ${error.message}`);
-      throw error;
-    }
-
-    const requiredPaths = mountParser.getRequiredLocalPaths(parsedMounts);
-    log.info(`Creating ${requiredPaths.length} local path(s) for ${appId}`);
-
-    // Create all required directories and files under appdata/
-    for (const pathInfo of requiredPaths) {
-      // Skip appdata itself as it's already created above
-      if (pathInfo.name === 'appdata') {
-        continue; // eslint-disable-line no-continue
-      }
-
-      if (pathInfo.isFile) {
-        // Create empty file under appdata/ - app will initialize it on first run
-        // File is mounted so changes persist across restarts
-        const createFileStatus = {
-          status: `Creating file: appdata/${pathInfo.name}...`,
-        };
-        log.info(createFileStatus);
-        if (res) {
-          res.write(serviceHelper.ensureString(createFileStatus));
-          if (res.flush) res.flush();
-        }
-
-        const filePath = `${appsFolder + appId}/appdata/${pathInfo.name}`;
-        const execFile = `sudo touch ${filePath}`;
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(execFile);
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(`sudo chown 100:101 ${filePath}`);
-        log.info(`Empty file created (app will initialize): appdata/${pathInfo.name}`);
-
-        const createFileStatus2 = {
-          status: `File created: appdata/${pathInfo.name}`,
-        };
-        log.info(createFileStatus2);
-        if (res) {
-          res.write(serviceHelper.ensureString(createFileStatus2));
-          if (res.flush) res.flush();
-        }
-      } else {
-        // Create a directory under appdata/
-        const createDirStatus = {
-          status: `Creating directory: appdata/${pathInfo.name}...`,
-        };
-        log.info(createDirStatus);
-        if (res) {
-          res.write(serviceHelper.ensureString(createDirStatus));
-          if (res.flush) res.flush();
-        }
-        const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata/${pathInfo.name}`;
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(execDIR);
-        const createDirStatus2 = {
-          status: `Directory created: appdata/${pathInfo.name}`,
-        };
-        log.info(createDirStatus2);
-        if (res) {
-          res.write(serviceHelper.ensureString(createDirStatus2));
-          if (res.flush) res.flush();
-        }
-      }
-    }
-
+    const execDIR2 = `sudo mkdir -p ${appsFolder + appId}/appdata`;
+    await cmdAsync(execDIR2);
     const makeDirectoryB2 = {
-      status: 'Application data directories and files created',
+      status: 'Application data directory made',
     };
     log.info(makeDirectoryB2);
     if (res) {
@@ -487,17 +397,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     await cmdAsync(execPERM);
     const execPERMdata = `sudo chmod 777 ${appsFolder + appId}/appdata`;
     await cmdAsync(execPERMdata);
-
-    // Set permissions for all created paths under appdata/
-    for (const pathInfo of requiredPaths) {
-      // Skip appdata itself as it's already handled above
-      if (pathInfo.name === 'appdata') {
-        continue; // eslint-disable-line no-continue
-      }
-      const execPERMpath = `sudo chmod 777 ${appsFolder + appId}/appdata/${pathInfo.name}`;
-      // eslint-disable-next-line no-await-in-loop
-      await cmdAsync(execPERMpath);
-    }
     const permissionsDirectory2 = {
       status: 'Permissions adjusted',
     };
@@ -507,43 +406,47 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       if (res.flush) res.flush();
     }
 
-    // Check if primary mount has syncthing flags (r:, g:, or s:)
-    // Syncthing is configured ONCE for the entire appdata folder based on primary mount flags only
-    const primaryFlags = mountParser.getPrimaryFlags(parsedMounts);
-    const hasSyncthingFlag = primaryFlags.includes('r') || primaryFlags.includes('g') || primaryFlags.includes('s');
-
-    if (hasSyncthingFlag) {
-      const stFolderCreation = {
-        status: 'Creating .stfolder for syncthing...',
-      };
-      log.info(stFolderCreation);
-      if (res) {
-        res.write(serviceHelper.ensureString(stFolderCreation));
-        if (res.flush) res.flush();
-      }
-      // Create .stfolder in parent directory for syncthing (not inside appdata)
-      const execDIRst = `sudo mkdir -p ${appsFolder + appId}/.stfolder`;
-      await cmdAsync(execDIRst);
-      const stFolderCreation2 = {
-        status: '.stfolder created',
-      };
-      log.info(stFolderCreation2);
-      if (res) {
-        res.write(serviceHelper.ensureString(stFolderCreation2));
-        if (res.flush) res.flush();
-      }
-
-      // Create .stignore file to exclude backup directory (in parent directory)
-      const stignore = `sudo echo '/backup' >| ${appsFolder + appId}/.stignore`;
-      log.info(stignore);
-      await cmdAsync(stignore);
-      const stiFileCreation = {
-        status: '.stignore created',
-      };
-      log.info(stiFileCreation);
-      if (res) {
-        res.write(serviceHelper.ensureString(stiFileCreation));
-        if (res.flush) res.flush();
+    // if s flag create .stfolder
+    const containersData = appSpecifications.containerData.split('|');
+    // eslint-disable-next-line no-restricted-syntax
+    for (let i = 0; i < containersData.length; i += 1) {
+      const container = containersData[i];
+      const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
+      if (containerDataFlags.includes('s') || containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
+        const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
+        const stFolderCreation = {
+          status: 'Creating .stfolder for syncthing...',
+        };
+        log.info(stFolderCreation);
+        if (res) {
+          res.write(serviceHelper.ensureString(stFolderCreation));
+          if (res.flush) res.flush();
+        }
+        const execDIRst = `sudo mkdir -p ${appsFolder + appId + containerFolder}/.stfolder`;
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(execDIRst);
+        const stFolderCreation2 = {
+          status: '.stfolder created',
+        };
+        log.info(stFolderCreation2);
+        if (res) {
+          res.write(serviceHelper.ensureString(stFolderCreation2));
+          if (res.flush) res.flush();
+        }
+        if (i === 0) {
+          const stignore = `sudo echo '/backup' >| ${appsFolder + appId + containerFolder}/.stignore`;
+          log.info(stignore);
+          // eslint-disable-next-line no-await-in-loop
+          await cmdAsync(stignore);
+          const stiFileCreation = {
+            status: '.stignore created',
+          };
+          log.info(stiFileCreation);
+          if (res) {
+            res.write(serviceHelper.ensureString(stiFileCreation));
+            if (res.flush) res.flush();
+          }
+        }
       }
     }
 
@@ -2916,6 +2819,9 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
     if (appsInstalled.status === 'error') {
       return;
     }
+
+    // Decrypt enterprise apps (version 8 with encrypted content)
+    appsInstalled.data = await decryptEnterpriseApps(appsInstalled.data);
     const runningAppsNames = runningApps.map((app) => {
       if (app.Names[0].startsWith('/zel')) {
         return app.Names[0].slice(4);
