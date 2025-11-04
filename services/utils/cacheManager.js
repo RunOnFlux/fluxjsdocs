@@ -127,10 +127,6 @@ class FluxCacheManager {
       max: 200,
       ttl: FluxCacheManager.oneHour,
     },
-    blockedRepositoriesCache: {
-      max: 10,
-      ttl: 6 * FluxCacheManager.oneHour,
-    },
     // fluxCommunicationMessageSender
     tempMessageCache: {
       max: 250,
@@ -154,7 +150,7 @@ class FluxCacheManager {
     // every message, and check if it's in the cache. We should come up with a better algo here.
     messageCache: {
       max: 1_000,
-      ttl: 5 * FluxCacheManager.oneMinute,
+      ttl: FluxCacheManager.oneMinute,
     },
     wsPeerCache: {
       max: 100,
@@ -172,11 +168,6 @@ class FluxCacheManager {
     daemonBlockCache: {
       max: 150,
       ttl: FluxCacheManager.oneHour,
-    },
-    // appQueryService
-    enterpriseAppDecryptionCache: {
-      max: 100,
-      ttl: 7 * FluxCacheManager.oneDay,
     },
   };
 
