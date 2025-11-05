@@ -3361,14 +3361,58 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   return 0;
                 });
                 const index = runningAppList.findIndex((x) => x.ip.split(':')[0] === myIP.split(':')[0]);
+
+                // Helper function to check if any lower-index nodes are running the app
+                const checkLowerIndexNodesRunning = async () => {
+                  if (index <= 0) return false; // Index 0 or not found, no lower nodes to check
+
+                  const { CancelToken } = axios;
+                  const timeout = 10 * 1000;
+
+                  // Check all nodes with lower index
+                  for (let i = 0; i < index; i += 1) {
+                    const nodeToCheck = runningAppList[i];
+                    if (!nodeToCheck) continue;
+
+                    const ipToCheck = nodeToCheck.ip.split(':')[0];
+                    const portToCheck = nodeToCheck.ip.split(':')[1] || '16127';
+                    const source = CancelToken.source();
+                    let isResolved = false;
+
+                    setTimeout(() => {
+                      if (!isResolved) {
+                        source.cancel('Operation canceled by timeout.');
+                      }
+                    }, timeout);
+
+                    try {
+                      // eslint-disable-next-line no-await-in-loop
+                      const response = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/listrunningapps`, { timeout, cancelToken: source.token });
+                      isResolved = true;
+                      const appsRunning = response.data.data;
+                      if (appsRunning.find((app) => app.Names[0].includes(installedApp.name))) {
+                        log.info(`masterSlaveApps: app:${installedApp.name} is running on lower-index node (index ${i}) at ${ipToCheck}, will not start`);
+                        return true;
+                      }
+                    } catch (error) {
+                      isResolved = true;
+                      log.info(`masterSlaveApps: Failed to check lower-index node ${i} at ${ipToCheck} for app:${installedApp.name}, error: ${error.message}`);
+                      // Continue checking other nodes
+                    }
+                  }
+                  return false;
+                };
+
                 if (index === 0 && !mastersRunningGSyncthingApps.has(identifier)) {
+                  // Index 0: Start immediately if no history
                   appDockerRestart(installedApp.name);
                   log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
                 } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && mastersRunningGSyncthingApps.get(identifier) !== myIP) {
+                  // There was a previous master (not me), and it's no longer on FDM
                   const { CancelToken } = axios;
                   const source = CancelToken.source();
                   let isResolved = false;
-                  const timeout = 5 * 1000; // 5 seconds
+                  const timeout = 10 * 1000; // 10 seconds
                   setTimeout(() => {
                     if (!isResolved) {
                       source.cancel('Operation canceled by the user.');
@@ -3394,7 +3438,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   if (previousMasterStillRunning) {
                     return;
                   }
-                  // if it was running before on this node was removed from fdm, app was stopped or node rebooted, we will only start the app on a different node
+                  // Previous master is not running, determine next primary
                   if (index === 0) {
                     appDockerRestart(installedApp.name);
                     log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
@@ -3412,19 +3456,38 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                       timetoStartApp += index * 3 * 60 * 1000;
                     }
                     if (timetoStartApp <= Date.now()) {
-                      appDockerRestart(installedApp.name);
-                      log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
+                      // Time to start, but check if lower-index nodes are running
+                      // eslint-disable-next-line no-await-in-loop
+                      const lowerNodeRunning = await checkLowerIndexNodesRunning();
+                      if (!lowerNodeRunning) {
+                        appDockerRestart(installedApp.name);
+                        log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index}`);
+                      }
                     } else {
                       log.info(`masterSlaveApps: will start docker app:${installedApp.name} at ${timetoStartApp.toString()}`);
                       timeTostartNewMasterApp.set(identifier, timetoStartApp);
                     }
                   }
                 } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= Date.now()) {
-                  appDockerRestart(installedApp.name);
-                  log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index} that was scheduled to start at ${timeTostartNewMasterApp.get(identifier).toString()}`);
+                  // Scheduled start time has arrived, check if lower-index nodes are running
+                  // eslint-disable-next-line no-await-in-loop
+                  const lowerNodeRunning = await checkLowerIndexNodesRunning();
+                  if (!lowerNodeRunning) {
+                    appDockerRestart(installedApp.name);
+                    log.info(`masterSlaveApps: starting docker app:${installedApp.name} index: ${index} that was scheduled to start at ${timeTostartNewMasterApp.get(identifier).toString()}`);
+                    timeTostartNewMasterApp.delete(identifier);
+                  } else {
+                    log.info(`masterSlaveApps: not starting app:${installedApp.name} index: ${index} - lower-index node is already running`);
+                    timeTostartNewMasterApp.delete(identifier);
+                  }
+                } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
+                  // Non-primary node with no history - schedule start based on index
+                  const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);
+                  log.info(`masterSlaveApps: scheduling app:${installedApp.name} index: ${index} to start at ${timetoStartApp.toString()}`);
+                  timeTostartNewMasterApp.set(identifier, timetoStartApp);
                 } else {
-                  appDockerRestart(installedApp.name);
-                  log.info(`masterSlaveApps: no previous information about primary, starting docker app:${installedApp.name}`);
+                  // All other cases: don't start
+                  log.info(`masterSlaveApps: not starting app:${installedApp.name} index: ${index} - conditions not met for primary selection`);
                 }
               }
             } else {
@@ -3585,13 +3648,11 @@ async function ensureMountPathsExist(appSpecifications, appName, isComponent, fu
   log.info(`Ensuring ${requiredPaths.length} local path(s) exist for ${appId}`);
 
   // Create all required directories and files under appdata/
-  // eslint-disable-next-line no-restricted-syntax
   for (const pathInfo of requiredPaths) {
     const fullPath = `${appsFolder}${appId}/appdata${pathInfo.name === 'appdata' ? '' : `/${pathInfo.name}`}`;
 
     // Check if path exists
     try {
-      // eslint-disable-next-line no-await-in-loop
       await fs.access(fullPath);
       // Path exists, skip
       log.info(`Path already exists: ${fullPath}`);
@@ -3600,99 +3661,15 @@ async function ensureMountPathsExist(appSpecifications, appName, isComponent, fu
       log.warn(`Path missing, creating: ${fullPath}`);
 
       if (pathInfo.isFile) {
-        // Ensure parent directory exists first
-        const parentDir = `${appsFolder}${appId}/appdata`;
-        const execParentDir = `sudo mkdir -p ${parentDir}`;
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(execParentDir);
-
         // Create empty file
         const execFile = `sudo touch ${fullPath}`;
-        // eslint-disable-next-line no-await-in-loop
         await cmdAsync(execFile);
         log.info(`Created empty file: ${fullPath}`);
       } else {
         // Create directory
         const execDIR = `sudo mkdir -p ${fullPath}`;
-        // eslint-disable-next-line no-await-in-loop
         await cmdAsync(execDIR);
         log.info(`Created directory: ${fullPath}`);
-      }
-    }
-  }
-
-  // Also ensure component reference paths exist
-  // These are paths from OTHER components that this component is trying to mount
-  const componentReferenceMounts = parsedMounts.allMounts.filter((mount) => (
-    mount.type === mountParser.MountType.COMPONENT_PRIMARY
-    || mount.type === mountParser.MountType.COMPONENT_DIRECTORY
-    || mount.type === mountParser.MountType.COMPONENT_FILE
-  ));
-
-  if (componentReferenceMounts.length > 0) {
-    log.info(`Ensuring ${componentReferenceMounts.length} component reference path(s) exist for ${appId}`);
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const mount of componentReferenceMounts) {
-      try {
-        // Validate and get the component identifier
-        if (!fullAppSpecs) {
-          throw new Error(`Component reference mount requires full app specifications: ${mount.containerPath}`);
-        }
-
-        let componentIdentifier;
-        if (fullAppSpecs.version >= 4) {
-          if (mount.componentIndex < 0 || mount.componentIndex >= fullAppSpecs.compose.length) {
-            throw new Error(`Invalid component index: ${mount.componentIndex}`);
-          }
-          const componentName = fullAppSpecs.compose[mount.componentIndex].name;
-          componentIdentifier = `${componentName}_${appName}`;
-        } else {
-          componentIdentifier = appName;
-        }
-
-        const componentAppId = dockerService.getAppIdentifier(componentIdentifier);
-
-        // Construct the full path for the component reference
-        let fullPath;
-        if (mount.subdir === 'appdata') {
-          fullPath = `${appsFolder}${componentAppId}/appdata`;
-        } else {
-          fullPath = `${appsFolder}${componentAppId}/appdata/${mount.subdir}`;
-        }
-
-        // Check if path exists
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          await fs.access(fullPath);
-          log.info(`Component reference path already exists: ${fullPath}`);
-        } catch (error) {
-          // Path doesn't exist, need to create it
-          log.warn(`Component reference path missing, creating: ${fullPath}`);
-
-          if (mount.isFile) {
-            // Ensure parent directory exists first
-            const parentDir = `${appsFolder}${componentAppId}/appdata`;
-            const execParentDir = `sudo mkdir -p ${parentDir}`;
-            // eslint-disable-next-line no-await-in-loop
-            await cmdAsync(execParentDir);
-
-            // Create empty file
-            const execFile = `sudo touch ${fullPath}`;
-            // eslint-disable-next-line no-await-in-loop
-            await cmdAsync(execFile);
-            log.info(`Created empty file for component reference: ${fullPath}`);
-          } else {
-            // Create directory
-            const execDIR = `sudo mkdir -p ${fullPath}`;
-            // eslint-disable-next-line no-await-in-loop
-            await cmdAsync(execDIR);
-            log.info(`Created directory for component reference: ${fullPath}`);
-          }
-        }
-      } catch (error) {
-        log.error(`Failed to ensure component reference path exists: ${error.message}`);
-        throw error;
       }
     }
   }
