@@ -25,7 +25,6 @@ const {
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
-const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -366,18 +365,109 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       if (res.flush) res.flush();
     }
 
+    // Create the appdata directory first (required for all apps)
+    const makeAppDataDir = {
+      status: 'Creating appdata directory...',
+    };
+    log.info(makeAppDataDir);
+    if (res) {
+      res.write(serviceHelper.ensureString(makeAppDataDir));
+      if (res.flush) res.flush();
+    }
+    const execAppdataDir = `sudo mkdir -p ${appsFolder + appId}/appdata`;
+    await cmdAsync(execAppdataDir);
+    const makeAppDataDir2 = {
+      status: 'Appdata directory created',
+    };
+    log.info(makeAppDataDir2);
+    if (res) {
+      res.write(serviceHelper.ensureString(makeAppDataDir2));
+      if (res.flush) res.flush();
+    }
+
     const makeDirectoryB = {
-      status: 'Making application data directory...',
+      status: 'Making application data directories and files...',
     };
     log.info(makeDirectoryB);
     if (res) {
       res.write(serviceHelper.ensureString(makeDirectoryB));
       if (res.flush) res.flush();
     }
-    const execDIR2 = `sudo mkdir -p ${appsFolder + appId}/appdata`;
-    await cmdAsync(execDIR2);
+
+    // Parse containerData to get all required local paths
+    const mountParser = require('../utils/mountParser');
+    let parsedMounts;
+    try {
+      parsedMounts = mountParser.parseContainerData(appSpecifications.containerData);
+    } catch (error) {
+      log.error(`Failed to parse containerData: ${error.message}`);
+      throw error;
+    }
+
+    const requiredPaths = mountParser.getRequiredLocalPaths(parsedMounts);
+    log.info(`Creating ${requiredPaths.length} local path(s) for ${appId}`);
+
+    // Create all required directories and files under appdata/
+    for (const pathInfo of requiredPaths) {
+      // Skip appdata itself as it's already created above
+      if (pathInfo.name === 'appdata') {
+        continue; // eslint-disable-line no-continue
+      }
+
+      if (pathInfo.isFile) {
+        // Create empty file under appdata/ - app will initialize it on first run
+        // File is mounted so changes persist across restarts
+        const createFileStatus = {
+          status: `Creating file: appdata/${pathInfo.name}...`,
+        };
+        log.info(createFileStatus);
+        if (res) {
+          res.write(serviceHelper.ensureString(createFileStatus));
+          if (res.flush) res.flush();
+        }
+
+        const filePath = `${appsFolder + appId}/appdata/${pathInfo.name}`;
+        const execFile = `sudo touch ${filePath}`;
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(execFile);
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(`sudo chown 100:101 ${filePath}`);
+        log.info(`Empty file created (app will initialize): appdata/${pathInfo.name}`);
+
+        const createFileStatus2 = {
+          status: `File created: appdata/${pathInfo.name}`,
+        };
+        log.info(createFileStatus2);
+        if (res) {
+          res.write(serviceHelper.ensureString(createFileStatus2));
+          if (res.flush) res.flush();
+        }
+      } else {
+        // Create a directory under appdata/
+        const createDirStatus = {
+          status: `Creating directory: appdata/${pathInfo.name}...`,
+        };
+        log.info(createDirStatus);
+        if (res) {
+          res.write(serviceHelper.ensureString(createDirStatus));
+          if (res.flush) res.flush();
+        }
+        const execDIR = `sudo mkdir -p ${appsFolder + appId}/appdata/${pathInfo.name}`;
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(execDIR);
+        const createDirStatus2 = {
+          status: `Directory created: appdata/${pathInfo.name}`,
+        };
+        log.info(createDirStatus2);
+        if (res) {
+          res.write(serviceHelper.ensureString(createDirStatus2));
+          if (res.flush) res.flush();
+        }
+      }
+    }
+
     const makeDirectoryB2 = {
-      status: 'Application data directory made',
+      status: 'Application data directories and files created',
     };
     log.info(makeDirectoryB2);
     if (res) {
@@ -397,6 +487,17 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     await cmdAsync(execPERM);
     const execPERMdata = `sudo chmod 777 ${appsFolder + appId}/appdata`;
     await cmdAsync(execPERMdata);
+
+    // Set permissions for all created paths under appdata/
+    for (const pathInfo of requiredPaths) {
+      // Skip appdata itself as it's already handled above
+      if (pathInfo.name === 'appdata') {
+        continue; // eslint-disable-line no-continue
+      }
+      const execPERMpath = `sudo chmod 777 ${appsFolder + appId}/appdata/${pathInfo.name}`;
+      // eslint-disable-next-line no-await-in-loop
+      await cmdAsync(execPERMpath);
+    }
     const permissionsDirectory2 = {
       status: 'Permissions adjusted',
     };
@@ -406,47 +507,43 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       if (res.flush) res.flush();
     }
 
-    // if s flag create .stfolder
-    const containersData = appSpecifications.containerData.split('|');
-    // eslint-disable-next-line no-restricted-syntax
-    for (let i = 0; i < containersData.length; i += 1) {
-      const container = containersData[i];
-      const containerDataFlags = container.split(':')[1] ? container.split(':')[0] : '';
-      if (containerDataFlags.includes('s') || containerDataFlags.includes('r') || containerDataFlags.includes('g')) {
-        const containerFolder = i === 0 ? '' : `/appdata${container.split(':')[1].replace(containersData[0], '')}`;
-        const stFolderCreation = {
-          status: 'Creating .stfolder for syncthing...',
-        };
-        log.info(stFolderCreation);
-        if (res) {
-          res.write(serviceHelper.ensureString(stFolderCreation));
-          if (res.flush) res.flush();
-        }
-        const execDIRst = `sudo mkdir -p ${appsFolder + appId + containerFolder}/.stfolder`;
-        // eslint-disable-next-line no-await-in-loop
-        await cmdAsync(execDIRst);
-        const stFolderCreation2 = {
-          status: '.stfolder created',
-        };
-        log.info(stFolderCreation2);
-        if (res) {
-          res.write(serviceHelper.ensureString(stFolderCreation2));
-          if (res.flush) res.flush();
-        }
-        if (i === 0) {
-          const stignore = `sudo echo '/backup' >| ${appsFolder + appId + containerFolder}/.stignore`;
-          log.info(stignore);
-          // eslint-disable-next-line no-await-in-loop
-          await cmdAsync(stignore);
-          const stiFileCreation = {
-            status: '.stignore created',
-          };
-          log.info(stiFileCreation);
-          if (res) {
-            res.write(serviceHelper.ensureString(stiFileCreation));
-            if (res.flush) res.flush();
-          }
-        }
+    // Check if primary mount has syncthing flags (r:, g:, or s:)
+    // Syncthing is configured ONCE for the entire appdata folder based on primary mount flags only
+    const primaryFlags = mountParser.getPrimaryFlags(parsedMounts);
+    const hasSyncthingFlag = primaryFlags.includes('r') || primaryFlags.includes('g') || primaryFlags.includes('s');
+
+    if (hasSyncthingFlag) {
+      const stFolderCreation = {
+        status: 'Creating .stfolder for syncthing...',
+      };
+      log.info(stFolderCreation);
+      if (res) {
+        res.write(serviceHelper.ensureString(stFolderCreation));
+        if (res.flush) res.flush();
+      }
+      // Create .stfolder in parent directory for syncthing (not inside appdata)
+      const execDIRst = `sudo mkdir -p ${appsFolder + appId}/.stfolder`;
+      await cmdAsync(execDIRst);
+      const stFolderCreation2 = {
+        status: '.stfolder created',
+      };
+      log.info(stFolderCreation2);
+      if (res) {
+        res.write(serviceHelper.ensureString(stFolderCreation2));
+        if (res.flush) res.flush();
+      }
+
+      // Create .stignore file to exclude backup directory (in parent directory)
+      const stignore = `sudo echo '/backup' >| ${appsFolder + appId}/.stignore`;
+      log.info(stignore);
+      await cmdAsync(stignore);
+      const stiFileCreation = {
+        status: '.stignore created',
+      };
+      log.info(stiFileCreation);
+      if (res) {
+        res.write(serviceHelper.ensureString(stiFileCreation));
+        if (res.flush) res.flush();
       }
     }
 
@@ -792,91 +889,147 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
 }
 
 /**
- * Soft uninstall a composed application (version >= 4) by removing all its components
- * @param {object} appSpecifications - Application specifications
- * @param {string} appName - Application name
- * @param {object} res - Response object for streaming
- * @returns {Promise<void>}
+ * Helper function to uninstall app components softly
+ * @param {string} appName App name
+ * @param {string} appId App ID
+ * @param {object} appSpecifications App specifications
+ * @param {boolean} isComponent Whether this is a component
+ * @param {object} res Response object
  */
-async function softUninstallComposedApp(appSpecifications, appName, res) {
-  // Dynamic require to avoid circular dependency
-  const appUninstaller = require('./appUninstaller');
-
-  // Uninstall all components in reverse order
-  // eslint-disable-next-line no-restricted-syntax
-  for (const appComposedComponent of appSpecifications.compose.reverse()) {
-    const appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
-    // eslint-disable-next-line no-await-in-loop
-    await appUninstaller.softUninstallComponent(appName, appId, appComposedComponent, res, stopAppMonitoring);
-  }
-}
-
-/**
- * Soft uninstall a single component of a composed application
- * @param {object} appSpecifications - Application specifications
- * @param {string} appName - Application name
- * @param {string} appComponent - Component name
- * @param {string} appId - Application/Component ID
- * @param {object} res - Response object for streaming
- * @returns {Promise<void>}
- */
-async function softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res) {
-  // Dynamic require to avoid circular dependency
-  const appUninstaller = require('./appUninstaller');
-
-  const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
-  await appUninstaller.softUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring);
-}
-
-/**
- * Soft uninstall a simple (non-composed) application
- * @param {object} appSpecifications - Application specifications
- * @param {string} appName - Application name
- * @param {string} appId - Application ID
- * @param {object} res - Response object for streaming
- * @returns {Promise<void>}
- */
-async function softUninstallSimpleApp(appSpecifications, appName, appId, res) {
-  // Dynamic require to avoid circular dependency
-  const appUninstaller = require('./appUninstaller');
-
-  await appUninstaller.softUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring);
-}
-
-/**
- * Clean up database after app removal
- * @param {object} appsDatabase - Database connection
- * @param {string} appName - Application name
- * @param {object} res - Response object for streaming
- * @returns {Promise<void>}
- */
-async function cleanupAppDatabase(appsDatabase, appName, res) {
-  const databaseStatus = {
-    status: 'Cleaning up database...',
+async function appUninstallSoft(appName, appId, appSpecifications, isComponent, res) {
+  const stopStatus = {
+    status: isComponent ? `Stopping Flux App Component ${appSpecifications.name}...` : `Stopping Flux App ${appName}...`,
   };
-  log.info(databaseStatus);
+  log.info(stopStatus);
   if (res) {
-    res.write(serviceHelper.ensureString(databaseStatus));
+    res.write(serviceHelper.ensureString(stopStatus));
+    if (res.flush) res.flush();
+  }
+  let monitoredName = appName;
+  if (isComponent) {
+    monitoredName = `${appSpecifications.name}_${appName}`;
+  }
+  stopAppMonitoring(monitoredName, false);
+  await dockerService.appDockerStop(appId).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    if (res) {
+      res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
+    }
+  });
+
+  const stopStatus2 = {
+    status: isComponent ? `Flux App Component ${appSpecifications.name} stopped` : `Flux App ${appName} stopped`,
+  };
+  log.info(stopStatus2);
+  if (res) {
+    res.write(serviceHelper.ensureString(stopStatus2));
     if (res.flush) res.flush();
   }
 
-  const appsQuery = { name: appName };
-  const appsProjection = {};
-  await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
-
-  const databaseStatus2 = {
-    status: 'Database cleaned',
+  const removeStatus = {
+    status: isComponent ? `Removing Flux App component ${appSpecifications.name} container...` : `Removing Flux App ${appName} container...`,
   };
-  log.info(databaseStatus2);
+  log.info(removeStatus);
   if (res) {
-    res.write(serviceHelper.ensureString(databaseStatus2));
+    res.write(serviceHelper.ensureString(removeStatus));
     if (res.flush) res.flush();
   }
 
-  const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
-  log.info(appRemovalResponseDone);
+  await dockerService.appDockerRemove(appId);
+
+  const removeStatus2 = {
+    status: isComponent ? `Flux App component ${appSpecifications.name}container removed` : `Flux App ${appName} container removed`,
+  };
+  log.info(removeStatus2);
   if (res) {
-    res.write(serviceHelper.ensureString(appRemovalResponseDone));
+    res.write(serviceHelper.ensureString(removeStatus2));
+    if (res.flush) res.flush();
+  }
+
+  const imageStatus = {
+    status: isComponent ? `Removing Flux App component ${appSpecifications.name} image...` : `Removing Flux App ${appName} image...`,
+  };
+  log.info(imageStatus);
+  if (res) {
+    res.write(serviceHelper.ensureString(imageStatus));
+    if (res.flush) res.flush();
+  }
+  await dockerService.appDockerImageRemove(appSpecifications.repotag).catch((error) => {
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    log.error(errorResponse);
+    if (res) {
+      res.write(serviceHelper.ensureString(errorResponse));
+      if (res.flush) res.flush();
+    }
+  });
+  const imageStatus2 = {
+    status: isComponent ? `Flux App component ${appSpecifications.name} image operations done` : `Flux App ${appName} image operations done`,
+  };
+  log.info(imageStatus2);
+  if (res) {
+    res.write(serviceHelper.ensureString(imageStatus2));
+    if (res.flush) res.flush();
+  }
+
+  const portStatus = {
+    status: isComponent ? `Denying Flux App component ${appSpecifications.name} ports...` : `Denying Flux App ${appName} ports...`,
+  };
+  log.info(portStatus);
+  if (res) {
+    res.write(serviceHelper.ensureString(portStatus));
+    if (res.flush) res.flush();
+  }
+  if (appSpecifications.ports) {
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
+    if (firewallActive) {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const port of appSpecifications.ports) {
+        // eslint-disable-next-line no-await-in-loop
+        await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(port));
+      }
+    }
+    const isUPNP = upnpService.isUPNP();
+    if (isUPNP) {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const port of appSpecifications.ports) {
+        // eslint-disable-next-line no-await-in-loop
+        await upnpService.removeMapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${appName}`);
+      }
+    }
+    // v1 compatibility
+  } else if (appSpecifications.port) {
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
+    if (firewallActive) {
+      await fluxNetworkHelper.deleteAllowPortRule(serviceHelper.ensureNumber(appSpecifications.port));
+    }
+    const isUPNP = upnpService.isUPNP();
+    if (isUPNP) {
+      await upnpService.removeMapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `Flux_App_${appName}`);
+    }
+  }
+  const portStatus2 = {
+    status: isComponent ? `Ports of component ${appSpecifications.name} denied` : `Ports of ${appName} denied`,
+  };
+  log.info(portStatus2);
+  if (res) {
+    res.write(serviceHelper.ensureString(portStatus2));
+    if (res.flush) res.flush();
+  }
+  const appRemovalResponse = {
+    status: isComponent ? `Flux App component ${appSpecifications.name} of ${appName} was successfuly removed` : `Flux App ${appName} was successfuly removed`,
+  };
+  log.info(appRemovalResponse);
+  if (res) {
+    res.write(serviceHelper.ensureString(appRemovalResponse));
     if (res.flush) res.flush();
   }
 }
@@ -887,61 +1040,89 @@ async function cleanupAppDatabase(appsDatabase, appName, res) {
  * @param {object} res Response.
  */
 async function softRemoveAppLocally(app, res) {
-  // Validate state
+  // remove app from local machine.
+  // find in database, stop app, remove container, close port, remove from database
+  // we want to remove the image as well (repotag) what if other container uses the same image -> then it shall result in an error so ok anyway
   if (globalState.removalInProgress) {
     throw new Error('Another application is undergoing removal');
   }
   if (globalState.installationInProgress) {
     throw new Error('Another application is undergoing installation');
   }
+  globalState.removalInProgress = true;
   if (!app) {
     throw new Error('No Flux App specified');
   }
 
-  globalState.removalInProgress = true;
+  let isComponent = app.includes('_'); // copmonent is defined by appComponent.name_appSpecs.name
 
-  try {
-    // Parse app name and component
-    const isComponent = app.includes('_'); // component is defined by appComponent.name_appSpecs.name
-    const appName = isComponent ? app.split('_')[1] : app;
-    const appComponent = app.split('_')[0];
+  const appName = isComponent ? app.split('_')[1] : app;
+  const appComponent = app.split('_')[0];
 
-    // Fetch app specifications from database
-    const dbopen = dbHelper.databaseConnection();
-    const appsDatabase = dbopen.db(config.database.appslocal.database);
-    const appsQuery = { name: appName };
-    const appsProjection = {};
+  // first find the appSpecifications in our database.
+  // connect to mongodb
+  const dbopen = dbHelper.databaseConnection();
 
-    let appSpecifications = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
-    if (!appSpecifications) {
-      throw new Error('Flux App not found');
-    }
+  const appsDatabase = dbopen.db(config.database.appslocal.database);
 
-    // Decrypt and format specifications
-    appSpecifications = await checkAndDecryptAppSpecs(appSpecifications);
-    appSpecifications = specificationFormatter(appSpecifications);
-
-    const appId = dockerService.getAppIdentifier(app);
-
-    // Determine uninstall strategy based on app type
-    if (appSpecifications.version >= 4 && !isComponent) {
-      // Composed application - uninstall all components
-      await softUninstallComposedApp(appSpecifications, appName, res);
-    } else if (isComponent) {
-      // Single component of a composed app
-      await softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res);
-    } else {
-      // Simple non-composed application
-      await softUninstallSimpleApp(appSpecifications, appName, appId, res);
-    }
-
-    // Clean up database (only for full app removal, not individual components)
-    if (!isComponent) {
-      await cleanupAppDatabase(appsDatabase, appName, res);
-    }
-  } finally {
-    globalState.removalInProgress = false;
+  const appsQuery = { name: appName };
+  const appsProjection = {};
+  let appSpecifications = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
+  if (!appSpecifications) {
+    throw new Error('Flux App not found');
   }
+
+  let appId = dockerService.getAppIdentifier(app);
+
+  // do this temporarily - otherwise we have to move a bunch of functions around
+  appSpecifications = await checkAndDecryptAppSpecs(appSpecifications);
+  appSpecifications = specificationFormatter(appSpecifications);
+
+  if (appSpecifications.version >= 4 && !isComponent) {
+    // it is a composed application
+    // eslint-disable-next-line no-restricted-syntax
+    for (const appComposedComponent of appSpecifications.compose.reverse()) {
+      isComponent = true;
+      appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
+      const appComponentSpecifications = appComposedComponent;
+      // eslint-disable-next-line no-await-in-loop
+      await appUninstallSoft(appName, appId, appComponentSpecifications, isComponent, res);
+    }
+    isComponent = false;
+  } else if (isComponent) {
+    const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
+    await appUninstallSoft(appName, appId, componentSpecifications, isComponent, res);
+  } else {
+    await appUninstallSoft(appName, appId, appSpecifications, isComponent, res);
+  }
+
+  if (!isComponent) {
+    const databaseStatus = {
+      status: 'Cleaning up database...',
+    };
+    log.info(databaseStatus);
+    if (res) {
+      res.write(serviceHelper.ensureString(databaseStatus));
+      if (res.flush) res.flush();
+    }
+    await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
+    const databaseStatus2 = {
+      status: 'Database cleaned',
+    };
+    log.info(databaseStatus2);
+    if (res) {
+      res.write(serviceHelper.ensureString(databaseStatus2));
+      if (res.flush) res.flush();
+    }
+    const appRemovalResponseDone = messageHelper.createSuccessMessage(`Removal step done. Result: Flux App ${appName} was partially removed`);
+    log.info(appRemovalResponseDone);
+    if (res) {
+      res.write(serviceHelper.ensureString(appRemovalResponseDone));
+      if (res.flush) res.flush();
+    }
+  }
+
+  globalState.removalInProgress = false;
 }
 
 /**
@@ -1088,288 +1269,6 @@ async function hardRedeploy(appSpecs, res) {
     globalState.hardRedeployInProgress = false;
     await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
     log.info(`Cleanup completed for ${appSpecs.name} after hard redeploy failure`);
-  }
-}
-
-/**
- * Soft redeploy a single component - removes and reinstalls component locally (soft)
- * @param {string} appName - Application name
- * @param {string} componentName - Component name
- * @param {object} res - Response object
- */
-async function softRedeployComponent(appName, componentName, res) {
-  const appUninstaller = require('./appUninstaller');
-  const appInstaller = require('./appInstaller');
-
-  try {
-    if (globalState.removalInProgress) {
-      log.warn('Another application is undergoing removal');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.installationInProgress) {
-      log.warn('Another application is undergoing installation');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.softRedeployInProgress) {
-      log.warn('Another application is undergoing soft redeploy');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.hardRedeployInProgress) {
-      log.warn('Another application is undergoing hard redeploy');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-
-    globalState.softRedeployInProgress = true;
-    log.info(`Starting soft redeploy of component ${componentName} from app ${appName}`);
-
-    // Get app specifications
-    const appSpecifications = await getStrictApplicationSpecifications(appName);
-    if (!appSpecifications) {
-      throw new Error(`Application ${appName} not found`);
-    }
-
-    // Find the component in the app specs
-    if (!appSpecifications.compose || appSpecifications.compose.length === 0) {
-      throw new Error(`Application ${appName} is not a composed application`);
-    }
-
-    const componentSpec = appSpecifications.compose.find((comp) => comp.name === componentName);
-    if (!componentSpec) {
-      throw new Error(`Component ${componentName} not found in application ${appName}`);
-    }
-
-    const fullComponentName = `${componentName}_${appName}`;
-
-    try {
-      log.warn(`Beginning Soft Redeployment of component ${fullComponentName}...`);
-      await appUninstaller.softUninstallComponent(fullComponentName, null, componentSpec, res, stopAppMonitoring);
-
-      const appRedeployResponse = messageHelper.createSuccessMessage(`Component ${fullComponentName} softly removed. Awaiting installation...`);
-      log.info(appRedeployResponse);
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-
-      await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
-
-      // Verify requirements
-      await appInstaller.checkAppRequirements(appSpecifications);
-
-      // Register component
-      log.warn(`Continuing Soft Redeployment of component ${fullComponentName}...`);
-      await softRegisterAppLocally(appSpecifications, componentSpec, res);
-
-      log.info(`Component ${fullComponentName} softly redeployed`);
-      globalState.softRedeployInProgress = false;
-    } catch (error) {
-      log.error(error);
-      log.warn(`REMOVAL REASON: Soft redeploy failure - ${appName} being removed after component ${fullComponentName} failed during soft redeploy: ${error.message} (softRedeployComponent)`);
-      globalState.softRedeployInProgress = false;
-      await appUninstaller.removeAppLocally(appName, res, true, true, true);
-      log.info(`Cleanup completed for ${appName} after component ${fullComponentName} soft redeploy failure`);
-      throw error;
-    }
-  } catch (error) {
-    log.error('Error on softRedeployComponent');
-    log.error(error);
-    globalState.softRedeployInProgress = false;
-    throw error;
-  }
-}
-
-/**
- * Hard redeploy a single component - removes and reinstalls component locally (hard)
- * @param {string} appName - Application name
- * @param {string} componentName - Component name
- * @param {object} res - Response object
- */
-async function hardRedeployComponent(appName, componentName, res) {
-  const appUninstaller = require('./appUninstaller');
-  const appInstaller = require('./appInstaller');
-
-  try {
-    if (globalState.removalInProgress) {
-      log.warn('Another application is undergoing removal');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.installationInProgress) {
-      log.warn('Another application is undergoing installation');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.softRedeployInProgress) {
-      log.warn('Another application is undergoing soft redeploy');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-    if (globalState.hardRedeployInProgress) {
-      log.warn('Another application is undergoing hard redeploy');
-      const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-      return;
-    }
-
-    globalState.hardRedeployInProgress = true;
-    log.info(`Starting hard redeploy of component ${componentName} from app ${appName}`);
-
-    // Get app specifications
-    const appSpecifications = await getStrictApplicationSpecifications(appName);
-    if (!appSpecifications) {
-      throw new Error(`Application ${appName} not found`);
-    }
-
-    // Find the component in the app specs
-    if (!appSpecifications.compose || appSpecifications.compose.length === 0) {
-      throw new Error(`Application ${appName} is not a composed application`);
-    }
-
-    const componentSpec = appSpecifications.compose.find((comp) => comp.name === componentName);
-    if (!componentSpec) {
-      throw new Error(`Component ${componentName} not found in application ${appName}`);
-    }
-
-    const fullComponentName = `${componentName}_${appName}`;
-
-    try {
-      log.warn(`Beginning Hard Redeployment of component ${fullComponentName}...`);
-      log.warn(`REMOVAL REASON: Hard redeploy initiated - ${fullComponentName} being removed as part of hard redeploy process (hardRedeployComponent)`);
-
-      await appUninstaller.hardUninstallComponent(fullComponentName, null, componentSpec, res, stopAppMonitoring, false);
-
-      const appRedeployResponse = messageHelper.createSuccessMessage(`Component ${fullComponentName} removed. Awaiting installation...`);
-      log.info(appRedeployResponse);
-      if (res) {
-        res.write(serviceHelper.ensureString(appRedeployResponse));
-        if (res.flush) res.flush();
-      }
-
-      await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
-
-      // Verify requirements
-      await appInstaller.checkAppRequirements(appSpecifications);
-
-      // Register component
-      log.warn(`Continuing Hard Redeployment of component ${fullComponentName}...`);
-      await appInstaller.registerAppLocally(appSpecifications, componentSpec, res);
-
-      log.info(`Component ${fullComponentName} hard redeployed`);
-      globalState.hardRedeployInProgress = false;
-    } catch (error) {
-      log.error(error);
-      log.warn(`REMOVAL REASON: Hard redeploy failure - ${appName} being removed after component ${fullComponentName} failed during hard redeploy: ${error.message} (hardRedeployComponent)`);
-      globalState.hardRedeployInProgress = false;
-      await appUninstaller.removeAppLocally(appName, res, true, true, true);
-      log.info(`Cleanup completed for ${appName} after component ${fullComponentName} hard redeploy failure`);
-      throw error;
-    }
-  } catch (error) {
-    log.error('Error on hardRedeployComponent');
-    log.error(error);
-    globalState.hardRedeployInProgress = false;
-    throw error;
-  }
-}
-
-/**
- * Redeploy component via API
- * @param {object} req - Request object
- * @param {object} res - Response object
- */
-async function redeployComponentAPI(req, res) {
-  try {
-    let { appname } = req.params;
-    appname = appname || req.query.appname;
-    let { component } = req.params;
-    component = component || req.query.component;
-
-    if (!appname) {
-      throw new Error('No Flux App specified');
-    }
-
-    if (!component) {
-      throw new Error('No component specified');
-    }
-
-    // Validate that appname does not contain underscore (it should be the app name, not component_app format)
-    if (appname.includes('_')) {
-      throw new Error('Invalid app name format. Please provide the app name and component name separately');
-    }
-
-    const redeploySkip = globalState.restoreInProgress.some((backupItem) => appname === backupItem);
-    if (redeploySkip) {
-      log.info(`Restore is running for ${appname}, component redeploy skipped...`);
-      const skipResponse = messageHelper.createWarningMessage(`Restore is running for ${appname}, component redeploy skipped...`);
-      res.json(skipResponse);
-      return;
-    }
-
-    let { force } = req.params;
-    force = force || req.query.force || false;
-    force = serviceHelper.ensureBoolean(force);
-
-    // Authorization check - must be app owner or above
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, appname);
-    if (!authorized) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      res.json(errMessage);
-      return;
-    }
-
-    res.setHeader('Content-Type', 'application/json');
-
-    if (force) {
-      await hardRedeployComponent(appname, component, res);
-    } else {
-      await softRedeployComponent(appname, component, res);
-    }
-
-    const successMessage = messageHelper.createSuccessMessage(`Component ${component} of ${appname} redeployed successfully`);
-    res.json(successMessage);
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    res.json(errorResponse);
   }
 }
 
@@ -2708,7 +2607,7 @@ async function reinstallOldApplications() {
               log.warn(`Beginning Soft Redeployment of ${appSpecifications.name}...`);
               // soft redeployment
               // eslint-disable-next-line no-await-in-loop
-              await appUninstaller.softUninstallApplication(appSpecifications.name, null, appSpecifications, null, true);
+              await appUninstaller.appUninstallSoft(appSpecifications.name, null, appSpecifications, false, null, true);
               // eslint-disable-next-line no-await-in-loop
               await appInstaller.installApplicationSoft(appSpecifications, appSpecifications.name, false, null, appSpecifications);
             } else {
@@ -2716,7 +2615,7 @@ async function reinstallOldApplications() {
               log.warn(`REMOVAL REASON: Hard redeployment - ${appSpecifications.name} HDD changed from ${installedApp.hdd} to ${appSpecifications.hdd}`);
               // hard redeployment
               // eslint-disable-next-line no-await-in-loop
-              await appUninstaller.hardUninstallApplication(appSpecifications.name, null, appSpecifications, null, true);
+              await appUninstaller.appUninstallHard(appSpecifications.name, null, appSpecifications, false, null, true);
               // eslint-disable-next-line no-await-in-loop
               await appInstaller.installApplicationHard(appSpecifications, appSpecifications.name, false, null, appSpecifications);
             }
@@ -2769,7 +2668,7 @@ async function reinstallOldApplications() {
                   log.warn(`Beginning Soft Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
                   // soft redeployment
                   // eslint-disable-next-line no-await-in-loop
-                  await appUninstaller.softUninstallComponent(`${appComponent.name}_${appSpecifications.name}`, null, appSpecifications, null, true); // component
+                  await appUninstaller.appUninstallSoft(`${appComponent.name}_${appSpecifications.name}`, null, appSpecifications, true, null, true); // component
                   log.warn(`Application component ${appComponent.name}_${appSpecifications.name} softly removed. Awaiting installation...`);
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
@@ -2778,7 +2677,7 @@ async function reinstallOldApplications() {
                   log.warn(`REMOVAL REASON: Hard redeployment (component) - ${appComponent.name}_${appSpecifications.name} HDD changed from ${installedComponent.hdd} to ${appComponent.hdd}`);
                   // hard redeployment
                   // eslint-disable-next-line no-await-in-loop
-                  await appUninstaller.hardUninstallComponent(`${appComponent.name}_${appSpecifications.name}`, null, appSpecifications, null, true); // component
+                  await appUninstaller.appUninstallHard(`${appComponent.name}_${appSpecifications.name}`, null, appSpecifications, true, null, true); // component
                   log.warn(`Application component ${appComponent.name}_${appSpecifications.name} removed. Awaiting installation...`);
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
@@ -2860,8 +2759,7 @@ async function reinstallOldApplications() {
             } catch (error) {
               log.error(error);
               log.warn(`REMOVAL REASON: Redeployment error - ${appSpecifications.name} failed during redeployment: ${error.message}`);
-              await appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
-              log.info(`Cleanup completed for ${appSpecifications.name} after redeployment failure`);
+              appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
             }
           }
         }
@@ -3018,9 +2916,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
     if (appsInstalled.status === 'error') {
       return;
     }
-
-    // Decrypt enterprise apps (version 8 with encrypted content)
-    appsInstalled.data = await decryptEnterpriseApps(appsInstalled.data);
     const runningAppsNames = runningApps.map((app) => {
       if (app.Names[0].startsWith('/zel')) {
         return app.Names[0].slice(4);
@@ -3458,15 +3353,71 @@ async function getPeerAppsInstallingErrorMessages() {
   }
 }
 
+/**
+ * Ensures all required local mount paths (files and directories) exist for a component.
+ * This function should be called before creating a container to prevent Docker mount errors
+ * when files or directories have been deleted or don't exist yet.
+ *
+ * @param {object} appSpecifications - Component specifications
+ * @param {string} appName - Application name
+ * @param {boolean} isComponent - Whether this is a component of a compose app
+ * @param {object} fullAppSpecs - Full application specifications (for compose apps)
+ * @returns {Promise<void>}
+ */
+async function ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs) {
+  const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+  const appId = dockerService.getAppIdentifier(identifier);
+
+  // Parse containerData to get required paths
+  const mountParser = require('../utils/mountParser');
+  // eslint-disable-next-line global-require
+  const fs = require('fs').promises;
+  let parsedMounts;
+  try {
+    parsedMounts = mountParser.parseContainerData(appSpecifications.containerData);
+  } catch (error) {
+    log.error(`Failed to parse containerData for ${identifier}: ${error.message}`);
+    throw error;
+  }
+
+  const requiredPaths = mountParser.getRequiredLocalPaths(parsedMounts);
+  log.info(`Ensuring ${requiredPaths.length} local path(s) exist for ${appId}`);
+
+  // Create all required directories and files under appdata/
+  for (const pathInfo of requiredPaths) {
+    const fullPath = `${appsFolder}${appId}/appdata${pathInfo.name === 'appdata' ? '' : `/${pathInfo.name}`}`;
+
+    // Check if path exists
+    try {
+      await fs.access(fullPath);
+      // Path exists, skip
+      log.info(`Path already exists: ${fullPath}`);
+    } catch (error) {
+      // Path doesn't exist, need to create it
+      log.warn(`Path missing, creating: ${fullPath}`);
+
+      if (pathInfo.isFile) {
+        // Create empty file
+        const execFile = `sudo touch ${fullPath}`;
+        await cmdAsync(execFile);
+        await cmdAsync(`sudo chown 100:101 ${fullPath}`);
+        log.info(`Created empty file: ${fullPath}`);
+      } else {
+        // Create directory
+        const execDIR = `sudo mkdir -p ${fullPath}`;
+        await cmdAsync(execDIR);
+        log.info(`Created directory: ${fullPath}`);
+      }
+    }
+  }
+}
+
 module.exports = {
   createAppVolume,
   softRegisterAppLocally,
   softRemoveAppLocally,
   hardRedeploy,
-  softRedeployComponent,
-  hardRedeployComponent,
   redeployAPI,
-  redeployComponentAPI,
   verifyAppUpdateParameters,
   updateAppGlobalyApi,
   stopSyncthingApp,
@@ -3491,4 +3442,5 @@ module.exports = {
   forceAppRemovals,
   masterSlaveApps,
   getPeerAppsInstallingErrorMessages,
+  ensureMountPathsExist,
 };
