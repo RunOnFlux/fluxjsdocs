@@ -423,15 +423,12 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       }
 
       if (pathInfo.isFile) {
-        // For file mounts, create directory and file with 777 permissions
+        // For file mounts, create file directly with 777 permissions
         // This allows any container user to write to the file
         // File will be bind-mounted directly to the container
 
-        // Extract filename from container path
-        const containerFilename = pathInfo.containerPath.substring(pathInfo.containerPath.lastIndexOf('/') + 1);
-
         const createFileStatus = {
-          status: `Creating file mount: ${pathInfo.name}/${containerFilename}...`,
+          status: `Creating file mount: ${pathInfo.name}...`,
         };
         log.info(createFileStatus);
         if (res) {
@@ -439,17 +436,16 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
           if (res.flush) res.flush();
         }
 
-        // Create subdirectory and file with 777 permissions at same level as appdata
-        const fileDir = `${appsFolder + appId}/${pathInfo.name}`;
-        const filePath = `${fileDir}/${containerFilename}`;
-        const execCommands = `sudo mkdir -p ${fileDir} && sudo touch ${filePath} && sudo chmod 777 ${filePath}`;
+        // Create file directly at same level as appdata with 777 permissions
+        const filePath = `${appsFolder + appId}/${pathInfo.name}`;
+        const execCommands = `sudo touch ${filePath} && sudo chmod 777 ${filePath}`;
         // eslint-disable-next-line no-await-in-loop
         await cmdAsync(execCommands);
 
-        log.info(`File mount created with 777 permissions: ${pathInfo.name}/${containerFilename}`);
+        log.info(`File mount created with 777 permissions: ${pathInfo.name}`);
 
         const createFileStatus2 = {
-          status: `File mount created: ${pathInfo.name}/${containerFilename}`,
+          status: `File mount created: ${pathInfo.name}`,
         };
         log.info(createFileStatus2);
         if (res) {
@@ -502,14 +498,14 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     const execPERMdata = `sudo chmod 777 ${appsFolder + appId}/appdata`;
     await cmdAsync(execPERMdata);
 
-    // Set permissions for all created paths under appdata/
+    // Set permissions for all created paths (appdata and additional mounts at same level)
     // eslint-disable-next-line no-restricted-syntax
     for (const pathInfo of requiredPaths) {
       // Skip appdata itself as it's already handled above
       if (pathInfo.name === 'appdata') {
         continue; // eslint-disable-line no-continue
       }
-      const execPERMpath = `sudo chmod 777 ${appsFolder + appId}/appdata/${pathInfo.name}`;
+      const execPERMpath = `sudo chmod 777 ${appsFolder + appId}/${pathInfo.name}`;
       // eslint-disable-next-line no-await-in-loop
       await cmdAsync(execPERMpath);
     }
@@ -1775,20 +1771,23 @@ async function changeSyncthingFolderType(folderId, folderType) {
 
 /**
  * Helper function to apply permissions fix on persistent container data
+ * Fixes permissions on appdata and all additional mount points
  * @param {string} appId - Application ID
  * @returns {Promise<boolean>} - true if successful, false otherwise
  */
 async function applyPermissionsFix(appId) {
   try {
-    const appDataPath = `${appsFolder}${appId}/appdata`;
+    // Fix permissions on entire app directory to cover appdata and all additional mounts
+    const appPath = `${appsFolder}${appId}`;
 
     log.info(`Applying permissions fix for app: ${appId}`);
 
-    // Apply 777 permissions to appdata directory recursively
-    const execPERM = `sudo chmod -R 777 ${appDataPath}`;
+    // Apply 777 permissions to entire app directory recursively
+    // This covers both appdata (primary mount) and all additional mounts at the same level
+    const execPERM = `sudo chmod -R 777 ${appPath}`;
     await cmdAsync(execPERM);
 
-    log.info(`Successfully applied permissions fix for app: ${appId}`);
+    log.info(`Successfully applied permissions fix for app: ${appId} (includes appdata and all mount points)`);
     return true;
   } catch (error) {
     log.error(`Error applying permissions fix for ${appId}: ${error.message}`);
@@ -3900,17 +3899,12 @@ async function ensureMountPathsExist(appSpecifications, appName, isComponent, fu
       log.warn(`Path missing, creating: ${fullPath}`);
 
       if (pathInfo.isFile) {
-        // For file mounts, create directory and file with 777 permissions
-        // Extract filename from container path
-        const containerFilename = pathInfo.containerPath.substring(pathInfo.containerPath.lastIndexOf('/') + 1);
-
-        // Create subdirectory and file with 777 permissions
-        const filePath = `${fullPath}/${containerFilename}`;
-        const execCommands = `sudo mkdir -p ${fullPath} && sudo touch ${filePath} && sudo chmod 777 ${filePath}`;
+        // For file mounts, create file directly with 777 permissions
+        const execCommands = `sudo touch ${fullPath} && sudo chmod 777 ${fullPath}`;
         // eslint-disable-next-line no-await-in-loop
         await cmdAsync(execCommands);
 
-        log.info(`Created file mount with 777 permissions: ${filePath}`);
+        log.info(`Created file mount with 777 permissions: ${fullPath}`);
       } else {
         // Create directory
         const execDIR = `sudo mkdir -p ${fullPath}`;
@@ -3971,17 +3965,12 @@ async function ensureMountPathsExist(appSpecifications, appName, isComponent, fu
           log.warn(`Component reference path missing, creating: ${fullPath}`);
 
           if (mount.isFile) {
-            // For component file mounts, create directory and file with 777 permissions
-            // Extract filename from container path
-            const containerFilename = mount.containerPath.substring(mount.containerPath.lastIndexOf('/') + 1);
-
-            // Create subdirectory and file with 777 permissions
-            const filePath = `${fullPath}/${containerFilename}`;
-            const execCommands = `sudo mkdir -p ${fullPath} && sudo touch ${filePath} && sudo chmod 777 ${filePath}`;
+            // For component file mounts, create file directly with 777 permissions
+            const execCommands = `sudo touch ${fullPath} && sudo chmod 777 ${fullPath}`;
             // eslint-disable-next-line no-await-in-loop
             await cmdAsync(execCommands);
 
-            log.info(`Created file mount with 777 permissions for component reference: ${filePath}`);
+            log.info(`Created file mount with 777 permissions for component reference: ${fullPath}`);
           } else {
             // Create directory
             const execDIR = `sudo mkdir -p ${fullPath}`;
