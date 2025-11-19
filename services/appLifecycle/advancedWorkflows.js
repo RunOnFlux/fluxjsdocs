@@ -472,14 +472,11 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       res.write(serviceHelper.ensureString(mountingStatus));
       if (res.flush) res.flush();
     }
-    let volumeFile = `${useThisVolume.mount}/${appId}FLUXFSVOL`;
+    let execMount = `sudo mount -o loop ${useThisVolume.mount}/${appId}FLUXFSVOL ${appsFolder + appId}`;
     if (useThisVolume.mount === '/') {
-      volumeFile = `${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
+      execMount = `sudo mount -o loop ${fluxDirPath}appvolumes/${appId}FLUXFSVOL ${appsFolder + appId}`;
     }
-    // Wait for volume file to exist (handles encrypted volumes not yet mounted after reboot)
-    // This ensures @reboot cron jobs don't fail when the encrypted partition isn't ready
-    let execMount = `while [ ! -f ${volumeFile} ]; do sleep 5; done && sudo mount -o loop ${volumeFile} ${appsFolder + appId}`;
-    await cmdAsync(`sudo mount -o loop ${volumeFile} ${appsFolder + appId}`);
+    await cmdAsync(execMount);
     const mountingStatus2 = {
       status: 'Volume mounted',
     };
@@ -1316,7 +1313,7 @@ async function hardRedeploy(appSpecs, res) {
     const appInstaller = require('./appInstaller');
     await appInstaller.checkAppRequirements(appSpecs);
     // register
-    await appInstaller.registerAppLocally(appSpecs, undefined, res, false, true); // can throw
+    await appInstaller.registerAppLocally(appSpecs, undefined, res); // can throw
     log.info('Application redeployed');
     globalState.hardRedeployInProgress = false;
   } catch (error) {
