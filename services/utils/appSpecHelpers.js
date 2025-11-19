@@ -321,19 +321,12 @@ async function getAppFiatAndFluxPrice(req, res) {
           actualPriceToPay -= (perc * previousSpecsPrice);
         }
       }
-      // Apply tier-based pricing based on hardware requirements
-      // Cumulus: up to 3 vcores, 6000MB RAM, 180GB disk - no extra charge
-      // Nimbus: up to 7 vcores, 28000MB RAM, 400GB disk - 15% extra
-      // Stratus: above Nimbus limits - 30% extra
       const appHWrequirements = hwRequirements.totalAppHWRequirements(appSpecFormatted, 'bamf');
-      if (appHWrequirements.cpu > 7 || appHWrequirements.ram > 28000 || appHWrequirements.hdd > 400) {
-        // Stratus tier required
-        actualPriceToPay *= 1.30;
-      } else if (appHWrequirements.cpu > 3 || appHWrequirements.ram > 6000 || appHWrequirements.hdd > 180) {
-        // Nimbus tier required
-        actualPriceToPay *= 1.15;
+      if (appHWrequirements.cpu < 3 && appHWrequirements.ram < 6000 && appHWrequirements.hdd < 150) {
+        actualPriceToPay *= 0.8;
+      } else if (appHWrequirements.cpu < 7 && appHWrequirements.ram < 29000 && appHWrequirements.hdd < 370) {
+        actualPriceToPay *= 0.9;
       }
-      // Cumulus tier - no extra charge
       let gSyncthgApp = false;
       if (appSpecFormatted.version <= 3) {
         gSyncthgApp = appSpecFormatted.containerData.includes('g:');
@@ -370,23 +363,6 @@ async function getAppFiatAndFluxPrice(req, res) {
           actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
         }
       }
-
-      // Apply subscription duration discount
-      const subscriptionMonths = expireIn / defaultExpire;
-      if (subscriptionMonths >= 9) {
-        actualPriceToPay *= 0.88; // 12% discount
-      } else if (subscriptionMonths >= 6) {
-        actualPriceToPay *= 0.94; // 6% discount
-      } else if (subscriptionMonths >= 3) {
-        actualPriceToPay *= 0.97; // 3% discount
-      }
-      actualPriceToPay = Number(actualPriceToPay).toFixed(2);
-
-      // Ensure final price meets minimum after all discounts
-      if (actualPriceToPay < appPrices[0].minUSDPrice) {
-        actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
-      }
-
       let fiatRates;
       let fluxUSDRate;
       if (myShortCache.has('fluxRates')) {
