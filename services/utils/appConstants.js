@@ -24,9 +24,6 @@ const globalAppsInstallingErrorsLocations = config.database.appsglobal.collectio
 // Supported architectures
 const supportedArchitectures = ['amd64', 'arm64'];
 
-// Enterprise required architectures (Arcane nodes are amd64-only)
-const enterpriseRequiredArchitectures = ['amd64'];
-
 // Environment flags
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -82,7 +79,6 @@ module.exports = {
 
   // Configuration
   supportedArchitectures,
-  enterpriseRequiredArchitectures,
   isArcane,
   appsThatMightBeUsingOldGatewayIpAssignment,
   defaultNodeSpecs,
