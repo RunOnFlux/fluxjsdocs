@@ -9,6 +9,7 @@ const dbHelper = require('../dbHelper');
 const messageHelper = require('../messageHelper');
 const generalService = require('../generalService');
 const benchmarkService = require('../benchmarkService');
+const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const geolocationService = require('../geolocationService');
 const appUninstaller = require('./appUninstaller');
@@ -16,7 +17,7 @@ const appUninstaller = require('./appUninstaller');
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
 const { storeAppRunningMessage, storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
 const { systemArchitecture } = require('../appSystem/systemIntegration');
-const { checkApplicationImagesCompliance } = require('../appSecurity/imageManager');
+const { checkApplicationImagesCompliance, verifyRepository } = require('../appSecurity/imageManager');
 const { startAppMonitoring } = require('../appManagement/appInspector');
 const imageVerifier = require('../utils/imageVerifier');
 // pgpService is used in commented out code
@@ -1060,11 +1061,73 @@ async function testAppInstall(req, res) {
         throw new Error(`Application Specifications of ${appname} not found`);
       }
 
+      // Decrypt enterprise specifications if needed
+      if (
+        appSpecifications.version >= 8
+        && appSpecifications.enterprise
+        && !appSpecifications.compose.length
+      ) {
+        // Get current daemon height for decryption
+        const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+        if (!syncStatus.data.synced) {
+          throw new Error('Daemon not yet synced.');
+        }
+        const daemonHeight = syncStatus.data.height;
+
+        appSpecifications = await checkAndDecryptAppSpecs(appSpecifications, {
+          daemonHeight,
+          owner: appSpecifications.owner,
+        });
+        appSpecifications = specificationFormatter(appSpecifications);
+      }
+
       // Test installation - similar to regular install but with test flag
       // Skip all requirement checks for test installations (geolocation, static IP, hardware, nodes)
       await checkAppRequirements(appSpecifications, true, true, true);
 
-      res.setHeader('Content-Type', 'application/json');
+      // Check architecture compatibility for test installations
+      // Get local node architecture
+      const localArch = await systemArchitecture();
+
+      // Collect supported architectures from all components
+      const componentArchitectures = [];
+      for (const component of appSpecifications.compose) {
+        const repoVerification = await verifyRepository(component.repotag);
+        componentArchitectures.push({
+          name: component.name,
+          architectures: repoVerification.supportedArchitectures,
+        });
+      }
+
+      // Calculate common architectures across all components
+      const findCommonArchitectures = (compArchs) => {
+        if (compArchs.length === 0) return [];
+        if (compArchs.length === 1) return compArchs[0].architectures;
+
+        return compArchs[0].architectures.filter((arch) =>
+          compArchs.every((comp) => comp.architectures.includes(arch)),
+        );
+      };
+
+      const commonArchitectures = findCommonArchitectures(componentArchitectures);
+
+      // If local architecture is not in common architectures, skip Docker operations
+      if (!commonArchitectures.includes(localArch)) {
+        // Write an initial status message
+        const initMessage = {
+          status: 'Checking architecture compatibility...',
+        };
+        res.write(serviceHelper.ensureString(initMessage));
+        if (res.flush) res.flush();
+
+        // Write the skip message
+        const successMessage = {
+          status: `Test installation validation passed. Installation skipped due to architecture incompatibility: this node is ${localArch} but app requires [${commonArchitectures.join(', ')}]`,
+        };
+        res.write(serviceHelper.ensureString(successMessage));
+        res.end();
+        return;
+      }
 
       // Run test installation (registerAppLocally with test=true)
       await registerAppLocally(appSpecifications, undefined, res, true);
