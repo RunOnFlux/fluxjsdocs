@@ -28,6 +28,7 @@ const appHashSyncService = require('./appMessaging/appHashSyncService');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
+const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
 const globalState = require('./utils/globalState');
 const appQueryService = require('./appQuery/appQueryService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
@@ -123,6 +124,9 @@ async function startFluxFunctions() {
     await database.collection(config.database.local.collections.loggedUsers).createIndex({ createdAt: 1 }, { expireAfterSeconds: 14 * 24 * 60 * 60 }); // 2days
     await database.collection(config.database.local.collections.activeLoginPhrases).createIndex({ createdAt: 1 }, { expireAfterSeconds: 900 });
     await database.collection(config.database.local.collections.activeSignatures).createIndex({ createdAt: 1 }, { expireAfterSeconds: 900 });
+    await database.collection(config.database.local.collections.activePaymentRequests).createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 }); // 1 hour
+    await database.collection(config.database.local.collections.completedPayments).createIndex({ paymentId: 1 });
+    await database.collection(config.database.local.collections.completedPayments).createIndex({ createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 }); // 7 days
     log.info('Local database prepared');
     log.info('Preparing temporary database...');
     // no need to drop temporary messages
@@ -190,14 +194,6 @@ async function startFluxFunctions() {
       });
     }, 45 * 1000); // Run after 45 seconds to allow system to stabilize
 
-    // Cleanup and fix crontab mount entries (add wait logic, remove stale entries, ensure mounts are active)
-    log.info('Scheduling crontab and mounts cleanup...');
-    setTimeout(() => {
-      crontabAndMountsCleanup.cleanupCrontabAndMounts().catch((error) => {
-        log.error(`Crontab and mounts cleanup service error: ${error.message}`);
-      });
-    }, 30 * 1000); // Run after 30 seconds to allow DB to be fully ready
-
     log.info('Flux Apps installing locations prepared');
 
     // Initialize appSpawner with dependencies to avoid circular dependency
@@ -217,6 +213,16 @@ async function startFluxFunctions() {
     log.info('Flux checks operational');
     fluxCommunication.fluxDiscovery();
     log.info('Flux Discovery started');
+    // Cleanup and fix crontab mount entries (add wait logic, remove stale entries, ensure mounts are active)
+    log.info('crontab and mounts cleanup...');
+    await crontabAndMountsCleanup.cleanupCrontabAndMounts().catch((error) => {
+      log.error(`Crontab and mounts cleanup service error: ${error.message}`);
+    });
+    // Perform container mount recovery - restart containers that started before their mounts were created
+    log.info('Container mount recovery check...');
+    await containerMountRecovery.performContainerMountRecovery().catch((error) => {
+      log.error(`Container mount recovery service error: ${error.message}`);
+    });
     syncthingService.startSyncthingSentinel();
     log.info('Syncthing service started');
     await pgpService.generateIdentity();
