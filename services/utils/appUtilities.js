@@ -28,13 +28,10 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
   const intervals = appPrices.filter((i) => i.height < height);
   const priceSpecifications = intervals[intervals.length - 1]; // filter does not change order
   let instancesAdditional = 0;
-  const isV8OrAbove = dataForAppRegistration.version >= 8 && height >= config.fluxapps.minimumInstancesV8Block;
-  const baseInstances = isV8OrAbove ? 1 : 3;
   if (dataForAppRegistration.instances) {
     // spec of version >= 3
-    // specification version 3-7 is saying. 3 instances are standard, every 3 additional is double the price.
-    // specification version 8+ allows 1 instance as base, pricing is per instance.
-    instancesAdditional = dataForAppRegistration.instances - baseInstances;
+    // specification version 3 is saying. 3 instances are standard, every 3 additional is double the price.
+    instancesAdditional = dataForAppRegistration.instances - 3; // has to always be >=0 as of checks before.
   }
   if (dataForAppRegistration.version <= 3) {
     if (dataForAppRegistration.tiered) {
@@ -141,14 +138,6 @@ async function appPricePerMonth(dataForAppRegistration, height, suppliedPrices) 
     totalPrice += priceSpecifications.staticip;
   }
   totalPrice += enterprisePorts.length * priceSpecifications.port; // enterprise ports
-
-  // For v8+ apps, calculate price per instance (base price is for 3 instances, so divide by 3)
-  // then multiply by actual number of instances
-  if (isV8OrAbove) {
-    const pricePerInstance = totalPrice / 3;
-    totalPrice = pricePerInstance * dataForAppRegistration.instances;
-  }
-
   if (priceSpecifications.minUSDPrice && height >= config.fluxapps.applyMinimumPriceOn3Instances && totalPrice < priceSpecifications.minUSDPrice) {
     totalPrice = Number(priceSpecifications.minUSDPrice).toFixed(2);
   }
@@ -700,11 +689,8 @@ function specificationFormatter(appSpecification) {
     if (Number.isInteger(instances) !== true) {
       throw new Error('Invalid instances specified');
     }
-    const minInstances = version >= 8
-      ? config.fluxapps.minimumInstancesV8
-      : config.fluxapps.minimumInstances;
-    if (instances < minInstances) {
-      throw new Error(`Minimum number of instances is ${minInstances}`);
+    if (instances < config.fluxapps.minimumInstances) {
+      throw new Error(`Minimum number of instances is ${config.fluxapps.minimumInstances}`);
     }
     if (instances > config.fluxapps.maximumInstances) {
       throw new Error(`Maximum number of instances is ${config.fluxapps.maximumInstances}`);
