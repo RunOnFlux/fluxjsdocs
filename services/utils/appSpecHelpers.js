@@ -300,18 +300,6 @@ async function getAppFiatAndFluxPrice(req, res) {
         if (daemonHeight > 1315000) {
           previousExpireIn = appInfo.expire || previousDefaultExpire;
         }
-
-        // Adjust previousExpireIn if app was registered before fork and expiration crosses fork
-        if (appInfo.height < config.fluxapps.daemonPONFork) {
-          const originalExpireHeight = appInfo.height + previousExpireIn;
-          if (originalExpireHeight > config.fluxapps.daemonPONFork) {
-            // Expiration crosses fork boundary - adjust blocks after fork
-            const blocksAfterFork = originalExpireHeight - config.fluxapps.daemonPONFork;
-            const adjustedBlocksAfterFork = blocksAfterFork * 4;
-            const adjustedExpireHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
-            previousExpireIn = adjustedExpireHeight - appInfo.height;
-          }
-        }
         const multiplierPrevious = previousExpireIn / previousDefaultExpire;
         previousSpecsPrice *= multiplierPrevious;
         previousSpecsPrice = Number(previousSpecsPrice).toFixed(2);
@@ -332,12 +320,6 @@ async function getAppFiatAndFluxPrice(req, res) {
         if (perc > 0) {
           actualPriceToPay -= (perc * previousSpecsPrice);
         }
-      }
-      const appHWrequirements = hwRequirements.totalAppHWRequirements(appSpecFormatted, 'bamf');
-      if (appHWrequirements.cpu < 3 && appHWrequirements.ram < 6000 && appHWrequirements.hdd < 150) {
-        actualPriceToPay *= 0.8;
-      } else if (appHWrequirements.cpu < 7 && appHWrequirements.ram < 29000 && appHWrequirements.hdd < 370) {
-        actualPriceToPay *= 0.9;
       }
       let gSyncthgApp = false;
       if (appSpecFormatted.version <= 3) {
@@ -375,6 +357,23 @@ async function getAppFiatAndFluxPrice(req, res) {
           actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
         }
       }
+
+      // Apply subscription duration discount
+      const subscriptionMonths = expireIn / defaultExpire;
+      if (subscriptionMonths >= 9) {
+        actualPriceToPay *= 0.88; // 12% discount
+      } else if (subscriptionMonths >= 6) {
+        actualPriceToPay *= 0.94; // 6% discount
+      } else if (subscriptionMonths >= 3) {
+        actualPriceToPay *= 0.97; // 3% discount
+      }
+      actualPriceToPay = Number(actualPriceToPay).toFixed(2);
+
+      // Ensure final price meets minimum after all discounts
+      if (actualPriceToPay < appPrices[0].minUSDPrice) {
+        actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
+      }
+
       let fiatRates;
       let fluxUSDRate;
       if (myShortCache.has('fluxRates')) {

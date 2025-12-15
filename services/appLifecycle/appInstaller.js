@@ -9,7 +9,6 @@ const dbHelper = require('../dbHelper');
 const messageHelper = require('../messageHelper');
 const generalService = require('../generalService');
 const benchmarkService = require('../benchmarkService');
-const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const geolocationService = require('../geolocationService');
 const appUninstaller = require('./appUninstaller');
@@ -17,7 +16,7 @@ const appUninstaller = require('./appUninstaller');
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
 const { storeAppRunningMessage, storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
 const { systemArchitecture } = require('../appSystem/systemIntegration');
-const { checkApplicationImagesCompliance, verifyRepository } = require('../appSecurity/imageManager');
+const { checkApplicationImagesCompliance } = require('../appSecurity/imageManager');
 const { startAppMonitoring } = require('../appManagement/appInspector');
 const imageVerifier = require('../utils/imageVerifier');
 // pgpService is used in commented out code
@@ -28,7 +27,6 @@ const upnpService = require('../upnpService');
 const globalState = require('../utils/globalState');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
-const { findCommonArchitectures } = require('../utils/appUtilities');
 const log = require('../../lib/log');
 const { appsFolder, localAppsInformation, scannedHeightCollection } = require('../utils/appConstants');
 const { checkAppTemporaryMessageExistence, checkAppMessageExistence } = require('../appMessaging/messageVerifier');
@@ -337,10 +335,9 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
- * @param {boolean} sendRemovalMessage whether to broadcast removal message to network if installation fails.
  * @returns {Promise<boolean>} Returns true if installation was successful, false otherwise.
  */
-async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false) {
+async function registerAppLocally(appSpecs, componentSpecs, res, test = false) {
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
@@ -685,7 +682,6 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       res.write(serviceHelper.ensureString(errorResponse));
       if (res.flush) res.flush();
     }
-
     if (!test) {
       const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
       log.info(removeStatus);
@@ -693,20 +689,10 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
         res.write(serviceHelper.ensureString(removeStatus));
         if (res.flush) res.flush();
       }
-      await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, sendRemovalMessage);
+      await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, false);
       log.info(`Cleanup completed for ${appSpecs.name} after installation failure`);
     }
-
     return false;
-  } finally {
-    if (test) {
-      try {
-        await appUninstaller.removeAppLocally(appSpecs.name, null, true, false, false);
-        log.info(`Test cleanup completed for ${appSpecs.name}`);
-      } catch (cleanupError) {
-        log.error(`Error during test cleanup for ${appSpecs.name}: ${cleanupError.message}`);
-      }
-    }
   }
   return true;
 }
@@ -969,28 +955,18 @@ async function installAppLocally(req, res) {
 /**
  * Check application requirements - validates hardware, static IP, nodes, and geolocation requirements
  * @param {object} appSpecs - Application specifications to check
- * @param {boolean} skipGeolocation - Whether to skip geolocation checks (useful for testing)
- * @param {boolean} skipStaticIp - Whether to skip static IP checks (useful for testing)
- * @param {boolean} skipHardware - Whether to skip hardware and nodes checks (useful for testing)
  * @returns {Promise<boolean>} True if requirements are met
  */
-async function checkAppRequirements(appSpecs, skipGeolocation = false, skipStaticIp = false, skipHardware = false) {
+async function checkAppRequirements(appSpecs) {
   // appSpecs has hdd, cpu and ram assigned to correct tier
-  if (!skipHardware) {
-    await hwRequirements.checkAppHWRequirements(appSpecs);
-  }
+  await hwRequirements.checkAppHWRequirements(appSpecs);
+  // check geolocation
 
-  if (!skipStaticIp) {
-    hwRequirements.checkAppStaticIpRequirements(appSpecs);
-  }
+  hwRequirements.checkAppStaticIpRequirements(appSpecs);
 
-  if (!skipHardware) {
-    await hwRequirements.checkAppNodesRequirements(appSpecs);
-  }
+  await hwRequirements.checkAppNodesRequirements(appSpecs);
 
-  if (!skipGeolocation) {
-    hwRequirements.checkAppGeolocationRequirements(appSpecs);
-  }
+  hwRequirements.checkAppGeolocationRequirements(appSpecs);
 
   return true;
 }
@@ -1062,66 +1038,10 @@ async function testAppInstall(req, res) {
         throw new Error(`Application Specifications of ${appname} not found`);
       }
 
-      // Decrypt enterprise specifications if needed
-      if (
-        appSpecifications.version >= 8
-        && appSpecifications.enterprise
-        && !appSpecifications.compose.length
-      ) {
-        // Get current daemon height for decryption
-        const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-        if (!syncStatus.data.synced) {
-          throw new Error('Daemon not yet synced.');
-        }
-        const daemonHeight = syncStatus.data.height;
-
-        appSpecifications = await checkAndDecryptAppSpecs(appSpecifications, {
-          daemonHeight,
-          owner: appSpecifications.owner,
-        });
-        appSpecifications = specificationFormatter(appSpecifications);
-      }
-
       // Test installation - similar to regular install but with test flag
-      // Skip all requirement checks for test installations (geolocation, static IP, hardware, nodes)
-      await checkAppRequirements(appSpecifications, true, true, true);
+      await checkAppRequirements(appSpecifications);
 
       res.setHeader('Content-Type', 'application/json');
-
-      // Check architecture compatibility for test installations
-      // Get local node architecture
-      const localArch = await systemArchitecture();
-
-      // Collect supported architectures from all components
-      const componentArchitectures = [];
-      for (const component of appSpecifications.compose) {
-        const repoVerification = await verifyRepository(component.repotag);
-        componentArchitectures.push({
-          name: component.name,
-          architectures: repoVerification.supportedArchitectures,
-        });
-      }
-
-      // Calculate common architectures across all components
-      const commonArchitectures = findCommonArchitectures(componentArchitectures);
-
-      // If local architecture is not in common architectures, skip Docker operations
-      if (!commonArchitectures.includes(localArch)) {
-        // Write an initial status message
-        const initMessage = {
-          status: 'Checking architecture compatibility...',
-        };
-        res.write(serviceHelper.ensureString(initMessage));
-        if (res.flush) res.flush();
-
-        // Write the skip message
-        const successMessage = {
-          status: `Test installation validation passed. Installation skipped due to architecture incompatibility: this node is ${localArch} but app requires [${commonArchitectures.join(', ')}]`,
-        };
-        res.write(serviceHelper.ensureString(successMessage));
-        res.end();
-        return;
-      }
 
       // Run test installation (registerAppLocally with test=true)
       await registerAppLocally(appSpecifications, undefined, res, true);
