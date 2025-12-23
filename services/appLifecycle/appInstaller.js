@@ -1095,12 +1095,7 @@ async function testAppInstall(req, res) {
       // Collect supported architectures from all components
       const componentArchitectures = [];
       for (const component of appSpecifications.compose) {
-        const repoVerification = await verifyRepository(component.repotag, {
-          repoauth: component.repoauth,
-          specVersion: appSpecifications.version,
-          appName: appSpecifications.name,
-          architecture: localArch,
-        });
+        const repoVerification = await verifyRepository(component.repotag);
         componentArchitectures.push({
           name: component.name,
           architectures: repoVerification.supportedArchitectures,

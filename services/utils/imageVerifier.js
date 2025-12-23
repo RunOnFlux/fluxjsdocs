@@ -132,8 +132,7 @@ class ImageVerifier {
   }
 
   get useable() {
-    // Namespace is optional (only Docker Hub uses it), so check for required fields only
-    return !!this.provider && !!this.repository && !!this.tag;
+    return this.parts.length === 4;
   }
 
   /**
