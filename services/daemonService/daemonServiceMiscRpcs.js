@@ -2,31 +2,14 @@ const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const daemonServiceBlockchainRpcs = require('./daemonServiceBlockchainRpcs');
 const log = require('../../lib/log');
-const configManager = require('../utils/configManager');
 
-/**
- * Get the default daemon header based on testnet configuration
- * @returns {number} Default header height
- */
-function getDefaultDaemonHeader() {
-  const isTestnet = globalThis.userconfig.initial?.testnet === true;
-  return isTestnet ? 377006 : 1136836;
-}
+const userconfig = require('../../../../config/userconfig');
+
+const { initial: { isTestnet } } = userconfig;
 
 let currentDaemonHeight = 0;
-let currentDaemonHeader = getDefaultDaemonHeader();
+let currentDaemonHeader = isTestnet === true ? 377006 : 1136836;
 let isDaemonInsightExplorer = null;
-let previousTestnetValue = globalThis.userconfig.initial?.testnet;
-
-// Listen for config changes and reset header if testnet mode changes
-configManager.on('configReloaded', (newConfig) => {
-  const newTestnetValue = newConfig.initial?.testnet;
-  if (newTestnetValue !== previousTestnetValue) {
-    previousTestnetValue = newTestnetValue;
-    currentDaemonHeader = getDefaultDaemonHeader();
-    log.info(`Testnet mode changed, reset daemon header to ${currentDaemonHeader}`);
-  }
-});
 
 /**
  * To check if Insight Explorer is activated in the daemon configuration file.
