@@ -103,24 +103,6 @@ function checkAppStaticIpRequirements(appSpecs) {
 }
 
 /**
- * To check app requirements of datacenter restrictions for a node
- * @param {object} appSpecs App specifications.
- * @returns {boolean} True if all checks passed.
- */
-function checkAppDataCenterRequirements(appSpecs) {
-  if (appSpecs.version >= 8 && appSpecs.datacenter === true) {
-    // Import locally to avoid circular dependency
-    // eslint-disable-next-line global-require
-    const geolocationService = require('../geolocationService');
-    const isMyNodeDataCenter = geolocationService.isDataCenter();
-    if (!isMyNodeDataCenter) {
-      throw new Error(`Application ${appSpecs.name} requires data center node to run. Aborting.`);
-    }
-  }
-  return true;
-}
-
-/**
  * To check app satisfaction of nodes restrictions for a node
  * @param {object} appSpecs App specifications.
  * @returns {boolean} True if all checks passed.
@@ -283,7 +265,6 @@ async function checkAppRequirements(appSpecs) {
   await checkAppHWRequirements(appSpecs);
   // check geolocation
   checkAppStaticIpRequirements(appSpecs);
-  checkAppDataCenterRequirements(appSpecs);
   await checkAppNodesRequirements(appSpecs);
   await checkAppGeolocationRequirements(appSpecs);
   return true;
@@ -501,7 +482,6 @@ module.exports = {
   returnNodeSpecs,
   systemArchitecture,
   checkAppStaticIpRequirements,
-  checkAppDataCenterRequirements,
   checkAppNodesRequirements,
   checkAppGeolocationRequirements,
   nodeFullGeolocation,
