@@ -53,6 +53,7 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
     expire,
     nodes,
     staticip,
+    datacenter,
     enterprise,
   } = appSpecification;
 
@@ -530,6 +531,20 @@ function verifyTypeCorrectnessOfApp(appSpecification) {
 
     if (typeof staticip !== 'boolean') {
       throw new Error('Invalid static ip value obtained. Only boolean as true or false allowed.');
+    }
+  }
+
+  // v8+ datacenter validation
+  if (version >= 8) {
+    if (datacenter !== null && datacenter !== true && datacenter !== false) {
+      throw new Error('Invalid datacenter value obtained. Only null, true, or false allowed.');
+    }
+    // datacenter=true is only allowed for enterprise app owners
+    if (datacenter === true) {
+      const enterpriseAppOwners = config.enterpriseAppOwners || [];
+      if (!enterpriseAppOwners.includes(owner)) {
+        throw new Error('Datacenter requirement is only available for enterprise app owners.');
+      }
     }
   }
 
@@ -1031,7 +1046,7 @@ function verifyObjectKeysCorrectnessOfApp(appSpecifications) {
   } else if (appSpecifications.version === 8) {
     const specifications = [
       'version', 'name', 'description', 'owner', 'compose', 'instances', 'contacts',
-      'geolocation', 'expire', 'nodes', 'staticip', 'enterprise',
+      'geolocation', 'expire', 'nodes', 'staticip', 'datacenter', 'enterprise',
     ];
     const componentSpecifications = [
       'name', 'description', 'repotag', 'ports', 'containerPorts', 'environmentParameters', 'commands', 'containerData', 'domains', 'repoauth',
@@ -1444,11 +1459,7 @@ async function verifyAppUpdateParameters(req, res) {
       // Dynamic require to avoid circular dependency
       // eslint-disable-next-line global-require
       const advancedWorkflows = require('../appLifecycle/advancedWorkflows');
-      const previousAppSpecs = await advancedWorkflows.getPreviousAppSpecifications(appSpecFormatted, timestamp);
-      if (!previousAppSpecs) {
-        throw new Error(`Flux App ${appSpecFormatted.name} does not exist and cannot be updated`);
-      }
-      await advancedWorkflows.validateApplicationUpdateCompatibility(appSpecFormatted, previousAppSpecs);
+      await advancedWorkflows.validateApplicationUpdateCompatibility(appSpecFormatted, timestamp);
 
       if (isEnterprise) {
         appSpecFormatted.contacts = [];
