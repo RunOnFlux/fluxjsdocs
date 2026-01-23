@@ -319,9 +319,9 @@ async function checkAndRemoveEnterpriseAppsOnNonArcane() {
 
 /**
  * To get previous app specifications.
- * @param {object} specifications App specifications.
+ * @param {object} specifications App sepcifications.
  * @param {object} verificationTimestamp Message timestamp
- * @returns {object|null} App specifications or null if not found.
+ * @returns {object} App specifications.
  */
 async function getPreviousAppSpecifications(specifications, verificationTimestamp) {
   // we may not have the application in global apps. This can happen when we receive the message
@@ -382,7 +382,7 @@ async function getPreviousAppSpecifications(specifications, verificationTimestam
     }
   });
   if (!latestPermanentRegistrationMessage) {
-    return null;
+    throw new Error(`Flux App ${specifications.name} update message received but application does not exists!`);
   }
   const appSpecs = latestPermanentRegistrationMessage.appSpecifications
     || latestPermanentRegistrationMessage.zelAppSpecifications;
@@ -1876,12 +1876,7 @@ async function verifyAppUpdateParameters(req, res) {
       // Validate update compatibility with previous version
       const timestamp = Date.now();
       // eslint-disable-next-line no-use-before-define
-      const previousAppSpecs = await getPreviousAppSpecifications(appSpecFormatted, timestamp);
-      if (!previousAppSpecs) {
-        throw new Error(`Flux App ${appSpecFormatted.name} does not exist and cannot be updated`);
-      }
-      // eslint-disable-next-line no-use-before-define
-      await validateApplicationUpdateCompatibility(appSpecFormatted, previousAppSpecs);
+      await validateApplicationUpdateCompatibility(appSpecFormatted, timestamp);
 
       if (isEnterprise) {
         appSpecFormatted.contacts = [];
@@ -2664,7 +2659,7 @@ async function testAppMount() {
  * @param {number} specifications.version - Specification version (1-4+)
  * @param {string} [specifications.repotag] - Docker image repository:tag (v1-3)
  * @param {Array} [specifications.compose] - Component definitions (v4+)
- * @param {object} previousAppSpecs - Previous app specifications (from getPreviousAppSpecifications)
+ * @param {number} verificationTimestamp - Timestamp for retrieving the correct previous app version
  * @returns {Promise<boolean>} Returns true if update is compatible
  * @throws {Error} When update violates version-specific compatibility rules:
  *   - Component count mismatch (v4+)
@@ -2673,8 +2668,9 @@ async function testAppMount() {
  *   - Version downgrade from v4+ to v1-3
  *   - Version change to anything other than version 8
  */
-async function validateApplicationUpdateCompatibility(specifications, previousAppSpecs) {
-  const appSpecs = previousAppSpecs;
+async function validateApplicationUpdateCompatibility(specifications, verificationTimestamp) {
+  // eslint-disable-next-line no-use-before-define
+  const appSpecs = await getPreviousAppSpecifications(specifications, verificationTimestamp);
 
   // Only allow version changes to version 8 (current latest supported version)
   if (appSpecs.version !== specifications.version && specifications.version !== 8) {
@@ -2947,8 +2943,7 @@ async function updateAppGlobalyApi(req, res) {
       await appMessaging.verifyAppMessageUpdateSignature(messageType, typeVersion, toVerify, timestamp, signature, appOwner, daemonHeight);
 
       // Validate update compatibility: ensure structural consistency (component names/count for v4+, repotag for v1-3)
-      // Use appInfo (already fetched above) as previousAppSpecs
-      await validateApplicationUpdateCompatibility(appSpecFormatted, appInfo);
+      await validateApplicationUpdateCompatibility(appSpecFormatted, timestamp);
 
       if (isEnterprise) {
         appSpecFormatted.contacts = [];
