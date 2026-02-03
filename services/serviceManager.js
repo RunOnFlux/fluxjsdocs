@@ -24,6 +24,7 @@ const nodeStatusMonitor = require('./appMonitoring/nodeStatusMonitor');
 const peerNotification = require('./appMessaging/peerNotification');
 const syncthingMonitor = require('./appMonitoring/syncthingMonitor');
 const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
+const bandwidthMonitor = require('./appMonitoring/bandwidthMonitor');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const appHashSyncService = require('./appMessaging/appHashSyncService');
 const imageManager = require('./appSecurity/imageManager');
@@ -394,6 +395,22 @@ async function startFluxFunctions() {
         appInspector.checkApplicationsCpuUSage(globalState.appsMonitored, appQueryService.installedApps);
       }, 15 * 60 * 1000);
     }, 15 * 60 * 1000);
+    // Enterprise CPU burst fast-loop - Kubernetes-like response time (~5 minutes)
+    // Runs every 2 minutes (configurable) with 5-minute detection window
+    const enterpriseBurstInterval = config.enterpriseBurst?.checkIntervalMs || 2 * 60 * 1000;
+    setTimeout(() => {
+      appInspector.checkEnterpriseCpuBurst(globalState.appsMonitored, appQueryService.installedApps);
+      setInterval(() => {
+        appInspector.checkEnterpriseCpuBurst(globalState.appsMonitored, appQueryService.installedApps);
+      }, enterpriseBurstInterval);
+    }, 3 * 60 * 1000); // Start after 3 minutes (give monitoring time to collect initial data)
+    // Bandwidth monitoring - check every 5 minutes after initial 10 minute delay
+    setTimeout(() => {
+      bandwidthMonitor.checkApplicationsBandwidthUsage(globalState.appsMonitored, appQueryService.installedApps);
+      setInterval(() => {
+        bandwidthMonitor.checkApplicationsBandwidthUsage(globalState.appsMonitored, appQueryService.installedApps);
+      }, 5 * 60 * 1000);
+    }, 10 * 60 * 1000);
     setTimeout(() => {
       // appsService.checkForNonAllowedAppsOnLocalNetwork();
       availabilityChecker.checkMyAppsAvailability(
