@@ -24,7 +24,6 @@ const nodeStatusMonitor = require('./appMonitoring/nodeStatusMonitor');
 const peerNotification = require('./appMessaging/peerNotification');
 const syncthingMonitor = require('./appMonitoring/syncthingMonitor');
 const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
-const bandwidthMonitor = require('./appMonitoring/bandwidthMonitor');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const appHashSyncService = require('./appMessaging/appHashSyncService');
 const imageManager = require('./appSecurity/imageManager');
@@ -49,6 +48,7 @@ const fluxNodeService = require('./fluxNodeService');
 const volumeValidationService = require('./volumeValidationService');
 const watchdogService = require('./watchdogService');
 const cloudUIUpdateService = require('./cloudUIUpdateService');
+const imageUpdateService = require('./imageUpdateService');
 // const throughputLogger = require('./utils/throughputLogger');
 
 // Initialize globalState caches with cacheManager
@@ -241,7 +241,13 @@ async function startFluxFunctions() {
     log.info('Connections polling prepared');
     daemonServiceMiscRpcs.daemonBlockchainInfoService();
     log.info('Flux Daemon Info Service Started');
-    fluxService.installFluxWatchTower();
+    // Remove existing watchtower container (replaced by native image update service)
+    imageUpdateService.removeWatchtowerContainer();
+    // Start native image update service (delayed start)
+    setTimeout(() => {
+      imageUpdateService.startImageUpdateService();
+      log.info('Native image update service started');
+    }, 10 * 60 * 1000); // 10 minutes after startup
     fluxNetworkHelper.checkDeterministicNodesCollisions();
     log.info('Flux checks operational');
     fluxCommunication.fluxDiscovery();
@@ -390,18 +396,11 @@ async function startFluxFunctions() {
       }
     }, 2 * 60 * 1000);
     setTimeout(() => {
-      appInspector.checkApplicationsCpuUsage(globalState.appsMonitored, appQueryService.installedApps);
+      appInspector.checkApplicationsCpuUSage(globalState.appsMonitored, appQueryService.installedApps);
       setInterval(() => {
-        appInspector.checkApplicationsCpuUsage(globalState.appsMonitored, appQueryService.installedApps);
+        appInspector.checkApplicationsCpuUSage(globalState.appsMonitored, appQueryService.installedApps);
       }, 15 * 60 * 1000);
     }, 15 * 60 * 1000);
-    // Bandwidth monitoring - check every 5 minutes after initial 10 minute delay
-    setTimeout(() => {
-      bandwidthMonitor.checkApplicationsBandwidthUsage(globalState.appsMonitored, appQueryService.installedApps);
-      setInterval(() => {
-        bandwidthMonitor.checkApplicationsBandwidthUsage(globalState.appsMonitored, appQueryService.installedApps);
-      }, 5 * 60 * 1000);
-    }, 10 * 60 * 1000);
     setTimeout(() => {
       // appsService.checkForNonAllowedAppsOnLocalNetwork();
       availabilityChecker.checkMyAppsAvailability(
