@@ -1572,9 +1572,14 @@ async function softRedeployComponent(appName, componentName, res) {
     log.info(`Starting soft redeploy of component ${componentName} from app ${appName}`);
 
     // Get app specifications
-    const appSpecifications = await getStrictApplicationSpecifications(appName);
+    let appSpecifications = await getStrictApplicationSpecifications(appName);
     if (!appSpecifications) {
       throw new Error(`Application ${appName} not found`);
+    }
+
+    // Decrypt enterprise apps before accessing compose
+    if (appSpecifications.version >= 8 && appSpecifications.enterprise && isArcane) {
+      appSpecifications = await checkAndDecryptAppSpecs(appSpecifications);
     }
 
     // Find the component in the app specs
@@ -3486,7 +3491,7 @@ async function reinstallOldApplications() {
                   // hard redeployment
                   const appId = dockerService.getAppIdentifier(`${appComponent.name}_${appSpecifications.name}`);
                   // eslint-disable-next-line no-await-in-loop
-                  await appUninstaller.hardUninstallComponent(`${appComponent.name}_${appSpecifications.name}`, appId, appComponent, null, true);
+                  await appUninstaller.hardUninstallComponent(`${appComponent.name}_${appSpecifications.name}`, appId, appComponent, null, stopAppMonitoring);
                   log.warn(`Application component ${appComponent.name}_${appSpecifications.name} removed. Awaiting installation...`);
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
