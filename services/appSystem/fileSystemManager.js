@@ -338,7 +338,7 @@ async function downloadAppsFile(req, res) {
       // beautify name
       const fileNameArray = filepath.split('/');
       const fileName = fileNameArray[fileNameArray.length - 1];
-      res.download(filepath, fileName, { dotfiles: 'allow' });
+      res.download(filepath, fileName);
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);

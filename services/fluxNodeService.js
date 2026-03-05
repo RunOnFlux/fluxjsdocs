@@ -69,9 +69,6 @@ async function getHostInfo(req, res) {
           download_speed: benchData.download_speed,
           upload_speed: benchData.upload_speed,
         };
-        if (benchData.eps_singlethread !== undefined) {
-          hostInfo.benchmark.eps_singlethread = benchData.eps_singlethread;
-        }
       } else {
         throw new Error('Benchmark information is not available at the moment');
       }

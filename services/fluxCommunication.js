@@ -438,8 +438,7 @@ async function handleNodeSigtermMessage(message, fromIP, port) {
     // Update broadcastedAt to make records expire 7 minutes after the sigterm broadcastedAt
     // TTL index is 7500 seconds, so set broadcastedAt = sigtermBroadcastedAt - (7500 - 420) seconds
     const newBroadcastedAt = new Date(broadcastedAt - (7500 - 420) * 1000);
-    const newExpireAt = new Date(broadcastedAt + (420 * 1000));
-    const update = { $set: { broadcastedAt: newBroadcastedAt, expireAt: newExpireAt } };
+    const update = { $set: { broadcastedAt: newBroadcastedAt } };
     await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
 
     // Rebroadcast to other peers
