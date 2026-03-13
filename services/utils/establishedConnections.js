@@ -1,9 +1,11 @@
-const { peerManager } = require('./FluxPeerManager');
+const incomingConnections = []; // websocket list
+const incomingPeers = []; // array of objects containing ip, port
+const outgoingConnections = []; // websocket list
+const outgoingPeers = []; // array of objects containing ip, port, latency, lastPingTime
 
 module.exports = {
-  peerManager,
-  get incomingConnections() { return peerManager.incomingConnections; },
-  get incomingPeers() { return peerManager.incomingPeers; },
-  get outgoingConnections() { return peerManager.outgoingConnections; },
-  get outgoingPeers() { return peerManager.outgoingPeers; },
+  incomingConnections,
+  incomingPeers,
+  outgoingConnections,
+  outgoingPeers,
 };

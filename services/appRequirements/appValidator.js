@@ -15,7 +15,9 @@ const { supportedArchitectures, enterpriseRequiredArchitectures } = require('../
 const { specificationFormatter, findCommonArchitectures } = require('../utils/appUtilities');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const portManager = require('../appNetwork/portManager');
-const { peerManager } = require('../utils/establishedConnections');
+const {
+  outgoingPeers, incomingPeers,
+} = require('../utils/establishedConnections');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -1505,10 +1507,10 @@ async function registerAppGlobalyApi(req, res) {
       }
 
       // first check if this node is available for application registration
-      if (peerManager.outboundCount < config.fluxapps.minOutgoing) {
+      if (outgoingPeers.length < config.fluxapps.minOutgoing) {
         throw new Error('Sorry, This Flux does not have enough outgoing peers for safe application registration');
       }
-      if (peerManager.inboundCount < config.fluxapps.minIncoming) {
+      if (incomingPeers.length < config.fluxapps.minIncoming) {
         throw new Error('Sorry, This Flux does not have enough incoming peers for safe application registration');
       }
 

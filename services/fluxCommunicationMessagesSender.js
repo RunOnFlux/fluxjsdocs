@@ -5,7 +5,9 @@ const serviceHelper = require('./serviceHelper');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
-const { peerManager } = require('./utils/establishedConnections');
+const {
+  outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
+} = require('./utils/establishedConnections');
 const cacheManager = require('./utils/cacheManager').default;
 
 const myMessageCache = cacheManager.tempMessageCache;
@@ -17,48 +19,53 @@ const myMessageCache = cacheManager.tempMessageCache;
  */
 async function sendToAllPeers(data, wsList) {
   try {
-    // wsList is a legacy parameter — an array of raw ws objects to send to
-    if (wsList) {
-      // Legacy path: iterate provided ws list (used by handleAppMessages)
-      for (const client of wsList) {
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(25);
-          if (client.readyState === WebSocket.OPEN) {
-            if (!data) {
-              client.ping();
-            } else {
-              client.send(data);
-            }
-          } else {
-            throw new Error(`Connection to ${client.ip} is not open`);
-          }
-        } catch (e) {
-          try {
-            fluxNetworkHelper.closeConnection(client.ip, client.port);
-          } catch (err) {
-            log.error(err);
-          }
-        }
-      }
-      return;
-    }
-    // New path: iterate peerManager outbound peers
-    for (const peer of peerManager.outboundValues()) {
+    const removals = [];
+    // wsList is always a sublist of outgoingConnections
+    const outConList = wsList || outgoingConnections;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const client of outConList) {
       try {
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.delay(25);
-        if (!data) {
-          peer.ping();
-        } else if (!peer.send(data)) {
-          throw new Error(`Connection to ${peer.key} is not open`);
+        if (client.readyState === WebSocket.OPEN) {
+          if (!data) {
+            const pingTime = Date.now();
+            client.ping(); // do ping instead
+            const foundPeer = outgoingPeers.find((peer) => peer.ip === client.ip && peer.port === client.port);
+            if (foundPeer) {
+              foundPeer.lastPingTime = pingTime;
+            }
+          } else {
+            client.send(data);
+          }
+        } else {
+          throw new Error(`Connection to ${client.ip} is not open`);
         }
       } catch (e) {
+        // removed this, we log anyway when the websocket is shut, no need to spam here
+        // log.error(e);
+        removals.push(client);
         try {
-          peer.close(4009, 'send failure');
+          const { ip } = client;
+          const { port } = client;
+          // eslint-disable-next-line no-use-before-define
+          fluxNetworkHelper.closeConnection(ip, port);
         } catch (err) {
           log.error(err);
         }
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = outgoingConnections.findIndex((ws) => removals[i].ip === ws.ip && removals[i].port === ws.port);
+      if (ocIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingConnections`);
+        outgoingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === removals[i].ip && peer.port === removals[i].port);
+      if (peerIndex > -1) {
+        outgoingPeers.splice(peerIndex, 1);
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingPeers`);
       }
     }
   } catch (error) {
@@ -72,16 +79,55 @@ async function sendToAllPeers(data, wsList) {
  */
 async function sendToRandomPeer(data) {
   try {
-    const peer = peerManager.getRandomPeer('outbound');
-    if (!peer) return;
-    await serviceHelper.delay(25);
-    if (!data) {
-      peer.ping();
-    } else if (!peer.send(data)) {
-      throw new Error(`Connection to ${peer.key} is not open`);
+    if (!outgoingConnections.length) {
+      return;
     }
-  } catch (e) {
-    log.error(e);
+    const removals = [];
+    const client = outgoingConnections[Math.floor(Math.random() * outgoingConnections.length)];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(25);
+      if (client.readyState === WebSocket.OPEN) {
+        if (!data) {
+          const pingTime = Date.now();
+          client.ping(); // do ping instead
+          const foundPeer = outgoingPeers.find((peer) => peer.ip === client.ip && peer.port === client.port);
+          if (foundPeer) {
+            foundPeer.lastPingTime = pingTime;
+          }
+        } else {
+          client.send(data);
+        }
+      } else {
+        throw new Error(`Connection to ${client.ip} is not open`);
+      }
+    } catch (e) {
+      log.error(e);
+      removals.push(client);
+      try {
+        const { ip } = client;
+        const { port } = client;
+        // eslint-disable-next-line no-use-before-define
+        fluxNetworkHelper.closeConnection(ip, port);
+      } catch (err) {
+        log.error(err);
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = outgoingConnections.findIndex((ws) => removals[i].ip === ws.ip && removals[i].port === ws.port);
+      if (ocIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingConnections`);
+        outgoingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === removals[i].ip && peer.port === removals[i].port);
+      if (peerIndex > -1) {
+        outgoingPeers.splice(peerIndex, 1);
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingPeers`);
+      }
+    }
+  } catch (error) {
+    log.error(error);
   }
 }
 
@@ -92,47 +138,45 @@ async function sendToRandomPeer(data) {
  */
 async function sendToAllIncomingConnections(data, wsList) {
   try {
-    // wsList is a legacy parameter — an array of raw ws objects
-    if (wsList) {
-      for (const client of wsList) {
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(25);
-          if (client.readyState === WebSocket.OPEN) {
-            if (!data) {
-              client.ping();
-            } else {
-              client.send(data);
-            }
-          } else {
-            throw new Error(`Connection to ${client.ip} is not open`);
-          }
-        } catch (e) {
-          try {
-            fluxNetworkHelper.closeIncomingConnection(client.ip, client.port);
-          } catch (err) {
-            log.error(err);
-          }
-        }
-      }
-      return;
-    }
-    // New path: iterate peerManager inbound peers
-    for (const peer of peerManager.inboundValues()) {
+    const removals = [];
+    // wsList is always a sublist of incomingConnections
+    const incConList = wsList || incomingConnections;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const client of incConList) {
       try {
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.delay(25);
-        if (!data) {
-          peer.ping();
-        } else if (!peer.send(data)) {
-          throw new Error(`Connection to ${peer.key} is not open`);
+        if (client.readyState === WebSocket.OPEN) {
+          if (!data) {
+            client.ping(); // do ping instead
+          } else {
+            client.send(data);
+          }
+        } else {
+          throw new Error(`Connection to ${client.ip} is not open`);
         }
       } catch (e) {
+        removals.push(client);
         try {
-          peer.close(4010, 'send failure');
+          const { ip } = client;
+          const { port } = client;
+          fluxNetworkHelper.closeIncomingConnection(ip, port);
         } catch (err) {
           log.error(err);
         }
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = incomingConnections.findIndex((incomingCon) => removals[i].ip === incomingCon.ip && removals[i].port === incomingCon.port);
+      if (ocIndex > -1) {
+        log.info(`Connection to ${removals[i].ip}:${removals[i].port} removed from incomingConnections`);
+        incomingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = incomingPeers.findIndex((mypeer) => mypeer.ip === removals[i].ip && mypeer.port === removals[i].port);
+      if (peerIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from incomingPeers`);
+        incomingPeers.splice(peerIndex, 1);
       }
     }
   } catch (error) {
@@ -146,16 +190,48 @@ async function sendToAllIncomingConnections(data, wsList) {
  */
 async function sendToRandomIncomingConnections(data) {
   try {
-    const peer = peerManager.getRandomPeer('inbound');
-    if (!peer) return;
-    await serviceHelper.delay(25);
-    if (!data) {
-      peer.ping();
-    } else if (!peer.send(data)) {
-      throw new Error(`Connection to ${peer.key} is not open`);
+    if (!incomingConnections.length) {
+      return;
     }
-  } catch (e) {
-    log.error(e);
+    const removals = [];
+    const client = incomingConnections[Math.floor(Math.random() * incomingConnections.length)];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(25);
+      if (client.readyState === WebSocket.OPEN) {
+        if (!data) {
+          client.ping(); // do ping instead
+        } else {
+          client.send(data);
+        }
+      } else {
+        throw new Error(`Connection to ${client.ip} is not open`);
+      }
+    } catch (e) {
+      removals.push(client);
+      try {
+        const { ip } = client;
+        const { port } = client;
+        fluxNetworkHelper.closeIncomingConnection(ip, port);
+      } catch (err) {
+        log.error(err);
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = incomingConnections.findIndex((incomingCon) => removals[i].ip === incomingCon.ip && removals[i].port === incomingCon.port);
+      if (ocIndex > -1) {
+        log.info(`Connection to ${removals[i].ip}:${removals[i].port} removed from incomingConnections`);
+        incomingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = incomingPeers.findIndex((mypeer) => mypeer.ip === removals[i].ip && mypeer.port === removals[i].port);
+      if (peerIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from incomingPeers`);
+        incomingPeers.splice(peerIndex, 1);
+      }
+    }
+  } catch (error) {
+    log.error(error);
   }
 }
 
@@ -308,17 +384,6 @@ async function broadcastMessageToOutgoing(dataToBroadcast) {
  */
 async function broadcastMessageToIncoming(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
-  await sendToAllIncomingConnections(serialisedData);
-}
-
-/**
- * Sign once, send to both outgoing and incoming peers. Fixes double-signing issue
- * where the same logical message would get two different timestamps/signatures.
- * @param {object} dataToBroadcast Data to broadcast.
- */
-async function broadcastMessageToAll(dataToBroadcast) {
-  const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
-  await sendToAllPeers(serialisedData);
   await sendToAllIncomingConnections(serialisedData);
 }
 
@@ -502,7 +567,8 @@ async function broadcastMessageFromUser(req, res) {
     let message;
 
     if (authorized === true) {
-      await broadcastMessageToAll(data);
+      await broadcastMessageToOutgoing(data);
+      await broadcastMessageToIncoming(data);
       message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
     } else {
       message = messageHelper.errUnauthorizedMessage();
@@ -540,7 +606,8 @@ async function broadcastMessageFromUserPost(req, res) {
       let message;
 
       if (authorized === true) {
-        await broadcastMessageToAll(processedBody);
+        await broadcastMessageToOutgoing(processedBody);
+        await broadcastMessageToIncoming(processedBody);
         message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
       } else {
         message = messageHelper.errUnauthorizedMessage();
@@ -576,8 +643,10 @@ async function broadcastTemporaryAppMessage(message) {
   if (typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number' || typeof message.appSpecifications !== 'object' || typeof message.signature !== 'string' || typeof message.timestamp !== 'number' || typeof message.hash !== 'string') {
     throw new Error('Invalid Flux App message for storing');
   }
-  // sign once, send to both directions
-  await broadcastMessageToAll(message);
+  // to all outoing
+  await broadcastMessageToOutgoing(message); // every outgoing peer AT LEAST 50ms - suppose 40 outgoing - 0.8 seconds
+  // to all incoming. Delay broadcast in case message is processing
+  await broadcastMessageToIncoming(message); // every incoing peer AT LEAST 50ms. Suppose 50 incoming - 1 second
 }
 
 module.exports = {
@@ -592,7 +661,6 @@ module.exports = {
   broadcastMessageToIncomingFromUser,
   broadcastMessageToIncomingFromUserPost,
   broadcastMessageToIncoming,
-  broadcastMessageToAll,
   broadcastMessageFromUser,
   broadcastMessageFromUserPost,
   broadcastTemporaryAppMessage,

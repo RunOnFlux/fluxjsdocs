@@ -19,7 +19,9 @@ const daemonServiceWalletRpcs = require('./daemonService/daemonServiceWalletRpcs
 const benchmarkService = require('./benchmarkService');
 const verificationHelper = require('./verificationHelper');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
-const { peerManager } = require('./utils/establishedConnections');
+const {
+  outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
+} = require('./utils/establishedConnections');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
 
@@ -655,13 +657,18 @@ async function getFluxNodePublicKey(privatekey) {
  */
 async function closeConnection(ip, port) {
   if (!ip) return messageHelper.createWarningMessage('To close a connection please provide a proper IP number.');
-  const key = `${ip}:${port}`;
-  const peer = peerManager.get(key);
-  if (!peer || peer.direction !== 'outbound') {
+  const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === ip && peer.port === port);
+  if (peerIndex > -1) {
+    outgoingPeers.splice(peerIndex, 1);
+  }
+  const ocIndex = outgoingConnections.findIndex((client) => client.ip === ip && client.port === port);
+  if (ocIndex < 0) {
     return messageHelper.createWarningMessage(`Connection to ${ip}:${port} does not exists.`);
   }
-  peer.close(4009, 'purposefully closed');
+  const wsObj = outgoingConnections[ocIndex];
+  wsObj.close(4009, 'purpusfully closed');
   log.info(`Connection to ${ip}:${port} closed with code 4009`);
+  outgoingConnections.splice(ocIndex, 1);
   return messageHelper.createSuccessMessage(`Outgoing connection to ${ip}:${port} closed`);
 }
 
@@ -675,13 +682,22 @@ async function closeConnection(ip, port) {
  */
 async function closeIncomingConnection(ip, port) {
   if (!ip) return messageHelper.createWarningMessage('To close a connection please provide a proper IP number.');
-  const key = `${ip}:${port}`;
-  const peer = peerManager.get(key);
-  if (!peer || peer.direction !== 'inbound') {
+
+  const conIndex = incomingConnections.findIndex((peer) => peer.ip === ip && peer.port === port);
+
+  if (conIndex === -1) {
     return messageHelper.createWarningMessage(`Connection from ${ip}:${port} does not exists.`);
   }
-  peer.close(4010, 'purposefully closed');
+
+  const peerIndex = incomingPeers.findIndex((peer) => peer.ip === ip && peer.port === port);
+
+  if (peerIndex > -1) incomingPeers.splice(peerIndex, 1);
+
+  const wsObj = incomingConnections[conIndex];
+  incomingConnections.splice(conIndex, 1);
+  wsObj.close(4010, 'purpusfully closed');
   log.info(`Connection from ${ip}:${port} closed with code 4010`);
+
   return messageHelper.createSuccessMessage(`Incoming connection to ${ip}:${port} closed`);
 }
 
@@ -691,8 +707,9 @@ async function closeIncomingConnection(ip, port) {
  * @param {object} res Response.
  */
 function getIncomingConnections(req, res) {
-  const connections = [];
-  for (const peer of peerManager.inboundValues()) connections.push(peer.ip);
+  const peers = incomingPeers;
+  const connections = peers.map((p) => p.ip);
+
   const message = messageHelper.createDataMessage(connections);
   res.json(message);
 }
@@ -703,7 +720,7 @@ function getIncomingConnections(req, res) {
  * @param {object} res Response.
  */
 function getIncomingConnectionsInfo(req, res) {
-  const connections = peerManager.incomingPeers;
+  const connections = incomingPeers;
   const message = messageHelper.createDataMessage(connections);
   return res ? res.json(message) : message;
 }
@@ -809,27 +826,17 @@ function fluxSystemUptime(req, res) {
  * @param {object} res Response.
  */
 function isCommunicationEstablished(req, res) {
-  const outboundCount = peerManager.outboundCount;
-  const inboundCount = peerManager.inboundCount;
   let message;
-  if (outboundCount < config.fluxapps.minOutgoing) { // easier to establish
-    message = messageHelper.createErrorMessage(`Not enough outgoing connections established to Flux network. Minimum required ${config.fluxapps.minOutgoing} found ${outboundCount}`);
-  } else if (inboundCount < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
-    message = messageHelper.createErrorMessage(`Not enough incoming connections from Flux network. Minimum required ${config.fluxapps.minIncoming} found ${inboundCount}`);
+  if (outgoingPeers.length < config.fluxapps.minOutgoing) { // easier to establish
+    message = messageHelper.createErrorMessage(`Not enough outgoing connections established to Flux network. Minimum required ${config.fluxapps.minOutgoing} found ${outgoingPeers.length}`);
+  } else if (incomingPeers.length < config.fluxapps.minIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
+    message = messageHelper.createErrorMessage(`Not enough incoming connections from Flux network. Minimum required ${config.fluxapps.minIncoming} found ${incomingPeers.length}`);
+  } else if ([...new Set(outgoingPeers.map((peer) => peer.ip))].length < config.fluxapps.minUniqueIpsOutgoing) { // depends on other nodes successfully connecting to my node, todo enforcement
+    message = messageHelper.createErrorMessage(`Not enough outgoing unique ip's connections established to Flux network. Minimum required ${config.fluxapps.minUniqueIpsOutgoing} found ${[...new Set(outgoingPeers.map((peer) => peer.ip))].length}`);
+  } else if ([...new Set(incomingPeers.map((peer) => peer.ip))].length < config.fluxapps.minUniqueIpsIncoming) { // depends on other nodes successfully connecting to my node, todo enforcement
+    message = messageHelper.createErrorMessage(`Not enough incoming unique ip's connections from Flux network. Minimum required ${config.fluxapps.minUniqueIpsIncoming} found ${[...new Set(incomingPeers.map((peer) => peer.ip))].length}`);
   } else {
-    const uniqueOutboundIps = new Set();
-    for (const peer of peerManager.outboundValues()) uniqueOutboundIps.add(peer.ip);
-    if (uniqueOutboundIps.size < config.fluxapps.minUniqueIpsOutgoing) {
-      message = messageHelper.createErrorMessage(`Not enough outgoing unique ip's connections established to Flux network. Minimum required ${config.fluxapps.minUniqueIpsOutgoing} found ${uniqueOutboundIps.size}`);
-    } else {
-      const uniqueInboundIps = new Set();
-      for (const peer of peerManager.inboundValues()) uniqueInboundIps.add(peer.ip);
-      if (uniqueInboundIps.size < config.fluxapps.minUniqueIpsIncoming) {
-        message = messageHelper.createErrorMessage(`Not enough incoming unique ip's connections from Flux network. Minimum required ${config.fluxapps.minUniqueIpsIncoming} found ${uniqueInboundIps.size}`);
-      } else {
-        message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
-      }
-    }
+    message = messageHelper.createSuccessMessage('Communication to Flux network is properly established');
   }
   return res ? res.json(message) : message;
 }
@@ -2017,7 +2024,7 @@ async function addFluxNodeServiceIpToLoopback() {
  * Return the number of peers this node is connected to
  */
 function getNumberOfPeers() {
-  return peerManager.getNumberOfPeers();
+  return incomingConnections.length + outgoingConnections.length;
 }
 
 module.exports = {
