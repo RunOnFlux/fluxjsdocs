@@ -595,7 +595,9 @@ async function trySpawningGlobalApplication() {
     // broadcast messages about running apps to all peers
     // eslint-disable-next-line global-require
     const fluxCommMessagesSender = require('../fluxCommunicationMessagesSender');
-    await fluxCommMessagesSender.broadcastMessageToAll(newAppInstallingMessage);
+    await fluxCommMessagesSender.broadcastMessageToOutgoing(newAppInstallingMessage);
+    await serviceHelper.delay(500);
+    await fluxCommMessagesSender.broadcastMessageToIncoming(newAppInstallingMessage);
 
     await serviceHelper.delay(90 * 1000); // give it 1.5m so messages are propagated on the network
 
