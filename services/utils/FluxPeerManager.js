@@ -1,10 +1,16 @@
 const config = require('config');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
-const { FluxPeerSocket, CLOSE_CODES } = require('./FluxPeerSocket');
+const { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE } = require('./FluxPeerSocket');
 
 const UNSTABLE_DISCONNECT_THRESHOLD = 5;
 const UNSTABLE_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+const HISTORY_BUFFER_SIZE = 1000;
+
+// Reverse lookup: code number → enum name
+const CLOSE_CODE_NAMES = Object.freeze(
+  Object.fromEntries(Object.entries(CLOSE_CODES).map(([name, code]) => [code, name])),
+);
 
 class FluxPeerManager {
   constructor() {
@@ -24,8 +30,15 @@ class FluxPeerManager {
     this._uniqueIps = new Map();
     /** @type {Map<string, {attempts: number, lastAttempt: number}>} */
     this._failedConnections = new Map();
-    /** @type {Set<string>} keys of outbound peers with connection in progress */
+    /** @type {Set<string>} keys of outbound connections currently being established */
     this._pendingConnections = new Set();
+
+    /** @type {Array<object>} Circular buffer of peer lifecycle events */
+    this._history = new Array(HISTORY_BUFFER_SIZE);
+    /** @type {number} Next write position in the ring buffer */
+    this._historyIndex = 0;
+    /** @type {number} Total events recorded (used to know if buffer has wrapped) */
+    this._historyCount = 0;
 
     /**
      * Message dispatch callback — set by fluxCommunication.js to break circular dependency.
@@ -45,12 +58,15 @@ class FluxPeerManager {
   /**
    * Add a peer connection.
    * @param {WebSocket} ws
-   * @param {'inbound'|'outbound'} direction
    * @param {string} ip
    * @param {string} port
+   * @param {object} [options]
+   * @param {string} [options.source] - PEER_SOURCE value
+   * @param {string[]} [options.remoteCapabilities] - Capabilities advertised by remote
+   * @param {number} [options.remoteClockOffsetMs] - Remote clock offset in ms
    * @returns {FluxPeerSocket}
    */
-  add(ws, direction, ip, port) {
+  add(ws, ip, port, options = {}) {
     const key = `${ip}:${String(port)}`;
     const existing = this._peers.get(key);
     if (existing) {
@@ -62,7 +78,16 @@ class FluxPeerManager {
       try { existing.ws.close(CLOSE_CODES.DUPLICATE_PEER, 'replaced'); } catch (_e) { /* noop */ }
       this._removeTracking(existing);
     }
-    const peer = new FluxPeerSocket(ws, direction, ip, String(port), this);
+    const peer = new FluxPeerSocket(ws, ip, String(port), this);
+    peer.source = options.source || PEER_SOURCE.INBOUND;
+    if (Array.isArray(options.remoteCapabilities) && options.remoteCapabilities.length) {
+      peer.remoteCapabilities = new Set(options.remoteCapabilities);
+      log.info(`Peer ${peer.key} capabilities: ${options.remoteCapabilities.join(', ')}`);
+    }
+    if (typeof options.remoteClockOffsetMs === 'number' && !Number.isNaN(options.remoteClockOffsetMs)) {
+      peer.remoteClockOffsetMs = options.remoteClockOffsetMs;
+    }
+    const { direction } = peer;
     this._peers.set(peer.key, peer);
     if (direction === 'inbound') {
       this._inboundKeys.add(peer.key);
@@ -79,6 +104,13 @@ class FluxPeerManager {
     // Successful connection — clear from failed connections and pending
     this._failedConnections.delete(peer.key);
     this._pendingConnections.delete(peer.key);
+    this._recordEvent({
+      event: 'connected',
+      ip,
+      port: String(port),
+      direction,
+      source: peer.source,
+    });
     return peer;
   }
 
@@ -103,6 +135,20 @@ class FluxPeerManager {
     if (peer.direction === 'outbound' && this._shouldReconnect(closeCode)) {
       this.queueReconnect(peer.ip, peer.port);
     }
+
+    const now = Date.now();
+    this._recordEvent({
+      event: 'disconnected',
+      ip: peer.ip,
+      port: peer.port,
+      direction: peer.direction,
+      source: peer.source,
+      closeCode: closeCode || null,
+      closeCodeName: CLOSE_CODE_NAMES[closeCode] || null,
+      duration: now - peer.connectedAt,
+      latency: peer.latency,
+      missedPongs: peer.missedPongs,
+    });
 
     log.info(`Connection ${key} removed from peerManager (${peer.direction}, code: ${closeCode})`);
     return peer;
@@ -501,13 +547,40 @@ class FluxPeerManager {
   /**
    * Validate and add an inbound WebSocket connection.
    * Handles max connections, IPv4 extraction, private IP rejection, and duplicate checks.
-   * Closes the socket on rejection.
+   * Extracts remote peer metadata (capabilities, clock offset) from the HTTP upgrade request headers.
+   *
+   * Called by socketServer route matching. For `/ws/flux/:port`, args are (ws, port, request).
+   * For `/ws/flux`, args are (ws, request) — the request lands in optionalPort.
+   *
    * @param {WebSocket} ws
-   * @param {string} [optionalPort]
+   * @param {string|object} [optionalPort] - Port string, or the request object if no :port in route
+   * @param {object} [request] - HTTP upgrade request (carries headers for metadata extraction)
    */
-  validateAndAddInbound(ws, optionalPort) {
+  validateAndAddInbound(ws, optionalPort, request) {
     try {
-      const port = optionalPort || '16127';
+      let port;
+      let req;
+      if (typeof optionalPort === 'object' && optionalPort !== null) {
+        // No :port in route — optionalPort is actually the request
+        req = optionalPort;
+        port = '16127';
+      } else {
+        port = optionalPort || '16127';
+        req = request;
+      }
+
+      // Extract remote peer metadata from upgrade request headers
+      const metadata = {};
+      if (req && req.headers) {
+        if (req.headers['x-flux-capabilities']) {
+          metadata.remoteCapabilities = req.headers['x-flux-capabilities']
+            .split(',').map((s) => s.trim()).filter(Boolean);
+        }
+        const clockHeader = req.headers['x-flux-clock-offset'];
+        if (clockHeader !== undefined) {
+          metadata.remoteClockOffsetMs = Number(clockHeader);
+        }
+      }
       const maxPeers = 4 * config.fluxapps.minIncoming;
       const maxNumberOfConnections = this.numberOfFluxNodes / 160 < 9 * config.fluxapps.minIncoming
         ? this.numberOfFluxNodes / 160
@@ -545,7 +618,7 @@ class FluxPeerManager {
         if (existing && !existing.isAlive) {
           // Replace stale connection — add() handles cleanup of existing peer
           log.info(`Replacing stale inbound connection ${key}`);
-          this.add(ws, 'inbound', ipv4Peer, port);
+          this.add(ws, ipv4Peer, port, { source: PEER_SOURCE.INBOUND, ...metadata });
           return;
         }
         setTimeout(() => {
@@ -554,7 +627,7 @@ class FluxPeerManager {
         return;
       }
 
-      this.add(ws, 'inbound', ipv4Peer, port);
+      this.add(ws, ipv4Peer, port, { source: PEER_SOURCE.INBOUND, ...metadata });
     } catch (error) {
       log.error(error);
     }
@@ -639,6 +712,37 @@ class FluxPeerManager {
     };
   }
 
+  // --- History ---
+
+  /**
+   * Record a peer lifecycle event to the ring buffer.
+   * @param {object} data Event data (event, ip, port, direction, etc.)
+   * @private
+   */
+  _recordEvent(data) {
+    this._history[this._historyIndex] = { timestamp: Date.now(), ...data };
+    this._historyIndex = (this._historyIndex + 1) % HISTORY_BUFFER_SIZE;
+    this._historyCount += 1;
+  }
+
+  /**
+   * Get peer history events in chronological order.
+   * @returns {Array<object>}
+   */
+  getHistory() {
+    const count = Math.min(this._historyCount, HISTORY_BUFFER_SIZE);
+    if (count === 0) return [];
+    if (this._historyCount <= HISTORY_BUFFER_SIZE) {
+      // Buffer hasn't wrapped yet
+      return this._history.slice(0, count);
+    }
+    // Buffer has wrapped — oldest is at _historyIndex, newest is at _historyIndex - 1
+    return [
+      ...this._history.slice(this._historyIndex),
+      ...this._history.slice(0, this._historyIndex),
+    ];
+  }
+
   /**
    * Clear all peers — for testing only.
    */
@@ -652,6 +756,9 @@ class FluxPeerManager {
     this._uniqueIps.clear();
     this._failedConnections.clear();
     this._pendingConnections.clear();
+    this._history = new Array(HISTORY_BUFFER_SIZE);
+    this._historyIndex = 0;
+    this._historyCount = 0;
   }
 }
 
@@ -661,4 +768,4 @@ FluxPeerManager.CONNECTION_BACKOFF_MS = [2 * 60000, 5 * 60000, 10 * 60000, 15 * 
 // Singleton export
 const peerManager = new FluxPeerManager();
 
-module.exports = { FluxPeerManager, peerManager, CLOSE_CODES };
+module.exports = { FluxPeerManager, peerManager, CLOSE_CODES, PEER_SOURCE };
