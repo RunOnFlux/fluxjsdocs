@@ -1760,29 +1760,35 @@ async function streamChainPreparation(req, res) {
 
     log.info(`Stream chain preparation request received from: ${ip}`);
 
-    // Check if local daemon is synced using local RPC only (no external explorer dependency)
-    const { status: chainInfoStatus, data: chainInfo } = await daemonServiceBlockchainRpcs.getBlockchainInfo();
+    // Check if local daemon is synced
+    const urlExplorerA = 'https://explorer.runonflux.io/api/status?q=getInfo';
+    const urlExplorerB = 'https://explorer.flux.zelcore.io/api/status?q=getInfo';
 
-    if (chainInfoStatus !== 'success' || !chainInfo?.bestblockhash) {
-      safeSetResponseStatus(res, 503, 'Error getting blockchain info from local Flux Daemon.');
+    const axiosConfig = {
+      timeout: 5000,
+    };
+
+    const { status: blockCountStatus, data: blockCount } = await daemonServiceBlockchainRpcs.getBlockCount();
+
+    if (blockCountStatus !== 'success') {
+      safeSetResponseStatus(res, 503, 'Error getting blockCount from local Flux Daemon.');
       return;
     }
 
-    const { status: blockStatus, data: bestBlock } = await daemonServiceBlockchainRpcs.getBlock({ params: { hashheight: chainInfo.bestblockhash, verbosity: 1 } });
+    const explorerResponse = await Promise.any([
+      serviceHelper.axiosGet(urlExplorerA, axiosConfig),
+      serviceHelper.axiosGet(urlExplorerB, axiosConfig),
+    ]).catch(() => null);
 
-    if (blockStatus !== 'success' || !bestBlock?.time) {
-      safeSetResponseStatus(res, 503, 'Error getting best block from local Flux Daemon.');
+    if (!explorerResponse || !explorerResponse?.data?.info?.blocks) {
+      safeSetResponseStatus(res, 503, 'Error getting Flux Explorer Height.');
       return;
     }
 
-    // 10 minutes ≈ 20 blocks at 30s block times
-    const tipAgeSecs = Math.floor(Date.now() / 1000) - bestBlock.time;
-    if (tipAgeSecs > 10 * 60) {
-      safeSetResponseStatus(res, 503, `Error local Daemon is not synced (tip age: ${tipAgeSecs}s).`);
+    if (blockCount + 20 < explorerResponse.data.info.blocks) {
+      safeSetResponseStatus(res, 503, 'Error local Daemon is not synced.');
       return;
     }
-
-    const blockCount = chainInfo.blocks;
 
     const { status: fluxNodeStatus, data: fluxNodeInfo } = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
 
