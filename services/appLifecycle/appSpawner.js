@@ -452,7 +452,7 @@ async function trySpawningGlobalApplication() {
       }
     }
 
-    if (!appFromAppsToBeCheckedLater && !appFromAppsSyncthingToBeCheckedLater) {
+    if (!appFromAppsToBeCheckedLater) {
       const tier = await generalService.nodeTier();
       const appHWrequirements = hwRequirements.totalAppHWRequirements(appSpecifications, tier);
       let delay = false;
