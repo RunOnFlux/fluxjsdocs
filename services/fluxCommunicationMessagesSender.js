@@ -1,14 +1,239 @@
 /* eslint-disable no-underscore-dangle */
+const WebSocket = require('ws');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
-const { peerManager } = require('./utils/peerState');
+const {
+  outgoingConnections, outgoingPeers, incomingPeers, incomingConnections,
+} = require('./utils/establishedConnections');
 const cacheManager = require('./utils/cacheManager').default;
 
 const myMessageCache = cacheManager.tempMessageCache;
 
+/**
+ * To send to all peers.
+ * @param {object} data Data.
+ * @param {object[]} wsList Web socket list.
+ */
+async function sendToAllPeers(data, wsList) {
+  try {
+    const removals = [];
+    // wsList is always a sublist of outgoingConnections
+    const outConList = wsList || outgoingConnections;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const client of outConList) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(25);
+        if (client.readyState === WebSocket.OPEN) {
+          if (!data) {
+            const pingTime = Date.now();
+            client.ping(); // do ping instead
+            const foundPeer = outgoingPeers.find((peer) => peer.ip === client.ip && peer.port === client.port);
+            if (foundPeer) {
+              foundPeer.lastPingTime = pingTime;
+            }
+          } else {
+            client.send(data);
+          }
+        } else {
+          throw new Error(`Connection to ${client.ip} is not open`);
+        }
+      } catch (e) {
+        // removed this, we log anyway when the websocket is shut, no need to spam here
+        // log.error(e);
+        removals.push(client);
+        try {
+          const { ip } = client;
+          const { port } = client;
+          // eslint-disable-next-line no-use-before-define
+          fluxNetworkHelper.closeConnection(ip, port);
+        } catch (err) {
+          log.error(err);
+        }
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = outgoingConnections.findIndex((ws) => removals[i].ip === ws.ip && removals[i].port === ws.port);
+      if (ocIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingConnections`);
+        outgoingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === removals[i].ip && peer.port === removals[i].port);
+      if (peerIndex > -1) {
+        outgoingPeers.splice(peerIndex, 1);
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingPeers`);
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
+ * To send random peers.
+ * @param {object} data Data.
+ */
+async function sendToRandomPeer(data) {
+  try {
+    if (!outgoingConnections.length) {
+      return;
+    }
+    const removals = [];
+    const client = outgoingConnections[Math.floor(Math.random() * outgoingConnections.length)];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(25);
+      if (client.readyState === WebSocket.OPEN) {
+        if (!data) {
+          const pingTime = Date.now();
+          client.ping(); // do ping instead
+          const foundPeer = outgoingPeers.find((peer) => peer.ip === client.ip && peer.port === client.port);
+          if (foundPeer) {
+            foundPeer.lastPingTime = pingTime;
+          }
+        } else {
+          client.send(data);
+        }
+      } else {
+        throw new Error(`Connection to ${client.ip} is not open`);
+      }
+    } catch (e) {
+      log.error(e);
+      removals.push(client);
+      try {
+        const { ip } = client;
+        const { port } = client;
+        // eslint-disable-next-line no-use-before-define
+        fluxNetworkHelper.closeConnection(ip, port);
+      } catch (err) {
+        log.error(err);
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = outgoingConnections.findIndex((ws) => removals[i].ip === ws.ip && removals[i].port === ws.port);
+      if (ocIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingConnections`);
+        outgoingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = outgoingPeers.findIndex((peer) => peer.ip === removals[i].ip && peer.port === removals[i].port);
+      if (peerIndex > -1) {
+        outgoingPeers.splice(peerIndex, 1);
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from outgoingPeers`);
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
+ * To send to all incoming connections.
+ * @param {object} data Data.
+ * @param {object[]} wsList Web socket list.
+ */
+async function sendToAllIncomingConnections(data, wsList) {
+  try {
+    const removals = [];
+    // wsList is always a sublist of incomingConnections
+    const incConList = wsList || incomingConnections;
+    // eslint-disable-next-line no-restricted-syntax
+    for (const client of incConList) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(25);
+        if (client.readyState === WebSocket.OPEN) {
+          if (!data) {
+            client.ping(); // do ping instead
+          } else {
+            client.send(data);
+          }
+        } else {
+          throw new Error(`Connection to ${client.ip} is not open`);
+        }
+      } catch (e) {
+        removals.push(client);
+        try {
+          const { ip } = client;
+          const { port } = client;
+          fluxNetworkHelper.closeIncomingConnection(ip, port);
+        } catch (err) {
+          log.error(err);
+        }
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = incomingConnections.findIndex((incomingCon) => removals[i].ip === incomingCon.ip && removals[i].port === incomingCon.port);
+      if (ocIndex > -1) {
+        log.info(`Connection to ${removals[i].ip}:${removals[i].port} removed from incomingConnections`);
+        incomingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = incomingPeers.findIndex((mypeer) => mypeer.ip === removals[i].ip && mypeer.port === removals[i].port);
+      if (peerIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from incomingPeers`);
+        incomingPeers.splice(peerIndex, 1);
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
+ * To send to random incoming connection.
+ * @param {object} data Data.
+ */
+async function sendToRandomIncomingConnections(data) {
+  try {
+    if (!incomingConnections.length) {
+      return;
+    }
+    const removals = [];
+    const client = incomingConnections[Math.floor(Math.random() * incomingConnections.length)];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(25);
+      if (client.readyState === WebSocket.OPEN) {
+        if (!data) {
+          client.ping(); // do ping instead
+        } else {
+          client.send(data);
+        }
+      } else {
+        throw new Error(`Connection to ${client.ip} is not open`);
+      }
+    } catch (e) {
+      removals.push(client);
+      try {
+        const { ip } = client;
+        const { port } = client;
+        fluxNetworkHelper.closeIncomingConnection(ip, port);
+      } catch (err) {
+        log.error(err);
+      }
+    }
+
+    for (let i = 0; i < removals.length; i += 1) {
+      const ocIndex = incomingConnections.findIndex((incomingCon) => removals[i].ip === incomingCon.ip && removals[i].port === incomingCon.port);
+      if (ocIndex > -1) {
+        log.info(`Connection to ${removals[i].ip}:${removals[i].port} removed from incomingConnections`);
+        incomingConnections.splice(ocIndex, 1);
+      }
+      const peerIndex = incomingPeers.findIndex((mypeer) => mypeer.ip === removals[i].ip && mypeer.port === removals[i].port);
+      if (peerIndex > -1) {
+        log.info(`Connection ${removals[i].ip}:${removals[i].port} removed from incomingPeers`);
+        incomingPeers.splice(peerIndex, 1);
+      }
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
 
 /**
  * To get Flux message signature.
@@ -51,14 +276,18 @@ async function serialiseAndSignFluxBroadcast(dataToBroadcast, privatekey) {
 }
 
 /**
- * Sign and send a message to a peer.
- * @param {object} message Message to sign and send.
- * @param {import('./utils/FluxPeerSocket').FluxPeerSocket} peer Peer to send to.
+ * To sign and send message to web socket.
+ * @param {object} message Message.
+ * @param {object} ws Web Socket.
  */
-async function sendSignedMessage(message, peer) {
+async function sendMessageToWS(message, ws) {
   try {
     const messageSigned = await serialiseAndSignFluxBroadcast(message);
-    peer.send(messageSigned);
+    try {
+      ws.send(messageSigned);
+    } catch (e) {
+      log.error(e);
+    }
   } catch (error) {
     log.error(error);
   }
@@ -66,11 +295,11 @@ async function sendSignedMessage(message, peer) {
 
 /**
  * To respond with app message.
- * @param {object} msgObj Message object with data.type and hashes.
- * @param {import('./utils/FluxPeerSocket').FluxPeerSocket} peer Peer that requested the message.
- * @returns {void}
+ * @param {object} message Message.
+ * @param {object} ws Web socket.
+ * @returns {void} Throws an error if invalid.
  */
-async function respondWithAppMessage(msgObj, peer) {
+async function respondWithAppMessage(msgObj, ws) {
   try {
     // check if we have it database of permanent appMessages
     // eslint-disable-next-line global-require
@@ -110,7 +339,7 @@ async function respondWithAppMessage(msgObj, peer) {
       if (myMessageCache.has(hash)) {
         const tempMesResponse = myMessageCache.get(hash);
         if (tempMesResponse) {
-          sendSignedMessage(tempMesResponse, peer);
+          sendMessageToWS(tempMesResponse, ws);
           // eslint-disable-next-line no-continue
           continue;
         }
@@ -128,7 +357,7 @@ async function respondWithAppMessage(msgObj, peer) {
           signature: appMessage.signature,
           arcaneSender: appMessage.arcaneSender || false,
         };
-        sendSignedMessage(temporaryAppMessage, peer);
+        sendMessageToWS(temporaryAppMessage, ws);
       }
       myMessageCache.set(hash, temporaryAppMessage);
       // eslint-disable-next-line no-await-in-loop
@@ -141,73 +370,184 @@ async function respondWithAppMessage(msgObj, peer) {
 }
 
 /**
- * Relay a message to all connected peers (both directions), excluding the sender.
- * @param {string} data Serialised message data.
- * @param {string} [excludeKey] Peer key (ip:port) to exclude (the sender).
- */
-async function relay(data, excludeKey) {
-  await peerManager.broadcast(data, { exclude: excludeKey });
-}
-
-/**
- * Sign once, send to all connected peers (both directions).
+ * To broadcast message to outgoing peers. Data is serialised and sent to outgoing peers.
  * @param {object} dataToBroadcast Data to broadcast.
  */
-async function broadcastMessageToAll(dataToBroadcast) {
+async function broadcastMessageToOutgoing(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
-  await relay(serialisedData);
+  await sendToAllPeers(serialisedData);
 }
 
 /**
- * Sign and send to a random outbound peer.
+ * To broadcast message to incoming peers. Data is serialised and sent to incoming peers.
+ * @param {object} dataToBroadcast Data to broadcast.
+ */
+async function broadcastMessageToIncoming(dataToBroadcast) {
+  const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
+  await sendToAllIncomingConnections(serialisedData);
+}
+
+/**
+ * To broadcast message to outgoing peers. Data is serialised and sent to outgoing peers.
  * @param {object} dataToBroadcast Data to broadcast.
  */
 async function broadcastMessageToRandomOutgoing(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
-  const peer = peerManager.getRandomPeer('outbound');
-  if (peer) peer.send(serialisedData);
+  await sendToRandomPeer(serialisedData);
 }
 
 /**
- * Sign and send to a random inbound peer.
+ * To broadcast message to incoming peers. Data is serialised and sent to incoming peers.
  * @param {object} dataToBroadcast Data to broadcast.
  */
 async function broadcastMessageToRandomIncoming(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
-  const peer = peerManager.getRandomPeer('inbound');
-  if (peer) peer.send(serialisedData);
+  await sendToRandomIncomingConnections(serialisedData);
 }
 
 /**
- * @deprecated Use broadcastMessageFromUser instead. Sends to all peers.
+ * To broadcast message from user to outgoing peers. Data is serialised and sent to outgoing peers. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
 async function broadcastMessageToOutgoingFromUser(req, res) {
-  log.warn('broadcastMessageToOutgoingFromUser is deprecated, use broadcastMessageFromUser');
-  return broadcastMessageFromUser(req, res);
+  try {
+    let { data } = req?.params || {};
+    data = data || req?.query?.data;
+    if (data === undefined || data === null) {
+      throw new Error('No message to broadcast attached.');
+    }
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+
+    let message;
+
+    if (authorized === true) {
+      await broadcastMessageToOutgoing(data);
+      message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+    } else {
+      message = messageHelper.errUnauthorizedMessage();
+    }
+    res.json(message);
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
 }
 
 /**
- * @deprecated Use broadcastMessageFromUserPost instead. Sends to all peers.
+ * To broadcast message from user to outgoing peers after data is processed. Processed data is serialised and sent to outgoing peers. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
 async function broadcastMessageToOutgoingFromUserPost(req, res) {
-  log.warn('broadcastMessageToOutgoingFromUserPost is deprecated, use broadcastMessageFromUserPost');
-  return broadcastMessageFromUserPost(req, res);
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      if (body === undefined || body === '') {
+        throw new Error('No message to broadcast attached.');
+      }
+      const processedBody = serviceHelper.ensureObject(body);
+      const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+
+      let message;
+
+      if (authorized === true) {
+        await broadcastMessageToOutgoing(processedBody);
+        message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      } else {
+        message = messageHelper.errUnauthorizedMessage();
+      }
+      res.json(message);
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(
+        error.message || error,
+        error.name,
+        error.code,
+      );
+      res.json(errorResponse);
+    }
+  });
 }
 
 /**
- * @deprecated Use broadcastMessageFromUser instead. Sends to all peers.
+ * To broadcast message from user to incoming peers. Data is serialised and sent to incoming peers. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
 async function broadcastMessageToIncomingFromUser(req, res) {
-  log.warn('broadcastMessageToIncomingFromUser is deprecated, use broadcastMessageFromUser');
-  return broadcastMessageFromUser(req, res);
+  try {
+    let { data } = req?.params || {};
+    data = data || req?.query?.data;
+    if (data === undefined || data === null) {
+      throw new Error('No message to broadcast attached.');
+    }
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+
+    let message;
+    if (authorized === true) {
+      await broadcastMessageToIncoming(data);
+      message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+    } else {
+      message = messageHelper.errUnauthorizedMessage();
+    }
+    res.json(message);
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    res.json(errorResponse);
+  }
 }
 
 /**
- * @deprecated Use broadcastMessageFromUserPost instead. Sends to all peers.
+ * To broadcast message from user to incoming peers after data is processed. Processed data is serialised and sent to incoming peers. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
  */
 async function broadcastMessageToIncomingFromUserPost(req, res) {
-  log.warn('broadcastMessageToIncomingFromUserPost is deprecated, use broadcastMessageFromUserPost');
-  return broadcastMessageFromUserPost(req, res);
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      if (body === undefined || body === '') {
+        throw new Error('No message to broadcast attached.');
+      }
+      const processedBody = serviceHelper.ensureObject(body);
+      const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+
+      let message;
+
+      if (authorized === true) {
+        await broadcastMessageToIncoming(processedBody);
+        message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
+      } else {
+        message = messageHelper.errUnauthorizedMessage();
+      }
+      res.json(message);
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(
+        error.message || error,
+        error.name,
+        error.code,
+      );
+      res.json(errorResponse);
+    }
+  });
 }
 
 /**
@@ -227,7 +567,8 @@ async function broadcastMessageFromUser(req, res) {
     let message;
 
     if (authorized === true) {
-      await broadcastMessageToAll(data);
+      await broadcastMessageToOutgoing(data);
+      await broadcastMessageToIncoming(data);
       message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
     } else {
       message = messageHelper.errUnauthorizedMessage();
@@ -265,7 +606,8 @@ async function broadcastMessageFromUserPost(req, res) {
       let message;
 
       if (authorized === true) {
-        await broadcastMessageToAll(processedBody);
+        await broadcastMessageToOutgoing(processedBody);
+        await broadcastMessageToIncoming(processedBody);
         message = messageHelper.createSuccessMessage('Message successfully broadcasted to Flux network');
       } else {
         message = messageHelper.errUnauthorizedMessage();
@@ -301,13 +643,16 @@ async function broadcastTemporaryAppMessage(message) {
   if (typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number' || typeof message.appSpecifications !== 'object' || typeof message.signature !== 'string' || typeof message.timestamp !== 'number' || typeof message.hash !== 'string') {
     throw new Error('Invalid Flux App message for storing');
   }
-  // sign once, send to both directions
-  await broadcastMessageToAll(message);
+  // to all outoing
+  await broadcastMessageToOutgoing(message); // every outgoing peer AT LEAST 50ms - suppose 40 outgoing - 0.8 seconds
+  // to all incoming. Delay broadcast in case message is processing
+  await broadcastMessageToIncoming(message); // every incoing peer AT LEAST 50ms. Suppose 50 incoming - 1 second
 }
 
 module.exports = {
-  relay,
-  sendSignedMessage,
+  sendToAllPeers,
+  sendMessageToWS,
+  sendToAllIncomingConnections,
   respondWithAppMessage,
   serialiseAndSignFluxBroadcast,
   getFluxMessageSignature,
@@ -315,10 +660,11 @@ module.exports = {
   broadcastMessageToOutgoingFromUserPost,
   broadcastMessageToIncomingFromUser,
   broadcastMessageToIncomingFromUserPost,
-  broadcastMessageToAll,
+  broadcastMessageToIncoming,
   broadcastMessageFromUser,
   broadcastMessageFromUserPost,
   broadcastTemporaryAppMessage,
+  broadcastMessageToOutgoing,
   broadcastMessageToRandomOutgoing,
   broadcastMessageToRandomIncoming,
 };
