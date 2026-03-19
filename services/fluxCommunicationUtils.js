@@ -181,13 +181,19 @@ async function verifyFluxBroadcast(broadcast) {
   }
 
   // if we get a map, we have hit the default case and searched for pubkeys
-  const found = target instanceof Map
-    ? true
-    : Boolean(await networkStateService.getFluxnodeBySocketAddress(target));
-
-  if (!found) {
-    log.warn(error);
-    return false;
+  if (target instanceof Map) {
+    // default case: already verified pubkey exists in network
+  } else {
+    const node = await networkStateService.getFluxnodeBySocketAddress(target);
+    if (!node) {
+      log.warn(error);
+      return false;
+    }
+    // verify the sender's pubKey matches the node at the target IP
+    if (node.pubkey !== pubKey) {
+      log.warn(`Sender pubkey ${pubKey} does not match node at ${target}`);
+      return false;
+    }
   }
 
   const messageToVerify = version + message + timestamp;
