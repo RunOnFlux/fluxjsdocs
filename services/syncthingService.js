@@ -2015,11 +2015,6 @@ async function debugFile(req, res) {
  * @returns {object} Message
  */
 async function getEvents(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  if (authorized !== true) {
-    const response = messageHelper.errUnauthorizedMessage();
-    return res ? res.json(response) : response;
-  }
   try {
     let { events } = req.params;
     events = events || req.query.events;
@@ -2055,11 +2050,6 @@ async function getEvents(req, res) {
  * @returns {object} Message
  */
 async function getEventsDisk(req, res) {
-  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
-  if (authorized !== true) {
-    const response = messageHelper.errUnauthorizedMessage();
-    return res ? res.json(response) : response;
-  }
   try {
     let { since } = req.params;
     since = since || req.query.since;
@@ -2124,8 +2114,7 @@ async function getSvcRandomString(req, res) {
   let apiPath = '/rest/svc/random/string';
   try {
     if (length) {
-      const parsedLength = Number(length);
-      if (!Number.isFinite(parsedLength) || parsedLength < 0 || parsedLength > 10000) {
+      if (+length < 0 || +length > 10000) {
         const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
         if (authorized !== true) {
           const response = messageHelper.errUnauthorizedMessage();
