@@ -884,7 +884,9 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         };
         log.info('Broadcasting appremoved message to the network');
         // broadcast messages about app removed to all peers
-        await fluxCommunicationMessagesSender.broadcastMessageToAll(appRemovedMessage);
+        await fluxCommunicationMessagesSender.broadcastMessageToOutgoing(appRemovedMessage);
+        await serviceHelper.delay(500);
+        await fluxCommunicationMessagesSender.broadcastMessageToIncoming(appRemovedMessage);
         // Remove app from running apps cache
         const { runningAppsCache } = globalState;
         if (runningAppsCache.has(appName)) {
