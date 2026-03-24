@@ -1,4 +1,4 @@
-const { pubKeyToAddr, WIFToPrivKey } = require('./utils/fluxCryptoUtils');
+const zeltrezjs = require('zeltrezjs');
 const bitcoinMessage = require('bitcoinjs-message');
 const { randomBytes } = require('crypto');
 
@@ -66,7 +66,7 @@ function verifyZelID(address) {
 
     if (address.length > 36) {
       const btcPubKeyHash = '00';
-      pubKeyToAddr(address, btcPubKeyHash);
+      zeltrezjs.address.pubKeyToAddr(address, btcPubKeyHash);
     }
     isValid = true;
   } catch (e) {
@@ -97,7 +97,7 @@ function verifyMessage(message, address, signature, strMessageMagic, checkSegwit
 
     if (address.length > 36) {
       const btcPubKeyHash = '00';
-      const sigAddress = pubKeyToAddr(address, btcPubKeyHash);
+      const sigAddress = zeltrezjs.address.pubKeyToAddr(address, btcPubKeyHash);
       signingAddress = sigAddress;
     }
     isValid = bitcoinMessage.verify(message, signingAddress, signature, strMessageMagic, checkSegwitAlways);
@@ -121,7 +121,7 @@ function signMessage(message, pk) {
     if (!pk || typeof pk !== 'string') {
       throw new Error('Invalid private key provided');
     }
-    const privateKey = WIFToPrivKey(pk);
+    const privateKey = zeltrezjs.address.WIFToPrivKey(pk);
 
     const isCompressed = !pk.startsWith('5');
 
