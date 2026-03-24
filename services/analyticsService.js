@@ -92,8 +92,11 @@ async function flushEvents() {
 
   // Atomic swap — new events during flush go to fresh Map
   const snapshot = eventBuffer;
+  const snapshotTotal = bufferTotal;
   eventBuffer = new Map();
   bufferTotal = 0;
+
+  log.info(`Analytics: flushing ${snapshotTotal} events from ${snapshot.size} users`);
 
   let anyFailed = false;
 
@@ -220,12 +223,14 @@ function analyticsMiddleware(req, res, next) {
  * @param {string} appName - Application name
  * @param {string} action - 'open' or 'close'
  * @param {string} [ipAddress] - Client IP address
+ * @param {string} [component] - Component name for multi-component apps
  */
-function trackTerminalSession(zelidauth, appName, action, ipAddress) {
+function trackTerminalSession(zelidauth, appName, action, ipAddress, component) {
   if (!analyticsUrlCached || !zelidauth) return;
 
+  const terminalTarget = component ? `${component}_${appName}` : appName;
   const event = {
-    apiEndpoint: `/terminal/${action}/${appName}`,
+    apiEndpoint: `/terminal/${action}/${terminalTarget}`,
     httpMethod: 'WS',
     responseCode: 200,
     responseStatus: 'success',
