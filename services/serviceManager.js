@@ -109,9 +109,6 @@ async function startFluxFunctions() {
     await systemService.mongoDBConfig();
     systemService.monitorSystem();
     log.info('System service initiated');
-    log.info('Initiating MongoDB connection');
-    await dbHelper.initiateDB(); // either true or throws error
-    log.info('DB connected');
     log.info('Preparing local database...');
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.local.database);
@@ -307,15 +304,12 @@ async function startFluxFunctions() {
     setTimeout(() => {
       appController.stopAllNonFluxRunningApps();
       monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
-      portManager.restoreAppsPortsSupport();
+      portManager.startPortsSupportLoop(); // self-scheduling, wall-clock-aligned
     }, 1 * 60 * 1000);
     setTimeout(() => {
       // Check for enterprise apps on non-arcaneOS nodes and remove them
       advancedWorkflows.checkAndRemoveEnterpriseAppsOnNonArcane();
     }, 2 * 60 * 1000); // 2 minutes after startup
-    setInterval(() => {
-      portManager.restorePortsSupport(); // restore fluxos and apps ports/upnp
-    }, 10 * 60 * 1000); // every 10 minutes
     log.info('Starting setting Node Geolocation');
     geolocationService.setNodeGeolocation();
     setTimeout(() => {
@@ -409,7 +403,6 @@ async function startFluxFunctions() {
         appQueryService.installedApps,
         dosState,
         portsNotWorking,
-        portManager.failedNodesTestPortsCache,
         fluxNetworkHelper.isArcane,
       );
     }, 3 * 60 * 1000);

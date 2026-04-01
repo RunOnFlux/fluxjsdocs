@@ -202,7 +202,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
       // eslint-disable-next-line no-restricted-syntax
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
-        const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${appName}`);
+        const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `${upnpService.MAPPING_DESC_APP_PREFIX}${appName}`);
         if (portResponse === true) {
           const portStatus = {
             status: `Port ${port} mapped OK`,
@@ -240,7 +240,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
     const isUPNP = upnpService.isUPNP();
     if (isUPNP) {
       log.info('Custom port specified, mapping ports');
-      const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `Flux_App_${appName}`);
+      const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `${upnpService.MAPPING_DESC_APP_PREFIX}${appName}`);
       if (portResponse === true) {
         const portStatus = {
           status: `Port ${appSpecifications.port} mapped OK`,
@@ -456,10 +456,9 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       throw new Error('Unable to check running Apps');
     }
     const appsInstalled = installedAppsRes.data;
-    const decryptedAppsInstalled = await appQueryService.decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
     const runningApps = runningAppsRes.data;
     const installedAppComponentNames = [];
-    decryptedAppsInstalled.forEach((app) => {
+    appsInstalled.forEach((app) => {
       if (app.version >= 4) {
         app.compose.forEach((appAux) => {
           installedAppComponentNames.push(`${appAux.name}_${app.name}`);
