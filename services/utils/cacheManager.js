@@ -115,11 +115,6 @@ class FluxCacheManager {
       max: 60,
       ttl: 3 * FluxCacheManager.oneHour,
     },
-    // portManager / availabilityChecker - peers that failed to respond to port checks
-    failedPeersCache: {
-      max: 75,
-      ttl: FluxCacheManager.oneHour,
-    },
     appPriceBlockedRepoCache: {
       max: 50,
       ttl: 3 * FluxCacheManager.oneHour,
