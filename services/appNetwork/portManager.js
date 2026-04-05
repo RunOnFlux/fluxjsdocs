@@ -11,26 +11,9 @@ const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { localAppsInformation, globalAppsInformation } = require('../utils/appConstants');
-const fluxCaching = require('../utils/cacheManager').default;
 
-// Track consecutive UPNP mapping-absent failures per app across restore cycles
-const upnpFailureCount = new Map(); // appName -> { count: number, firstFailure: number }
-const UPNP_FAILURE_THRESHOLD = 3; // consecutive cycles (~30 min at 10-min intervals)
-const UPNP_RETRY_COUNT = 2;
-const UPNP_RETRY_DELAY_MS = 2000;
-
-
-// Periodic cleanup of orphaned UPNP mappings
-let lastMappingCleanup = 0;
-const MAPPING_CLEANUP_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-// UPnP smart refresh: wall-clock-aligned slot scheduling
-// 8 fixed slots in a CYCLE_DURATION_S cycle. Each node's slot is determined by its API port.
-// Slot formula: Math.floor((apiPort % 100) / 10) % 8
-// Standard Flux ports (16127–16197) each get a unique slot, no collisions.
-const { CYCLE_DURATION_S } = upnpService;
-const SLOT_COUNT = 8;
-const SLOT_DURATION_S = CYCLE_DURATION_S / SLOT_COUNT; // 75 seconds
+// Global cache for failed nodes
+const failedNodesTestPortsCache = new Map();
 
 /**
  * Check if ports in array are unique
@@ -236,348 +219,51 @@ async function ensureApplicationPortsNotUsed(appSpecFormatted, globalCheckedApps
   return true;
 }
 
-
 /**
- * Removes orphaned UPNP mappings from the router:
- * - Flux_App_* mappings for apps no longer installed on this node
- * - Flux_Test_App and Flux_Prelaunch_App_* mappings (always stale — these are
- *   short-lived test mappings that should have auto-expired or been deleted)
- * @param {Array} localMappings Current mappings from the router.
- * @param {Set} installedAppNames Names of currently installed apps.
+ * Restores FluxOS firewall, UPNP rules
  * @returns {Promise<void>}
  */
-async function cleanupOrphanedUpnpMappings(localMappings, installedAppNames) {
-  // Deduplicate by port since removeMapUpnpPort removes both TCP and UDP
-  const orphanedPorts = new Map(); // port -> description
-  // eslint-disable-next-line no-restricted-syntax
-  for (const m of localMappings) {
-    if (!m.description) continue;
-
-    // Stale test mappings — always orphans
-    if (m.description === upnpService.MAPPING_DESC_APP_TEST
-        || m.description.startsWith(upnpService.MAPPING_DESC_PRELAUNCH_PREFIX)) {
-      orphanedPorts.set(m.public.port, m.description);
-      continue;
-    }
-
-    // App mappings for uninstalled apps
-    if (m.description.startsWith(upnpService.MAPPING_DESC_APP_PREFIX)) {
-      const appName = m.description.slice(upnpService.MAPPING_DESC_APP_PREFIX.length);
-      if (!installedAppNames.has(appName)) {
-        orphanedPorts.set(m.public.port, m.description);
-      }
-    }
-  }
-
-  if (orphanedPorts.size === 0) return;
-
-  log.info(`Cleaning up ${orphanedPorts.size} orphaned UPNP port mapping(s)`);
-  // eslint-disable-next-line no-restricted-syntax
-  for (const [port, description] of orphanedPorts) {
-    log.info(`Removing orphaned UPNP mapping: ${description} port ${port}`);
-    // eslint-disable-next-line no-await-in-loop
-    await upnpService.removeMapUpnpPort(port).catch((error) => log.error(error));
-  }
-  lastMappingCleanup = Date.now();
-}
-
-/**
- * Attempts to retry UPNP port mapping after confirmed mapping loss.
- * @param {number} port Port number.
- * @param {string} description UPNP mapping description.
- * @param {object} [options] Options passed through to mapUpnpPort.
- * @returns {Promise<boolean>} True if a retry succeeded.
- */
-async function retryUpnpMapping(port, description, options = {}) {
-  for (let i = 0; i < UPNP_RETRY_COUNT; i += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.delay(UPNP_RETRY_DELAY_MS);
-    // eslint-disable-next-line no-await-in-loop
-    if (await upnpService.mapUpnpPort(port, description, options)) return true;
-  }
-  return false;
-}
-
-/**
- * Handles a failed UPNP mapping attempt for a single port. Checks if the existing
- * mapping is still valid on the router before taking action.
- * @param {string} appName Application name.
- * @param {number} port Port number.
- * @param {string} description UPNP mapping description.
- * @param {Array|null} localMappings Cached local mappings from router (null if query failed).
- * @param {object} [options] Options passed through to mapUpnpPort.
- * @returns {Promise<boolean>} True if the port is ok (mapping exists or retry succeeded), false if genuinely failed.
- */
-async function handleUpnpPortFailure(appName, port, description, localMappings, options = {}) {
-  // Only positive confirmation of an active mapping is a free pass
-  if (localMappings && localMappings.some((m) => m.public.port === port && m.enabled)) {
-    log.warn(`UPNP refresh failed for ${appName} port ${port} but existing mapping is still active on router`);
-    return true;
-  }
-
-  if (localMappings === null) {
-    log.warn(`UPNP refresh failed for ${appName} port ${port} and unable to query router mapping state`);
-  }
-
-  if (await retryUpnpMapping(port, description, options)) return true;
-
-  log.error(`UPNP mapping missing and retries exhausted for ${appName} port ${port}`);
-  return false;
-}
-
-/**
- * Handles the failure counting and potential removal of an app after confirmed UPNP failure.
- * @param {string} appName Application name.
- * @returns {Promise<boolean>} True if the app was removed.
- */
-async function handleUpnpAppFailure(appName) {
-  const prev = upnpFailureCount.get(appName) || { count: 0, firstFailure: Date.now() };
-  const updated = { count: prev.count + 1, firstFailure: prev.firstFailure };
-  upnpFailureCount.set(appName, updated);
-
-  if (updated.count < UPNP_FAILURE_THRESHOLD) {
-    log.warn(`UPNP mapping failure for ${appName} - attempt ${updated.count}/${UPNP_FAILURE_THRESHOLD}, will retry next cycle`);
-    return false;
-  }
-
-  log.error(`REMOVAL REASON: UPNP port mapping failure - ${appName} failed ${UPNP_FAILURE_THRESHOLD} consecutive cycles (since ${new Date(updated.firstFailure).toISOString()})`);
-  // eslint-disable-next-line global-require
-  const appUninstaller = require('../appLifecycle/appUninstaller');
-  await appUninstaller.removeAppLocally(appName, null, true, true, true).catch((error) => log.error(error));
-  upnpFailureCount.delete(appName);
-  await serviceHelper.delay(3 * 60 * 1000);
-  return true;
-}
-
-/**
- * Get the UPnP slot index (0–7) for this node based on its API port.
- * Flux API ports (16127–16197) differ in their tens digit, giving unique slots.
- * @param {number} apiPort This node's API port.
- * @returns {number} Slot index 0–7.
- */
-function getUpnpSlot(apiPort) {
-  return Math.floor((apiPort % 100) / 10) % SLOT_COUNT;
-}
-
-/**
- * Compute seconds until the next occurrence of this node's slot in the
- * wall-clock-aligned 10-minute cycle.
- * @param {number} slot Slot index 0–7.
- * @returns {number} Seconds to wait (0 if currently in-slot).
- */
-function secondsUntilSlot(slot) {
-  const nowEpoch = Math.floor(Date.now() / 1000);
-  const cycleOffset = nowEpoch % CYCLE_DURATION_S;
-  const slotStart = slot * SLOT_DURATION_S;
-  const slotEnd = slotStart + SLOT_DURATION_S;
-
-  if (cycleOffset >= slotStart && cycleOffset < slotEnd) return 0;
-  if (cycleOffset < slotStart) return slotStart - cycleOffset;
-  return (CYCLE_DURATION_S - cycleOffset) + slotStart;
-}
-
-/**
- * Check a single port's UPnP mapping via GetSpecificPortMappingEntry.
- * Validates that the mapping is present, points to this node, and has sufficient TTL.
- * @param {number} port Port to check (TCP only — if TCP is gone, UDP is too).
- * @returns {Promise<boolean|null>} true=healthy, false=needs repair, null=router unreachable.
- */
-async function checkPortMapping(port) {
+async function restoreFluxPortsSupport() {
   try {
-    const mapping = await upnpService.getPortMapping(port);
-    if (!mapping || !mapping.local) return false;
-    if (mapping.ttl > 0 && mapping.ttl < upnpService.MIN_MAPPING_TTL_S) return false;
-    return true;
-  } catch (error) {
-    log.warn(`UPnP verify: router unreachable checking port ${port} (${error.message})`);
-    return null;
-  }
-}
+    const isUPNP = upnpService.isUPNP();
 
-/**
- * Calculate adaptive delay based on remaining time budget and ports left.
- * @param {number} slotStartMono Monotonic start time (performance.now()).
- * @param {number} slotBudgetMs Total slot budget in milliseconds.
- * @param {number} remainingPorts Number of ports still to process.
- * @returns {number} Delay in milliseconds (0 if budget exhausted or no ports left).
- */
-function adaptiveDelay(slotStartMono, slotBudgetMs, remainingPorts) {
-  if (remainingPorts <= 0) return 0;
-  const elapsed = performance.now() - slotStartMono;
-  const remainingMs = slotBudgetMs - elapsed;
-  if (remainingMs <= 0) return 0;
-  return Math.floor(remainingMs / (remainingPorts + 1));
-}
-
-/**
- * Verify all UPnP port mappings and repair any that are missing.
- * Unified loop over FluxOS and app ports. Each port is checked via
- * GetSpecificPortMappingEntry (1 SOAP call, TCP only). If missing,
- * the specific port is repaired immediately. Delays between calls
- * adapt to remaining time budget so repairs don't cause slot overruns.
- *
- * @param {Array} portEntries Unified list of { port, description, protocols, appName? }.
- * @param {Set} currentAppNames Installed app names (for orphan cleanup).
- * @returns {Promise<void>}
- */
-async function verifyAndRepairUpnpMappings(portEntries, currentAppNames) {
-  const slotStartMono = performance.now();
-  const slotBudgetMs = SLOT_DURATION_S * 1000;
-  let repairCount = 0;
-  let unreachableCount = 0;
-  const caps = upnpService.getRouterCapabilities();
-  const mappingTtl = caps.supportsLeaseDuration ? upnpService.MAPPING_TTL_S : 0;
-  let installedAppsSnapshot; // lazy-loaded on first missing app port
-
-  // Per-app tracking for failure counting
-  const appResults = new Map(); // appName -> { failed: boolean, verified: boolean }
-
-  for (let i = 0; i < portEntries.length; i += 1) {
-    if (performance.now() - slotStartMono >= slotBudgetMs) {
-      log.warn('UPnP verify: slot time exhausted, remaining ports will be checked next cycle');
-      break;
-    }
-
-    const entry = portEntries[i];
-    const remainingPorts = portEntries.length - i - 1;
-
-    // eslint-disable-next-line no-await-in-loop
-    const result = await checkPortMapping(entry.port);
-
-    if (result === 'unreachable') unreachableCount += 1;
-
-    if (result === true || result === null) {
-      if (entry.appName && result === true) {
-        const ar = appResults.get(entry.appName) || { failed: false, verified: false };
-        ar.verified = true;
-        appResults.set(entry.appName, ar);
-      }
-      const delayMs = adaptiveDelay(slotStartMono, slotBudgetMs, remainingPorts);
-      if (delayMs > 0) {
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(delayMs);
-      }
-      continue;
-    }
-
-    // Mapping missing, wrong host, or TTL too low — repair
-    // For app ports, verify the app is still installed before re-mapping
-    if (entry.appName) {
-      if (!installedAppsSnapshot) {
-        // eslint-disable-next-line no-await-in-loop
-        installedAppsSnapshot = await assignedPortsInstalledApps();
-      }
-      if (!installedAppsSnapshot.some((a) => a.name === entry.appName)) {
-        log.info(`UPnP verify: ${entry.appName} was uninstalled mid-cycle, skipping re-map`);
-        continue;
-      }
-    }
-
-    const portLabel = entry.appName ?? 'FluxOS';
-    log.info(`UPnP verify: mapping missing for ${portLabel} port ${entry.port} — re-mapping`);
-
-    // eslint-disable-next-line no-await-in-loop
-    const upnpOk = await upnpService.mapUpnpPort(entry.port, entry.description, {
-      protocols: entry.protocols,
-      delay: 0, // no inter-protocol delay during repair — budget is adaptive
-      ttl: mappingTtl,
-    });
-
-    if (upnpOk) {
-      repairCount += 1;
-      if (entry.appName) {
-        const ar = appResults.get(entry.appName) || { failed: false, verified: false };
-        ar.verified = true;
-        appResults.set(entry.appName, ar);
-      }
-      const delayMs = adaptiveDelay(slotStartMono, slotBudgetMs, remainingPorts);
-      if (delayMs > 0) {
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(delayMs);
-      }
-      continue;
-    }
-
-    // Re-map failed — retry + threshold (app ports only)
-    if (entry.appName) {
-      // eslint-disable-next-line no-await-in-loop
-      const portOk = await handleUpnpPortFailure(entry.appName, entry.port, entry.description, null, {
-        protocols: entry.protocols, ttl: mappingTtl,
-      });
-      if (portOk) {
-        repairCount += 1;
-        const ar = appResults.get(entry.appName) || { failed: false, verified: false };
-        ar.verified = true;
-        appResults.set(entry.appName, ar);
-      } else {
-        const ar = appResults.get(entry.appName) || { failed: false, verified: false };
-        ar.failed = true;
-        appResults.set(entry.appName, ar);
-      }
-    } else {
-      log.error(`UPnP verify: failed to restore FluxOS port ${entry.port}`);
-    }
-
-    const delayMs = adaptiveDelay(slotStartMono, slotBudgetMs, remainingPorts);
-    if (delayMs > 0) {
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(delayMs);
-    }
-  }
-
-  // Process app failure/success counters
-  // eslint-disable-next-line no-restricted-syntax
-  for (const [appName, ar] of appResults) {
-    if (ar.failed) {
-      // eslint-disable-next-line no-await-in-loop
-      await handleUpnpAppFailure(appName);
-    } else if (ar.verified) {
-      upnpFailureCount.delete(appName);
-    }
-    // If !failed && !verified (all ports unreachable), leave counter unchanged
-  }
-
-  if (unreachableCount > 0) {
-    log.warn(`UPnP verify: router unreachable for ${unreachableCount} port check(s)`);
-  }
-  if (repairCount === 0 && unreachableCount === 0) {
-    log.info('UPnP verify: all mappings present');
-  } else if (repairCount > 0) {
-    log.info(`UPnP verify: repaired ${repairCount} missing mapping(s)`);
-  }
-
-  // Periodic orphan cleanup — uses getLocalMappings (heavier, but only every 2 hours)
-  if (currentAppNames && Date.now() - lastMappingCleanup >= MAPPING_CLEANUP_INTERVAL_MS) {
-    const localMappings = await upnpService.getLocalMappings();
-    if (localMappings && localMappings.length > 0) {
-      await cleanupOrphanedUpnpMappings(localMappings, currentAppNames);
-    }
-  }
-}
-
-/**
- * Restores firewall rules and verifies/repairs UPnP mappings for all ports.
- * Builds a unified port list (FluxOS + app) and delegates to
- * verifyAndRepairUpnpMappings which uses adaptive timing.
- * @returns {Promise<void>}
- */
-async function restorePortsSupport() {
-  try {
-    const currentAppsPorts = await assignedPortsInstalledApps();
     const userconfig = globalThis.userconfig;
-    const apiPort = +(userconfig.initial.apiport || config.server.apiport);
+    const apiPort = userconfig.initial.apiport || config.server.apiport;
+    const homePort = +apiPort - 1;
+    const apiPortSSL = +apiPort + 1;
+    const syncthingPort = +apiPort + 2;
 
-    // Build FluxOS port list from definitions
-    const fluxOsPorts = upnpService.FLUXOS_PORT_DEFS.map((def) => apiPort + def.offset);
-
-    // Firewall rules (local, cheap — no spacing needed)
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const port of fluxOsPorts) {
-        // eslint-disable-next-line no-await-in-loop
-        await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
-      }
+      // setup UFW if active
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(apiPort));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(homePort));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(apiPortSSL));
+      await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(syncthingPort));
+    }
+
+    // UPNP
+    if (isUPNP) {
+      // map our Flux API, UI and SYNCTHING port
+      await upnpService.setupUPNP(apiPort);
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+/**
+ * Restores applications firewall, UPNP rules
+ * @returns {Promise<void>}
+ */
+async function restoreAppsPortsSupport() {
+  try {
+    const currentAppsPorts = await assignedPortsInstalledApps();
+    const isUPNP = upnpService.isUPNP();
+
+    const firewallActive = await fluxNetworkHelper.isFirewallActive();
+    // setup UFW for apps
+    if (firewallActive) {
       // eslint-disable-next-line no-restricted-syntax
       for (const application of currentAppsPorts) {
         // eslint-disable-next-line no-restricted-syntax
@@ -588,88 +274,44 @@ async function restorePortsSupport() {
       }
     }
 
-    if (!upnpService.isUPNP()) return;
-
-    const currentAppNames = new Set();
-    // eslint-disable-next-line no-restricted-syntax
-    for (const application of currentAppsPorts) {
-      currentAppNames.add(application.name);
-    }
-
-    // Clean up stale failure counter entries for apps no longer installed
-    // eslint-disable-next-line no-restricted-syntax
-    for (const appName of upnpFailureCount.keys()) {
-      if (!currentAppNames.has(appName)) {
-        upnpFailureCount.delete(appName);
-      }
-    }
-
-    // Build unified port entry list: FluxOS ports first, then app ports
-    const portEntries = [];
-    // eslint-disable-next-line no-restricted-syntax
-    for (const def of upnpService.FLUXOS_PORT_DEFS) {
-      portEntries.push({
-        port: apiPort + def.offset,
-        description: def.description,
-        protocols: def.protocols,
-      });
-    }
-    // eslint-disable-next-line no-restricted-syntax
-    for (const application of currentAppsPorts) {
+    // UPNP
+    if (isUPNP) {
+      // map application ports
       // eslint-disable-next-line no-restricted-syntax
-      for (const port of application.ports) {
-        portEntries.push({
-          port: serviceHelper.ensureNumber(port),
-          description: `${upnpService.MAPPING_DESC_APP_PREFIX}${application.name}`,
-          protocols: ['TCP', 'UDP'],
-          appName: application.name,
-        });
+      for (const application of currentAppsPorts) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const port of application.ports) {
+          // eslint-disable-next-line no-await-in-loop
+          const upnpOk = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
+          if (!upnpOk) {
+            log.warn(`REMOVAL REASON: UPNP port mapping failure - ${application.name} failed to map port ${port} via UPNP (portManager)`);
+            // Import locally to avoid circular dependency
+            // eslint-disable-next-line global-require
+            const appUninstaller = require('../appLifecycle/appUninstaller');
+            // eslint-disable-next-line no-await-in-loop
+            await appUninstaller.removeAppLocally(application.name, null, true, true, true).catch((error) => log.error(error)); // remove entire app
+            // eslint-disable-next-line no-await-in-loop
+            await serviceHelper.delay(3 * 60 * 1000); // 3 mins
+            break;
+          }
+        }
       }
     }
-
-    await verifyAndRepairUpnpMappings(portEntries, currentAppNames);
   } catch (error) {
     log.error(error);
   }
 }
 
 /**
- * Self-scheduling loop for UPnP port verification.
- * Runs restorePortsSupport once per 10-minute cycle, wall-clock-aligned to
- * this node's deterministic slot. SOAP calls are spread evenly across the
- * 75-second slot so sibling nodes behind the same router don't collide.
+ * Restores FluxOS and applications firewall, UPNP rules
+ * @returns {Promise<void>}
  */
-async function startPortsSupportLoop() {
-  const userconfig = globalThis.userconfig;
-  const apiPort = +(userconfig.initial.apiport || config.server.apiport);
-  const slot = getUpnpSlot(apiPort);
-
-  log.info(`UPnP smart refresh: slot ${slot} (API port ${apiPort}), ${SLOT_DURATION_S}s window every ${CYCLE_DURATION_S}s`);
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      const waitS = secondsUntilSlot(slot);
-      if (waitS > 0) {
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(waitS * 1000);
-      }
-
-      // eslint-disable-next-line no-await-in-loop
-      await restorePortsSupport();
-    } catch (error) {
-      log.error(error);
-    }
-
-    // If still inside our slot, sleep past the boundary to prevent double-fire.
-    // Next iteration's secondsUntilSlot re-aligns to the wall clock.
-    const nowOffset = Math.floor(Date.now() / 1000) % CYCLE_DURATION_S;
-    const slotEnd = (slot + 1) * SLOT_DURATION_S;
-    const remainingInSlot = slotEnd > nowOffset ? slotEnd - nowOffset : 0;
-    if (remainingInSlot > 0) {
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay((remainingInSlot + 1) * 1000);
-    }
+async function restorePortsSupport() {
+  try {
+    await restoreFluxPortsSupport();
+    await restoreAppsPortsSupport();
+  } catch (error) {
+    log.error(error);
   }
 }
 
@@ -791,10 +433,8 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
         await fluxNetworkHelper.allowPort(portToTest);
       }
       if (isUPNP) {
-        const caps = upnpService.getRouterCapabilities();
-        const testTtl = caps.supportsLeaseDuration ? Math.max(caps.minLeaseDuration, upnpService.MIN_TEST_MAPPING_TTL_S) : 0;
         // eslint-disable-next-line no-await-in-loop
-        const upnpMapResult = await upnpService.mapUpnpPort(portToTest, `${upnpService.MAPPING_DESC_PRELAUNCH_PREFIX}${portToTest}`, { ttl: testTtl });
+        const upnpMapResult = await upnpService.mapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
         if (!upnpMapResult) {
           throw new Error('Failed to create map UPNP port');
         }
@@ -895,12 +535,8 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
         await fluxNetworkHelper.deleteAllowPortRule(portToTest);
       }
       if (isUPNP) {
-        const caps = upnpService.getRouterCapabilities();
-        if (!caps.supportsLeaseDuration) {
-          // eslint-disable-next-line no-await-in-loop
-          await upnpService.removeMapUpnpPort(portToTest);
-        }
-        // If router supports lease duration, test mapping auto-expires — skip explicit delete
+        // eslint-disable-next-line no-await-in-loop
+        await upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
       }
     }
     // Close all test servers and wait for them to finish
@@ -926,11 +562,8 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
         await fluxNetworkHelper.deleteAllowPortRule(portToTest).catch((e) => log.error(e));
       }
       if (isUPNP) {
-        const caps = upnpService.getRouterCapabilities();
-        if (!caps.supportsLeaseDuration) {
-          // eslint-disable-next-line no-await-in-loop
-          await upnpService.removeMapUpnpPort(portToTest).catch((e) => log.error(e));
-        }
+        // eslint-disable-next-line no-await-in-loop
+        await upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`).catch((e) => log.error(e));
       }
     }
     // Close all test servers and wait for them to finish
@@ -979,7 +612,7 @@ async function callOtherNodeToKeepUpnpPortsOpen() {
       callOtherNodeToKeepUpnpPortsOpen();
       return;
     }
-    if (fluxCaching.failedPeersCache.has(randomSocketAddress)) {
+    if (failedNodesTestPortsCache.has(askingIP)) {
       callOtherNodeToKeepUpnpPortsOpen();
       return;
     }
@@ -1058,13 +691,14 @@ module.exports = {
   assignedPortsInstalledApps,
   assignedPortsGlobalApps,
   ensureApplicationPortsNotUsed,
+  restoreFluxPortsSupport,
+  restoreAppsPortsSupport,
   restorePortsSupport,
-  startPortsSupportLoop,
   getAllUsedPorts,
   isPortAvailable,
   findNextAvailablePort,
   signCheckAppData,
-  checkPortMapping,
   checkInstallingAppPortAvailable,
   callOtherNodeToKeepUpnpPortsOpen,
+  failedNodesTestPortsCache,
 };
