@@ -42,7 +42,7 @@ async function checkAndSyncAppHashes() {
       },
     };
     const results = await dbHelper.findInDatabase(database, appsHashesCollection, query, projection);
-    const numberOfMissingApps = results.filter((app) => app.message === false).length;
+    const numberOfMissingApps = results.filter((app) => app.message === false && app.rejected !== true).length;
     if (numberOfMissingApps > results.length * 0.95) {
       let finished = false;
       let i = 0;
@@ -108,7 +108,7 @@ async function checkAndSyncAppHashes() {
               cleanMessage.zelAppSpecifications = appMessage.zelAppSpecifications;
             }
             // eslint-disable-next-line no-await-in-loop
-            await messageStore.storeAppTemporaryMessage(cleanMessage, { isHistoricSync: true });
+            await messageStore.storeAppTemporaryMessage(cleanMessage);
             // eslint-disable-next-line no-await-in-loop
             await messageVerifier.checkAndRequestApp(appMessage.hash, appMessage.txid, appMessage.height, appMessage.valueSat, 2);
             // eslint-disable-next-line no-await-in-loop
@@ -186,8 +186,8 @@ async function continuousFluxAppHashesCheck(force = false) {
     }
     const explorerHeight = serviceHelper.ensureNumber(scanHeight.generalScannedHeight);
 
-    // get flux app hashes that do not have a message;
-    const query = { message: false };
+    // get flux app hashes that do not have a message (excluding rejected ones);
+    const query = { message: false, rejected: { $ne: true } };
     const projection = {
       projection: {
         _id: 0,
