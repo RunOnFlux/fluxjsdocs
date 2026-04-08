@@ -1313,9 +1313,17 @@ async function reconstructAppMessagesHashCollection() {
 
       const permanentMessageFound = permanentMessages.find((message) => message.hash === appHash.hash);
 
-      const update = { $set: { message: !!permanentMessageFound, messageNotFound: false } };
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, options);
+      if (permanentMessageFound) {
+        // update that we have the message
+        const update = { $set: { message: true, messageNotFound: false } };
+        // eslint-disable-next-line no-await-in-loop
+        await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, options);
+      } else {
+        // update that we do not have the message
+        const update = { $set: { message: false, messageNotFound: false } };
+        // eslint-disable-next-line no-await-in-loop
+        await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, options);
+      }
     }
 
     return 'Reconstruct success';
