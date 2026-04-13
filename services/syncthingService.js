@@ -2293,11 +2293,10 @@ async function adjustSyncthing() {
       listenAddresses: [`tcp://:${myPort}`, `quic://:${myPort}`],
     };
     const newConfigDefaultFolders = {
-      syncOwnership: false,
-      sendOwnership: false,
+      syncOwnership: true,
+      sendOwnership: true,
       syncXattrs: true,
       sendXattrs: true,
-      ignorePerms: true,
       maxConflicts: 0,
     };
     if (currentConfigOptions.status === 'success') {
@@ -2313,28 +2312,17 @@ async function adjustSyncthing() {
       if (currentDefaultsFolderOptions.data.syncOwnership !== newConfigDefaultFolders.syncOwnership
         || currentDefaultsFolderOptions.data.sendOwnership !== newConfigDefaultFolders.sendOwnership
         || currentDefaultsFolderOptions.data.syncXattrs !== newConfigDefaultFolders.syncXattrs
-        || currentDefaultsFolderOptions.data.sendXattrs !== newConfigDefaultFolders.sendXattrs
-        || currentDefaultsFolderOptions.data.ignorePerms !== newConfigDefaultFolders.ignorePerms) {
+        || currentDefaultsFolderOptions.data.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
         // patch our defaults folder config
         await adjustConfigDefaultsFolder('patch', newConfigDefaultFolders);
       }
     }
-    // patch existing folders that still have old ownership/permission settings
-    // this ensures folders created before the defaults change also get updated
+    // remove default folder
     const allFolders = await getConfigFolders();
     if (allFolders.status === 'success') {
       const defaultFolderExists = allFolders.data.find((syncthingFolder) => syncthingFolder.id === 'default');
       if (defaultFolderExists) {
         await adjustConfigFolders('delete', undefined, 'default');
-      }
-      // eslint-disable-next-line no-restricted-syntax
-      for (const folder of allFolders.data) {
-        if (folder.id === 'default') continue; // eslint-disable-line no-continue
-        if (folder.syncOwnership !== false || folder.sendOwnership !== false || folder.ignorePerms !== true) {
-          log.info(`Patching folder ${folder.id} to disable ownership sync and ignore permissions`);
-          // eslint-disable-next-line no-await-in-loop
-          await adjustConfigFolders('patch', { syncOwnership: false, sendOwnership: false, ignorePerms: true }, folder.id);
-        }
       }
     }
     // enable gui debugging for development nodes only

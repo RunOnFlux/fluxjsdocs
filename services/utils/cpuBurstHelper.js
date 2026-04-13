@@ -73,7 +73,6 @@ async function isCpuBurstSupported() {
  * @returns {Promise<string|null>} Path to cpu.max.burst, or null if not resolvable
  */
 async function getCgroupBurstPath(pid) {
-  if (!pid) return null;
   try {
     const data = await fsp.readFile(`/proc/${pid}/cgroup`, 'utf8');
     // cgroup v2 format: a single line "0::<path>"
