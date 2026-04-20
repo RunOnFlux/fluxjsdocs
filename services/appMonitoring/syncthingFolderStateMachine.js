@@ -6,7 +6,6 @@ const dockerService = require('../dockerService');
 const syncthingService = require('../syncthingService');
 const serviceHelper = require('../serviceHelper');
 const { appsFolder } = require('../utils/appConstants');
-const appTamperingDetectionService = require('../appTamperingDetectionService');
 const {
   MAX_SYNC_WAIT_EXECUTIONS,
   STALLED_SYNC_CHECK_COUNT,
@@ -82,7 +81,6 @@ async function verifyFolderMountSafety(appId, folderPath) {
       result.isSafe = false;
       result.reason = 'base_directory_missing';
       log.warn(`verifyFolderMountSafety - ${appId} base directory does not exist: ${baseDir}`);
-      await appTamperingDetectionService.recordEvent(appId, 'mount_vanished', `Base directory missing: ${baseDir}`);
       return result;
     }
 
