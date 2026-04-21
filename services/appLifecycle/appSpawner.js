@@ -17,6 +17,7 @@ const portManager = require('../appNetwork/portManager');
 const appUtilities = require('../utils/appUtilities');
 const systemIntegration = require('../appSystem/systemIntegration');
 const globalState = require('../utils/globalState');
+const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { FluxCacheManager } = require('../utils/cacheManager');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 
@@ -46,8 +47,17 @@ function initialize(deps) {
  * @returns {Promise<void>}
  */
 async function trySpawningGlobalApplication() {
-  let shortDelayTime = 5 * 60 * 1000; // Default 5 minutes
-  let delayTime = 30 * 60 * 1000; // Default 30 minutes
+  // Identity is resolved once at boot by scheduleIdentityResolution() in
+  // serviceManager. Until that lands we defer the spawn attempt, mirroring
+  // the synced / isNodeConfirmed branches below — no exception-for-retry.
+  const isEnterprise = enterpriseNetwork.getCachedEnterpriseIdentity();
+  if (isEnterprise === null) {
+    log.info('Flux enterprise identity not yet resolved');
+    await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
+    trySpawningGlobalApplication();
+    return;
+  }
+  let { shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, 0);
   let appHash = null; // Declare outside try block to be accessible in catch
   try {
     // how do we continue with this function?
@@ -149,6 +159,7 @@ async function trySpawningGlobalApplication() {
           hash: '$hash',
           version: '$version',
           enterprise: '$enterprise',
+          owner: '$owner',
         },
       },
       { $sort: { name: 1 } },
@@ -211,9 +222,10 @@ async function trySpawningGlobalApplication() {
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('a!c')).length === 0 || !app.geolocation.find((loc) => loc.startsWith('a!c') && `a!c${myNodeLocation}`.startsWith(loc.replace('_NONE', '')))));
       // filter apps that dont have geolocation or have and match my node geolocation
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('ac')).length === 0 || app.geolocation.find((loc) => loc.startsWith('ac') && `ac${myNodeLocation}`.startsWith(loc))));
+      globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
 
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
-      shortDelayTime = appsCountAvailableToInstallOnMyNode > 1 ? 60 * 1000 : 5 * 60 * 1000;
+      ({ shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, appsCountAvailableToInstallOnMyNode));
 
       if (globalAppNamesLocation.length === 0) {
         log.info('trySpawningGlobalApplication - No app currently to be processed');
@@ -252,10 +264,6 @@ async function trySpawningGlobalApplication() {
         return;
       }
     }
-
-    // If there are multiple apps to process, use shorter delays
-    delayTime = appsCountAvailableToInstallOnMyNode > 1 ? 60 * 1000 : 30 * 60 * 1000;
-    shortDelayTime = appsCountAvailableToInstallOnMyNode > 1 ? 60 * 1000 : 5 * 60 * 1000;
 
     globalState.trySpawningGlobalAppCache.set(appHash, '');
     log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
@@ -347,6 +355,10 @@ async function trySpawningGlobalApplication() {
 
     // verify requirements
     await hwRequirements.checkAppRequirements(appSpecifications);
+    // enterprise network nodes: reserve >4 vCores of burst headroom (automatic CPU burst)
+    if (isEnterprise) {
+      await hwRequirements.checkAppCpuBurstHeadroom(appSpecifications);
+    }
 
     // ensure ports unused
     // Get apps running specifically on this IP
@@ -452,7 +464,23 @@ async function trySpawningGlobalApplication() {
       }
     }
 
-    if (!appFromAppsToBeCheckedLater && !appFromAppsSyncthingToBeCheckedLater) {
+    if (!appFromAppsToBeCheckedLater && !appFromAppsSyncthingToBeCheckedLater
+      && appToRunAux.nodes.length > 0 && !appToRunAux.nodes.find((ip) => ip === myIP)) {
+      const appToCheck = {
+        timeToCheck: appToRunAux.enterprise ? Date.now() + 0.5 * 60 * 60 * 1000 : Date.now() + 0.95 * 60 * 60 * 1000,
+        appName: appToRun,
+        hash: appHash,
+        required: minInstances,
+      };
+      log.info(`trySpawningGlobalApplication - App ${appToRun} specs have target ips, will check in around 0.5h if instances are still missing`);
+      globalState.appsToBeCheckedLater.push(appToCheck);
+      globalState.trySpawningGlobalAppCache.delete(appHash);
+      await serviceHelper.delay(shortDelayTime);
+      trySpawningGlobalApplication();
+      return;
+    }
+
+    if (!isEnterprise && !appFromAppsToBeCheckedLater && !appFromAppsSyncthingToBeCheckedLater) {
       const tier = await generalService.nodeTier();
       const appHWrequirements = hwRequirements.totalAppHWRequirements(appSpecifications, tier);
       let delay = false;
@@ -490,20 +518,9 @@ async function trySpawningGlobalApplication() {
         globalState.appsToBeCheckedLater.push(appToCheck);
         globalState.trySpawningGlobalAppCache.delete(appHash);
         delay = true;
-      } else if (appToRunAux.nodes.length > 0 && !appToRunAux.nodes.find((ip) => ip === myIP)) {
-        const appToCheck = {
-          timeToCheck: appToRunAux.enterprise ? Date.now() + 0.5 * 60 * 60 * 1000 : Date.now() + 0.95 * 60 * 60 * 1000,
-          appName: appToRun,
-          hash: appHash,
-          required: minInstances,
-        };
-        log.info(`trySpawningGlobalApplication - App ${appToRun} specs have target ips, will check in around 0.5h if instances are still missing`);
-        globalState.appsToBeCheckedLater.push(appToCheck);
-        globalState.trySpawningGlobalAppCache.delete(appHash);
-        delay = true;
       } else if (appToRunAux.nodes.length > 0 && appToRunAux.nodes.find((ip) => ip === myIP)) {
         log.info(`trySpawningGlobalApplication - App ${appToRun} specs have this node as target ip`);
-      }else if (appToRunAux.nodes.length === 0 && tier === 'bamf' && appHWrequirements.cpu < 3 && appHWrequirements.ram < 6000 && appHWrequirements.hdd < 150) {
+      } else if (appToRunAux.nodes.length === 0 && tier === 'bamf' && appHWrequirements.cpu < 3 && appHWrequirements.ram < 6000 && appHWrequirements.hdd < 150) {
         const appToCheck = {
           timeToCheck: appToRunAux.enterprise ? Date.now() + 0.5 * 60 * 60 * 1000 : Date.now() + 1.95 * 60 * 60 * 1000,
           appName: appToRun,
@@ -697,7 +714,9 @@ async function trySpawningGlobalApplication() {
       }
     }
 
-    await serviceHelper.delay(delayTime);
+    if (!isEnterprise) {
+      await serviceHelper.delay(delayTime);
+    }
     log.info('trySpawningGlobalApplication - Reinitiating possible app installation');
     trySpawningGlobalApplication();
   } catch (error) {
