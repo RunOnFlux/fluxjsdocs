@@ -8,7 +8,6 @@ const { localAppsInformation, appsFolder } = require('../utils/appConstants');
 const dockerService = require('../dockerService');
 const appUninstaller = require('./appUninstaller');
 const { isPathMounted } = require('../appMonitoring/syncthingFolderStateMachine');
-const appTamperingDetectionService = require('../appTamperingDetectionService');
 
 const crontabLoad = util.promisify(systemcrontab.load);
 const cmdAsync = util.promisify(nodecmd.run);
@@ -243,13 +242,6 @@ async function cleanupCrontabAndMounts() {
 
     if (!jobs || jobs.length === 0) {
       log.info('cleanupCrontabAndMounts - No crontab jobs found');
-      if (installedAppIds.size > 0) {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appId of installedAppIds) {
-          // eslint-disable-next-line no-await-in-loop
-          await appTamperingDetectionService.recordEvent(appId, 'crontab_wiped', `Crontab empty despite ${installedAppIds.size} installed apps`);
-        }
-      }
       return results;
     }
 
@@ -367,8 +359,6 @@ async function cleanupCrontabAndMounts() {
       const mountResult = await ensureAppMounted(appId, volumeFile, mountPoint);
       if (mountResult.error) {
         results.mounts.failed.push({ appId, error: mountResult.error });
-        // eslint-disable-next-line no-await-in-loop
-        await appTamperingDetectionService.recordEvent(appId, 'mount_vanished', `Mount failed during crontab cleanup: ${mountResult.error}`);
       } else if (mountResult.mounted) {
         // Check if we actually mounted it or it was already mounted
         const wasMounted = await isPathMounted(mountPoint);
