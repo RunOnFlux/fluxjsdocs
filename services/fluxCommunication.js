@@ -67,13 +67,31 @@ async function handleAppMessages(message, fromIP, port) {
   }
 }
 
-/**
- * To handle check if message hash is present, if node doesn't have that message hash will send to the client a message requesting for the message.
- * @param {string} messageHash Message hash.
- * @param {string} fromIP Sender's IP address.
- * @param {string} port Sender's node Api port.
- * @param {boolean} outgoingConnection says if ip/port is from incoming or outgoing connections.
- */
+async function handleTempSyncResponse(message) {
+  try {
+    if (!message.data || message.data.type !== 'fluxapptempsync') return;
+    const { messages } = message.data;
+    if (!Array.isArray(messages)) return;
+    log.info(`handleTempSyncResponse - Received ${messages.length} temp messages`);
+    const toProcess = messages.slice(0, 500);
+    if (messages.length > 500) {
+      log.warn(`handleTempSyncResponse - Capped from ${messages.length} to 500`);
+    }
+    let stored = 0;
+    for (const msg of toProcess) {
+      try {
+        const result = await messageStore.storeAppTemporaryMessage(msg, { furtherVerification: true });
+        if (result === true || result === false) stored += 1;
+      } catch (err) {
+        log.error(`Temp sync message failed: ${err.message}`);
+      }
+    }
+    log.info(`handleTempSyncResponse - Processed ${stored} of ${toProcess.length} messages`);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
 async function handleCheckMessageHashPresent(messageHash, fromIP, port) {
   try {
     if (!messageCache.has(messageHash)) {
@@ -396,6 +414,8 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
           setImmediate(() => handleAppInstallingErrorMessage(msgObj, peerSocket.ip, peerSocket.port));
         } else if (msgObj.data.type === 'fluxnodesigterm') {
           setImmediate(() => handleNodeSigtermMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxapptempsync') {
+          setImmediate(() => handleTempSyncResponse(msgObj));
         } else {
           log.warn(`Unrecognised message type of ${msgObj.data.type}`);
         }
@@ -446,6 +466,13 @@ peerManager.hashHandlers = {
     const counter = peer.msgMap.get('requestHash');
     peer.msgMap.set('requestHash', counter + 1);
     setImmediate(() => handleRequestMessageHash(hexHash, peer.ip, peer.port));
+  },
+  handleTempMessagesRequest: (peer) => {
+    const now = Date.now();
+    const last = peer.lastTempSyncResponse || 0;
+    if (now - last < 5 * 60 * 1000) return;
+    peer.lastTempSyncResponse = now;
+    setImmediate(() => fluxCommunicationMessagesSender.respondWithTempMessages(peer));
   },
 };
 
@@ -604,6 +631,7 @@ function onOutboundOpen() {
     remoteCapabilities: meta.remoteCapabilities,
     remoteClockOffsetMs: meta.remoteClockOffsetMs,
     remoteVersion: meta.remoteVersion,
+    remoteFluxUptime: meta.remoteFluxUptime,
   });
 }
 
@@ -619,6 +647,9 @@ function onOutboundUpgrade(response) {
   }
   if (response.headers['x-flux-version']) {
     meta.remoteVersion = response.headers['x-flux-version'];
+  }
+  if (response.headers['x-flux-uptime']) {
+    meta.remoteFluxUptime = Number(response.headers['x-flux-uptime']);
   }
 }
 
@@ -664,8 +695,9 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
       // should not be compressed if context takeover is disabled.
       },
       headers: {
-        'X-Flux-Capabilities': 'transmissionTimestamps,peerExchange,binaryMessages',
+        'X-Flux-Capabilities': 'transmissionTimestamps,peerExchange,binaryMessages,tempMessageSync',
         'X-Flux-Version': FLUX_VERSION,
+        'X-Flux-Uptime': String(Math.floor(process.uptime())),
       },
     };
     const offsetMs = fluxNetworkHelper.getLocalClockOffsetMs();
