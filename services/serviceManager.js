@@ -25,9 +25,9 @@ const peerNotification = require('./appMessaging/peerNotification');
 const syncthingMonitor = require('./appMonitoring/syncthingMonitor');
 const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
+const appHashSyncService = require('./appMessaging/appHashSyncService');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
-const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
 const stoppedAppsRecovery = require('./appLifecycle/stoppedAppsRecovery');
@@ -191,41 +191,31 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.version': 1 }, { name: 'query for getting app message based on version' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.nodes': 1 }, { name: 'query for getting app message based on nodes' });
-    // TTL is driven by expireAt (set per-document by store functions). Migrate from old broadcastedAt-based TTL.
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    // more than 2 hours and 5m. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 7500 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ name: 1 }, { name: 'query for getting zelapp location based on zelapp specs name' });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ ip: 1, name: 1 });
     log.info('Flux Apps locations prepared');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).createIndex({ broadcastedAt: 1 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).dropIndex('ip_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).createIndex({ ip: 1, 'data.name': 1 }, { unique: true });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsRunningBroadcasts).createIndex({ 'data.apps.name': 1 }, { name: 'query for app location from v2 broadcasts' });
-    log.info('Signed apprunning broadcasts collection prepared');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ broadcastedAt: 1 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ 'data.name': 1, 'data.ip': 1 }, { unique: true });
-    log.info('Signed appinstalling broadcasts collection prepared');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    // we just keep installing messages for 15 minutes
+    // Update existing TTL index if it exists (for nodes that already have it created with old value)
+    await databaseTemp.command({
+      collMod: config.database.appsglobal.collections.appsInstallingLocations,
+      index: {
+        keyPattern: { broadcastedAt: 1 },
+        expireAfterSeconds: 900,
+      },
+    }).catch(() => {}); // Ignore error if index doesn't exist yet
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: 900 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ name: 1 }, { name: 'query for getting flux app install location based on specs name' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting flux app install location based on specs name and node ip' });
     log.info('Flux Apps installing locations prepared');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('cachedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    // we keep installing error messages for 60 minutes
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ cachedAt: 1 }, { expireAfterSeconds: 3600 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1 }, { name: 'query for getting flux app install errors location based on specs name' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1, ip: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash and node ip' });
-    log.info('App installing errors locations prepared');
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ broadcastedAt: 1 });
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ 'data.name': 1, 'data.hash': 1, 'data.ip': 1 }, { unique: true });
-    log.info('Signed app installing errors broadcasts collection prepared');
+    log.info('Clearing app installing errors from previous sessions...');
+    await dbHelper.removeDocumentsFromCollection(databaseTemp, config.database.appsglobal.collections.appsInstallingErrorsLocations, {});
+    log.info('App installing errors cleared');
 
     // This fixes an issue where the appsMessage db has NaN for valueSat. Once db is repaired on all nodes,
     // we can remove this.
@@ -273,16 +263,8 @@ async function startFluxFunctions() {
 
     log.info('Flux Apps installing locations prepared');
 
-    // Initialize app sync orchestrator and spawner
-    const { peerManager } = require('./utils/peerState');
-    const orchestrator = new AppSyncOrchestrator({
-      blockEmitter: explorerService.getBlockEmitter(),
-      peerManager,
-      isEnterprise: () => enterpriseNetwork.getCachedEnterpriseIdentity(),
-    });
-    appSpawner.initialize({ appInstaller, appUninstaller, orchestrator });
-    appInstaller.setOnInstallComplete(() => peerNotification.checkAndNotifyPeersOfRunningApps());
-    fluxCommunication.setOnSyncComplete((syncType) => orchestrator.onSyncComplete(syncType));
+    // Initialize appSpawner with dependencies to avoid circular dependency
+    appSpawner.initialize({ appInstaller, appUninstaller });
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
@@ -491,6 +473,34 @@ async function startFluxFunctions() {
       nodeStatusMonitor.monitorNodeStatus(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, 1.5 * 60 * 1000);
     setTimeout(() => {
+      peerNotification.checkAndNotifyPeersOfRunningApps(
+        appQueryService.installedApps,
+        appQueryService.listRunningApps,
+        globalState.appsMonitored,
+        globalState.removalInProgress,
+        globalState.installationInProgress,
+        globalState.softRedeployInProgress,
+        globalState.hardRedeployInProgress,
+        globalState.reinstallationOfOldAppsInProgress,
+        () => globalState,
+        cacheManager,
+      ); // first broadcast after 1m of starting fluxos
+      setInterval(() => { // every 60 mins messages stay on db for 65m
+        peerNotification.checkAndNotifyPeersOfRunningApps(
+          appQueryService.installedApps,
+          appQueryService.listRunningApps,
+          globalState.appsMonitored,
+          globalState.removalInProgress,
+          globalState.installationInProgress,
+          globalState.softRedeployInProgress,
+          globalState.hardRedeployInProgress,
+          globalState.reinstallationOfOldAppsInProgress,
+          () => globalState,
+          cacheManager,
+        );
+      }, 60 * 60 * 1000);
+    }, 1 * 60 * 1000);
+    setTimeout(() => {
       syncthingMonitor.syncthingApps(
         globalState,
         appQueryService.installedApps,
@@ -515,9 +525,36 @@ async function startFluxFunctions() {
         appInspector.monitorSharedDBApps(appQueryService.installedApps, appUninstaller.removeAppLocally, globalState); // Monitor SharedDB Apps.
       }, 60 * 1000);
     }, 3 * 60 * 1000);
-    // Hash sync and spawner startup are now managed by the AppSyncOrchestrator (event-driven)
-    orchestrator.start();
-    log.info('AppSyncOrchestrator started');
+    setTimeout(() => {
+      setInterval(() => { // every 30 mins (15 blocks)
+        appHashSyncService.continuousFluxAppHashesCheck();
+      }, 30 * 60 * 1000);
+      appHashSyncService.continuousFluxAppHashesCheck();
+    }, (Math.floor(Math.random() * (30 - 15 + 1)) + 15) * 60 * 1000); // start between 15m and 30m after fluxOs start
+    setTimeout(async () => {
+      // Enterprise-network nodes (pubkey in enterpriseNodesPublicKeys) start
+      // spawning at T+62m. Every other node keeps the legacy 125-135m window,
+      // which gives enough time to receive apprunning messages at least twice.
+      let isEnterprise = enterpriseNetwork.getCachedEnterpriseIdentity();
+      if (isEnterprise === null) {
+        try {
+          isEnterprise = await enterpriseNetwork.isEnterpriseNode();
+        } catch (err) {
+          log.warn(`Enterprise identity unresolved at spawn-gate, treating as non-enterprise: ${err.message || err}`);
+          isEnterprise = false;
+        }
+      }
+      if (isEnterprise) {
+        log.info('Starting to spawn applications (enterprise, 62m)');
+        appSpawner.trySpawningGlobalApplication();
+        return;
+      }
+      const remainingMs = (Math.floor(Math.random() * (135 - 125 + 1)) + 125 - 62) * 60 * 1000;
+      setTimeout(() => {
+        log.info('Starting to spawn applications');
+        appSpawner.trySpawningGlobalApplication();
+      }, remainingMs);
+    }, 62 * 60 * 1000);
     setInterval(() => {
       imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, 60 * 60 * 1000); //  every hour

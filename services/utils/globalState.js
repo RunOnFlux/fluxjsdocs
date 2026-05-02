@@ -20,7 +20,6 @@ let appsMonitored = {};
 let fluxNodeWasNotConfirmedOnLastCheck = false;
 let firstExecutionAfterItsSynced = true;
 let fluxNodeWasAlreadyConfirmed = false;
-let spawnerPaused = false;
 
 // Cache and delay lists
 const appsToBeCheckedLater = [];
@@ -92,9 +91,6 @@ module.exports = {
 
   get fluxNodeWasAlreadyConfirmed() { return fluxNodeWasAlreadyConfirmed; },
   set fluxNodeWasAlreadyConfirmed(value) { fluxNodeWasAlreadyConfirmed = value; },
-
-  get spawnerPaused() { return spawnerPaused; },
-  set spawnerPaused(value) { spawnerPaused = value; },
 
   get appsToBeCheckedLater() { return appsToBeCheckedLater; },
   get appsSyncthingToBeCheckedLater() { return appsSyncthingToBeCheckedLater; },

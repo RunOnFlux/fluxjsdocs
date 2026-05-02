@@ -13,10 +13,8 @@ const {
   localAppsInformation,
   globalAppsMessages,
   globalAppsLocations,
-  globalAppsRunningBroadcasts,
   globalAppsInstallingLocations,
   globalAppsInstallingErrorsLocations,
-  globalAppsInstallingErrorsBroadcasts,
   appsHashesCollection,
   scannedHeightCollection,
 } = require('../utils/appConstants');
@@ -88,76 +86,6 @@ async function appLocation(appname) {
   return results;
 }
 
-async function appLocationFromBroadcasts(appname) {
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  const collection = database.collection(globalAppsRunningBroadcasts);
-
-  const nameMatch = appname ? new RegExp(`^${appname}$`, 'i') : null;
-
-  const pipeline = [
-    {
-      $facet: {
-        v2: [
-          { $match: { 'data.apps': { $exists: true } } },
-          { $unwind: '$data.apps' },
-          {
-            $project: {
-              _id: 0,
-              name: '$data.apps.name',
-              hash: '$data.apps.hash',
-              ip: '$data.ip',
-              broadcastedAt: '$broadcastedAt',
-              runningSince: { $ifNull: ['$data.apps.runningSince', '$data.runningSince'] },
-              osUptime: '$data.osUptime',
-              staticIp: '$data.staticIp',
-            },
-          },
-        ],
-        v1: [
-          { $match: { 'data.name': { $exists: true } } },
-          {
-            $project: {
-              _id: 0,
-              name: '$data.name',
-              hash: '$data.hash',
-              ip: '$data.ip',
-              broadcastedAt: '$broadcastedAt',
-              runningSince: '$data.runningSince',
-              osUptime: '$data.osUptime',
-              staticIp: '$data.staticIp',
-            },
-          },
-        ],
-      },
-    },
-    { $project: { all: { $concatArrays: ['$v2', '$v1'] } } },
-    { $unwind: '$all' },
-    { $replaceRoot: { newRoot: '$all' } },
-    { $sort: { broadcastedAt: -1 } },
-    {
-      $group: {
-        _id: { name: '$name', ip: '$ip' },
-        name: { $first: '$name' },
-        hash: { $first: '$hash' },
-        ip: { $first: '$ip' },
-        broadcastedAt: { $first: '$broadcastedAt' },
-        runningSince: { $first: '$runningSince' },
-        osUptime: { $first: '$osUptime' },
-        staticIp: { $first: '$staticIp' },
-      },
-    },
-    { $project: { _id: 0 } },
-  ];
-
-  if (nameMatch) {
-    pipeline.push({ $match: { name: nameMatch } });
-  }
-
-  const results = await collection.aggregate(pipeline).toArray();
-  return results;
-}
-
 /**
  * Get app installing locations
  * @param {string} appname - Optional app name filter
@@ -188,12 +116,6 @@ async function appInstallingLocation(appname) {
  * @param {string} appname - Application name (optional)
  * @returns {Promise<Array>} Array of app installing error locations
  */
-async function countAppInstallingErrors(hash) {
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  return dbHelper.countInDatabase(database, globalAppsInstallingErrorsLocations, { hash });
-}
-
 async function appInstallingErrorsLocation(appname) {
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
@@ -209,6 +131,8 @@ async function appInstallingErrorsLocation(appname) {
       ip: 1,
       error: 1,
       broadcastedAt: 1,
+      cachedAt: 1,
+      expireAt: 1,
     },
   };
   const results = await dbHelper.findInDatabase(database, globalAppsInstallingErrorsLocations, query, projection);
@@ -1210,8 +1134,6 @@ async function expireGlobalApplications() {
       const queryDeleteAppErrors = { name: app.name };
       // eslint-disable-next-line no-await-in-loop
       await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsBroadcasts, { 'data.name': app.name });
     }
 
     // get list of locally installed apps.
@@ -1310,7 +1232,6 @@ async function updateAppSpecifications(appSpecs) {
     }
     const queryDeleteAppErrors = { name: appSpecs.name };
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
   } catch (error) {
     // retry
     log.error(error);
@@ -1360,6 +1281,7 @@ async function reindexGlobalAppsInformation() {
       appsLocalDb,
       globalAppsMessages,
       globalAppsInformation,
+      globalAppsInstallingErrorsLocations,
       localAppsInformation,
       scannedHeight,
     );
@@ -1792,10 +1714,8 @@ async function rescanGlobalAppsInformationAPI(req, res) {
 module.exports = {
   getAppHashes,
   appLocation,
-  appLocationFromBroadcasts,
   appInstallingLocation,
   appInstallingErrorsLocation,
-  countAppInstallingErrors,
   storeAppInstallingMessage,
   getAppsLocations,
   getAppsLocation,
