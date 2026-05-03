@@ -15,8 +15,13 @@ const dbHelper = require('./dbHelper');
 const { peerManager, PEER_SOURCE } = require('./utils/peerState');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
-
 const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
+const appsRunningBroadcasts = config.database.appsglobal.collections.appsRunningBroadcasts;
+
+let onSyncComplete = null;
+function setOnSyncComplete(callback) {
+  onSyncComplete = callback;
+}
 
 const { messageCache, wsPeerCache } = cacheManager;
 
@@ -28,7 +33,7 @@ const { messageCache, wsPeerCache } = cacheManager;
 
 const testListCache = new LRUCache(LRUTest); */
 
-const { FluxPeerManager, DIRECTION, FLUX_VERSION } = require('./utils/FluxPeerManager');
+const { FluxPeerManager, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES } = require('./utils/FluxPeerManager');
 const { NAK_REASON } = require('./utils/peerCodec');
 const { networkHealthMonitor } = require('./utils/NetworkHealthMonitor');
 
@@ -67,13 +72,123 @@ async function handleAppMessages(message, fromIP, port) {
   }
 }
 
-/**
- * To handle check if message hash is present, if node doesn't have that message hash will send to the client a message requesting for the message.
- * @param {string} messageHash Message hash.
- * @param {string} fromIP Sender's IP address.
- * @param {string} port Sender's node Api port.
- * @param {boolean} outgoingConnection says if ip/port is from incoming or outgoing connections.
- */
+async function handleTempSyncResponse(message) {
+  try {
+    if (!message.data || message.data.type !== 'fluxapptempsync') return;
+    const { messages, done } = message.data;
+    if (!Array.isArray(messages)) return;
+    log.info(`handleTempSyncResponse - Received ${messages.length} temp messages (done: ${!!done})`);
+    let stored = 0;
+    for (const msg of messages) {
+      try {
+        const result = await messageStore.storeAppTemporaryMessage(msg, { furtherVerification: true });
+        if (result === true || result === false) stored += 1;
+      } catch (err) {
+        log.error(`Temp sync message failed: ${err.message}`);
+      }
+    }
+    log.info(`handleTempSyncResponse - Processed ${stored} of ${messages.length} messages`);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function handleAppRunningSyncResponse(message) {
+  try {
+    if (!message.data || message.data.type !== 'fluxapprunningsync') return;
+    const { messages, done } = message.data;
+    if (!Array.isArray(messages)) return;
+    log.info(`handleAppRunningSyncResponse - Received ${messages.length} broadcasts (done: ${!!done})`);
+    const verified = [];
+    for (const broadcast of messages) {
+      try {
+        const result = await fluxCommunicationUtils.verifyFluxBroadcast(broadcast);
+        if (result === fluxCommunicationUtils.VerifyResult.OK) {
+          verified.push(broadcast);
+        } else {
+          log.warn(`handleAppRunningSyncResponse - Broadcast from ${broadcast.data?.ip} failed verification: ${result}`);
+        }
+      } catch (err) {
+        log.error(`handleAppRunningSyncResponse - Verification error: ${err.message}`);
+      }
+    }
+    if (verified.length > 0) {
+      const { stored } = await messageStore.storeBatchAppRunningMessages(verified);
+      log.info(`handleAppRunningSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
+    }
+    if (done) {
+      if (onSyncComplete) onSyncComplete('apprunning');
+      log.info('handleAppRunningSyncResponse - Sync complete');
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function handleAppInstallingSyncResponse(message) {
+  try {
+    if (!message.data || message.data.type !== 'fluxappinstallingsync') return;
+    const { messages, done } = message.data;
+    if (!Array.isArray(messages)) return;
+    log.info(`handleAppInstallingSyncResponse - Received ${messages.length} broadcasts (done: ${!!done})`);
+    const verified = [];
+    for (const broadcast of messages) {
+      try {
+        const result = await fluxCommunicationUtils.verifyFluxBroadcast(broadcast);
+        if (result === fluxCommunicationUtils.VerifyResult.OK) {
+          verified.push(broadcast);
+        } else {
+          log.warn(`handleAppInstallingSyncResponse - Broadcast from ${broadcast.data?.ip} failed: ${result}`);
+        }
+      } catch (err) {
+        log.error(`handleAppInstallingSyncResponse - Verification error: ${err.message}`);
+      }
+    }
+    if (verified.length > 0) {
+      const { stored } = await messageStore.storeBatchAppInstallingMessages(verified);
+      log.info(`handleAppInstallingSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
+    }
+    if (done) {
+      if (onSyncComplete) onSyncComplete('appinstalling');
+      log.info('handleAppInstallingSyncResponse - Sync complete');
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function handleAppInstallingErrorsSyncResponse(message) {
+  try {
+    if (!message.data || message.data.type !== 'fluxappinstallingerrorssync') return;
+    const { messages, done } = message.data;
+    if (!Array.isArray(messages)) return;
+    log.info(`handleAppInstallingErrorsSyncResponse - Received ${messages.length} broadcasts (done: ${!!done})`);
+    const verified = [];
+    for (const broadcast of messages) {
+      try {
+        const result = await fluxCommunicationUtils.verifyFluxBroadcast(broadcast);
+        if (result === fluxCommunicationUtils.VerifyResult.OK) {
+          verified.push(broadcast);
+        } else {
+          log.warn(`handleAppInstallingErrorsSyncResponse - Broadcast from ${broadcast.data?.ip} failed: ${result}`);
+        }
+      } catch (err) {
+        log.error(`handleAppInstallingErrorsSyncResponse - Verification error: ${err.message}`);
+      }
+    }
+    if (verified.length > 0) {
+      const { stored } = await messageStore.storeBatchAppInstallingErrorMessages(verified);
+      log.info(`handleAppInstallingErrorsSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
+    }
+    if (done) {
+      if (onSyncComplete) onSyncComplete('apperrors');
+      log.info('handleAppInstallingErrorsSyncResponse - Sync complete');
+    }
+  } catch (error) {
+    log.error(error);
+  }
+}
+
 async function handleCheckMessageHashPresent(messageHash, fromIP, port) {
   try {
     if (!messageCache.has(messageHash)) {
@@ -116,13 +231,13 @@ async function handleRequestMessageHash(messageHash, fromIP, port) {
  */
 async function handleAppRunningMessage(message, fromIP, port) {
   try {
-    // check if we have it exactly like that in database and if not, update
-    // if not in database, rebroadcast to all connections
-    // do furtherVerification of message
-    const rebroadcastToPeers = await messageStore.storeAppRunningMessage(message.data);
+    const result = await messageStore.storeAppRunningMessage(message.data);
+    if (result.stored) {
+      messageStore.storeSignedAppRunningBroadcast(message);
+    }
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
-    if (rebroadcastToPeers === true && timestampOK) {
+    if (result.rebroadcast && timestampOK) {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       const daemonHeight = syncStatus.data.height || 0;
       if (daemonHeight >= config.messagesBroadcastRefactorStart) {
@@ -144,10 +259,8 @@ async function handleAppRunningMessage(message, fromIP, port) {
  */
 async function handleAppInstallingMessage(message, fromIP, port) {
   try {
-    // check if we have it exactly like that in database and if not, update
-    // if not in database, rebroadcast to all connections
-    // do furtherVerification of message
     const rebroadcastToPeers = await messageStore.storeAppInstallingMessage(message.data);
+    messageStore.storeSignedAppInstallingBroadcast(message);
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp);
     if (rebroadcastToPeers === true && timestampOK) {
@@ -172,10 +285,8 @@ async function handleAppInstallingMessage(message, fromIP, port) {
  */
 async function handleAppInstallingErrorMessage(message, fromIP, port) {
   try {
-    // check if we have it exactly like that in database and if not, update
-    // if not in database, rebroadcast to all connections
-    // do furtherVerification of message
     const rebroadcastToPeers = await messageStore.storeAppInstallingErrorMessage(message.data);
+    messageStore.storeSignedAppInstallingErrorBroadcast(message);
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp);
     if (rebroadcastToPeers === true && timestampOK) {
@@ -279,12 +390,10 @@ async function handleNodeSigtermMessage(message, fromIP, port) {
 
     log.info(`Found ${appsOnNode.length} apps for node ${ip}, updating expiration and rebroadcasting sigterm`);
 
-    // Update broadcastedAt to make records expire 7 minutes after the sigterm broadcastedAt
-    // TTL index is 7500 seconds, so set broadcastedAt = sigtermBroadcastedAt - (7500 - 420) seconds
-    const newBroadcastedAt = new Date(broadcastedAt - (7500 - 420) * 1000);
     const newExpireAt = new Date(broadcastedAt + (420 * 1000));
-    const update = { $set: { broadcastedAt: newBroadcastedAt, expireAt: newExpireAt } };
+    const update = { $set: { expireAt: newExpireAt } };
     await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
+    await dbHelper.updateInDatabase(database, appsRunningBroadcasts, query, update);
 
     // Rebroadcast to other peers
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
@@ -396,6 +505,14 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
           setImmediate(() => handleAppInstallingErrorMessage(msgObj, peerSocket.ip, peerSocket.port));
         } else if (msgObj.data.type === 'fluxnodesigterm') {
           setImmediate(() => handleNodeSigtermMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxapptempsync') {
+          setImmediate(() => handleTempSyncResponse(msgObj));
+        } else if (msgObj.data.type === 'fluxapprunningsync') {
+          setImmediate(() => handleAppRunningSyncResponse(msgObj));
+        } else if (msgObj.data.type === 'fluxappinstallingsync') {
+          setImmediate(() => handleAppInstallingSyncResponse(msgObj));
+        } else if (msgObj.data.type === 'fluxappinstallingerrorssync') {
+          setImmediate(() => handleAppInstallingErrorsSyncResponse(msgObj));
         } else {
           log.warn(`Unrecognised message type of ${msgObj.data.type}`);
         }
@@ -446,6 +563,34 @@ peerManager.hashHandlers = {
     const counter = peer.msgMap.get('requestHash');
     peer.msgMap.set('requestHash', counter + 1);
     setImmediate(() => handleRequestMessageHash(hexHash, peer.ip, peer.port));
+  },
+  handleTempMessagesRequest: (peer, sinceTimestamp) => {
+    const now = Date.now();
+    const last = peer.lastTempSyncResponse || 0;
+    if (now - last < 5 * 60 * 1000) return;
+    peer.lastTempSyncResponse = now;
+    setImmediate(() => fluxCommunicationMessagesSender.respondWithTempMessages(peer, sinceTimestamp));
+  },
+  handleAppRunningRequest: (peer, sinceTimestamp) => {
+    const now = Date.now();
+    const last = peer.lastAppRunningSyncResponse || 0;
+    if (now - last < 5 * 60 * 1000) return;
+    peer.lastAppRunningSyncResponse = now;
+    setImmediate(() => fluxCommunicationMessagesSender.respondWithAppRunningMessages(peer, sinceTimestamp));
+  },
+  handleAppInstallingRequest: (peer, sinceTimestamp) => {
+    const now = Date.now();
+    const last = peer.lastAppInstallingSyncResponse || 0;
+    if (now - last < 5 * 60 * 1000) return;
+    peer.lastAppInstallingSyncResponse = now;
+    setImmediate(() => fluxCommunicationMessagesSender.respondWithAppInstallingMessages(peer, sinceTimestamp));
+  },
+  handleAppInstallingErrorsRequest: (peer, sinceTimestamp) => {
+    const now = Date.now();
+    const last = peer.lastAppInstallingErrorsSyncResponse || 0;
+    if (now - last < 5 * 60 * 1000) return;
+    peer.lastAppInstallingErrorsSyncResponse = now;
+    setImmediate(() => fluxCommunicationMessagesSender.respondWithAppInstallingErrorsMessages(peer, sinceTimestamp));
   },
 };
 
@@ -604,6 +749,7 @@ function onOutboundOpen() {
     remoteCapabilities: meta.remoteCapabilities,
     remoteClockOffsetMs: meta.remoteClockOffsetMs,
     remoteVersion: meta.remoteVersion,
+    remoteFluxUptime: meta.remoteFluxUptime,
   });
 }
 
@@ -619,6 +765,9 @@ function onOutboundUpgrade(response) {
   }
   if (response.headers['x-flux-version']) {
     meta.remoteVersion = response.headers['x-flux-version'];
+  }
+  if (response.headers['x-flux-uptime']) {
+    meta.remoteFluxUptime = Number(response.headers['x-flux-uptime']);
   }
 }
 
@@ -664,8 +813,9 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
       // should not be compressed if context takeover is disabled.
       },
       headers: {
-        'X-Flux-Capabilities': 'transmissionTimestamps,peerExchange,binaryMessages',
+        'X-Flux-Capabilities': FLUX_CAPABILITIES.join(','),
         'X-Flux-Version': FLUX_VERSION,
+        'X-Flux-Uptime': String(Math.floor(process.uptime())),
       },
     };
     const offsetMs = fluxNetworkHelper.getLocalClockOffsetMs();
@@ -1176,4 +1326,5 @@ module.exports = {
   getPeerHistory,
   getTopology,
   getNetworkHealth,
+  setOnSyncComplete,
 };

@@ -9,6 +9,10 @@
  * Type 0x03 — nak                 [type:1][hash:20][reason:1]  = 22 bytes
  * Type 0x10 — peerExchange        [type:1][count:2][peer:6]... = 3 + count*6
  * Type 0x11 — peerUpdate          [type:1][addCnt:2][rmCnt:2][peer:6]... = 5 + total*6
+ * Type 0x20 — requestTempMessages  [type:1][sinceTs:8]          = 9 bytes
+ * Type 0x21 — requestAppRunning   [type:1][sinceTs:8]          = 9 bytes
+ * Type 0x22 — requestAppInstalling [type:1][sinceTs:8]         = 9 bytes
+ * Type 0x23 — requestAppInstallingErrors [type:1][sinceTs:8]  = 9 bytes
  */
 
 const MSG_TYPE = Object.freeze({
@@ -17,6 +21,10 @@ const MSG_TYPE = Object.freeze({
   NAK: 0x03,
   PEER_EXCHANGE: 0x10,
   PEER_UPDATE: 0x11,
+  REQUEST_TEMP_MESSAGES: 0x20,
+  REQUEST_APP_RUNNING: 0x21,
+  REQUEST_APP_INSTALLING: 0x22,
+  REQUEST_APP_INSTALLING_ERRORS: 0x23,
 });
 
 const NAK_REASON = Object.freeze({
@@ -188,6 +196,41 @@ function decodePeerUpdate(buf) {
   return { addOutbound, addInbound, rm };
 }
 
+// --- Sync Requests ---
+
+function encodeRequestTempMessages(sinceTimestamp = 0) {
+  const buf = Buffer.allocUnsafe(9);
+  buf[0] = MSG_TYPE.REQUEST_TEMP_MESSAGES;
+  buf.writeBigUInt64BE(BigInt(sinceTimestamp), 1);
+  return buf;
+}
+
+function encodeRequestAppRunning(sinceTimestamp = 0) {
+  const buf = Buffer.allocUnsafe(9);
+  buf[0] = MSG_TYPE.REQUEST_APP_RUNNING;
+  buf.writeBigUInt64BE(BigInt(sinceTimestamp), 1);
+  return buf;
+}
+
+function encodeRequestAppInstalling(sinceTimestamp = 0) {
+  const buf = Buffer.allocUnsafe(9);
+  buf[0] = MSG_TYPE.REQUEST_APP_INSTALLING;
+  buf.writeBigUInt64BE(BigInt(sinceTimestamp), 1);
+  return buf;
+}
+
+function encodeRequestAppInstallingErrors(sinceTimestamp = 0) {
+  const buf = Buffer.allocUnsafe(9);
+  buf[0] = MSG_TYPE.REQUEST_APP_INSTALLING_ERRORS;
+  buf.writeBigUInt64BE(BigInt(sinceTimestamp), 1);
+  return buf;
+}
+
+function decodeSyncTimestamp(buf) {
+  if (buf.length < 9) return 0;
+  return Number(buf.readBigUInt64BE(1));
+}
+
 module.exports = {
   MSG_TYPE,
   NAK_REASON,
@@ -203,4 +246,9 @@ module.exports = {
   decodePeerExchange,
   encodePeerUpdate,
   decodePeerUpdate,
+  encodeRequestTempMessages,
+  encodeRequestAppRunning,
+  encodeRequestAppInstalling,
+  encodeRequestAppInstallingErrors,
+  decodeSyncTimestamp,
 };

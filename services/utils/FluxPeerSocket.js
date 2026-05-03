@@ -84,6 +84,7 @@ class FluxPeerSocket {
     this.remoteCapabilities = new Set();
     this.remoteClockOffsetMs = null;
     this.remoteVersion = null;
+    this.remoteFluxUptime = null;
     this.source = PEER_SOURCE.INBOUND;
     this.msgMap = new Map([['requestHash', 0], ['newHash', 0]]);
     this.messagesReceived = 0;
@@ -338,4 +339,11 @@ class FluxPeerSocket {
   }
 }
 
-module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION };
+const FLUX_CAPABILITIES = Object.freeze([
+  'transmissionTimestamps',
+  'peerExchange',
+  'binaryMessages',
+  'appStateSync',
+]);
+
+module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES };

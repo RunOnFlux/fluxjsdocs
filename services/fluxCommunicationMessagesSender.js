@@ -1,9 +1,11 @@
 /* eslint-disable no-underscore-dangle */
+const config = require('config');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const verificationHelper = require('./verificationHelper');
 const messageHelper = require('./messageHelper');
+const dbHelper = require('./dbHelper');
 const { peerManager } = require('./utils/peerState');
 const cacheManager = require('./utils/cacheManager').default;
 
@@ -161,6 +163,7 @@ async function relay(data, excludeKey) {
 async function broadcastMessageToAll(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
   await relay(serialisedData);
+  return JSON.parse(serialisedData);
 }
 
 /**
@@ -310,10 +313,153 @@ async function broadcastTemporaryAppMessage(message) {
   await broadcastMessageToAll(message);
 }
 
+async function respondWithTempMessages(peer, sinceTimestamp = 0) {
+  try {
+    const globalAppsTempMessages = config.database.appsglobal.collections.appsTemporaryMessages;
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    const query = sinceTimestamp > 0 ? { receivedAt: { $gt: new Date(sinceTimestamp) } } : {};
+    const cursor = database.collection(globalAppsTempMessages)
+      .find(query, { projection: { _id: 0, receivedAt: 0, expireAt: 0 } })
+      .sort({ receivedAt: 1 });
+
+    const batchSize = 2000;
+    let batch = [];
+    let total = 0;
+    for await (const msg of cursor) {
+      batch.push({
+        type: msg.type,
+        version: msg.version,
+        appSpecifications: msg.appSpecifications,
+        hash: msg.hash,
+        timestamp: msg.timestamp,
+        signature: msg.signature,
+        arcaneSender: msg.arcaneSender,
+      });
+      if (batch.length >= batchSize) {
+        log.info(`respondWithTempMessages - Sending chunk of ${batch.length} to ${peer.key}`);
+        await sendSignedMessage({ type: 'fluxapptempsync', version: 1, messages: batch, done: false }, peer);
+        total += batch.length;
+        batch = [];
+      }
+    }
+    log.info(`respondWithTempMessages - Sending final ${batch.length} to ${peer.key} (total: ${total + batch.length})`);
+    await sendSignedMessage({ type: 'fluxapptempsync', version: 1, messages: batch, done: true }, peer);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function respondWithAppRunningMessages(peer, sinceTimestamp = 0) {
+  try {
+    const appsRunningBroadcasts = config.database.appsglobal.collections.appsRunningBroadcasts;
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+
+    const adjustedTimestamp = sinceTimestamp > 0
+      ? new Date(sinceTimestamp - (peer.remoteClockOffsetMs || 0))
+      : new Date(0);
+    const validAfter = new Date(Date.now() - 125 * 60 * 1000);
+    const minTimestamp = adjustedTimestamp > validAfter ? adjustedTimestamp : validAfter;
+    const cursor = database.collection(appsRunningBroadcasts)
+      .find({ broadcastedAt: { $gt: minTimestamp } }, { projection: { _id: 0, expireAt: 0 } })
+      .sort({ broadcastedAt: 1 });
+
+    const batchSize = 2000;
+    let batch = [];
+    let total = 0;
+    for await (const doc of cursor) {
+      batch.push(doc);
+      if (batch.length >= batchSize) {
+        log.info(`respondWithAppRunningMessages - Sending chunk of ${batch.length} to ${peer.key}`);
+        await sendSignedMessage({ type: 'fluxapprunningsync', messages: batch, done: false }, peer);
+        total += batch.length;
+        batch = [];
+      }
+    }
+    log.info(`respondWithAppRunningMessages - Sending final ${batch.length} to ${peer.key} (total: ${total + batch.length})`);
+    await sendSignedMessage({ type: 'fluxapprunningsync', messages: batch, done: true }, peer);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function respondWithAppInstallingMessages(peer, sinceTimestamp = 0) {
+  try {
+    const appsInstallingBroadcasts = config.database.appsglobal.collections.appsInstallingBroadcasts;
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+
+    const adjustedTimestamp = sinceTimestamp > 0
+      ? new Date(sinceTimestamp - (peer.remoteClockOffsetMs || 0))
+      : new Date(0);
+    const validAfter = new Date(Date.now() - 15 * 60 * 1000);
+    const minTimestamp = adjustedTimestamp > validAfter ? adjustedTimestamp : validAfter;
+    const cursor = database.collection(appsInstallingBroadcasts)
+      .find({ broadcastedAt: { $gt: minTimestamp } }, { projection: { _id: 0, expireAt: 0 } })
+      .sort({ broadcastedAt: 1 });
+
+    const batchSize = 2000;
+    let batch = [];
+    let total = 0;
+    for await (const doc of cursor) {
+      batch.push(doc);
+      if (batch.length >= batchSize) {
+        log.info(`respondWithAppInstallingMessages - Sending chunk of ${batch.length} to ${peer.key}`);
+        await sendSignedMessage({ type: 'fluxappinstallingsync', messages: batch, done: false }, peer);
+        total += batch.length;
+        batch = [];
+      }
+    }
+    log.info(`respondWithAppInstallingMessages - Sending final ${batch.length} to ${peer.key} (total: ${total + batch.length})`);
+    await sendSignedMessage({ type: 'fluxappinstallingsync', messages: batch, done: true }, peer);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
+async function respondWithAppInstallingErrorsMessages(peer, sinceTimestamp = 0) {
+  try {
+    const appsInstallingErrorsBroadcasts = config.database.appsglobal.collections.appsInstallingErrorsBroadcasts;
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+
+    const adjustedTimestamp = sinceTimestamp > 0
+      ? new Date(sinceTimestamp - (peer.remoteClockOffsetMs || 0))
+      : new Date(0);
+    const validAfter = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const minTimestamp = adjustedTimestamp > validAfter ? adjustedTimestamp : validAfter;
+    const cursor = database.collection(appsInstallingErrorsBroadcasts)
+      .find({ broadcastedAt: { $gt: minTimestamp } }, { projection: { _id: 0 } })
+      .sort({ broadcastedAt: 1 });
+
+    const batchSize = 2000;
+    let batch = [];
+    let total = 0;
+    for await (const doc of cursor) {
+      batch.push(doc);
+      if (batch.length >= batchSize) {
+        log.info(`respondWithAppInstallingErrorsMessages - Sending chunk of ${batch.length} to ${peer.key}`);
+        await sendSignedMessage({ type: 'fluxappinstallingerrorssync', messages: batch, done: false }, peer);
+        total += batch.length;
+        batch = [];
+      }
+    }
+    log.info(`respondWithAppInstallingErrorsMessages - Sending final ${batch.length} to ${peer.key} (total: ${total + batch.length})`);
+    await sendSignedMessage({ type: 'fluxappinstallingerrorssync', messages: batch, done: true }, peer);
+  } catch (error) {
+    log.error(error);
+  }
+}
+
 module.exports = {
   relay,
   sendSignedMessage,
   respondWithAppMessage,
+  respondWithTempMessages,
+  respondWithAppRunningMessages,
+  respondWithAppInstallingMessages,
+  respondWithAppInstallingErrorsMessages,
   serialiseAndSignFluxBroadcast,
   getFluxMessageSignature,
   broadcastMessageToOutgoingFromUser,
