@@ -1505,39 +1505,35 @@ async function expireGlobalApplications() {
  * To update app specifications.
  * @param {object} appSpecs App specifications.
  */
+async function insertAppSpecifications(appSpecs) {
+  try {
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    const query = { name: appSpecs.name };
+    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: true });
+    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
+    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
+  } catch (error) {
+    log.error(`insertAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
+  }
+}
+
 async function updateAppSpecifications(appSpecs) {
   try {
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.appsglobal.database);
-
     const query = { name: appSpecs.name };
-    const options = {
-      upsert: true,
-    };
-    const projection = {
-      projection: {
-        _id: 0,
-      },
-    };
+    const projection = { projection: { _id: 0 } };
     const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-    if (appInfo) {
-      if (appInfo.height < appSpecs.height) {
-        // replaceOne instead of $set to avoid accumulating ghost fields
-        // from prior spec versions (e.g. flat fields from v1-v3 lingering
-        // after upgrade to v4+ compose format)
-        await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
-      }
-    } else {
-      await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
-    }
-    const queryDeleteAppErrors = { name: appSpecs.name };
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
+    if (!appInfo || appInfo.height >= appSpecs.height) return;
+    // replaceOne instead of $set to avoid accumulating ghost fields
+    // from prior spec versions (e.g. flat fields from v1-v3 lingering
+    // after upgrade to v4+ compose format)
+    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: false });
+    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
   } catch (error) {
-    // retry
-    log.error(error);
-    await serviceHelper.delay(60 * 1000);
-    updateAppSpecifications(appSpecs);
+    log.error(`updateAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
   }
 }
 
@@ -2039,6 +2035,7 @@ module.exports = {
   getGlobalAppsSpecifications,
   availableApps,
   checkApplicationRegistrationNameConflicts,
+  insertAppSpecifications,
   updateAppSpecifications,
   updateAppSpecsForRescanReindex,
   storeAppSpecificationInPermanentStorage,
