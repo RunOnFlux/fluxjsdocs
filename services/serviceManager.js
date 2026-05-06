@@ -27,6 +27,7 @@ const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
+const appHashSyncService = require('./appMessaging/appHashSyncService');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
@@ -271,6 +272,15 @@ async function startFluxFunctions() {
 
     log.info('Flux Apps installing locations prepared');
 
+    // Reset stale messageNotFound flags on version upgrade
+    const { version: fluxVersion } = require('../../package.json');
+    const startupCollection = config.database.local.collections.nodeStartupTracker;
+    const hashSyncMarker = await dbHelper.findOneInDatabase(database, startupCollection, { _id: 'hashSyncVersion' });
+    if (!hashSyncMarker || hashSyncMarker.version !== fluxVersion) {
+      const resetCount = await appHashSyncService.resetMessageNotFoundFlags();
+      log.info(`Version upgrade to ${fluxVersion}, reset ${resetCount} messageNotFound flags`);
+    }
+
     // Initialize app sync orchestrator and spawner
     const { peerManager } = require('./utils/peerState');
     const orchestrator = new AppSyncOrchestrator({
@@ -278,6 +288,18 @@ async function startFluxFunctions() {
       peerManager,
       isEnterprise: () => enterpriseNetwork.getCachedEnterpriseIdentity(),
       networkStateReady: networkStateService.waitStarted(),
+    });
+    orchestrator.on('syncComplete', async () => {
+      try {
+        await dbHelper.findOneAndUpdateInDatabase(
+          database, startupCollection,
+          { _id: 'hashSyncVersion' },
+          { $set: { version: fluxVersion } },
+          { upsert: true },
+        );
+      } catch (error) {
+        log.error(`Failed to update hashSyncVersion marker: ${error.message}`);
+      }
     });
     appSpawner.initialize({ appInstaller, appUninstaller, orchestrator });
     appInstaller.setOnInstallComplete(() => peerNotification.checkAndNotifyPeersOfRunningApps());
