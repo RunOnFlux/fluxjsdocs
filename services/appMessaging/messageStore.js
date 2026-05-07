@@ -38,12 +38,12 @@ const APP_STATE_EVENT_TYPES = Object.freeze({
   IPCHANGED: 'ipchanged',
 });
 
-async function getPreviousOwner(appName, beforeHeight) {
+async function getPreviousOwner(appName, currentOwner) {
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
   const doc = await database.collection(globalAppsMessages)
     .findOne(
-      { 'appSpecifications.name': appName, height: { $lt: beforeHeight } },
+      { 'appSpecifications.name': appName, 'appSpecifications.owner': { $ne: currentOwner } },
       { projection: { _id: 0, 'appSpecifications.owner': 1 }, sort: { height: -1 } },
     );
   return doc?.appSpecifications?.owner ?? null;
@@ -172,8 +172,8 @@ async function storeAppTemporaryMessage(message, options = {}) {
         await messageVerifier.verifyAppMessageUpdateSignature(message.type, messageVersion, appSpecFormatted, messageTimestamp, message.signature, owner, block, previousAppSpecs);
       } catch (sigError) {
         if (!isAppRequested) throw sigError;
-        const prevOwner = await getPreviousOwner(appSpecFormatted.name, previousAppSpecs.height);
-        if (!prevOwner || prevOwner === owner) throw sigError;
+        const prevOwner = await getPreviousOwner(appSpecFormatted.name, owner);
+        if (!prevOwner) throw sigError;
         await messageVerifier.verifyAppMessageUpdateSignature(message.type, messageVersion, appSpecFormatted, messageTimestamp, message.signature, prevOwner, block, previousAppSpecs);
       }
     }
