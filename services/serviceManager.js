@@ -34,6 +34,8 @@ const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
 const stoppedAppsRecovery = require('./appLifecycle/stoppedAppsRecovery');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
+const { peerManager } = require('./utils/peerState');
+const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('./utils/appSyncEvents');
 const enterpriseNetwork = require('./utils/enterpriseNetwork');
 const appQueryService = require('./appQuery/appQueryService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
@@ -282,14 +284,16 @@ async function startFluxFunctions() {
     }
 
     // Initialize app sync orchestrator and spawner
-    const { peerManager } = require('./utils/peerState');
     const orchestrator = new AppSyncOrchestrator({
       blockEmitter: explorerService.getBlockEmitter(),
-      peerManager,
+      getEligibleSyncPeers: (minUptime) => peerManager.getEligibleSyncPeers(minUptime)
+        .map((p) => ({ key: p.key, send: (msg) => p.send(msg) })),
+      onPeerEvent: (event, cb) => peerManager.on(event, cb),
+      offPeerEvent: (event, cb) => peerManager.removeListener(event, cb),
       isEnterprise: () => enterpriseNetwork.getCachedEnterpriseIdentity(),
-      networkStateReady: networkStateService.waitStarted(),
+      networkStateReady: () => networkStateService.waitStarted(),
     });
-    orchestrator.on('syncComplete', async () => {
+    appSyncEvents.on(SYNC_EVENTS.HASH_SYNC_COMPLETE, async () => {
       try {
         await dbHelper.findOneAndUpdateInDatabase(
           database, startupCollection,
@@ -301,9 +305,8 @@ async function startFluxFunctions() {
         log.error(`Failed to update hashSyncVersion marker: ${error.message}`);
       }
     });
-    appSpawner.initialize({ appInstaller, appUninstaller, orchestrator });
+    appSpawner.initialize();
     appInstaller.setOnInstallComplete(() => peerNotification.checkAndNotifyPeersOfRunningApps());
-    fluxCommunication.setOnSyncComplete((syncType) => orchestrator.onSyncComplete(syncType));
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
