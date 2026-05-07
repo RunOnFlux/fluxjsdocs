@@ -627,6 +627,53 @@ async function isReindexAppsInformationRequired(
       return true;
     }
 
+    // Detect spec drift: each alive app's globalAppsInformation doc must point
+    // to the same message (same hash + height) as the max-height message for
+    // that app in globalAppsMessages. Catches the race where two updates for
+    // the same app run updateAppSpecifications concurrently and the older
+    // update's replaceOne lands second, pinning globalAppsInformation to a
+    // stale spec. Counts match in that state, so the count check above misses
+    // it.
+    const driftPipeline = [
+      { $sort: { 'appSpecifications.name': 1, height: -1 } },
+      {
+        $group: {
+          _id: '$appSpecifications.name',
+          maxHeightMsg: { $first: '$$ROOT' },
+        },
+      },
+      {
+        $lookup: {
+          from: appsInformationCol,
+          localField: '_id',
+          foreignField: 'name',
+          as: 'currentInfo',
+        },
+      },
+      {
+        $match: {
+          $expr: {
+            $or: [
+              { $ne: [{ $arrayElemAt: ['$currentInfo.hash', 0] }, '$maxHeightMsg.hash'] },
+              { $ne: [{ $arrayElemAt: ['$currentInfo.height', 0] }, '$maxHeightMsg.height'] },
+            ],
+          },
+        },
+      },
+      { $count: 'count' },
+    ];
+    const driftCursor = await aggregateInDatabase(
+      appsGlobalDb,
+      appsMessagesCol,
+      driftPipeline,
+      { returnArray: false },
+    );
+    const driftResult = await driftCursor.next();
+    if (driftResult && driftResult.count > 0) {
+      log.info(`Found ${driftResult.count} apps with stale specs in appsInformation vs latest message, reindex required`);
+      return true;
+    }
+
     // Detect ghost flat fields on v4+ specs caused by $set accumulating
     // fields from prior spec versions. Fixed by replaceOne in registryManager.
     const ghostCount = await countInDatabase(appsGlobalDb, appsInformationCol, {
@@ -721,6 +768,7 @@ async function reindexGlobalAppsInformation(
   appsLocalDb,
   globalAppsMessagesCol,
   globalAppsInformationCol,
+  globalAppsInstallingErrorsLocationsCol,
   localAppsInformationCol,
   scannedHeight,
 ) {
@@ -807,6 +855,14 @@ async function reindexGlobalAppsInformation(
     localAppsInformationCol,
   );
 
+  // Drop all install errors. Collection has a 1-hour TTL anyway and any
+  // surviving errors would be tied to specs that may have just changed.
+  await removeDocumentsFromCollection(
+    appsGlobalDb,
+    globalAppsInstallingErrorsLocationsCol,
+    {},
+  );
+
   log.info(
     `Reindexing of global applications finished. Local apps to be removed: ${JSON.stringify(appsToRemove)}`,
   );
@@ -830,6 +886,7 @@ async function validateAppsInformation() {
         collections: {
           appsInformation: globalAppsInformationCol,
           appsMessages: globalAppsMessagesCol,
+          appsInstallingErrorsLocations: globalAppsInstallingErrorsLocationsCol,
         },
       },
       appslocal: {
@@ -884,6 +941,7 @@ async function validateAppsInformation() {
       appsLocalDb,
       globalAppsMessagesCol,
       globalAppsInformationCol,
+      globalAppsInstallingErrorsLocationsCol,
       localAppsInformationCol,
       scannedHeight,
     );
