@@ -27,6 +27,7 @@ const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const upnpService = require('../upnpService');
 const globalState = require('../utils/globalState');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
+const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { findCommonArchitectures } = require('../utils/appUtilities');
 const log = require('../../lib/log');
@@ -281,7 +282,11 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
 
   const imgVerifier = new imageVerifier.ImageVerifier(
     repotag,
-    { maxImageSize: config.fluxapps.maxImageSize, architecture, architectureSet: supportedArchitectures },
+    {
+      maxImageSize: enterpriseNetwork.getMaxImageSizeForOwner(fullAppSpecs.owner),
+      architecture,
+      architectureSet: supportedArchitectures,
+    },
   );
 
   const pullConfig = { repoTag: repotag };
@@ -1183,6 +1188,7 @@ async function testAppInstall(req, res) {
           specVersion: appSpecifications.version,
           appName: appSpecifications.name,
           architecture: localArch,
+          owner: appSpecifications.owner,
         });
         componentArchitectures.push({
           name: component.name,
