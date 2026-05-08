@@ -1949,7 +1949,5 @@ module.exports = {
   setIsInInitiationOfBP,
   restoreDatabaseToBlockheightState,
 
-  // temporary function
-  fixExplorer,
   isExplorerSynced,
 };
