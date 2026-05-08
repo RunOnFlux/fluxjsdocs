@@ -6,7 +6,6 @@ const generalService = require('../generalService');
 const benchmarkService = require('../benchmarkService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const geolocationService = require('../geolocationService');
-const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const log = require('../../lib/log');
 
 // Import modular services
@@ -20,22 +19,21 @@ const systemIntegration = require('../appSystem/systemIntegration');
 const globalState = require('../utils/globalState');
 const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { FluxCacheManager } = require('../utils/cacheManager');
-const { registerAppLocally } = require('./appInstaller');
-const { removeAppLocally } = require('./appUninstaller');
-const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
+// const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 
+let appInstaller; // Will be initialized to avoid circular dependency
+let appUninstaller; // Will be initialized to avoid circular dependency
 let appsCountAvailableToInstallOnMyNode = 0;
 
-function initialize() {
-  appSyncEvents.on(SYNC_EVENTS.SPAWNER_READY, () => {
-    log.info('AppSyncOrchestrator signals ready, starting spawn loop');
-    globalState.spawnerPaused = false;
-    trySpawningGlobalApplication();
-  });
-  appSyncEvents.on(SYNC_EVENTS.READINESS_LOST, () => {
-    log.warn('AppSyncOrchestrator signals readiness lost, spawner will pause on next iteration');
-    globalState.spawnerPaused = true;
-  });
+/**
+ * Initialize the module with dependencies
+ * @param {object} deps - Dependencies object
+ */
+function initialize(deps) {
+  // eslint-disable-next-line prefer-destructuring
+  appInstaller = deps.appInstaller;
+  // eslint-disable-next-line prefer-destructuring
+  appUninstaller = deps.appUninstaller;
 }
 
 // Note: Docker Hub error classification and caching is now handled by imageManager.js
@@ -49,10 +47,9 @@ function initialize() {
  * @returns {Promise<void>}
  */
 async function trySpawningGlobalApplication() {
-  if (globalState.spawnerPaused) {
-    log.info('Spawner paused by orchestrator, waiting for readiness');
-    return;
-  }
+  // Identity is resolved once at boot by scheduleIdentityResolution() in
+  // serviceManager. Until that lands we defer the spawn attempt, mirroring
+  // the synced / isNodeConfirmed branches below — no exception-for-retry.
   const isEnterprise = enterpriseNetwork.getCachedEnterpriseIdentity();
   if (isEnterprise === null) {
     log.info('Flux enterprise identity not yet resolved');
@@ -95,6 +92,10 @@ async function trySpawningGlobalApplication() {
       log.info('Explorer Synced, checking for expired apps');
       await registryManager.expireGlobalApplications();
       globalState.firstExecutionAfterItsSynced = false;
+      // Dynamic require to avoid circular dependency
+      // eslint-disable-next-line global-require
+      const advancedWorkflows = require('./advancedWorkflows');
+      await advancedWorkflows.getPeerAppsInstallingErrorMessages();
     }
 
     if (globalState.fluxNodeWasAlreadyConfirmed && globalState.fluxNodeWasNotConfirmedOnLastCheck) {
@@ -128,59 +129,7 @@ async function trySpawningGlobalApplication() {
     // get all the applications list names missing instances
     // eslint-disable-next-line global-require
     const { globalAppsInformation } = require('../utils/appConstants');
-    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
-    const currentHeight = syncStatus.data.height;
-    const ponFork = config.fluxapps.daemonPONFork;
-    const blocksLasting = config.fluxapps.blocksLasting;
-    const minBlocksAllowance = config.fluxapps.newMinBlocksAllowance;
     const pipeline = [
-      // Filter out apps that are expired or expiring within minBlocksAllowance (100) blocks
-      {
-        $addFields: {
-          _expireIn: {
-            $ifNull: [
-              '$expire',
-              {
-                $cond: {
-                  if: { $gte: ['$height', ponFork] },
-                  then: blocksLasting * 4,
-                  else: blocksLasting,
-                },
-              },
-            ],
-          },
-        },
-      },
-      {
-        $addFields: {
-          _actualExpirationHeight: {
-            $cond: {
-              if: { $lt: ['$height', ponFork] },
-              then: {
-                $cond: {
-                  if: { $lte: [{ $add: ['$height', '$_expireIn'] }, ponFork] },
-                  then: { $add: ['$height', '$_expireIn'] },
-                  else: {
-                    $add: [
-                      ponFork,
-                      { $multiply: [
-                        { $subtract: [{ $add: ['$height', '$_expireIn'] }, ponFork] },
-                        4,
-                      ] },
-                    ],
-                  },
-                },
-              },
-              else: { $add: ['$height', '$_expireIn'] },
-            },
-          },
-        },
-      },
-      {
-        $match: {
-          _actualExpirationHeight: { $gt: currentHeight + minBlocksAllowance },
-        },
-      },
       {
         $lookup: {
           from: 'zelappslocation',
@@ -223,7 +172,7 @@ async function trySpawningGlobalApplication() {
     const numberOfGlobalApps = globalAppNamesLocation.length;
     if (!numberOfGlobalApps) {
       log.info('trySpawningGlobalApplication - No installable application found');
-      await serviceHelper.delay(30 * 60 * 1000);
+      await serviceHelper.delay(delayTime);
       trySpawningGlobalApplication();
       return;
     }
@@ -280,7 +229,7 @@ async function trySpawningGlobalApplication() {
 
       if (globalAppNamesLocation.length === 0) {
         log.info('trySpawningGlobalApplication - No app currently to be processed');
-        await serviceHelper.delay(30 * 60 * 1000);
+        await serviceHelper.delay(delayTime);
         trySpawningGlobalApplication();
         return;
       }
@@ -319,11 +268,11 @@ async function trySpawningGlobalApplication() {
     globalState.trySpawningGlobalAppCache.set(appHash, '');
     log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
 
-    const errorCount = await registryManager.countAppInstallingErrors(appHash);
-    if (errorCount >= 5) {
+    /* const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
+    if (installingAppErrorsList.find((app) => !app.expireAt && app.hash === appHash)) {
       globalState.spawnErrorsLongerAppCache.set(appHash, '');
-      throw new Error(`trySpawningGlobalApplication - App ${appToRun} hash ${appHash} has ${errorCount} network-wide install failures, skipping`);
-    }
+      throw new Error(`trySpawningGlobalApplication - App ${appToRun} is marked as having errors on app installing errors locations.`);
+    } */
 
     runningAppList = await registryManager.appLocation(appToRun);
 
