@@ -2,10 +2,9 @@
  * Stopped Apps Recovery Service
  *
  * This module handles the recovery of Flux applications that are stopped on boot.
- * It iterates installed apps with stopped containers and starts every component
- * that is NOT in g: syncthing mode. Components in g: mode are left stopped so the
- * masterSlaveApps service can elect a primary. For mixed compose apps (some
- * components g:, some not), only the non-g components are started here.
+ * It checks for installed apps that have stopped containers and starts them,
+ * but only if they do NOT use g: syncthing mode (master/slave mode).
+ * Apps using g: syncthing mode are managed by the masterSlaveApps service.
  */
 
 const config = require('config');
@@ -14,9 +13,16 @@ const dbHelper = require('../dbHelper');
 const dockerService = require('../dockerService');
 const serviceHelper = require('../serviceHelper');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
+const generalService = require('../generalService');
 const registryManager = require('../appDatabase/registryManager');
 const advancedWorkflows = require('./advancedWorkflows');
+const appInstaller = require('./appInstaller');
 const appUninstaller = require('./appUninstaller');
+const appInspector = require('../appManagement/appInspector');
+const appTamperingDetectionService = require('../appTamperingDetectionService');
+const globalState = require('../utils/globalState');
+const cacheManager = require('../utils/cacheManager').default;
+const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const { localAppsInformation } = require('../utils/appConstants');
 
 const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
@@ -44,36 +50,6 @@ function appUsesGSyncthingMode(appSpec) {
   }
 
   return false;
-}
-
-/**
- * Return the identifiers (component_appName for v>=4, appName for v<=3) of the
- * components this service should start on boot — i.e. every component that does
- * NOT use g: syncthing mode. g: components are intentionally left stopped so
- * masterSlaveApps can elect a primary.
- * @param {Object} appSpec - App specification
- * @param {string} appName - Canonical app name (from container parsing); used as
- *   the fallback when appSpec.name is absent (e.g. legacy specs or test fixtures).
- * @returns {string[]} Identifiers ready to pass to advancedWorkflows.appDockerStart
- */
-function getNonGComponentIdentifiers(appSpec, appName) {
-  if (!appSpec) {
-    return [];
-  }
-  const resolvedName = appSpec.name || appName;
-
-  // Compose apps (version >= 4): partition components by containerData.
-  if (appSpec.compose && appSpec.compose.length > 0) {
-    return appSpec.compose
-      .filter((comp) => !(comp.containerData && comp.containerData.includes('g:')))
-      .map((comp) => `${comp.name}_${resolvedName}`);
-  }
-
-  // Legacy single-component apps (version <= 3).
-  if (appSpec.containerData && appSpec.containerData.includes('g:')) {
-    return [];
-  }
-  return [resolvedName];
 }
 
 /**
@@ -196,17 +172,14 @@ function parseContainerName(containerName) {
 }
 
 /**
- * Start stopped Flux app containers on boot, partitioned by g: syncthing mode.
- * - Apps with no g: components: started normally (whole app).
- * - Apps where every component is g:: skipped entirely (managed by masterSlaveApps).
- * - Mixed compose apps: only non-g components started; g: components left stopped.
+ * Start stopped apps that don't use g: syncthing mode in ANY component
+ * If an app has ANY component using g: syncthing, ALL containers for that app are skipped
  * @returns {Promise<Object>} Results of the recovery operation
  */
 async function startStoppedAppsOnBoot() {
   const results = {
     appsChecked: 0,
     appsStarted: [],
-    appsPartiallyStarted: [], // mixed compose: non-g components started, g: components left for masterSlaveApps
     appsSkippedGMode: [],
     appsSkippedNoSpec: [],
     appsRemoved: [],
@@ -280,18 +253,9 @@ async function startStoppedAppsOnBoot() {
         continue;
       }
 
-      // Partition the app's components by g: syncthing mode. Non-g components are
-      // started here; g: components are left stopped for masterSlaveApps to elect a
-      // primary. If every component is g:, the app is skipped entirely.
-      const componentsToStart = getNonGComponentIdentifiers(appSpec, appName);
-      const totalComponents = (appSpec.compose && appSpec.compose.length > 0)
-        ? appSpec.compose.length
-        : 1;
-      const isPartial = componentsToStart.length > 0
-        && componentsToStart.length < totalComponents;
-
-      if (componentsToStart.length === 0) {
-        log.info(`stoppedAppsRecovery - App ${appName} uses g: syncthing mode in every component, skipping (managed by masterSlaveApps)`);
+      // Check if ANY component of the app uses g: syncthing mode
+      if (appUsesGSyncthingMode(appSpec)) {
+        log.info(`stoppedAppsRecovery - App ${appName} uses g: syncthing mode, skipping all its containers (managed by masterSlaveApps)`);
         results.appsSkippedGMode.push(appName);
         // eslint-disable-next-line no-continue
         continue;
@@ -321,40 +285,24 @@ async function startStoppedAppsOnBoot() {
         }
       }
 
-      // App has valid location - start the non-g components individually so that any
-      // g: siblings remain stopped (masterSlaveApps will start them only on the primary).
-      if (isPartial) {
-        log.info(`stoppedAppsRecovery - App ${appName} has valid location, starting ${componentsToStart.length}/${totalComponents} non-g components (g: components managed by masterSlaveApps)`);
-      } else {
-        log.info(`stoppedAppsRecovery - App ${appName} has valid location, starting app`);
-      }
+      // App has valid location - start it (handles all components)
+      log.info(`stoppedAppsRecovery - App ${appName} has valid location, starting app`);
 
-      let anyComponentFailed = false;
-      // eslint-disable-next-line no-restricted-syntax
-      for (const identifier of componentsToStart) {
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          await advancedWorkflows.appDockerStart(identifier);
-          log.info(`stoppedAppsRecovery - Successfully started ${identifier}`);
-          // Add small delay between starts to avoid overwhelming the system
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(2000);
-        } catch (startError) {
-          anyComponentFailed = true;
-          log.error(`stoppedAppsRecovery - Failed to start ${identifier}: ${startError.message}`);
-          results.appsFailed.push({
-            app: identifier,
-            error: startError.message,
-          });
-        }
-      }
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await advancedWorkflows.appDockerStart(appName);
+        results.appsStarted.push(appName);
+        log.info(`stoppedAppsRecovery - Successfully started app ${appName}`);
 
-      if (!anyComponentFailed) {
-        if (isPartial) {
-          results.appsPartiallyStarted.push(appName);
-        } else {
-          results.appsStarted.push(appName);
-        }
+        // Add small delay between app starts to avoid overwhelming the system
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(2000);
+      } catch (startError) {
+        log.error(`stoppedAppsRecovery - Failed to start app ${appName}: ${startError.message}`);
+        results.appsFailed.push({
+          app: appName,
+          error: startError.message,
+        });
       }
     }
 
@@ -362,7 +310,6 @@ async function startStoppedAppsOnBoot() {
       'stoppedAppsRecovery - Recovery complete. '
       + `Apps checked: ${results.appsChecked}, `
       + `Apps started: ${results.appsStarted.length}, `
-      + `Apps partially started (mixed g:): ${results.appsPartiallyStarted.length}, `
       + `Apps removed (expired location): ${results.appsRemoved.length}, `
       + `Apps skipped (g: mode): ${results.appsSkippedGMode.length}, `
       + `Apps skipped (no spec): ${results.appsSkippedNoSpec.length}, `
@@ -375,11 +322,218 @@ async function startStoppedAppsOnBoot() {
   }
 }
 
+async function recreateMissingContainers(componentIdentifier) {
+  const mainAppName = componentIdentifier.split('_')[1] || componentIdentifier;
+  const dbopen = dbHelper.databaseConnection();
+  const appsDatabase = dbopen.db(config.database.appslocal.database);
+
+  const appsQuery = { name: mainAppName };
+  const appsProjection = { projection: { _id: 0 } };
+  let appSpec = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
+
+  if (!appSpec) {
+    throw new Error(`App ${mainAppName} not found in local database`);
+  }
+
+  appSpec = await decryptEnterpriseApps([appSpec], { formatSpecs: false });
+  // eslint-disable-next-line prefer-destructuring
+  appSpec = appSpec[0];
+
+  if (!appSpec.compose || appSpec.compose.length === 0) {
+    throw new Error(`App ${mainAppName} has no components to install`);
+  }
+
+  const tier = await generalService.nodeTier();
+  const isComponent = componentIdentifier.includes('_');
+
+  if (isComponent) {
+    const componentName = componentIdentifier.split('_')[0];
+    const componentSpec = appSpec.compose.find((c) => c.name === componentName);
+    if (!componentSpec) {
+      throw new Error(`Component ${componentName} not found in app ${mainAppName}`);
+    }
+    const hddTier = `hdd${tier}`;
+    const ramTier = `ram${tier}`;
+    const cpuTier = `cpu${tier}`;
+    componentSpec.cpu = componentSpec[cpuTier] || componentSpec.cpu;
+    componentSpec.ram = componentSpec[ramTier] || componentSpec.ram;
+    componentSpec.hdd = componentSpec[hddTier] || componentSpec.hdd;
+    await appInstaller.installApplicationHard(componentSpec, mainAppName, true, null, appSpec);
+  } else {
+    for (const componentSpec of appSpec.compose) {
+      const hddTier = `hdd${tier}`;
+      const ramTier = `ram${tier}`;
+      const cpuTier = `cpu${tier}`;
+      componentSpec.cpu = componentSpec[cpuTier] || componentSpec.cpu;
+      componentSpec.ram = componentSpec[ramTier] || componentSpec.ram;
+      componentSpec.hdd = componentSpec[hddTier] || componentSpec.hdd;
+      // eslint-disable-next-line no-await-in-loop
+      await appInstaller.installApplicationHard(componentSpec, mainAppName, true, null, appSpec);
+    }
+  }
+
+  log.info(`Successfully recreated missing containers for ${componentIdentifier}`);
+}
+
+async function handleMissingMasterSlaveContainer(stoppedApp, mainAppName) {
+  const containerExists = await dockerService.getDockerContainerOnly(stoppedApp);
+  if (containerExists) return;
+
+  log.warn(`Container for master/slave app ${stoppedApp} doesn't exist, recreating...`);
+  try {
+    await recreateMissingContainers(stoppedApp);
+    log.info(`Successfully recreated master/slave app container ${stoppedApp}`);
+    appInspector.startAppMonitoring(stoppedApp, globalState.appsMonitored);
+  } catch (recreateErr) {
+    const containerExistsNow = await dockerService.getDockerContainerOnly(stoppedApp);
+    if (containerExistsNow) {
+      log.info(`Container for ${stoppedApp} was created by another process, skipping removal`);
+      return;
+    }
+    log.error(`Failed to recreate master/slave app ${stoppedApp}: ${recreateErr.message}`);
+    log.warn(`REMOVAL REASON: Master/slave container recreation failure - ${mainAppName} (stoppedAppsRecovery)`);
+    await appTamperingDetectionService.recordEvent(mainAppName, 'recreation_failed', `Master/slave container recreation failure: ${recreateErr.message}`);
+    if (appTamperingDetectionService.isNetworkMissingError(recreateErr.message)) {
+      await appTamperingDetectionService.recordEvent(mainAppName, 'network_pruned', `Docker network missing during recreation: ${recreateErr.message}`);
+    }
+    await appUninstaller.removeAppLocally(mainAppName, null, false, true, true, () => {},
+      () => globalState, (name, deleteData) => appInspector.stopAppMonitoring(name, deleteData, globalState.appsMonitored));
+  }
+}
+
+/**
+ * Check for stopped apps and recover them. Returns list of master/slave apps
+ * that have syncthing containers (needed by the broadcast to include them even
+ * if some containers are stopped).
+ * @param {string} myIP - This node's IP
+ * @param {Array} appsInstalled - Installed app specs
+ * @param {Array} runningAppsNames - Names of running containers
+ * @returns {Promise<Array>} masterSlaveAppsInstalled
+ */
+async function checkStoppedApps(myIP, appsInstalled, runningAppsNames) {
+  const masterSlaveAppsInstalled = [];
+  const installedAppComponentNames = [];
+  appsInstalled.forEach((app) => {
+    if (app.version >= 4) {
+      app.compose.forEach((appComponent) => {
+        installedAppComponentNames.push(`${appComponent.name}_${app.name}`);
+      });
+    } else {
+      installedAppComponentNames.push(app.name);
+    }
+  });
+  const runningSet = new Set(runningAppsNames);
+  const stoppedApps = installedAppComponentNames.filter((installedApp) => !runningSet.has(installedApp));
+
+  const backupInProgress = globalState.backupInProgress || [];
+  const restoreInProgress = globalState.restoreInProgress || [];
+  const appsStoppedCache = cacheManager.stoppedAppsCache;
+
+  if (globalState.removalInProgress || globalState.installationInProgress || globalState.softRedeployInProgress || globalState.hardRedeployInProgress || globalState.reinstallationOfOldAppsInProgress) {
+    log.warn('Stopped application checks not running, some removal or installation is in progress');
+    return masterSlaveAppsInstalled;
+  }
+
+  // eslint-disable-next-line no-restricted-syntax
+  for (const stoppedApp of stoppedApps) {
+    try {
+      const mainAppName = stoppedApp.split('_')[1] || stoppedApp;
+      // eslint-disable-next-line no-await-in-loop
+      const appDetails = await registryManager.getApplicationGlobalSpecifications(mainAppName);
+      const appInstalledMasterSlave = appsInstalled.find((app) => app.name === mainAppName);
+      const appInstalledSyncthing = appInstalledMasterSlave.compose.find((comp) => comp.containerData.includes('g:') || comp.containerData.includes('r:'));
+      const appInstalledMasterSlaveCheck = appInstalledMasterSlave.compose.find((comp) => comp.containerData.includes('g:'));
+      if (appInstalledSyncthing) {
+        masterSlaveAppsInstalled.push(appInstalledMasterSlave);
+      }
+      if (appInstalledMasterSlaveCheck && appDetails) {
+        const backupSkip = backupInProgress.some((backupItem) => stoppedApp === backupItem);
+        const restoreSkip = restoreInProgress.some((backupItem) => stoppedApp === backupItem);
+        if (!backupSkip && !restoreSkip) {
+          // eslint-disable-next-line no-await-in-loop
+          await handleMissingMasterSlaveContainer(stoppedApp, mainAppName);
+        }
+      } else if (appDetails) {
+        log.warn(`${stoppedApp} is stopped but should be running. Starting...`);
+        const backupSkip = backupInProgress.some((backupItem) => stoppedApp === backupItem);
+        const restoreSkip = restoreInProgress.some((backupItem) => stoppedApp === backupItem);
+        if (backupSkip || restoreSkip) {
+          log.warn(`Application ${stoppedApp} backup/restore is in progress...`);
+        }
+        if (!globalState.removalInProgress && !globalState.installationInProgress && !globalState.softRedeployInProgress && !globalState.hardRedeployInProgress && !globalState.reinstallationOfOldAppsInProgress && !restoreSkip && !backupSkip) {
+          // eslint-disable-next-line no-await-in-loop
+          const containerExists = await dockerService.getDockerContainerOnly(stoppedApp);
+
+          if (containerExists && appInstalledSyncthing) {
+            const db = dbHelper.databaseConnection();
+            const database = db.db(config.database.appsglobal.database);
+            const queryFind = { name: mainAppName, ip: myIP };
+            const projection = { _id: 0, runningSince: 1 };
+            // eslint-disable-next-line no-await-in-loop
+            const result = await dbHelper.findOneInDatabase(database, globalAppsLocations, queryFind, projection);
+            if (!result || !result.runningSince || Date.parse(result.runningSince) + 30 * 60 * 1000 > Date.now()) {
+              log.info(`Application ${stoppedApp} uses r syncthing and container exists but is stopped. Haven't started yet because was installed less than 30m ago.`);
+              // eslint-disable-next-line no-continue
+              continue;
+            }
+          }
+
+          if (!containerExists) {
+            log.warn(`Container for ${stoppedApp} doesn't exist, recreating immediately...`);
+            // eslint-disable-next-line no-await-in-loop
+            await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${stoppedApp} missing, not found in Docker`);
+            try {
+              // eslint-disable-next-line no-await-in-loop
+              await recreateMissingContainers(stoppedApp);
+              log.info(`Successfully recreated ${stoppedApp}`);
+              appInspector.startAppMonitoring(stoppedApp, globalState.appsMonitored);
+            } catch (recreateErr) {
+              log.error(`Failed to recreate containers for ${stoppedApp}: ${recreateErr.message}`);
+              log.warn(`REMOVAL REASON: Container recreation failure - ${mainAppName} failed to recreate with error: ${recreateErr.message} (stoppedAppsRecovery)`);
+              // eslint-disable-next-line no-await-in-loop
+              await appTamperingDetectionService.recordEvent(mainAppName, 'recreation_failed', `Container recreation failure: ${recreateErr.message}`);
+              if (appTamperingDetectionService.isNetworkMissingError(recreateErr.message)) {
+                // eslint-disable-next-line no-await-in-loop
+                await appTamperingDetectionService.recordEvent(mainAppName, 'network_pruned', `Docker network missing during recreation: ${recreateErr.message}`);
+              }
+              // eslint-disable-next-line no-await-in-loop
+              await appUninstaller.removeAppLocally(mainAppName, null, false, true, true, () => {
+              }, () => globalState, (name, deleteData) => appInspector.stopAppMonitoring(name, deleteData, globalState.appsMonitored));
+            }
+          } else {
+            log.warn(`${stoppedApp} is stopped, starting`);
+            if (!appsStoppedCache.has(stoppedApp)) {
+              appsStoppedCache.set(stoppedApp, '');
+            } else {
+              // eslint-disable-next-line no-await-in-loop
+              await dockerService.appDockerStart(stoppedApp);
+              appInspector.startAppMonitoring(stoppedApp, globalState.appsMonitored);
+            }
+          }
+        } else {
+          log.warn(`Not starting ${stoppedApp} as application removal or installation or backup/restore is in progress`);
+        }
+      }
+    } catch (err) {
+      log.error(err);
+      const mainAppName = stoppedApp.split('_')[1] || stoppedApp;
+      if (!globalState.removalInProgress && !globalState.installationInProgress && !globalState.softRedeployInProgress && !globalState.hardRedeployInProgress && !globalState.reinstallationOfOldAppsInProgress) {
+        log.warn(`REMOVAL REASON: App start failure - ${mainAppName} failed to start with error: ${err.message} (stoppedAppsRecovery)`);
+        // eslint-disable-next-line no-await-in-loop
+        await appUninstaller.removeAppLocally(mainAppName, null, false, true, true, () => {
+        }, () => globalState, (name, deleteData) => appInspector.stopAppMonitoring(name, deleteData, globalState.appsMonitored));
+      }
+    }
+  }
+  return masterSlaveAppsInstalled;
+}
+
 module.exports = {
   startStoppedAppsOnBoot,
   getStoppedFluxContainers,
   appUsesGSyncthingMode,
-  getNonGComponentIdentifiers,
   appHasValidLocationOnNode,
+  checkStoppedApps,
   parseContainerName,
+  handleMissingMasterSlaveContainer,
 };

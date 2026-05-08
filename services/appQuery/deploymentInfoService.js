@@ -38,8 +38,6 @@ async function deploymentInformation(req, res) {
       enterprisePorts: config.fluxapps.enterprisePorts,
       bannedPorts: config.fluxapps.bannedPorts,
       maxImageSize: config.fluxapps.maxImageSize,
-      enterpriseMaxImageSize: config.fluxapps.enterpriseMaxImageSize,
-      enterpriseAppOwners: config.enterpriseAppOwners || [],
       minimumInstances: config.fluxapps.minimumInstances,
       maximumInstances: config.fluxapps.maximumInstances,
       blocksLasting: config.fluxapps.blocksLasting,
