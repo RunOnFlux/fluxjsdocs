@@ -20,6 +20,21 @@ function isEnterpriseAppOwner(owner) {
 }
 
 /**
+ * Returns the docker image size limit (in bytes) that applies to an app
+ * with the given owner. Enterprise app owners get the higher
+ * config.fluxapps.enterpriseMaxImageSize; everyone else gets the default
+ * config.fluxapps.maxImageSize.
+ * @param {string} owner
+ * @returns {number}
+ */
+function getMaxImageSizeForOwner(owner) {
+  if (isEnterpriseAppOwner(owner)) {
+    return config.fluxapps.enterpriseMaxImageSize || config.fluxapps.maxImageSize;
+  }
+  return config.fluxapps.maxImageSize;
+}
+
+/**
  * Returns true if this fluxnode's own pubkey is listed in
  * config.enterpriseNodesPublicKeys. Result is cached for the lifetime of the
  * process after a successful resolution; call resetEnterpriseNodeCache() if
@@ -169,6 +184,7 @@ module.exports = {
   getCachedEnterpriseIdentity,
   getEnterpriseAppOwners,
   getEnterpriseNodesPublicKeys,
+  getMaxImageSizeForOwner,
   getSpawnDelays,
   isEnterpriseAppOwner,
   isEnterpriseNode,

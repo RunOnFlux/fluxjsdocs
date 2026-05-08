@@ -1264,7 +1264,9 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
 
     if (appSpecifications.version <= 3) {
       // check repository whitelisted and repotag is available for download
-      const result = await imageManager.verifyRepository(appSpecifications.repotag);
+      const result = await imageManager.verifyRepository(appSpecifications.repotag, {
+        owner: appSpecifications.owner,
+      });
       componentArchitectures.push({
         name: appSpecifications.name,
         repotag: appSpecifications.repotag,
@@ -1288,6 +1290,7 @@ async function verifyAppSpecifications(appSpecifications, height, checkDockerAnd
           repoauth: appComponent.repoauth,
           specVersion: appSpecifications.version,
           appName: appSpecifications.name,
+          owner: appSpecifications.owner,
         });
 
         componentArchitectures.push({
