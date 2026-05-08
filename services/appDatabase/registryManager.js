@@ -9,15 +9,12 @@ const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const { checkAndDecryptAppSpecs, encryptEnterpriseFromSession } = require('../utils/enterpriseHelper');
 const { specificationFormatter, updateToLatestAppSpecifications } = require('../utils/appUtilities');
 const {
-  SIGTERM_EXPIRY_MS,
   globalAppsInformation,
   localAppsInformation,
   globalAppsMessages,
   globalAppsLocations,
-  globalAppStateEvents,
   globalAppsInstallingLocations,
   globalAppsInstallingErrorsLocations,
-  globalAppsInstallingErrorsBroadcasts,
   appsHashesCollection,
   scannedHeightCollection,
 } = require('../utils/appConstants');
@@ -89,297 +86,6 @@ async function appLocation(appname) {
   return results;
 }
 
-// Derives running app locations from the event log. Will replace appLocation() once callers are switched.
-//
-// Performance: shutdown/v1 filtering happens at IP level BEFORE unwinding to individual apps.
-// Lookups use $filter + $first against small arrays (shutdowns ~10, ipChanges ~5) which is
-// O(IPs * arraySize) — fast because the arrays are small. The v2Timestamps lookup for v1
-// filtering is O(v1Count * v2IPs) which dominates at ~2.4M comparisons at steady state.
-//
-// MongoDB 7.2+ optimization: $getField supports dynamic field references, enabling
-// $arrayToObject maps with O(1) key lookup via $getField({ field: '$$var.ip', input: '$map' }).
-// This would reduce all lookups to O(n) total. Blocked by MongoDB 7.0 on CI (SERVER-74371).
-async function appLocationFromEvents(options = {}) {
-  const { appname, ip } = options;
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  const collection = database.collection(globalAppStateEvents);
-
-  const escapedName = appname ? appname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : null;
-  const nameMatch = escapedName ? new RegExp(`^${escapedName}$`, 'i') : null;
-  const now = new Date();
-
-  const v1NameFilter = nameMatch ? [{ $match: { 'data.name': nameMatch } }] : [];
-  const removalNameFilter = nameMatch ? [{ $match: { 'data.appName': nameMatch } }] : [];
-
-  const initialMatch = {
-    $or: [
-      { type: { $in: ['apprunning', 'appremoved', 'ipchanged'] }, expireAt: { $gt: now } },
-      { type: { $in: ['sigterm', 'evicted'] } },
-    ],
-  };
-  if (ip) initialMatch.ip = ip;
-
-  const pipeline = [
-    { $match: initialMatch },
-    { $sort: { broadcastedAt: -1 } },
-    {
-      $facet: {
-        v2: [
-          { $match: { type: 'apprunning', 'data.apps': { $exists: true } } },
-          { $group: { _id: '$ip', doc: { $first: '$$ROOT' } } },
-          { $replaceRoot: { newRoot: '$doc' } },
-          {
-            $project: {
-              _id: 0,
-              ip: '$data.ip',
-              broadcastedAt: 1,
-              apps: '$data.apps',
-              osUptime: '$data.osUptime',
-              staticIp: '$data.staticIp',
-              runningSince: '$data.runningSince',
-            },
-          },
-        ],
-        v1: [
-          ...v1NameFilter,
-          { $match: { type: 'apprunning', 'data.name': { $exists: true } } },
-          {
-            $group: {
-              _id: { ip: '$ip', name: '$data.name' },
-              doc: { $first: '$$ROOT' },
-            },
-          },
-          { $replaceRoot: { newRoot: '$doc' } },
-          {
-            $project: {
-              _id: 0,
-              name: '$data.name',
-              hash: '$data.hash',
-              ip: '$data.ip',
-              broadcastedAt: 1,
-              runningSince: '$data.runningSince',
-              osUptime: '$data.osUptime',
-              staticIp: '$data.staticIp',
-            },
-          },
-        ],
-        v2Timestamps: [
-          { $match: { type: 'apprunning', 'data.apps': { $exists: true } } },
-          { $group: { _id: '$ip', latestV2: { $first: '$broadcastedAt' } } },
-        ],
-        removals: [
-          { $match: { type: 'appremoved' } },
-          ...removalNameFilter,
-          {
-            $group: {
-              _id: { ip: '$ip', name: '$data.appName' },
-              removedAt: { $first: '$broadcastedAt' },
-            },
-          },
-        ],
-        shutdowns: [
-          { $match: { type: { $in: ['sigterm', 'evicted'] } } },
-          { $addFields: { _eventAt: { $ifNull: ['$broadcastedAt', '$createdAt'] } } },
-          { $sort: { _eventAt: -1 } },
-          {
-            $group: {
-              _id: '$ip',
-              eventAt: { $first: '$_eventAt' },
-              expireAt: { $first: '$expireAt' },
-              type: { $first: '$type' },
-            },
-          },
-        ],
-        ipChanges: [
-          { $match: { type: 'ipchanged' } },
-          { $group: { _id: '$ip', newIP: { $first: '$data.newIP' }, changedAt: { $first: '$broadcastedAt' } } },
-        ],
-      },
-    },
-    // Filter v2 at IP level before unwinding — shutdown check against small array
-    {
-      $addFields: {
-        _v2Filtered: {
-          $filter: {
-            input: '$v2',
-            as: 'entry',
-            cond: {
-              $let: {
-                vars: { sd: { $first: { $filter: { input: '$shutdowns', as: 's', cond: { $eq: ['$$s._id', '$$entry.ip'] } } } } },
-                in: {
-                  $or: [
-                    { $eq: ['$$sd', null] },
-                    { $gte: ['$$entry.broadcastedAt', '$$sd.eventAt'] },
-                    { $and: [{ $eq: ['$$sd.type', 'sigterm'] }, { $gt: [{ $add: ['$$sd.eventAt', SIGTERM_EXPIRY_MS] }, now] }] },
-                  ],
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-    // Filter v1: newer than latest v2 for that IP and not shutdown
-    {
-      $addFields: {
-        _v1Filtered: {
-          $filter: {
-            input: '$v1',
-            as: 'entry',
-            cond: {
-              $and: [
-                {
-                  $let: {
-                    vars: { v2Ts: { $first: { $filter: { input: '$v2Timestamps', as: 't', cond: { $eq: ['$$t._id', '$$entry.ip'] } } } } },
-                    in: { $or: [{ $eq: ['$$v2Ts', null] }, { $gt: ['$$entry.broadcastedAt', '$$v2Ts.latestV2'] }] },
-                  },
-                },
-                {
-                  $let: {
-                    vars: { sd: { $first: { $filter: { input: '$shutdowns', as: 's', cond: { $eq: ['$$s._id', '$$entry.ip'] } } } } },
-                    in: {
-                      $or: [
-                        { $eq: ['$$sd', null] },
-                        { $gte: ['$$entry.broadcastedAt', '$$sd.eventAt'] },
-                        { $and: [{ $eq: ['$$sd.type', 'sigterm'] }, { $gt: [{ $add: ['$$sd.eventAt', SIGTERM_EXPIRY_MS] }, now] }] },
-                      ],
-                    },
-                  },
-                },
-              ],
-            },
-          },
-        },
-      },
-    },
-    // Unwind v2 apps and v1 into flat docs, apply per-app removal + IP change filters
-    {
-      $facet: {
-        fromV2: [
-          { $unwind: '$_v2Filtered' },
-          { $unwind: '$_v2Filtered.apps' },
-          ...(nameMatch ? [{ $match: { '_v2Filtered.apps.name': nameMatch } }] : []),
-          {
-            $project: {
-              _id: 0,
-              name: '$_v2Filtered.apps.name',
-              hash: '$_v2Filtered.apps.hash',
-              ip: '$_v2Filtered.ip',
-              broadcastedAt: '$_v2Filtered.broadcastedAt',
-              runningSince: { $ifNull: ['$_v2Filtered.apps.runningSince', '$_v2Filtered.runningSince'] },
-              osUptime: '$_v2Filtered.osUptime',
-              staticIp: '$_v2Filtered.staticIp',
-              removals: 1,
-              ipChanges: 1,
-            },
-          },
-          {
-            $addFields: {
-              _removedAt: {
-                $ifNull: [
-                  { $let: {
-                    vars: { r: { $first: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } } } },
-                    in: '$$r.removedAt',
-                  } },
-                  new Date(0),
-                ],
-              },
-            },
-          },
-          { $match: { $expr: { $gt: ['$broadcastedAt', '$_removedAt'] } } },
-          {
-            $addFields: {
-              _ipChange: { $first: { $filter: { input: '$ipChanges', as: 'c', cond: { $eq: ['$$c._id', '$ip'] } } } },
-            },
-          },
-          {
-            $addFields: {
-              ip: {
-                $cond: [
-                  { $and: [{ $ne: ['$_ipChange', null] }, { $gt: ['$_ipChange.changedAt', '$broadcastedAt'] }] },
-                  '$_ipChange.newIP',
-                  '$ip',
-                ],
-              },
-            },
-          },
-          { $project: { removals: 0, ipChanges: 0, _removedAt: 0, _ipChange: 0 } },
-        ],
-        fromV1: [
-          { $unwind: '$_v1Filtered' },
-          {
-            $project: {
-              _id: 0,
-              name: '$_v1Filtered.name',
-              hash: '$_v1Filtered.hash',
-              ip: '$_v1Filtered.ip',
-              broadcastedAt: '$_v1Filtered.broadcastedAt',
-              runningSince: '$_v1Filtered.runningSince',
-              osUptime: '$_v1Filtered.osUptime',
-              staticIp: '$_v1Filtered.staticIp',
-              removals: 1,
-              ipChanges: 1,
-            },
-          },
-          {
-            $addFields: {
-              _removedAt: {
-                $ifNull: [
-                  { $let: {
-                    vars: { r: { $first: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } } } },
-                    in: '$$r.removedAt',
-                  } },
-                  new Date(0),
-                ],
-              },
-            },
-          },
-          { $match: { $expr: { $gt: ['$broadcastedAt', '$_removedAt'] } } },
-          {
-            $addFields: {
-              _ipChange: { $first: { $filter: { input: '$ipChanges', as: 'c', cond: { $eq: ['$$c._id', '$ip'] } } } },
-            },
-          },
-          {
-            $addFields: {
-              ip: {
-                $cond: [
-                  { $and: [{ $ne: ['$_ipChange', null] }, { $gt: ['$_ipChange.changedAt', '$broadcastedAt'] }] },
-                  '$_ipChange.newIP',
-                  '$ip',
-                ],
-              },
-            },
-          },
-          { $project: { removals: 0, ipChanges: 0, _removedAt: 0, _ipChange: 0 } },
-        ],
-      },
-    },
-    // Combine and dedup by {name, ip}, taking latest broadcastedAt
-    { $project: { all: { $concatArrays: ['$fromV2', '$fromV1'] } } },
-    { $unwind: '$all' },
-    { $replaceRoot: { newRoot: '$all' } },
-    { $sort: { broadcastedAt: -1 } },
-    {
-      $group: {
-        _id: { name: '$name', ip: '$ip' },
-        name: { $first: '$name' },
-        hash: { $first: '$hash' },
-        ip: { $first: '$ip' },
-        broadcastedAt: { $first: '$broadcastedAt' },
-        runningSince: { $first: '$runningSince' },
-        osUptime: { $first: '$osUptime' },
-        staticIp: { $first: '$staticIp' },
-      },
-    },
-    { $project: { _id: 0 } },
-  ];
-
-  const results = await collection.aggregate(pipeline).toArray();
-  return results;
-}
-
 /**
  * Get app installing locations
  * @param {string} appname - Optional app name filter
@@ -410,12 +116,6 @@ async function appInstallingLocation(appname) {
  * @param {string} appname - Application name (optional)
  * @returns {Promise<Array>} Array of app installing error locations
  */
-async function countAppInstallingErrors(hash) {
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  return dbHelper.countInDatabase(database, globalAppsInstallingErrorsLocations, { hash });
-}
-
 async function appInstallingErrorsLocation(appname) {
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
@@ -431,6 +131,8 @@ async function appInstallingErrorsLocation(appname) {
       ip: 1,
       error: 1,
       broadcastedAt: 1,
+      cachedAt: 1,
+      expireAt: 1,
     },
   };
   const results = await dbHelper.findInDatabase(database, globalAppsInstallingErrorsLocations, query, projection);
@@ -1432,8 +1134,6 @@ async function expireGlobalApplications() {
       const queryDeleteAppErrors = { name: app.name };
       // eslint-disable-next-line no-await-in-loop
       await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsBroadcasts, { 'data.name': app.name });
     }
 
     // get list of locally installed apps.
@@ -1505,35 +1205,38 @@ async function expireGlobalApplications() {
  * To update app specifications.
  * @param {object} appSpecs App specifications.
  */
-async function insertAppSpecifications(appSpecs) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    const query = { name: appSpecs.name };
-    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: true });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
-  } catch (error) {
-    log.error(`insertAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
-  }
-}
-
 async function updateAppSpecifications(appSpecs) {
   try {
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.appsglobal.database);
+
     const query = { name: appSpecs.name };
-    const projection = { projection: { _id: 0 } };
+    const options = {
+      upsert: true,
+    };
+    const projection = {
+      projection: {
+        _id: 0,
+      },
+    };
     const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-    if (!appInfo || appInfo.height >= appSpecs.height) return;
-    // replaceOne instead of $set to avoid accumulating ghost fields
-    // from prior spec versions (e.g. flat fields from v1-v3 lingering
-    // after upgrade to v4+ compose format)
-    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: false });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
+    if (appInfo) {
+      if (appInfo.height < appSpecs.height) {
+        // replaceOne instead of $set to avoid accumulating ghost fields
+        // from prior spec versions (e.g. flat fields from v1-v3 lingering
+        // after upgrade to v4+ compose format)
+        await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
+      }
+    } else {
+      await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
+    }
+    const queryDeleteAppErrors = { name: appSpecs.name };
+    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
   } catch (error) {
-    log.error(`updateAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
+    // retry
+    log.error(error);
+    await serviceHelper.delay(60 * 1000);
+    updateAppSpecifications(appSpecs);
   }
 }
 
@@ -1578,6 +1281,7 @@ async function reindexGlobalAppsInformation() {
       appsLocalDb,
       globalAppsMessages,
       globalAppsInformation,
+      globalAppsInstallingErrorsLocations,
       localAppsInformation,
       scannedHeight,
     );
@@ -1606,32 +1310,23 @@ async function reconstructAppMessagesHashCollection() {
 
     const permanentMessages = await dbHelper.findInDatabase(databaseApps, globalAppsMessages, query, projection);
     const appHashes = await dbHelper.findInDatabase(databaseDaemon, appsHashesCollection, query, projection);
-    const permHashSet = new Set(permanentMessages.map((m) => m.hash));
 
-    let changed = 0;
     // eslint-disable-next-line no-restricted-syntax
     for (const appHash of appHashes) {
+      const options = {};
       const queryUpdate = {
         hash: appHash.hash,
         txid: appHash.txid,
       };
 
-      const hasPermanent = permHashSet.has(appHash.hash);
+      const permanentMessageFound = permanentMessages.find((message) => message.hash === appHash.hash);
 
-      if (hasPermanent && (!appHash.message || appHash.messageNotFound)) {
-        const update = { $set: { message: true, messageNotFound: false }, $unset: { nextRetryHeight: '', syncAttempts: '' } };
-        // eslint-disable-next-line no-await-in-loop
-        await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, {});
-        changed += 1;
-      } else if (!hasPermanent && appHash.message) {
-        const update = { $set: { message: false } };
-        // eslint-disable-next-line no-await-in-loop
-        await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, {});
-        changed += 1;
-      }
+      const update = { $set: { message: !!permanentMessageFound, messageNotFound: false } };
+      // eslint-disable-next-line no-await-in-loop
+      await dbHelper.updateOneInDatabase(databaseDaemon, appsHashesCollection, queryUpdate, update, options);
     }
 
-    return { changed };
+    return 'Reconstruct success';
   } catch (error) {
     log.error(error);
     throw error;
@@ -1852,11 +1547,6 @@ async function reindexGlobalAppsLocation() {
         throw error;
       }
     });
-    await dbHelper.dropCollection(database, globalAppStateEvents).catch((error) => {
-      if (error.message !== 'ns not found') {
-        throw error;
-      }
-    });
     await database.collection(globalAppsLocations).createIndex({ name: 1 }, { name: 'query for getting app location based on app specs name' });
     await database.collection(globalAppsLocations).createIndex({ hash: 1 }, { name: 'query for getting app location based on app hash' });
     await database.collection(globalAppsLocations).createIndex({ ip: 1 }, { name: 'query for getting app location based on ip' });
@@ -2024,10 +1714,8 @@ async function rescanGlobalAppsInformationAPI(req, res) {
 module.exports = {
   getAppHashes,
   appLocation,
-  appLocationFromEvents,
   appInstallingLocation,
   appInstallingErrorsLocation,
-  countAppInstallingErrors,
   storeAppInstallingMessage,
   getAppsLocations,
   getAppsLocation,
@@ -2044,7 +1732,6 @@ module.exports = {
   getGlobalAppsSpecifications,
   availableApps,
   checkApplicationRegistrationNameConflicts,
-  insertAppSpecifications,
   updateAppSpecifications,
   updateAppSpecsForRescanReindex,
   storeAppSpecificationInPermanentStorage,
