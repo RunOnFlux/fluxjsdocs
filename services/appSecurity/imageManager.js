@@ -8,7 +8,6 @@ const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
 const verificationHelper = require('../verificationHelper');
-const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const { supportedArchitectures, globalAppsMessages, globalAppsInformation } = require('../utils/appConstants');
@@ -80,7 +79,6 @@ function classifyVerificationError(error, errorMeta) {
  * @param {number} [options.specVersion] - App specification version (required with repoauth)
  * @param {string} [options.architecture] - Specific architecture to validate support for
  * @param {string} [options.appName] - Application name (for logging)
- * @param {string} [options.owner] - App owner address; enterprise owners get the higher image size limit
  * @returns {Promise<{verified: boolean, supportedArchitectures: string[]}>} Verification result with supported architectures
  */
 async function verifyRepository(repotag, options = {}) {
@@ -88,13 +86,10 @@ async function verifyRepository(repotag, options = {}) {
   const specVersion = options.specVersion || null;
   const architecture = options.architecture || null;
   const appName = options.appName || null;
-  const owner = options.owner || null;
-  const maxImageSize = enterpriseNetwork.getMaxImageSizeForOwner(owner);
 
-  // Cache key includes the size tier so a "size_limit" cached for a non-enterprise
-  // owner doesn't reject the same image for an enterprise owner (different limit).
-  const sizeTier = maxImageSize === config.fluxapps.maxImageSize ? 'std' : 'ent';
-  const cacheKey = `${repotag}:${architecture || 'any'}:${repoauth ? 'auth' : 'noauth'}:${sizeTier}`;
+  // Check cache first to avoid redundant Docker Hub API calls
+  // Cache key includes architecture since same image may have different arch support
+  const cacheKey = `${repotag}:${architecture || 'any'}:${repoauth ? 'auth' : 'noauth'}`;
   const cached = fluxCaching.dockerHubVerificationCache.get(cacheKey);
 
   if (repoauth && !specVersion) {
@@ -114,7 +109,7 @@ async function verifyRepository(repotag, options = {}) {
   }
 
   const imgVerifier = new imageVerifier.ImageVerifier(repotag, {
-    maxImageSize,
+    maxImageSize: config.fluxapps.maxImageSize,
     architecture,
     architectureSet: supportedArchitectures,
   });
