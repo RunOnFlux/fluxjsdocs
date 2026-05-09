@@ -781,10 +781,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
     throw error;
   }
 
-  // Determine restart policy based on flags and owner
-  const appOwner = fullAppSpecs?.owner || null;
-  const restartPolicy = volumeConstructor.getRestartPolicy(parsedMounts.primary.flags, appOwner);
-
   // Construct Docker bind mounts
   let constructedVolumes;
   try {
@@ -927,7 +923,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       ],
       PortBindings: portBindings,
       RestartPolicy: {
-        Name: restartPolicy,
+        Name: 'no',
       },
       NetworkMode: `fluxDockerNetwork_${appName}`,
       LogConfig: logConfig,
@@ -1547,6 +1543,30 @@ async function getAppNameByContainerIp(ip) {
   return appName;
 }
 
+async function migrateContainerRestartPolicies() {
+  try {
+    const containers = await dockerListContainers(true);
+    if (!containers) return;
+    const fluxContainers = containers.filter((c) => c.Names[0].startsWith('/flux') || c.Names[0].startsWith('/zel'));
+    let migrated = 0;
+    for (const c of fluxContainers) {
+      const container = docker.getContainer(c.Id);
+      // eslint-disable-next-line no-await-in-loop
+      const info = await container.inspect();
+      if (info.HostConfig.RestartPolicy.Name !== 'no') {
+        // eslint-disable-next-line no-await-in-loop
+        await container.update({ RestartPolicy: { Name: 'no' } });
+        migrated += 1;
+      }
+    }
+    if (migrated > 0) {
+      log.info(`Migrated restart policy to 'no' for ${migrated} containers`);
+    }
+  } catch (error) {
+    log.error(`Failed to migrate container restart policies: ${error.message}`);
+  }
+}
+
 module.exports = {
   appDockerCreate,
   appDockerUpdateCpu,
@@ -1588,6 +1608,7 @@ module.exports = {
   getDockerContainerOnly,
   getFluxDockerNetworkPhysicalInterfaceNames,
   getFluxDockerNetworkSubnets,
+  migrateContainerRestartPolicies,
   pruneContainers,
   pruneImages,
   pruneNetworks,
