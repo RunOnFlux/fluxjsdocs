@@ -266,6 +266,8 @@ async function startFluxFunctions() {
     // before daemonReady is set so its timeout/removal logic can trigger.
     await daemonServiceUtils.buildFluxdClient();
     await daemonServiceMiscRpcs.waitForDaemonRpc();
+    // awaited so isDaemonSynced cache is populated before hash sync reads it
+    await daemonServiceMiscRpcs.daemonBlockchainInfoService();
     globalState.daemonReady = true;
 
     // Initialize app sync orchestrator and spawner
@@ -293,8 +295,6 @@ async function startFluxFunctions() {
     log.info('Connections polling prepared');
     fluxNetworkHelper.initClockOffsetCache();
     log.info('Clock offset cache initialized');
-    daemonServiceMiscRpcs.daemonBlockchainInfoService();
-    log.info('Flux Daemon Info Service Started');
     // Remove existing watchtower container (replaced by native image update service)
     imageUpdateService.removeWatchtowerContainer();
     // Start native image update service (delayed start)

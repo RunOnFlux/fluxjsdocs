@@ -100,11 +100,15 @@ async function fluxDaemonBlockchainInfo() {
 /**
  * To call the flux daemon blockchain info function at set intervals.
  */
-function daemonBlockchainInfoService() {
-  fluxDaemonBlockchainInfo();
-  setInterval(() => {
-    fluxDaemonBlockchainInfo();
-  }, 30 * 1000);
+async function daemonBlockchainInfoService() {
+  await fluxDaemonBlockchainInfo();
+  function scheduleNext() {
+    setTimeout(async () => {
+      await fluxDaemonBlockchainInfo();
+      scheduleNext();
+    }, 30 * 1000);
+  }
+  scheduleNext();
 }
 
 const RPC_IN_WARMUP = -28;
