@@ -43,12 +43,6 @@ const CLOSE_CODES = Object.freeze({
   // Invalid messages
   INVALID_MSG_INBOUND: 4016,
   INVALID_MSG_OUTBOUND: 4017,
-
-  // Ephemeral connection complete
-  EPHEMERAL_DONE: 4018,
-
-  // Node lost confirmation — disconnecting all peers
-  NODE_UNCONFIRMED: 4019,
 });
 
 const PEER_SOURCE = Object.freeze({
@@ -57,7 +51,6 @@ const PEER_SOURCE = Object.freeze({
   RECONNECT: 'reconnect',
   MANUAL: 'manual',
   INBOUND: 'inbound',
-  EPHEMERAL: 'ephemeral',
 });
 
 const DIRECTION = Object.freeze({
@@ -91,7 +84,6 @@ class FluxPeerSocket {
     this.remoteCapabilities = new Set();
     this.remoteClockOffsetMs = null;
     this.remoteVersion = null;
-    this.remoteFluxUptime = null;
     this.source = PEER_SOURCE.INBOUND;
     this.msgMap = new Map([['requestHash', 0], ['newHash', 0]]);
     this.messagesReceived = 0;
@@ -269,11 +261,7 @@ class FluxPeerSocket {
 
     ws.onclose = (evt) => {
       log.info(`${this.direction === DIRECTION.INBOUND ? 'Incoming' : 'Outgoing'} connection ${this.direction === DIRECTION.INBOUND ? 'from' : 'to'} ${this.key} closed with code ${evt.code}`);
-      if (this.source === PEER_SOURCE.EPHEMERAL) {
-        manager.removeEphemeral(this.key);
-      } else {
-        manager.remove(this.key, evt.code);
-      }
+      manager.remove(this.key, evt.code);
     };
 
     ws.onerror = (evt) => {
@@ -350,11 +338,4 @@ class FluxPeerSocket {
   }
 }
 
-const FLUX_CAPABILITIES = Object.freeze([
-  'transmissionTimestamps',
-  'peerExchange',
-  'binaryMessages',
-  'appStateSync',
-]);
-
-module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES };
+module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION };

@@ -1,9 +1,10 @@
+const config = require('config');
 const messageHelper = require('../messageHelper');
-const serviceHelper = require('../serviceHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const daemonServiceBlockchainRpcs = require('./daemonServiceBlockchainRpcs');
 const log = require('../../lib/log');
 const configManager = require('../utils/configManager');
+const fluxEventBus = require('../utils/fluxEventBus');
 
 /**
  * Get the default daemon header based on testnet configuration
@@ -91,6 +92,7 @@ async function fluxDaemonBlockchainInfo() {
       currentDaemonHeader = daemonBlockChainInfo.data.headers;
     }
     lastSuccessfulRpcCall = Date.now();
+    fluxEventBus.publish('daemon:polled', { height: currentDaemonHeight, headers: currentDaemonHeader });
     return log.info(`Daemon Sync status: ${currentDaemonHeight}/${currentDaemonHeader}`);
   } catch (error) {
     return log.warn(error);
@@ -100,47 +102,11 @@ async function fluxDaemonBlockchainInfo() {
 /**
  * To call the flux daemon blockchain info function at set intervals.
  */
-async function daemonBlockchainInfoService() {
-  await fluxDaemonBlockchainInfo();
-  function scheduleNext() {
-    setTimeout(async () => {
-      await fluxDaemonBlockchainInfo();
-      scheduleNext();
-    }, 30 * 1000);
-  }
-  scheduleNext();
-}
-
-const RPC_IN_WARMUP = -28;
-
-/**
- * Wait for the daemon RPC to become available.
- * Polls getblockcount every 5 seconds until a successful response.
- * @returns {Promise<number>} The block height once RPC is available.
- */
-async function waitForDaemonRpc() {
-  const POLL_INTERVAL_MS = 5000;
-  const LOG_INTERVAL_MS = 60000;
-  let lastLogAt = 0;
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const result = await daemonServiceBlockchainRpcs.getBlockCount();
-    if (result.status === 'success') {
-      log.info(`Daemon RPC available at block height ${result.data}`);
-      return result.data;
-    }
-    const now = Date.now();
-    if (!lastLogAt || now - lastLogAt >= LOG_INTERVAL_MS) {
-      const reason = result.data?.code === RPC_IN_WARMUP
-        ? result.data.message
-        : 'daemon not reachable';
-      log.info(`Waiting for daemon RPC... (${reason})`);
-      lastLogAt = now;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.delay(POLL_INTERVAL_MS);
-  }
+function daemonBlockchainInfoService() {
+  fluxDaemonBlockchainInfo();
+  setInterval(() => {
+    fluxDaemonBlockchainInfo();
+  }, config.fluxapps.daemonInfoIntervalMs ?? 30000);
 }
 
 function getIsDaemonInsightExplorer() {
@@ -180,7 +146,6 @@ module.exports = {
   // == NON Daemon ==
   isDaemonSynced,
   daemonBlockchainInfoService,
-  waitForDaemonRpc,
 
   // exports for testing purposes
   fluxDaemonBlockchainInfo,
