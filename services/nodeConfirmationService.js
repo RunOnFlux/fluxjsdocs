@@ -6,8 +6,8 @@ const { AsyncGate } = require('./utils/asyncGate');
 const fluxEventBus = require('./utils/fluxEventBus');
 const log = require('../lib/log');
 
-const DAEMON_STALE_MS = config.fluxapps.confirmationDaemonStaleMs;
-const DAEMON_EXPIRED_MS = config.fluxapps.confirmationDaemonExpiredMs;
+const DAEMON_STALE_MS = config.confirmation.daemonStaleMs;
+const DAEMON_EXPIRED_MS = config.confirmation.daemonExpiredMs;
 
 let ourPubkey = null;
 let daemonConfirmed = null;
@@ -148,6 +148,7 @@ async function poll() {
   if (prevMessageCapable !== messageCapable) {
     const direction = messageCapable ? 'gained' : 'lost';
     log.info(`nodeConfirmationService - Message capability ${direction} (confirmed=${daemonConfirmed}, messageCapable=${messageCapable})`);
+    fluxEventBus.publish('messageCapability:changed', { capable: messageCapable });
     for (const cb of messageCapabilityListeners) {
       try { cb(messageCapable); } catch (e) { log.error(e); }
     }
@@ -158,7 +159,7 @@ function scheduleNext() {
   setTimeout(async () => {
     await poll();
     scheduleNext();
-  }, config.fluxapps.confirmationPollIntervalMs);
+  }, config.confirmation.pollIntervalMs);
 }
 
 async function start() {

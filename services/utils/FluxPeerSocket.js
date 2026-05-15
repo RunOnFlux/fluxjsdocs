@@ -84,7 +84,7 @@ class FluxPeerSocket {
     this.lastPingTime = null;
     this.lastPongTime = null;
     this.missedPongs = 0;
-    this.maxMissedPongs = config.fluxapps.wsMaxMissedPongs ?? 3;
+    this.maxMissedPongs = config.peers.wsMaxMissedPongs ?? 3;
     this.connectedAt = Date.now();
     this.nakCount = 0;
     this.nakWindowStart = Date.now();
@@ -136,8 +136,8 @@ class FluxPeerSocket {
     this.lastPingTime = Date.now();
     this.missedPongs += 1;
     if (this.missedPongs >= this.maxMissedPongs) {
-      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs, closing`);
-      this.close(CLOSE_CODES.DEAD_CONNECTION, 'dead connection');
+      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs, terminating`);
+      this.terminate();
     }
   }
 
@@ -197,6 +197,10 @@ class FluxPeerSocket {
     } catch (e) {
       log.error(e);
     }
+  }
+
+  terminate() {
+    this.ws.terminate();
   }
 
   /**

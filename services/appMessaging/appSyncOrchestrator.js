@@ -88,6 +88,12 @@ class AppSyncOrchestrator {
     if (prevState === newState) return;
     this.#state = newState;
     fluxEventBus.publish('orchestrator:stateChanged', { from: prevState, to: newState });
+    if (prevState === STATES.READY && newState !== STATES.READY) {
+      appSyncEvents.emit(EVENTS.READINESS_LOST);
+    }
+    if (newState === STATES.READY && prevState !== STATES.READY) {
+      appSyncEvents.emit(EVENTS.SPAWNER_READY);
+    }
   }
 
   async start(bootContext) {
@@ -115,9 +121,9 @@ class AppSyncOrchestrator {
     appSyncEvents.on(EVENTS.HASH_UNRESOLVED, this.#hashUnresolvedHandler);
 
     this.#blockReceivedHandler = (blockHeight) => {
-      this.#onBlockReceived(blockHeight);
+      this.#onBlocksProcessed(blockHeight);
     };
-    this.#blockEmitter.on('blockReceived', this.#blockReceivedHandler);
+    this.#blockEmitter.on('blocksProcessed', this.#blockReceivedHandler);
 
     this.#hashesChangedHandler = () => this.#onHashesChanged();
     this.#blockEmitter.on('hashesChanged', this.#hashesChangedHandler);
@@ -243,14 +249,13 @@ class AppSyncOrchestrator {
   }
 
   #onPeersDegraded() {
-    if (this.#state === STATES.READY) {
+    if (this.#state === STATES.READY || this.#state === STATES.SYNCING) {
       this.#setState(STATES.DEGRADED);
       this.#hashSyncComplete = false;
       this.#dbRebuilt = false;
       globalState.dbReady = false;
       this.#resetSyncState();
       log.warn('AppSyncOrchestrator - Degraded, pausing spawner');
-      appSyncEvents.emit(EVENTS.READINESS_LOST);
     }
   }
 
@@ -263,9 +268,14 @@ class AppSyncOrchestrator {
       clearTimeout(this.#syncTimeout);
       this.#syncTimeout = null;
     }
+    if (this.#hashSyncRetryTimer) {
+      clearTimeout(this.#hashSyncRetryTimer);
+      this.#hashSyncRetryTimer = null;
+    }
   }
 
-  #onBlockReceived(blockHeight) {
+  #onBlocksProcessed(blockHeight) {
+    const count = this.#lastBlockHeight > 0 ? blockHeight - this.#lastBlockHeight : 1;
     this.#lastBlockHeight = blockHeight;
     if (!this.#explorerSynced) {
       this.#explorerSynced = true;
@@ -276,8 +286,8 @@ class AppSyncOrchestrator {
         this.#runInitialSync();
       }
     }
-    if (this.#state === STATES.SYNCING || this.#state === STATES.READY) {
-      this.#blocksSinceSyncStarted += 1;
+    if (this.#state === STATES.SYNCING || this.#state === STATES.READY || this.#state === STATES.RESYNCING) {
+      this.#blocksSinceSyncStarted += count;
       this.#checkReadiness();
       this.#checkHashRetry(blockHeight);
     }
@@ -440,7 +450,6 @@ class AppSyncOrchestrator {
 
     this.#setState(STATES.READY);
     log.info('AppSyncOrchestrator - All readiness conditions met');
-    appSyncEvents.emit(EVENTS.SPAWNER_READY);
   }
 
   onMessageCapabilityChange(capable) {
@@ -459,7 +468,6 @@ class AppSyncOrchestrator {
       if (this.#state === STATES.READY) {
         this.#setState(STATES.SYNCING);
         log.warn('AppSyncOrchestrator - Readiness lost (message capability), pausing spawner');
-        appSyncEvents.emit(EVENTS.READINESS_LOST);
       }
     }
   }
@@ -484,7 +492,8 @@ class AppSyncOrchestrator {
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
       const heartbeat = await dbHelper.findOneInDatabase(database, startupCollection, { _id: 'heartbeat' });
-      const currentBootId = (await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+      const bootIdPath = config.system.bootIdPath ?? '/proc/sys/kernel/random/boot_id';
+      const currentBootId = (await fs.readFile(bootIdPath, 'utf8')).trim();
       const machineRebooted = !heartbeat || heartbeat.machineBootId !== currentBootId;
       const downtimeMs = heartbeat ? Date.now() - heartbeat.lastAlive : Infinity;
       const cleanShutdown = heartbeat?.shutdownReason === 'sigterm';
@@ -520,7 +529,7 @@ class AppSyncOrchestrator {
       }
     };
     writeHeartbeat();
-    this.#heartbeatInterval = setInterval(writeHeartbeat, config.fluxapps.heartbeatIntervalMs ?? 30000);
+    this.#heartbeatInterval = setInterval(writeHeartbeat, config.system.heartbeatIntervalMs ?? 30000);
   }
 
   static async writeShutdownReason(reason) {
@@ -552,7 +561,7 @@ class AppSyncOrchestrator {
       appSyncEvents.removeListener(EVENTS.HASH_UNRESOLVED, this.#hashUnresolvedHandler);
     }
     if (this.#blockReceivedHandler) {
-      this.#blockEmitter.removeListener('blockReceived', this.#blockReceivedHandler);
+      this.#blockEmitter.removeListener('blocksProcessed', this.#blockReceivedHandler);
     }
     if (this.#hashesChangedHandler) {
       this.#blockEmitter.removeListener('hashesChanged', this.#hashesChangedHandler);
