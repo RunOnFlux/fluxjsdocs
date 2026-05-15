@@ -15,12 +15,7 @@ const geolocationService = require('../geolocationService');
 const appUninstaller = require('./appUninstaller');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
-const { storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
-
-let onInstallComplete = null;
-function setOnInstallComplete(callback) {
-  onInstallComplete = callback;
-}
+const { storeAppRunningMessage, storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
 const { systemArchitecture } = require('../appSystem/systemIntegration');
 const { checkApplicationImagesCompliance, verifyRepository } = require('../appSecurity/imageManager');
 const { startAppMonitoring } = require('../appManagement/appInspector');
@@ -40,7 +35,6 @@ const { checkAppTemporaryMessageExistence, checkAppMessageExistence } = require(
 const { availableApps, getApplicationGlobalSpecifications } = require('../appDatabase/registryManager');
 const hwRequirements = require('../appRequirements/hwRequirements');
 const config = require('config');
-const fluxEventBus = require('../utils/fluxEventBus');
 
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
@@ -645,9 +639,26 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
 
     log.info(`Flux App: ${appName} is test install: ${test}`);
 
-    if (!test && onInstallComplete) {
-      await onInstallComplete();
-      fluxEventBus.publish('app:installed', { name: appSpecifications.name, hash: appSpecifications.hash });
+    if (!test) {
+      const broadcastedAt = Date.now();
+      const newAppRunningMessage = {
+        type: 'fluxapprunning',
+        version: 1,
+        name: appSpecifications.name,
+        hash: appSpecifications.hash, // hash of application specifics that are running
+        ip: myIP,
+        broadcastedAt,
+        runningSince: new Date(broadcastedAt).toISOString(),
+        osUptime: os.uptime(),
+        staticIp: geolocationService.isStaticIP(),
+      };
+
+      // store it in local database first
+      // eslint-disable-next-line no-await-in-loop, no-use-before-define
+      await storeAppRunningMessage(newAppRunningMessage);
+      // broadcast messages about running apps to all peers
+      await fluxCommunicationMessagesSender.broadcastMessageToAll(newAppRunningMessage);
+      // broadcast messages about running apps to all peers
     }
 
     // all done message
@@ -1224,5 +1235,4 @@ module.exports = {
   installAppLocally,
   checkAppRequirements,
   testAppInstall,
-  setOnInstallComplete,
 };
