@@ -11,6 +11,7 @@ const daemonServiceControlRpcs = require('./daemonService/daemonServiceControlRp
 const daemonServiceAddressRpcs = require('./daemonService/daemonServiceAddressRpcs');
 const daemonServiceTransactionRpcs = require('./daemonService/daemonServiceTransactionRpcs');
 const daemonServiceBlockchainRpcs = require('./daemonService/daemonServiceBlockchainRpcs');
+const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 const chainUtilities = require('./utils/chainUtilities');
 const messageVerifier = require('./appMessaging/messageVerifier');
 const registryManager = require('./appDatabase/registryManager');
@@ -18,6 +19,8 @@ const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const benchmarkService = require('./benchmarkService');
 const fluxNetworkhelper = require('./fluxNetworkHelper');
 const fluxEventBus = require('./utils/fluxEventBus');
+const globalState = require('./utils/globalState');
+const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('./utils/appSyncEvents');
 
 const coinbaseFusionIndexCollection = config.database.daemon.collections.coinbaseFusionIndex; // fusion
 const utxoIndexCollection = config.database.daemon.collections.utxoIndex;
@@ -347,6 +350,7 @@ async function processInsight(blockDataVerbose, database) {
         if (isFluxAppMessageValue >= (priceSpecifications.minPrice * 1e8) && message.length === 64 && blockDataVerbose.height >= config.fluxapps.epochstart) { // min of X flux had to be paid for us bothering checking
           const appTxRecord = {
             txid: tx.txid, height: blockDataVerbose.height, hash: message, value: isFluxAppMessageValue, message: false, // message is boolean saying if we already have it stored as permanent message
+            syncAttempts: 0, nextRetryHeight: blockDataVerbose.height, retryFromHeight: blockDataVerbose.height,
           };
           // Unique hash - If we already have a hash of this app in our database, do not insert it!
           try {
@@ -431,13 +435,19 @@ async function insertAndRequestAppHashes(apps, database) {
     await insertTransactions(apps, database);
     setTimeout(async () => {
       const appsToRemove = [];
+      let hasUnresolved = false;
       // eslint-disable-next-line no-restricted-syntax
       for (const app of apps) {
         // eslint-disable-next-line no-await-in-loop
         const messageReceived = await messageVerifier.checkAndRequestApp(app.hash, app.txid, app.height, app.value, 2);
         if (messageReceived) {
           appsToRemove.push(app);
+        } else {
+          hasUnresolved = true;
         }
+      }
+      if (hasUnresolved) {
+        appSyncEvents.emit(SYNC_EVENTS.HASH_UNRESOLVED);
       }
       apps.filter((item) => !appsToRemove.includes(item));
       while (apps.length > 500) {
@@ -515,6 +525,7 @@ async function processStandard(blockDataVerbose, database) {
         if (isFluxAppMessageValue >= (priceSpecifications.minPrice * 1e8) && message.length === 64 && blockDataVerbose.height >= config.fluxapps.epochstart) { // min of 1 flux had to be paid for us bothering checking
           const appTxRecord = {
             txid: tx.txid, height: blockDataVerbose.height, hash: message, value: isFluxAppMessageValue, message: false, // message is boolean saying if we already have it stored as permanent message
+            syncAttempts: 0, nextRetryHeight: blockDataVerbose.height, retryFromHeight: blockDataVerbose.height,
           };
           // Unique hash - If we already have a hash of this app in our database, do not insert it!
           try {
@@ -618,28 +629,27 @@ async function processBlock(blockHeight, isInsightExplorer) {
     if (isSynced) {
       blockEmitter.emit('blockReceived', scannedHeight);
 
-      if (blockHeight % (2 * speedMultiplier) === 0) {
-        if (blockDataVerbose.height >= config.fluxapps.epochstart) {
+      if (globalState.dbReady && blockDataVerbose.height >= config.fluxapps.epochstart) {
+        if (blockHeight % (2 * speedMultiplier) === 0) {
           await registryManager.expireGlobalApplications();
         }
-      }
-      if (blockHeight % (config.fluxapps.removeFluxAppsPeriod * speedMultiplier) === 0) {
-        if (blockDataVerbose.height >= config.fluxapps.epochstart) {
+        if (blockHeight % (config.fluxapps.removeFluxAppsPeriod * speedMultiplier) === 0) {
           advancedWorkflows.checkAndRemoveApplicationInstance();
         }
-      }
-      if (blockHeight % (updateFluxAppsPeriod * speedMultiplier) === 0) {
-        if (blockDataVerbose.height >= config.fluxapps.epochstart) {
+        if (blockHeight % (updateFluxAppsPeriod * speedMultiplier) === 0) {
           advancedWorkflows.reinstallOldApplications();
           updateFluxAppsPeriod = Math.floor(Math.random() * 6 + 4);
         }
-      }
-      if (blockDataVerbose.height % (config.fluxapps.reconstructAppMessagesHashPeriod * speedMultiplier) === 0) {
-        try {
-          registryManager.reconstructAppMessagesHashCollection();
-          log.info('Validation of App Messages Hash Collection');
-        } catch (error) {
-          log.error(error);
+        if (blockDataVerbose.height % (config.fluxapps.reconstructAppMessagesHashPeriod * speedMultiplier) === 0) {
+          try {
+            const reconstructResult = await registryManager.reconstructAppMessagesHashCollection();
+            log.info(`Validation of App Messages Hash Collection — ${reconstructResult.changed} corrected`);
+            if (reconstructResult.changed > 0) {
+              blockEmitter.emit('hashesChanged');
+            }
+          } catch (error) {
+            log.error(error);
+          }
         }
       }
       if (blockDataVerbose.height % (config.fluxapps.benchUpnpPeriod * speedMultiplier) === 0) {
@@ -800,6 +810,160 @@ async function cleanupDuplicateScannedHeight(database) {
  * @param {boolean} reindexOrRescanGlobalApps True if apps collections are to be reindexed.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
+
+function getPriceSpecForHeight(priceSpecs, height) {
+  let lo = 0;
+  let hi = priceSpecs.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (priceSpecs[mid].height < height) lo = mid;
+    else hi = mid - 1;
+  }
+  return priceSpecs[lo];
+}
+
+function processBootstrapTx(tx, priceSpecs, seenHashes, hashBatch, softForkBatch) {
+  if (tx.version >= 5 || tx.version <= 0) return;
+  const { height } = tx;
+  if (!height) return;
+
+  let message = '';
+  let appValue = 0;
+  let senderFoundation = false;
+  let receiverFoundation = false;
+
+  for (const vin of (tx.vin || [])) {
+    if (vin.address === config.fluxapps.addressMultisig || vin.address === config.fluxapps.addressMultisigB) {
+      senderFoundation = true;
+      break;
+    }
+  }
+
+  for (const vout of tx.vout) {
+    if (vout.scriptPubKey.addresses) {
+      const addr = vout.scriptPubKey.addresses[0];
+      if (addr === config.fluxapps.address
+        || (addr === config.fluxapps.addressMultisig && height >= config.fluxapps.appSpecsEnforcementHeights[6])
+        || (addr === config.fluxapps.addressMultisigB && height >= config.fluxapps.multisigAddressChange)
+        || (addr === config.fluxapps.addressDevelopment && config.development)) {
+        appValue += vout.valueSat;
+      }
+      if (addr === config.fluxapps.addressMultisig || addr === config.fluxapps.addressMultisigB) {
+        receiverFoundation = true;
+      }
+    }
+    if (vout.scriptPubKey.asm) {
+      message = decodeMessage(vout.scriptPubKey.asm);
+    }
+  }
+
+  if (appValue > 0) {
+    const priceSpec = getPriceSpecForHeight(priceSpecs, height);
+    if (appValue >= (priceSpec.minPrice * 1e8) && message.length === 64
+      && height >= config.fluxapps.epochstart && !seenHashes.has(message)) {
+      seenHashes.add(message);
+      hashBatch.push({
+        txid: tx.txid, height, hash: message, value: appValue,
+        message: false, syncAttempts: 0, nextRetryHeight: height, retryFromHeight: height,
+      });
+    }
+  }
+
+  if (senderFoundation && receiverFoundation && message) {
+    softForkBatch.push({ txid: tx.txid, height, message });
+  }
+}
+
+async function bootstrapAppHashes(currentDaemonHeight) {
+  const appAddresses = [
+    config.fluxapps.address,
+    config.fluxapps.addressMultisig,
+    config.fluxapps.addressMultisigB,
+  ];
+  if (config.development) {
+    appAddresses.push(config.fluxapps.addressDevelopment);
+  }
+
+  log.info(`Bootstrap: Fetching txids for ${appAddresses.length} app addresses from height ${config.fluxapps.epochstart} to ${currentDaemonHeight}`);
+
+  const txidResult = await daemonServiceUtils.executeCall('getaddresstxids', [{
+    addresses: appAddresses,
+    start: config.fluxapps.epochstart,
+    end: currentDaemonHeight,
+  }]);
+  if (txidResult.status !== 'success') {
+    throw new Error(`getaddresstxids failed: ${txidResult.data.message || txidResult.data}`);
+  }
+
+  const allTxids = [...new Set(txidResult.data)];
+  log.info(`Bootstrap: ${allTxids.length} unique txids to process`);
+
+  const priceSpecs = await chainUtilities.getChainParamsPriceUpdates();
+  const seenHashes = new Set();
+  let hashBatch = [];
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.daemon.database);
+
+  const BATCH_SIZE = 500;
+  const INSERT_THRESHOLD = 5000;
+  let totalHashes = 0;
+  let totalSoftForks = 0;
+
+  for (let i = 0; i < allTxids.length; i += BATCH_SIZE) {
+    const batch = allTxids.slice(i, i + BATCH_SIZE);
+    const calls = batch.map((txid) => ({ method: 'getrawtransaction', params: [txid, 1] }));
+
+    // eslint-disable-next-line no-await-in-loop
+    const batchResult = await daemonServiceUtils.executeBatchCall(calls);
+    if (batchResult.status !== 'success') {
+      throw new Error(`Batch getrawtransaction failed: ${batchResult.data.message || batchResult.data}`);
+    }
+
+    const softForkBatch = [];
+    for (const response of batchResult.data) {
+      if (response.error) {
+        log.warn(`Bootstrap: failed to fetch tx: ${response.error.message || JSON.stringify(response.error)}`);
+        continue;
+      }
+      processBootstrapTx(response.result, priceSpecs, seenHashes, hashBatch, softForkBatch);
+    }
+
+    for (const sf of softForkBatch) {
+      // eslint-disable-next-line no-await-in-loop
+      await processSoftFork(sf.txid, sf.height, sf.message);
+      const splitted = sf.message.split('_');
+      if (splitted[0] === 'p' && splitted[4]) {
+        priceSpecs.push({
+          height: sf.height, cpu: +splitted[1], ram: +splitted[2], hdd: +splitted[3],
+          minPrice: +splitted[4], port: +splitted[5] || 2, scope: +splitted[6] || 6, staticip: +splitted[7] || 3,
+        });
+        priceSpecs.sort((a, b) => a.height - b.height);
+      }
+    }
+    totalSoftForks += softForkBatch.length;
+
+    if (hashBatch.length >= INSERT_THRESHOLD || i + BATCH_SIZE >= allTxids.length) {
+      if (hashBatch.length > 0) {
+        // eslint-disable-next-line no-await-in-loop
+        await insertTransactions(hashBatch, database);
+        totalHashes += hashBatch.length;
+        hashBatch = [];
+      }
+    }
+
+    const processed = Math.min(i + BATCH_SIZE, allTxids.length);
+    if (processed % 5000 < BATCH_SIZE || processed === allTxids.length) {
+      log.info(`Bootstrap: ${processed}/${allTxids.length} txids processed, ${totalHashes + hashBatch.length} hashes, ${totalSoftForks} soft forks`);
+    }
+  }
+
+  const query = { generalScannedHeight: { $gte: 0 } };
+  const update = { $set: { generalScannedHeight: currentDaemonHeight } };
+  await dbHelper.updateOneInDatabase(database, scannedHeightCollection, query, update, { upsert: true });
+
+  log.info(`Bootstrap complete: ${totalHashes} app hashes, ${totalSoftForks} soft fork messages, scanned to height ${currentDaemonHeight}`);
+}
+
 // do a deepRestore of 100 blocks if daemon if enouncters an error (mostly flux daemon was down) or if its initial start of flux
 // use reindexGlobalApps with caution!!!
 async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRescanGlobalApps) {
@@ -821,25 +985,6 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
     const currentHeight = await dbHelper.findOneInDatabase(database, scannedHeightCollection, query, projection);
     if (currentHeight && currentHeight.generalScannedHeight) {
       scannedBlockHeight = currentHeight.generalScannedHeight;
-    }
-    // fix for a node if they have corrupted global app list
-    if (scannedBlockHeight >= config.fluxapps.epochstart) {
-      const globalAppsSpecs = await registryManager.getAllGlobalApplications(['height']); // already sorted from oldest lowest height to newest highest height
-
-      if (globalAppsSpecs.length >= 2) {
-        // Account for PON fork - chain is 4x faster after fork
-        const defaultExpire = scannedBlockHeight >= config.fluxapps.daemonPONFork
-          ? config.fluxapps.blocksLasting * 4
-          : config.fluxapps.blocksLasting;
-        const minBlockheightDifference = defaultExpire * 0.9; // it is highly unlikely that there was no app registration or an update for default of 2200 blocks ~3days
-        const oldestAppHeight = globalAppsSpecs[0].height;
-        const youngestAppHeight = globalAppsSpecs.pop().height;
-        const blockDifference = youngestAppHeight - oldestAppHeight;
-
-        if (blockDifference < minBlockheightDifference) {
-          await registryManager.reindexGlobalAppsInformation();
-        }
-      }
     }
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
     if (!syncStatus.data.synced) {
@@ -940,7 +1085,22 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
             throw error;
           }
         });
-        log.info(resultE, resultF, resultG, resultH, resultI);
+        const resultJ = await dbHelper.dropCollection(databaseGlobal, config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).catch((error) => {
+          if (error.message !== 'ns not found') {
+            throw error;
+          }
+        });
+        const resultK = await dbHelper.dropCollection(databaseGlobal, config.database.appsglobal.collections.appStateEvents).catch((error) => {
+          if (error.message !== 'ns not found') {
+            throw error;
+          }
+        });
+        const resultL = await dbHelper.dropCollection(databaseGlobal, config.database.appsglobal.collections.appsInstallingBroadcasts).catch((error) => {
+          if (error.message !== 'ns not found') {
+            throw error;
+          }
+        });
+        log.info(resultE, resultF, resultG, resultH, resultI, resultJ, resultK, resultL);
       }
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
       await databaseGlobal.collection(config.database.appsglobal.collections.appsMessages).createIndex({ txid: 1 }, { name: 'query for getting zelapp message based on txid' });
@@ -1001,13 +1161,23 @@ async function initiateBlockProcessor(restoreDatabase, deepRestore, reindexOrRes
       isInInitiationOfBP = false;
       const isInsightExplorer = daemonServiceMiscRpcs.isInsightExplorer();
 
-      if (isInsightExplorer) {
-        // if node is insight explorer based, we are only processing flux app messages
-        if (scannedBlockHeight < config.fluxapps.epochstart - 1) {
+      if (scannedBlockHeight === 0 && isInsightExplorer) {
+        try {
+          log.info('Bootstrap: Using address-index fast path');
+          await bootstrapAppHashes(daemonHeight);
+          log.info('Bootstrap complete, entering steady-state block processing');
+          processBlock(daemonHeight + 1, isInsightExplorer);
+        } catch (error) {
+          log.error('Bootstrap failed, falling back to block-by-block scan');
+          log.error(error);
+          processBlock(config.fluxapps.epochstart, isInsightExplorer);
+        }
+      } else {
+        if (isInsightExplorer && scannedBlockHeight < config.fluxapps.epochstart - 1) {
           scannedBlockHeight = config.fluxapps.epochstart - 1;
         }
+        processBlock(scannedBlockHeight + 1, isInsightExplorer);
       }
-      processBlock(scannedBlockHeight + 1, isInsightExplorer);
     } else if (scannedBlockHeight >= config.daemon.chainValidHeight && lastchainTipCheck !== 0 && lastchainTipCheck + 100 < scannedBlockHeight) {
       log.info(`Explorer - Checking for chain reorganisations - lastchainTipCheck: ${lastchainTipCheck} scannedBlockHeight: ${scannedBlockHeight}`);
 
@@ -1745,7 +1915,10 @@ module.exports = {
   getAddressFusionCoinbase,
   getBlockEmitter,
 
-  // exports for testing puproses
+  // exports for testing purposes
+  bootstrapAppHashes,
+  getPriceSpecForHeight,
+  processBootstrapTx,
   getSenderTransactionFromDaemon,
   getSender,
   processBlockTransactions,
@@ -1758,7 +1931,5 @@ module.exports = {
   setIsInInitiationOfBP,
   restoreDatabaseToBlockheightState,
 
-  // temporary function
-  fixExplorer,
   isExplorerSynced,
 };

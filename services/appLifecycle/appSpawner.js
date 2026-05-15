@@ -6,6 +6,7 @@ const generalService = require('../generalService');
 const benchmarkService = require('../benchmarkService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const geolocationService = require('../geolocationService');
+const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const log = require('../../lib/log');
 
 // Import modular services
@@ -19,25 +20,29 @@ const systemIntegration = require('../appSystem/systemIntegration');
 const globalState = require('../utils/globalState');
 const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { FluxCacheManager } = require('../utils/cacheManager');
-// const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
+const appInstaller = require('./appInstaller');
+const appUninstaller = require('./appUninstaller');
+const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
+const fluxEventBus = require('../utils/fluxEventBus');
 
-let appInstaller; // Will be initialized to avoid circular dependency
-let appUninstaller; // Will be initialized to avoid circular dependency
 let appsCountAvailableToInstallOnMyNode = 0;
 
 const collisionWaitMs = config.fluxapps.installCollisionWaitMs;
 const spawnReconfirmDelayMs = config.fluxapps.spawnReconfirmDelayMs;
 const nonEnterpriseSpawnDelayMs = config.fluxapps.nonEnterpriseSpawnDelayMs ?? 2 * 60 * 1000;
 
-/**
- * Initialize the module with dependencies
- * @param {object} deps - Dependencies object
- */
-function initialize(deps) {
-  // eslint-disable-next-line prefer-destructuring
-  appInstaller = deps.appInstaller;
-  // eslint-disable-next-line prefer-destructuring
-  appUninstaller = deps.appUninstaller;
+function initialize() {
+  appSyncEvents.on(SYNC_EVENTS.SPAWNER_READY, () => {
+    log.info('AppSyncOrchestrator signals ready, starting spawn loop');
+    globalState.spawnerPaused = false;
+    fluxEventBus.publish('spawner:resumed', {});
+    trySpawningGlobalApplication();
+  });
+  appSyncEvents.on(SYNC_EVENTS.READINESS_LOST, () => {
+    log.warn('AppSyncOrchestrator signals readiness lost, spawner will pause on next iteration');
+    globalState.spawnerPaused = true;
+    fluxEventBus.publish('spawner:paused', {});
+  });
 }
 
 // Note: Docker Hub error classification and caching is now handled by imageManager.js
@@ -51,12 +56,15 @@ function initialize(deps) {
  * @returns {Promise<void>}
  */
 async function trySpawningGlobalApplication() {
-  // Identity is resolved once at boot by scheduleIdentityResolution() in
-  // serviceManager. Until that lands we defer the spawn attempt, mirroring
-  // the synced / isNodeConfirmed branches below — no exception-for-retry.
+  if (globalState.spawnerPaused) {
+    log.info('Spawner paused by orchestrator, waiting for readiness');
+    fluxEventBus.publish('spawner:blocked', { reason: 'paused' });
+    return;
+  }
   const isEnterprise = enterpriseNetwork.getCachedEnterpriseIdentity();
   if (isEnterprise === null) {
     log.info('Flux enterprise identity not yet resolved');
+    fluxEventBus.publish('spawner:blocked', { reason: 'enterprise_unresolved' });
     await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
     trySpawningGlobalApplication();
     return;
@@ -70,13 +78,23 @@ async function trySpawningGlobalApplication() {
     const synced = await generalService.checkSynced();
     if (synced !== true) {
       log.info('Flux not yet synced');
+      fluxEventBus.publish('spawner:blocked', { reason: 'not_synced' });
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
       return;
     }
 
-    if (!globalState.checkAndSyncAppHashesWasEverExecuted) {
-      log.info('Flux checkAndSyncAppHashesWasEverExecuted not yet executed');
+    if (!globalState.dbReady) {
+      log.info('DB not yet ready, waiting for orchestrator');
+      fluxEventBus.publish('spawner:blocked', { reason: 'db_not_ready' });
+      await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
+      trySpawningGlobalApplication();
+      return;
+    }
+
+    if (fluxNetworkHelper.isNodeDos()) {
+      log.info('Node is in DOS state. Global applications will not be installed');
+      fluxEventBus.publish('spawner:blocked', { reason: 'dos' });
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
       return;
@@ -86,6 +104,7 @@ async function trySpawningGlobalApplication() {
     isNodeConfirmed = await generalService.isNodeStatusConfirmed().catch(() => null);
     if (!isNodeConfirmed) {
       log.info('Flux Node not Confirmed. Global applications will not be installed');
+      fluxEventBus.publish('spawner:blocked', { reason: 'not_confirmed' });
       globalState.fluxNodeWasNotConfirmedOnLastCheck = true;
       await serviceHelper.delay(config.fluxapps.installation.delay * 1000);
       trySpawningGlobalApplication();
@@ -96,10 +115,6 @@ async function trySpawningGlobalApplication() {
       log.info('Explorer Synced, checking for expired apps');
       await registryManager.expireGlobalApplications();
       globalState.firstExecutionAfterItsSynced = false;
-      // Dynamic require to avoid circular dependency
-      // eslint-disable-next-line global-require
-      const advancedWorkflows = require('./advancedWorkflows');
-      await advancedWorkflows.getPeerAppsInstallingErrorMessages();
     }
 
     if (globalState.fluxNodeWasAlreadyConfirmed && globalState.fluxNodeWasNotConfirmedOnLastCheck) {
@@ -130,10 +145,73 @@ async function trySpawningGlobalApplication() {
       throw new Error('Unable to detect Flux IP address');
     }
 
+    const runningApps = await appQueryService.listRunningApps();
+    if (runningApps.status !== 'success') {
+      throw new Error('trySpawningGlobalApplication - Unable to check running apps on this Flux');
+    }
+    if (runningApps.data.length >= config.fluxapps.maxAppsPerNode) {
+      log.info(`trySpawningGlobalApplication - Node at max apps capacity (${runningApps.data.length}/${config.fluxapps.maxAppsPerNode})`);
+      await serviceHelper.delay(delayTime);
+      trySpawningGlobalApplication();
+      return;
+    }
+
     // get all the applications list names missing instances
     // eslint-disable-next-line global-require
     const { globalAppsInformation } = require('../utils/appConstants');
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const currentHeight = syncStatus.data.height;
+    const ponFork = config.fluxapps.daemonPONFork;
+    const blocksLasting = config.fluxapps.blocksLasting;
+    const minBlocksAllowance = config.fluxapps.newMinBlocksAllowance;
     const pipeline = [
+      // Filter out apps that are expired or expiring within minBlocksAllowance (100) blocks
+      {
+        $addFields: {
+          _expireIn: {
+            $ifNull: [
+              '$expire',
+              {
+                $cond: {
+                  if: { $gte: ['$height', ponFork] },
+                  then: blocksLasting * 4,
+                  else: blocksLasting,
+                },
+              },
+            ],
+          },
+        },
+      },
+      {
+        $addFields: {
+          _actualExpirationHeight: {
+            $cond: {
+              if: { $lt: ['$height', ponFork] },
+              then: {
+                $cond: {
+                  if: { $lte: [{ $add: ['$height', '$_expireIn'] }, ponFork] },
+                  then: { $add: ['$height', '$_expireIn'] },
+                  else: {
+                    $add: [
+                      ponFork,
+                      { $multiply: [
+                        { $subtract: [{ $add: ['$height', '$_expireIn'] }, ponFork] },
+                        4,
+                      ] },
+                    ],
+                  },
+                },
+              },
+              else: { $add: ['$height', '$_expireIn'] },
+            },
+          },
+        },
+      },
+      {
+        $match: {
+          _actualExpirationHeight: { $gt: currentHeight + minBlocksAllowance },
+        },
+      },
       {
         $lookup: {
           from: 'zelappslocation',
@@ -210,11 +288,6 @@ async function trySpawningGlobalApplication() {
     } else {
       const myNodeLocation = await systemIntegration.nodeFullGeolocation();
 
-      const runningApps = await appQueryService.listRunningApps();
-      if (runningApps.status !== 'success') {
-        throw new Error('trySpawningGlobalApplication - Unable to check running apps on this Flux');
-      }
-
       // filter apps that failed to install before
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => !runningApps.data.find((appsRunning) => appsRunning.Names[0].slice(5) === app.name)
         && !globalState.spawnErrorsLongerAppCache.has(app.hash)
@@ -272,11 +345,11 @@ async function trySpawningGlobalApplication() {
     globalState.trySpawningGlobalAppCache.set(appHash, '');
     log.info(`trySpawningGlobalApplication - App ${appToRun} hash: ${appHash}`);
 
-    /* const installingAppErrorsList = await registryManager.appInstallingErrorsLocation(appToRun);
-    if (installingAppErrorsList.find((app) => !app.expireAt && app.hash === appHash)) {
+    const errorCount = await registryManager.countAppInstallingErrors(appHash);
+    if (errorCount >= 5) {
       globalState.spawnErrorsLongerAppCache.set(appHash, '');
-      throw new Error(`trySpawningGlobalApplication - App ${appToRun} is marked as having errors on app installing errors locations.`);
-    } */
+      throw new Error(`trySpawningGlobalApplication - App ${appToRun} hash ${appHash} has ${errorCount} network-wide install failures, skipping`);
+    }
 
     runningAppList = await registryManager.appLocation(appToRun);
 

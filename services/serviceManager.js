@@ -17,7 +17,6 @@ const appController = require('./appManagement/appController');
 const dockerOperations = require('./appManagement/dockerOperations');
 const monitoringOrchestrator = require('./appMonitoring/monitoringOrchestrator');
 const portManager = require('./appNetwork/portManager');
-const messageVerifier = require('./appMessaging/messageVerifier');
 const appInspector = require('./appManagement/appInspector');
 const availabilityChecker = require('./appMonitoring/availabilityChecker');
 const nodeStatusMonitor = require('./appMonitoring/nodeStatusMonitor');
@@ -25,14 +24,15 @@ const peerNotification = require('./appMessaging/peerNotification');
 const syncthingMonitor = require('./appMonitoring/syncthingMonitor');
 const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
-const appHashSyncService = require('./appMessaging/appHashSyncService');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
+const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
-const stoppedAppsRecovery = require('./appLifecycle/stoppedAppsRecovery');
+const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
+const { peerManager } = require('./utils/peerState');
 const enterpriseNetwork = require('./utils/enterpriseNetwork');
 const appQueryService = require('./appQuery/appQueryService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
@@ -50,8 +50,10 @@ const volumeValidationService = require('./volumeValidationService');
 const watchdogService = require('./watchdogService');
 const cloudUIUpdateService = require('./cloudUIUpdateService');
 const appTamperingBlocklistService = require('./appTamperingBlocklistService');
+const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const imageUpdateService = require('./imageUpdateService');
+const { version: fluxVersion } = require('../../../package.json');
 // const throughputLogger = require('./utils/throughputLogger');
 
 // Initialize globalState caches with cacheManager
@@ -120,6 +122,10 @@ async function startFluxFunctions() {
       log.error(`Flux port ${apiPort} is not supported. Shutting down.`);
       process.exit();
     }
+    // Hard dependencies — nothing starts until these are confirmed.
+    await dbHelper.waitForMongo();
+    await dockerService.waitForDocker();
+
     // Check and update CloudUI if needed (for legacy nodes without watchdog)
     log.info('Checking CloudUI installation...');
     await cloudUIUpdateService.checkAndUpdateCloudUI();
@@ -140,16 +146,12 @@ async function startFluxFunctions() {
     await fluxNetworkHelper.addFluxNodeServiceIpToLoopback();
     await fluxNetworkHelper.allowOnlyDockerNetworksToFluxNodeService();
     fluxNodeService.start();
-    await daemonServiceUtils.buildFluxdClient();
     log.info('Checking docker log for corruption...');
     await dockerService.dockerLogsFix();
     await systemService.mongodGpgKeyVeryfity();
     await systemService.mongoDBConfig();
     systemService.monitorSystem();
     log.info('System service initiated');
-    log.info('Initiating MongoDB connection');
-    await dbHelper.initiateDB(); // either true or throws error
-    log.info('DB connected');
     log.info('Preparing local database...');
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.local.database);
@@ -206,51 +208,43 @@ async function startFluxFunctions() {
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.version': 1 }, { name: 'query for getting app message based on version' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsMessages).createIndex({ 'appSpecifications.nodes': 1 }, { name: 'query for getting app message based on nodes' });
-    // more than 2 hours and 5m. Meaning we have not received status message for a long time. So that node is no longer on a network or app is down.
-    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: locationTtlS });
+    // TTL is driven by expireAt (set per-document by store functions). Migrate from old broadcastedAt-based TTL.
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).dropIndex('broadcastedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ name: 1 }, { name: 'query for getting zelapp location based on zelapp specs name' });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).createIndex({ ip: 1, name: 1 });
     log.info('Flux Apps locations prepared');
-    // we just keep installing messages for 15 minutes
-    // Update existing TTL index if it exists (for nodes that already have it created with old value)
-    await databaseTemp.command({
-      collMod: config.database.appsglobal.collections.appsInstallingLocations,
-      index: {
-        keyPattern: { broadcastedAt: 1 },
-        expireAfterSeconds: installingTtlS,
-      },
-    }).catch(() => {}); // Ignore error if index doesn't exist yet
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ broadcastedAt: 1 }, { expireAfterSeconds: installingTtlS });
+    await databaseTemp.collection(config.database.appsglobal.collections.appStateEvents).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appStateEvents).createIndex({ ip: 1, type: 1, dedupKey: 1 }, { unique: true });
+    await databaseTemp.collection(config.database.appsglobal.collections.appStateEvents).createIndex({ broadcastedAt: 1 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appStateEvents).createIndex({ createdAt: 1 });
+    log.info('App state events collection prepared');
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ broadcastedAt: 1 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).createIndex({ 'data.name': 1, 'data.ip': 1 }, { unique: true });
+    log.info('Signed appinstalling broadcasts collection prepared');
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).dropIndex('broadcastedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ name: 1 }, { name: 'query for getting flux app install location based on specs name' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).createIndex({ name: 1, ip: 1 }, { name: 'query for getting flux app install location based on specs name and node ip' });
     log.info('Flux Apps installing locations prepared');
-    // we keep installing error messages for 60 minutes
-    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ cachedAt: 1 }, { expireAfterSeconds: installErrorTtlS });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('cachedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('broadcastedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1 }, { name: 'query for getting flux app install errors location based on specs name' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash' });
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).createIndex({ name: 1, hash: 1, ip: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash and node ip' });
-    log.info('Clearing app installing errors from previous sessions...');
-    await dbHelper.removeDocumentsFromCollection(databaseTemp, config.database.appsglobal.collections.appsInstallingErrorsLocations, {});
-    log.info('App installing errors cleared');
+    log.info('App installing errors locations prepared');
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ broadcastedAt: 1 });
+    await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).createIndex({ 'data.name': 1, 'data.hash': 1, 'data.ip': 1 }, { unique: true });
+    log.info('Signed app installing errors broadcasts collection prepared');
 
     // This fixes an issue where the appsMessage db has NaN for valueSat. Once db is repaired on all nodes,
     // we can remove this.
     await dbHelper.repairNanInAppsMessagesDb();
-
-    const { appsToRemove } = await dbHelper.validateAppsInformation();
-
-    const appRemover = async () => {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const appName of appsToRemove) {
-        log.warn(`Application ${appName} is expired, removing`);
-        log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (serviceManager)`);
-        // eslint-disable-next-line no-await-in-loop
-        await appUninstaller.removeAppLocally(appName, null, false, true, true);
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((r) => { setTimeout(r, removalSpacingMs); });
-      }
-    };
-
-    if (appsToRemove.length) setImmediate(appRemover);
 
     // Check for apps with incorrect volume mounts (containing /flux/ path)
     log.info('Checking for apps with incorrect volume mounts...');
@@ -268,18 +262,47 @@ async function startFluxFunctions() {
       });
     }, bootDelay(50 * 1000)); // Run at 50 seconds - BEFORE stopped apps recovery
 
-    // Start stopped apps on boot (excluding g: syncthing mode apps which are managed by masterSlaveApps)
-    log.info('Scheduling stopped apps recovery check...');
-    setTimeout(() => {
-      stoppedAppsRecovery.startStoppedAppsOnBoot().catch((error) => {
-        log.error(`Stopped apps recovery service error: ${error.message}`);
-      });
-    }, bootDelay(55 * 1000)); // Run after 55 seconds, after hardware validation
+    // Migrate existing containers from 'unless-stopped'/'always' to 'no' restart policy.
+    // Non-destructive — doesn't stop containers, just prevents Docker from auto-starting
+    // them on future daemon restarts. FluxOS manages container startup after dbReady.
+    dockerService.migrateContainerRestartPolicies();
 
-    log.info('Flux Apps installing locations prepared');
+    // Read boot context early — determines startup behavior for container management.
+    const bootContext = await AppSyncOrchestrator.readBootContext();
 
-    // Initialize appSpawner with dependencies to avoid circular dependency
-    appSpawner.initialize({ appInstaller, appUninstaller });
+    // App startup manager owns all boot-time container lifecycle decisions:
+    // FluxOS restart → skip (containers running). Locations expired → remove all.
+    // Machine rebooted → wait for dbReady, then start valid apps. Timeout → remove all.
+    appStartupManager.manageAppsOnBoot(bootContext).catch((error) => {
+      log.error(`App startup manager error: ${error.message}`);
+    });
+
+    // Wait for daemon RPC — manageAppsOnBoot (above) is fire-and-forget and gates
+    // on waitForDaemonReady() internally with a 5-min timeout. It must be running
+    // before daemonReady is set so its timeout/removal logic can trigger.
+    await daemonServiceUtils.buildFluxdClient();
+    await daemonServiceMiscRpcs.waitForDaemonRpc();
+    // awaited so isDaemonSynced cache is populated before hash sync reads it
+    await daemonServiceMiscRpcs.daemonBlockchainInfoService();
+    globalState.daemonReady = true;
+
+    // Initialize app sync orchestrator and spawner
+    const orchestrator = new AppSyncOrchestrator({
+      blockEmitter: explorerService.getBlockEmitter(),
+      getEligibleSyncPeers: (minUptime) => peerManager.getEligibleSyncPeers(minUptime)
+        .map((p) => ({ key: p.key, send: (msg) => p.send(msg) })),
+      onPeerEvent: (event, cb) => peerManager.on(event, cb),
+      offPeerEvent: (event, cb) => peerManager.removeListener(event, cb),
+      markSyncRequested: (key) => peerManager.markSyncRequested(key),
+      clearSyncRequested: () => peerManager.clearSyncRequested(),
+      isEnterprise: () => enterpriseNetwork.getCachedEnterpriseIdentity(),
+      networkStateReady: () => networkStateService.waitStarted(),
+      fluxVersion,
+    });
+    nodeConfirmationService.onMessageCapabilityChange((capable) => orchestrator.onMessageCapabilityChange(capable));
+    peerNotification.initialize();
+    appSpawner.initialize();
+    appInstaller.setOnInstallComplete(() => peerNotification.checkAndNotifyPeersOfRunningApps());
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
@@ -290,8 +313,6 @@ async function startFluxFunctions() {
     log.info('Connections polling prepared');
     fluxNetworkHelper.initClockOffsetCache();
     log.info('Clock offset cache initialized');
-    daemonServiceMiscRpcs.daemonBlockchainInfoService();
-    log.info('Flux Daemon Info Service Started');
     // Remove existing watchtower container (replaced by native image update service)
     imageUpdateService.removeWatchtowerContainer();
     // Start native image update service (delayed start)
@@ -304,8 +325,10 @@ async function startFluxFunctions() {
       log.error(`appTamperingBlocklist start error: ${err.message}`);
     });
     log.info('Flux checks operational');
+    fluxCommunication.initializeDiscovery();
+    await nodeConfirmationService.start();
     if (config.fluxapps.discoveryAutostart !== false) {
-      fluxCommunication.startDiscovery();
+      fluxCommunication.fluxDiscovery();
       log.info('Flux Discovery started');
     }
     // Cleanup and fix crontab mount entries (add wait logic, remove stale entries, ensure mounts are active)
@@ -363,32 +386,30 @@ async function startFluxFunctions() {
       monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
       portManager.restoreAppsPortsSupport();
     }, bootDelay(1 * 60 * 1000));
-    setTimeout(() => {
-      // Check for enterprise apps on non-arcaneOS nodes and remove them
-      advancedWorkflows.checkAndRemoveEnterpriseAppsOnNonArcane();
-    }, bootDelay(2 * 60 * 1000)); // 2 minutes after startup
     // Resolve this node's enterprise identity once, up front. Self-reschedules
     // every 5 minutes until the pubkey resolves (daemon/benchmark may still be
     // coming up). Once cached, hot paths (spawn loop) read it synchronously
     // via getCachedEnterpriseIdentity() with no network call and no throws.
-    //
-    // After identity is known, run the ownership-split cleanup once at T+5min:
-    // enterprise nodes drop any app whose owner isn't in enterpriseAppOwners;
-    // every other node drops any app whose owner IS in enterpriseAppOwners.
-    // Broadcasts fluxappremoved so peers update appLocations.
-    enterpriseNetwork.scheduleIdentityResolution().then(() => {
-      setTimeout(async () => {
-        try {
-          await enterpriseNetwork.cleanupOwnershipViolations();
-          log.info('Enterprise network cleanup completed');
-        } catch (error) {
-          log.error(`Enterprise network cleanup failed: ${error.message || error}`);
-        }
-      }, 5 * 60 * 1000);
-    });
-    setInterval(() => {
-      portManager.restorePortsSupport(); // restore fluxos and apps ports/upnp
-    }, portRestoreIntervalMs); // every 10 minutes
+    const identityReady = enterpriseNetwork.scheduleIdentityResolution();
+
+    // Services that read from zelappsinformation wait for the orchestrator
+    // to finish rebuilding it rather than guessing a setTimeout delay.
+    async function startDbDependentServices() {
+      await globalState.waitForDbReady();
+      log.info('DB ready - starting db-dependent services');
+      advancedWorkflows.checkAndRemoveEnterpriseAppsOnNonArcane();
+      await identityReady;
+      try {
+        await enterpriseNetwork.cleanupOwnershipViolations();
+        log.info('Enterprise network cleanup completed');
+      } catch (error) {
+        log.error(`Enterprise network cleanup failed: ${error.message || error}`);
+      }
+      setInterval(() => {
+        portManager.restorePortsSupport();
+      }, portRestoreIntervalMs);
+    }
+    startDbDependentServices();
     log.info('Starting setting Node Geolocation');
     geolocationService.setNodeGeolocation();
     setTimeout(() => {
@@ -400,76 +421,8 @@ async function startFluxFunctions() {
         log.error(err);
       }
     }, bootDelay(20 * 60 * 1000));
-    setTimeout(async () => { // wait as of restarts due to ui building
-      try {
-        // todo code shall be removed after some time
-        const databaseApps = db.db(config.database.appsglobal.database);
-        const databaseDaemon = db.db(config.database.daemon.database);
-        const resultApps = await dbHelper.collectionStats(databaseApps, config.database.appsglobal.collections.appsMessages);
-        log.info(`Apps messages count: ${resultApps.count}`);
-        const resultHashes = await dbHelper.collectionStats(databaseDaemon, config.database.daemon.collections.appsHashes);
-        log.info(`Apps hashes count: ${resultHashes.count}`);
-        const query = {};
-        const projection = { projection: { _id: 0 } };
-        const resultAppsA = await dbHelper.findInDatabase(databaseApps, config.database.appsglobal.collections.appsMessages, query, projection);
-        // for every hash of app check if it is in the database of hashes
-        const processedHashes = [];
-        const duplicateHashes = [];
-        log.info('Running database consistency check');
-        for (let i = 0; i < resultAppsA.length; i += 1) {
-          const queryHash = { hash: resultAppsA[i].hash };
-          // eslint-disable-next-line no-await-in-loop
-          const resultHash = await dbHelper.findOneInDatabase(databaseDaemon, config.database.daemon.collections.appsHashes, queryHash, projection);
-          if (resultHash && processedHashes.includes(resultAppsA[i].hash)) {
-            log.info(`Duplicate hash in apps: ${resultAppsA[i].hash}`);
-            // remove from app messages
-            // eslint-disable-next-line no-await-in-loop
-            await dbHelper.findOneAndDeleteInDatabase(databaseApps, config.database.appsglobal.collections.appsMessages, queryHash, projection);
-            duplicateHashes.push(resultAppsA[i].hash);
-          } else {
-            processedHashes.push(resultAppsA[i].hash);
-          }
-        }
-        // log all duplicated hashes
-        log.info('Duplicate hashes:');
-        log.info(JSON.stringify(duplicateHashes));
-        const result = await dbHelper.findInDatabase(databaseDaemon, config.database.daemon.collections.appsHashes, query, projection);
-        if (result && result.length) {
-          log.info('Last known application hash');
-          log.info(result[result.length - 1]);
-        } else {
-          log.info('No known application hash');
-        }
-        // check if valueSat is null, if so run fixExplorer as of typo bug
-        let wrongAppMessage = false;
-        const appMessage = await messageVerifier.checkAppMessageExistence('e7e2e129dd24b8bcc5a93800c425da81f69c3dcdf02d1d5b3ce09ce2e1c94d67');
-        if (appMessage && !appMessage.valueSat) {
-          wrongAppMessage = true;
-          log.info('Fixing explorer due to wrong app message');
-        } else {
-          log.info('App consistency check OK');
-        }
-        // rescan before last known height of hashes
-        // it is important to have count values before consistency check
-        if ((resultApps.count > resultHashes.count && result && result.length && result[result.length - 1].height >= 100) || wrongAppMessage) {
-          // run fixExplorer at least from height 1670000
-          explorerService.fixExplorer(result[result.length - 1].height - 50 > 1670000 ? 1670000 : result[result.length - 1].height - 50, wrongAppMessage);
-          log.info('Flux Block Processing Service started in fix mode');
-        } else if (resultApps.count > resultHashes.count) {
-          explorerService.fixExplorer(0, true);
-          log.info('Flux Block Processing Service started in fix mode from scratch');
-        } else {
-          // just initiate
-          explorerService.initiateBlockProcessor(true, true);
-          log.info('Flux Block Processing Service started');
-        }
-      } catch (error) {
-        log.error(error);
-        // just initiate
-        explorerService.initiateBlockProcessor(true, true);
-        log.info('Flux Block Processing Service started with exception.');
-      }
-    }, bootDelay(2 * 60 * 1000));
+    explorerService.initiateBlockProcessor(true, true);
+    log.info('Flux Block Processing Service started');
     setTimeout(() => {
       appInspector.checkApplicationsCpuUSage(globalState.appsMonitored, appQueryService.installedApps);
       setInterval(() => {
@@ -486,37 +439,10 @@ async function startFluxFunctions() {
         fluxNetworkHelper.isArcane,
       );
     }, bootDelay(3 * 60 * 1000));
+    nodeStatusMonitor.initialize(appQueryService.installedApps, appUninstaller.removeAppLocally);
     setTimeout(() => {
       nodeStatusMonitor.monitorNodeStatus(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, bootDelay(1.5 * 60 * 1000));
-    setTimeout(() => {
-      peerNotification.checkAndNotifyPeersOfRunningApps(
-        appQueryService.installedApps,
-        appQueryService.listRunningApps,
-        globalState.appsMonitored,
-        globalState.removalInProgress,
-        globalState.installationInProgress,
-        globalState.softRedeployInProgress,
-        globalState.hardRedeployInProgress,
-        globalState.reinstallationOfOldAppsInProgress,
-        () => globalState,
-        cacheManager,
-      ); // first broadcast after 1m of starting fluxos
-      setInterval(() => { // every 60 mins
-        peerNotification.checkAndNotifyPeersOfRunningApps(
-          appQueryService.installedApps,
-          appQueryService.listRunningApps,
-          globalState.appsMonitored,
-          globalState.removalInProgress,
-          globalState.installationInProgress,
-          globalState.softRedeployInProgress,
-          globalState.hardRedeployInProgress,
-          globalState.reinstallationOfOldAppsInProgress,
-          () => globalState,
-          cacheManager,
-        );
-      }, peerNotifyIntervalMs);
-    }, bootDelay(1 * 60 * 1000));
     setTimeout(() => {
       syncthingMonitor.syncthingApps(
         globalState,
@@ -542,44 +468,9 @@ async function startFluxFunctions() {
         appInspector.monitorSharedDBApps(appQueryService.installedApps, appUninstaller.removeAppLocally, globalState); // Monitor SharedDB Apps.
       }, 60 * 1000);
     }, bootDelay(3 * 60 * 1000));
-    setTimeout(() => {
-      setInterval(() => {
-        appHashSyncService.continuousFluxAppHashesCheck();
-      }, hashSyncIntervalMs);
-      appHashSyncService.continuousFluxAppHashesCheck();
-    }, bootDelay((Math.floor(Math.random() * (30 - 15 + 1)) + 15) * 60 * 1000)); // start between 15m and 30m after fluxOs start
-    const spawnDelayMs = config.fluxapps.spawnDelayMs;
-    if (spawnDelayMs > 0) {
-      setTimeout(() => {
-        log.info('Starting to spawn applications (configured delay)');
-        appSpawner.trySpawningGlobalApplication();
-      }, spawnDelayMs);
-    } else {
-      setTimeout(async () => {
-        // Enterprise-network nodes (pubkey in enterpriseNodesPublicKeys) start
-        // spawning at T+62m. Every other node keeps the legacy 125-135m window,
-        // which gives enough time to receive apprunning messages at least twice.
-        let isEnterprise = enterpriseNetwork.getCachedEnterpriseIdentity();
-        if (isEnterprise === null) {
-          try {
-            isEnterprise = await enterpriseNetwork.isEnterpriseNode();
-          } catch (err) {
-            log.warn(`Enterprise identity unresolved at spawn-gate, treating as non-enterprise: ${err.message || err}`);
-            isEnterprise = false;
-          }
-        }
-        if (isEnterprise) {
-          log.info('Starting to spawn applications (enterprise, 62m)');
-          appSpawner.trySpawningGlobalApplication();
-          return;
-        }
-        const remainingMs = (Math.floor(Math.random() * (135 - 125 + 1)) + 125 - 62) * 60 * 1000;
-        setTimeout(() => {
-          log.info('Starting to spawn applications');
-          appSpawner.trySpawningGlobalApplication();
-        }, remainingMs);
-      }, bootDelay(62 * 60 * 1000));
-    }
+    // Hash sync and spawner startup are now managed by the AppSyncOrchestrator (event-driven)
+    orchestrator.start(bootContext);
+    log.info('AppSyncOrchestrator started');
     setInterval(() => {
       imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, imageComplianceIntervalMs);
