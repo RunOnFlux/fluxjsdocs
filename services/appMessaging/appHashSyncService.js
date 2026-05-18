@@ -13,6 +13,7 @@ const { serialiseAndSignFluxBroadcast } = require('../utils/fluxBroadcastHelper'
 const { peerManager } = require('../utils/peerState');
 const fluxCommunicationUtils = require('../fluxCommunicationUtils');
 const { openEphemeralConnection } = require('../fluxCommunication');
+const fluxNetworkHelper = require('../fluxNetworkHelper');
 const { CLOSE_CODES } = require('../utils/FluxPeerSocket');
 const globalState = require('../utils/globalState');
 const { appSyncEvents, EVENTS } = require('../utils/appSyncEvents');
@@ -289,11 +290,11 @@ async function processMessages(messages, onProgress) {
  * @param {boolean} force - Pass to getMissingHashes
  * @returns {Promise<Array>} Remaining missing hashes
  */
-async function waitForResolution(previousCount, maxWaitMs, force, currentHeight) {
+async function waitForResolution(pendingHashes, maxWaitMs, force, currentHeight) {
   const deadline = Date.now() + maxWaitMs;
   let lastActivityAt = Date.now();
 
-  const handler = () => { lastActivityAt = Date.now(); };
+  const handler = (hash) => { if (pendingHashes.has(hash)) lastActivityAt = Date.now(); };
   appSyncEvents.on(EVENTS.HASH_RESPONSE_RECEIVED, handler);
 
   try {
@@ -336,18 +337,20 @@ function pickRandomPeers(peerManager, count, options = {}) {
 }
 
 /**
- * Send a fluxapprequest v2 message to a specific peer.
+ * Sign a fluxapprequest v2 message once and send to all peers.
  * @param {Array<string>} hashes - Hashes to request
- * @param {object} peer - Peer socket to send to
+ * @param {Array<object>} peers - Peer sockets to send to
  */
-async function requestHashesFromPeer(hashes, peer) {
+async function broadcastHashRequest(hashes, peers) {
   const message = {
     type: 'fluxapprequest',
     version: 2,
     hashes,
   };
   const signed = await serialiseAndSignFluxBroadcast(message);
-  peer.send(signed);
+  for (const peer of peers) {
+    peer.send(signed);
+  }
 }
 
 /**
@@ -357,6 +360,8 @@ async function requestHashesFromPeer(hashes, peer) {
  */
 async function pickEphemeralTargets(count) {
   const nodeList = await fluxCommunicationUtils.deterministicFluxList();
+  const localSocketAddress = await fluxNetworkHelper.getMyFluxIPandPort();
+  const selfKey = localSocketAddress.includes(':') ? localSocketAddress : `${localSocketAddress}:16127`;
   const connectedKeys = new Set();
   for (const peer of peerManager.allValues()) {
     connectedKeys.add(peer.key);
@@ -365,7 +370,9 @@ async function pickEphemeralTargets(count) {
   for (const node of nodeList) {
     if (!node.ip) continue;
     const key = node.ip.includes(':') ? node.ip : `${node.ip}:16127`;
-    if (!connectedKeys.has(key)) candidates.push(key);
+    if (connectedKeys.has(key)) continue;
+    if (key === selfKey) continue;
+    candidates.push(key);
   }
   for (let i = candidates.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -399,14 +406,10 @@ async function ephemeralHashRound(hashes, force, currentHeight) {
   const peerKeys = peers.map((p) => p.key).join(', ');
   log.info(`syncMissingHashes - Ephemeral round: requesting ${hashes.length} hashes from ${peers.length} peers: ${peerKeys}`);
 
-  globalState.pendingHashRequests = new Set(hashes);
-  for (const peer of peers) {
-    requestHashesFromPeer(hashes, peer);
-  }
+  await broadcastHashRequest(hashes, peers);
 
   const maxWait = hashes.length * RESPONSE_TIME_PER_HASH_MS + BUFFER_MS;
-  const remaining = await waitForResolution(hashes.length, maxWait, force, currentHeight);
-  globalState.pendingHashRequests = null;
+  const remaining = await waitForResolution(new Set(hashes), maxWait, force, currentHeight);
 
   for (const peer of peers) {
     try { peer.close(CLOSE_CODES.EPHEMERAL_DONE, 'done'); } catch (_e) { /* noop */ }
@@ -516,18 +519,14 @@ async function syncMissingHashes(options = {}) {
         }
 
         const hashes = missingHashes.map((h) => h.hash);
-        globalState.pendingHashRequests = new Set(hashes);
         const peerKeys = peers.map((p) => p.key).join(', ');
         log.info(`syncMissingHashes - Round ${round + 1}: requesting ${hashes.length} hashes from ${peers.length} peers: ${peerKeys}`);
 
-        for (const peer of peers) {
-          requestHashesFromPeer(hashes, peer);
-        }
+        await broadcastHashRequest(hashes, peers);
 
         const maxWait = hashes.length * RESPONSE_TIME_PER_HASH_MS + BUFFER_MS;
         const beforeCount = missingHashes.length;
-        missingHashes = await waitForResolution(beforeCount, maxWait, force, currentHeight);
-        globalState.pendingHashRequests = null;
+        missingHashes = await waitForResolution(new Set(hashes), maxWait, force, currentHeight);
         const resolvedThisRound = beforeCount - missingHashes.length;
         resolved += resolvedThisRound;
 
