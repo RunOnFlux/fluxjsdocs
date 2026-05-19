@@ -347,7 +347,8 @@ async function trySpawningGlobalApplication() {
 
     const errorCount = await registryManager.countAppInstallingErrors(appHash);
     if (errorCount >= 5) {
-      globalState.spawnErrorsLongerAppCache.set(appHash, '');
+      globalState.trySpawningGlobalAppCache.set(appHash, '', { ttl: FluxCacheManager.oneHour * 6 });
+      fluxEventBus.publish('spawner:networkErrorSkip', { appName: appToRun, hash: appHash, errorCount });
       throw new Error(`trySpawningGlobalApplication - App ${appToRun} hash ${appHash} has ${errorCount} network-wide install failures, skipping`);
     }
 
@@ -772,7 +773,9 @@ async function trySpawningGlobalApplication() {
       registerOk = false;
     }
     if (!registerOk) {
-      log.info('trySpawningGlobalApplication - Error on registerAppLocally');
+      log.info(`trySpawningGlobalApplication - Install failed for ${appToRun}, adding to local error cache`);
+      globalState.spawnErrorsLongerAppCache.set(appHash, '');
+      fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash });
       await serviceHelper.delay(shortDelayTime);
       trySpawningGlobalApplication();
       return;
@@ -817,9 +820,8 @@ async function trySpawningGlobalApplication() {
     trySpawningGlobalApplication();
   } catch (error) {
     log.error(error);
-    // Check if hash is assigned and not present in both caches, then add to trySpawningGlobalAppCache
     if (appHash && !globalState.spawnErrorsLongerAppCache.has(appHash) && !globalState.trySpawningGlobalAppCache.has(appHash)) {
-      log.info(`trySpawningGlobalApplication - Adding app hash ${appHash} to trySpawningGlobalAppCache due to installation error`);
+      log.info(`trySpawningGlobalApplication - Adding app hash ${appHash} to trySpawningGlobalAppCache due to pre-install error`);
       globalState.trySpawningGlobalAppCache.set(appHash, '', { ttl: FluxCacheManager.oneHour * 6 });
     }
     await serviceHelper.delay(shortDelayTime || 5 * 60 * 1000);

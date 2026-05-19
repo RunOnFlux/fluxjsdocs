@@ -53,6 +53,7 @@ class AppSyncOrchestrator {
   #hashUnresolvedHandler = null;
   #hashesChangedHandler = null;
   #broadcastStarted = null;
+  #started = false;
   #syncInProgress = false;
   #askedPeers = new Set();
   #syncCompletions = { apprunning: 0, appinstalling: 0, apperrors: 0 };
@@ -97,6 +98,8 @@ class AppSyncOrchestrator {
   }
 
   async start(bootContext) {
+    if (this.#started) return;
+    this.#started = true;
     log.info(`AppSyncOrchestrator - Starting in state ${this.#state}`);
 
     this.#bootContext = bootContext;
@@ -194,10 +197,6 @@ class AppSyncOrchestrator {
     }
 
     const peersToAsk = fresh.slice(0, MIN_SYNC_COMPLETIONS);
-    for (const peer of peersToAsk) {
-      this.#askedPeers.add(peer.key);
-      this.#markSyncRequested(peer.key);
-    }
 
     let pubkey;
     let requestTs;
@@ -213,6 +212,11 @@ class AppSyncOrchestrator {
     } catch (error) {
       log.error(`AppSyncOrchestrator - Failed to sign sync requests: ${error.message}`);
       return;
+    }
+
+    for (const peer of peersToAsk) {
+      this.#askedPeers.add(peer.key);
+      this.#markSyncRequested(peer.key);
     }
 
     const tempSig = signMsg(peerCodec.MSG_TYPE.REQUEST_TEMP_MESSAGES, 0);
@@ -264,6 +268,7 @@ class AppSyncOrchestrator {
     this.#clearSyncRequested();
     this.#syncCompletions = { apprunning: 0, appinstalling: 0, apperrors: 0 };
     this.#stateSyncComplete = false;
+    this.#hashSyncAttempts = 0;
     if (this.#syncTimeout) {
       clearTimeout(this.#syncTimeout);
       this.#syncTimeout = null;
@@ -386,9 +391,12 @@ class AppSyncOrchestrator {
       await this.#writeVersionMarker();
       await this.#rebuildDb();
       globalState.dbReady = true;
+      fluxEventBus.publish('hashSync:complete', { attempt: this.#hashSyncAttempts, missing: result.missing });
     } catch (error) {
       log.error(`AppSyncOrchestrator - Hash sync failed (attempt ${this.#hashSyncAttempts}/${HASH_SYNC_MAX_RETRIES}): ${error.message}`);
-      if (this.#hashSyncAttempts < HASH_SYNC_MAX_RETRIES) {
+      const willRetry = this.#hashSyncAttempts < HASH_SYNC_MAX_RETRIES;
+      fluxEventBus.publish('hashSync:failed', { attempt: this.#hashSyncAttempts, maxRetries: HASH_SYNC_MAX_RETRIES, willRetry, error: error.message });
+      if (willRetry) {
         log.info(`AppSyncOrchestrator - Scheduling hash sync retry in ${HASH_SYNC_RETRY_MS / 1000}s`);
         this.#hashSyncRetryTimer = setTimeout(() => {
           this.#hashSyncRetryTimer = null;
@@ -495,9 +503,16 @@ class AppSyncOrchestrator {
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
       const heartbeat = await dbHelper.findOneInDatabase(database, startupCollection, { _id: 'heartbeat' });
-      const bootIdPath = config.system.bootIdPath ?? '/proc/sys/kernel/random/boot_id';
-      const currentBootId = (await fs.readFile(bootIdPath, 'utf8')).trim();
-      const machineRebooted = !heartbeat || heartbeat.machineBootId !== currentBootId;
+
+      let currentBootId = null;
+      try {
+        const bootIdPath = config.system.bootIdPath ?? '/proc/sys/kernel/random/boot_id';
+        currentBootId = (await fs.readFile(bootIdPath, 'utf8')).trim();
+      } catch (err) {
+        log.warn(`Failed to read boot_id: ${err.message}, assuming machine rebooted`);
+      }
+
+      const machineRebooted = !currentBootId || !heartbeat || heartbeat.machineBootId !== currentBootId;
       const downtimeMs = heartbeat ? Date.now() - heartbeat.lastAlive : Infinity;
       const cleanShutdown = heartbeat?.shutdownReason === 'sigterm';
 
@@ -540,19 +555,23 @@ class AppSyncOrchestrator {
       const db = dbHelper.databaseConnection();
       if (!db) return;
       const database = db.db(config.database.local.database);
-      await dbHelper.findOneAndUpdateInDatabase(
-        database,
-        config.database.local.collections.nodeStartupTracker,
-        { _id: 'heartbeat' },
-        { $set: { shutdownReason: reason } },
-        { upsert: true },
-      );
+      await Promise.race([
+        dbHelper.findOneAndUpdateInDatabase(
+          database,
+          config.database.local.collections.nodeStartupTracker,
+          { _id: 'heartbeat' },
+          { $set: { shutdownReason: reason } },
+          { upsert: true },
+        ),
+        new Promise((_, reject) => { setTimeout(() => reject(new Error('shutdown write timeout')), 3000); }),
+      ]);
     } catch (error) {
       log.error(`Failed to write shutdown reason: ${error.message}`);
     }
   }
 
   stop() {
+    this.#started = false;
     if (this.#heartbeatInterval) {
       clearInterval(this.#heartbeatInterval);
       this.#heartbeatInterval = null;
