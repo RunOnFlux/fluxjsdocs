@@ -1,4 +1,3 @@
-const config = require('config');
 const WebSocket = require('ws');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
@@ -44,12 +43,6 @@ const CLOSE_CODES = Object.freeze({
   // Invalid messages
   INVALID_MSG_INBOUND: 4016,
   INVALID_MSG_OUTBOUND: 4017,
-
-  // Ephemeral connection complete
-  EPHEMERAL_DONE: 4018,
-
-  // Node lost confirmation — disconnecting all peers
-  NODE_UNCONFIRMED: 4019,
 });
 
 const PEER_SOURCE = Object.freeze({
@@ -58,7 +51,6 @@ const PEER_SOURCE = Object.freeze({
   RECONNECT: 'reconnect',
   MANUAL: 'manual',
   INBOUND: 'inbound',
-  EPHEMERAL: 'ephemeral',
 });
 
 const DIRECTION = Object.freeze({
@@ -84,7 +76,6 @@ class FluxPeerSocket {
     this.lastPingTime = null;
     this.lastPongTime = null;
     this.missedPongs = 0;
-    this.maxMissedPongs = config.peers.wsMaxMissedPongs ?? 3;
     this.connectedAt = Date.now();
     this.nakCount = 0;
     this.nakWindowStart = Date.now();
@@ -93,7 +84,6 @@ class FluxPeerSocket {
     this.remoteCapabilities = new Set();
     this.remoteClockOffsetMs = null;
     this.remoteVersion = null;
-    this.remoteFluxUptime = null;
     this.source = PEER_SOURCE.INBOUND;
     this.msgMap = new Map([['requestHash', 0], ['newHash', 0]]);
     this.messagesReceived = 0;
@@ -125,7 +115,7 @@ class FluxPeerSocket {
   }
 
   get isAlive() {
-    return this.missedPongs < this.maxMissedPongs && this.ws.readyState === WebSocket.OPEN;
+    return this.missedPongs < 3 && this.ws.readyState === WebSocket.OPEN;
   }
 
   get reconnects() {
@@ -135,9 +125,9 @@ class FluxPeerSocket {
   onPingSent() {
     this.lastPingTime = Date.now();
     this.missedPongs += 1;
-    if (this.missedPongs >= this.maxMissedPongs) {
-      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs, terminating`);
-      this.terminate();
+    if (this.missedPongs >= 3) {
+      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs, closing`);
+      this.close(CLOSE_CODES.DEAD_CONNECTION, 'dead connection');
     }
   }
 
@@ -197,10 +187,6 @@ class FluxPeerSocket {
     } catch (e) {
       log.error(e);
     }
-  }
-
-  terminate() {
-    this.ws.terminate();
   }
 
   /**
@@ -275,11 +261,7 @@ class FluxPeerSocket {
 
     ws.onclose = (evt) => {
       log.info(`${this.direction === DIRECTION.INBOUND ? 'Incoming' : 'Outgoing'} connection ${this.direction === DIRECTION.INBOUND ? 'from' : 'to'} ${this.key} closed with code ${evt.code}`);
-      if (this.source === PEER_SOURCE.EPHEMERAL) {
-        manager.removeEphemeral(this.key);
-      } else {
-        manager.remove(this.key, evt.code);
-      }
+      manager.remove(this.key, evt.code);
     };
 
     ws.onerror = (evt) => {
@@ -356,11 +338,4 @@ class FluxPeerSocket {
   }
 }
 
-const FLUX_CAPABILITIES = Object.freeze([
-  'transmissionTimestamps',
-  'peerExchange',
-  'binaryMessages',
-  'appStateSync',
-]);
-
-module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES };
+module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION };

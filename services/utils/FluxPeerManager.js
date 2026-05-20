@@ -1,10 +1,8 @@
-const { EventEmitter } = require('events');
 const config = require('config');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
-const { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES } = require('./FluxPeerSocket');
+const { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION } = require('./FluxPeerSocket');
 const peerCodec = require('./peerCodec');
-const fluxEventBus = require('./fluxEventBus');
 
 const UNSTABLE_DISCONNECT_THRESHOLD = 5;
 const UNSTABLE_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -27,13 +25,11 @@ const CLOSE_CODE_NAMES = Object.freeze(
   Object.fromEntries(Object.entries(CLOSE_CODES).map(([name, code]) => [code, name])),
 );
 
-class FluxPeerManager extends EventEmitter {
-  static CONNECTION_BACKOFF_MS = config.fluxapps.connectionBackoffMs ?? [2 * 60000, 5 * 60000, 10 * 60000, 15 * 60000];
+class FluxPeerManager {
+  static CONNECTION_BACKOFF_MS = [2 * 60000, 5 * 60000, 10 * 60000, 15 * 60000];
 
   /** @type {Map<string, FluxPeerSocket>} */
   #peers = new Map();
-  /** @type {Map<string, FluxPeerSocket>} */
-  #ephemeralPeers = new Map();
   /** @type {Set<string>} */
   #inboundKeys = new Set();
   /** @type {Set<string>} */
@@ -52,12 +48,6 @@ class FluxPeerManager extends EventEmitter {
   #pendingConnections = new Set();
   /** @type {Map<string, number>} reconnect count per peer key, persists across connection cycles */
   #reconnectCounts = new Map();
-  /** @type {number} peer count threshold for app sync readiness */
-  #syncPeerThreshold;
-  /** @type {number} peer count threshold for degraded state */
-  #syncDegradedThreshold;
-  /** @type {boolean} true when peer count is above syncPeerThreshold */
-  #aboveThreshold;
   /** @type {Map<string, Set<string>>} reporter key → their peer keys */
   #peerTopology = new Map();
   /** @type {Array<function>} topology change listeners */
@@ -66,8 +56,6 @@ class FluxPeerManager extends EventEmitter {
   #pendingAdds = { outbound: new Set(), inbound: new Set() };
   /** @type {Set<string>} peers removed since last peerUpdate broadcast */
   #pendingRemoves = new Set();
-
-  #syncRequestedPeers = new Set();
   /** @type {ReturnType<typeof setTimeout>|null} debounce timer */
   #peerUpdateTimer = null;
   /** @type {Array<object>} Circular buffer of peer lifecycle events */
@@ -78,12 +66,6 @@ class FluxPeerManager extends EventEmitter {
   #historyCount = 0;
 
   constructor() {
-    super();
-
-    this.#syncPeerThreshold = config.fluxapps.appSyncPeerThreshold;
-    this.#syncDegradedThreshold = config.fluxapps.appSyncDegradedThreshold;
-    this.#aboveThreshold = false;
-
     /**
      * Hash message handlers — set by fluxCommunication.js to break circular dependency.
      * @type {{ handleHashPresent: function, handleHashRequest: function }|null}
@@ -107,7 +89,6 @@ class FluxPeerManager extends EventEmitter {
      * @type {number}
      */
     this.numberOfFluxNodes = 0;
-    this.acceptingConnections = false;
   }
 
   // --- Core CRUD ---
@@ -147,9 +128,6 @@ class FluxPeerManager extends EventEmitter {
     if (typeof options.remoteVersion === 'string' && options.remoteVersion) {
       peer.remoteVersion = options.remoteVersion;
     }
-    if (typeof options.remoteFluxUptime === 'number' && !Number.isNaN(options.remoteFluxUptime)) {
-      peer.remoteFluxUptime = options.remoteFluxUptime;
-    }
     if (existing || options.source === PEER_SOURCE.RECONNECT) {
       this.#reconnectCounts.set(key, (this.#reconnectCounts.get(key) || 0) + 1);
     }
@@ -184,12 +162,6 @@ class FluxPeerManager extends EventEmitter {
     this.#pendingRemoves.delete(peer.key);
     this.#schedulePeerUpdate();
     if (this.networkHealthMonitor) this.networkHealthMonitor.recordConnect();
-    fluxEventBus.publish('peers:added', { ip, port: String(port), direction, outbound: this.#outboundKeys.size, inbound: this.#inboundKeys.size, total: this.#peers.size });
-    if (!this.#aboveThreshold && this.#peers.size >= this.#syncPeerThreshold) {
-      this.#aboveThreshold = true;
-      this.emit('peerThresholdReached', this.#peers.size);
-      fluxEventBus.publish('peers:thresholdReached', { count: this.#peers.size, threshold: this.#syncPeerThreshold });
-    }
     return peer;
   }
 
@@ -203,7 +175,6 @@ class FluxPeerManager extends EventEmitter {
     const peer = this.#peers.get(key);
     if (!peer) return null;
 
-    this.#syncRequestedPeers.delete(key);
     this.#removeTracking(peer);
 
     // Clean up peer exchange topology and notify others
@@ -243,12 +214,6 @@ class FluxPeerManager extends EventEmitter {
     });
 
     log.info(`Connection ${key} removed from peerManager (${peer.direction}, code: ${closeCode})`);
-    fluxEventBus.publish('peers:removed', { ip: peer.ip, port: peer.port, direction: peer.direction, closeCode: closeCode || null, outbound: this.#outboundKeys.size, inbound: this.#inboundKeys.size, total: this.#peers.size });
-    if (this.#aboveThreshold && this.#peers.size < this.#syncDegradedThreshold) {
-      this.#aboveThreshold = false;
-      this.emit('peersBelowThreshold', this.#peers.size);
-      fluxEventBus.publish('peers:belowThreshold', { count: this.#peers.size, threshold: this.#syncDegradedThreshold });
-    }
     return peer;
   }
 
@@ -272,58 +237,6 @@ class FluxPeerManager extends EventEmitter {
     const ipCount = (this.#uniqueIps.get(ipKey) || 1) - 1;
     if (ipCount <= 0) this.#uniqueIps.delete(ipKey);
     else this.#uniqueIps.set(ipKey, ipCount);
-  }
-
-  disconnectAll() {
-    this.acceptingConnections = false;
-    const count = this.#peers.size;
-    for (const peer of this.#peers.values()) {
-      try { peer.close(CLOSE_CODES.NODE_UNCONFIRMED, 'node unconfirmed'); } catch (_e) { /* noop */ }
-    }
-    log.info(`Disconnected all ${count} peers, no longer accepting connections`);
-  }
-
-  allowConnections() {
-    this.acceptingConnections = true;
-    log.info('Now accepting peer connections');
-  }
-
-  /**
-   * Add an ephemeral peer. Used for short-lived connections that request
-   * specific data and disconnect. Not included in broadcasts, peer exchange,
-   * connection limits, or reconnection logic.
-   * @param {WebSocket} ws
-   * @param {string} ip
-   * @param {string} port
-   * @param {object} [options]
-   * @returns {FluxPeerSocket}
-   */
-  addEphemeral(ws, ip, port, options = {}) {
-    const peer = new FluxPeerSocket(ws, ip, String(port), this);
-    peer.source = PEER_SOURCE.EPHEMERAL;
-    if (Array.isArray(options.remoteCapabilities) && options.remoteCapabilities.length) {
-      peer.remoteCapabilities = new Set(options.remoteCapabilities);
-    }
-    if (typeof options.remoteClockOffsetMs === 'number' && !Number.isNaN(options.remoteClockOffsetMs)) {
-      peer.remoteClockOffsetMs = options.remoteClockOffsetMs;
-    }
-    this.#ephemeralPeers.set(peer.key, peer);
-    this.#pendingConnections.delete(peer.key);
-    log.info(`Ephemeral connection to ${peer.key} established`);
-    return peer;
-  }
-
-  /**
-   * Remove an ephemeral peer. No reconnection, no tracking, no threshold events.
-   * @param {string} key
-   * @returns {FluxPeerSocket|null}
-   */
-  removeEphemeral(key) {
-    const peer = this.#ephemeralPeers.get(key);
-    if (!peer) return null;
-    this.#ephemeralPeers.delete(key);
-    log.info(`Ephemeral connection ${key} removed`);
-    return peer;
   }
 
   /**
@@ -426,36 +339,6 @@ class FluxPeerManager extends EventEmitter {
   getNumberOfPeers() {
     return this.#peers.size;
   }
-
-  getPeerFluxUptime(key) {
-    const peer = this.#peers.get(key);
-    if (!peer || peer.remoteFluxUptime === null) return null;
-    return peer.remoteFluxUptime + (Date.now() - peer.connectedAt) / 1000;
-  }
-
-  getEligibleSyncPeers(minUptimeSeconds, count) {
-    const eligible = [];
-    for (const peer of this.#peers.values()) {
-      if (peer.missedPongs !== 0) continue;
-      if (!peer.remoteCapabilities.has('appStateSync')) continue;
-      const uptime = this.getPeerFluxUptime(peer.key);
-      if (uptime === null || uptime < minUptimeSeconds) continue;
-      eligible.push(peer);
-    }
-    for (let i = eligible.length - 1; i > 0; i -= 1) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [eligible[i], eligible[j]] = [eligible[j], eligible[i]];
-    }
-    return count ? eligible.slice(0, count) : eligible;
-  }
-
-  markSyncRequested(key) { this.#syncRequestedPeers.add(key); }
-
-  isSyncRequested(key) { return this.#syncRequestedPeers.has(key); }
-
-  completeSyncRequest(key) { this.#syncRequestedPeers.delete(key); }
-
-  clearSyncRequested() { this.#syncRequestedPeers.clear(); }
 
   // --- Liveness ---
 
@@ -786,10 +669,6 @@ class FluxPeerManager extends EventEmitter {
    * @param {object} [request] - HTTP upgrade request (carries headers for metadata extraction)
    */
   validateAndAddInbound(ws, optionalPort, request) {
-    if (!this.acceptingConnections) {
-      ws.close(CLOSE_CODES.NODE_UNCONFIRMED, 'node not confirmed');
-      return;
-    }
     try {
       let port;
       let req;
@@ -815,9 +694,6 @@ class FluxPeerManager extends EventEmitter {
         }
         if (req.headers['x-flux-version']) {
           metadata.remoteVersion = req.headers['x-flux-version'];
-        }
-        if (req.headers['x-flux-uptime']) {
-          metadata.remoteFluxUptime = Number(req.headers['x-flux-uptime']);
         }
       }
       const maxPeers = 4 * config.fluxapps.minIncoming;
@@ -1054,38 +930,6 @@ class FluxPeerManager extends EventEmitter {
           if (buf.length < 7) return;
           const { addOutbound, addInbound, rm } = peerCodec.decodePeerUpdate(buf);
           this.handlePeerUpdate(peer, addOutbound, addInbound, rm);
-          break;
-        }
-        case peerCodec.MSG_TYPE.REQUEST_TEMP_MESSAGES: {
-          const decoded = peerCodec.decodeSignedSyncRequest(buf);
-          if (!decoded) break;
-          if (this.hashHandlers?.handleTempMessagesRequest) {
-            this.hashHandlers.handleTempMessagesRequest(peer, decoded);
-          }
-          break;
-        }
-        case peerCodec.MSG_TYPE.REQUEST_APP_RUNNING: {
-          const decoded = peerCodec.decodeSignedSyncRequest(buf);
-          if (!decoded) break;
-          if (this.hashHandlers?.handleAppRunningRequest) {
-            this.hashHandlers.handleAppRunningRequest(peer, decoded);
-          }
-          break;
-        }
-        case peerCodec.MSG_TYPE.REQUEST_APP_INSTALLING: {
-          const decoded = peerCodec.decodeSignedSyncRequest(buf);
-          if (!decoded) break;
-          if (this.hashHandlers?.handleAppInstallingRequest) {
-            this.hashHandlers.handleAppInstallingRequest(peer, decoded);
-          }
-          break;
-        }
-        case peerCodec.MSG_TYPE.REQUEST_APP_INSTALLING_ERRORS: {
-          const decoded = peerCodec.decodeSignedSyncRequest(buf);
-          if (!decoded) break;
-          if (this.hashHandlers?.handleAppInstallingErrorsRequest) {
-            this.hashHandlers.handleAppInstallingErrorsRequest(peer, decoded);
-          }
           break;
         }
         default:
@@ -1470,4 +1314,4 @@ class FluxPeerManager extends EventEmitter {
 // Singleton export
 const peerManager = new FluxPeerManager();
 
-module.exports = { FluxPeerManager, peerManager, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES };
+module.exports = { FluxPeerManager, peerManager, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION };

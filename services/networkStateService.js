@@ -59,8 +59,7 @@ async function start(options = {}) {
 
     stateManager = new networkStateManager.NetworkStateManager(fetcher, {
       stateEmitter,
-      stateEvent: 'blocksProcessed',
-      progressEvent: 'syncProgress',
+      stateEvent: 'blockReceived',
     });
 
     const timeout = waitTimeoutMs ? setTimeout(
