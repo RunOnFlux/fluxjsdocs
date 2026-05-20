@@ -10,6 +10,7 @@ const config = require('config');
 const qs = require('qs');
 
 const asyncLock = require('./utils/asyncLock');
+const dbHelper = require('./dbHelper');
 const log = require('../lib/log');
 
 const fluxController = require('./utils/fluxController');
@@ -296,6 +297,23 @@ function ensureArray(parameter) {
   }
   // Convert single value to array
   return [parameter];
+}
+
+/**
+ * To delete login phrase.
+ * @param {string} phrase Login phrase.
+ */
+async function deleteLoginPhrase(phrase) {
+  try {
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.local.database);
+    const collection = config.database.local.collections.activeLoginPhrases;
+    const query = { loginPhrase: phrase };
+    const projection = {};
+    await dbHelper.findOneAndDeleteInDatabase(database, collection, query, projection);
+  } catch (error) {
+    log.error(error);
+  }
 }
 
 /**
@@ -718,6 +736,7 @@ module.exports = {
   commandStringToArray,
   axiosInstance,
   delay,
+  deleteLoginPhrase,
   dirInfo,
   dockerBufferToString,
   ensureBoolean,

@@ -1,4 +1,3 @@
-const config = require('config');
 const serviceHelper = require('../serviceHelper');
 
 const { AsyncLock } = require('./asyncLock');
@@ -189,7 +188,7 @@ class ImageVerifier {
 
       const { data } = await serviceHelper
         .axiosGet(
-          `${config.github.rawBaseUrl}/helpers/repositories.json`,
+          'https://raw.githubusercontent.com/RunOnFlux/flux/master/helpers/repositories.json',
           { timeout: 20_000 },
         )
         .catch((err) => {
