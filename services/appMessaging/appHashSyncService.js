@@ -1,10 +1,10 @@
 const zlib = require('zlib');
+const { StringDecoder } = require('string_decoder');
 const config = require('config');
 const dbHelper = require('../dbHelper');
 const messageHelper = require('../messageHelper');
 const verificationHelper = require('../verificationHelper');
 const serviceHelper = require('../serviceHelper');
-const messageStore = require('./messageStore');
 const messageVerifier = require('./messageVerifier');
 const appValidator = require('../appRequirements/appValidator');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
@@ -16,7 +16,6 @@ const fluxCommunicationUtils = require('../fluxCommunicationUtils');
 const { openEphemeralConnection } = require('../fluxCommunication');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const { CLOSE_CODES } = require('../utils/FluxPeerSocket');
-const globalState = require('../utils/globalState');
 const { appSyncEvents, EVENTS } = require('../utils/appSyncEvents');
 const { HASH_EXPIRY_BLOCKS, HASH_RETRY_BACKOFF } = require('../utils/appConstants');
 const log = require('../../lib/log');
@@ -175,7 +174,8 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missingSet, onProgres
     }
   });
 
-  dataStream.on('data', (chunk) => extractor.write(chunk.toString()));
+  const decoder = new StringDecoder('utf8');
+  dataStream.on('data', (chunk) => extractor.write(decoder.write(chunk)));
   dataStream.on('end', () => { streamDone = true; signalBatch(); });
   dataStream.on('close', () => { streamDone = true; signalBatch(); });
   dataStream.on('error', (err) => {
