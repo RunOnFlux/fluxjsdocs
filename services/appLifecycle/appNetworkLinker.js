@@ -1,19 +1,19 @@
 /**
- * App Dependency Manager
+ * App Network Linker
  *
- * Implements opt-in app-to-app dependency networking. An app owner declares
- * dependencies by embedding a token in the app `description` text:
+ * Implements opt-in app-to-app network linking. An app owner links the app to
+ * other apps by embedding a token in the app `description` text:
  *
- *     dependsOn:[appA,appB]
+ *     networkWith:[appA,appB]
  *
  * Brackets are required, quotes are optional, the key is matched
  * case-insensitively and names are comma separated. When the token is present,
- * before the app is installed or redeployed the node verifies every named
- * dependency is installed locally and owned by the same owner; otherwise the
- * install fails. Each of the app's component containers is then attached to the
- * private docker network of every dependency (`fluxDockerNetwork_<dep>`), so it
- * can reach the dependency's components by their docker DNS name
- * `flux<component>_<depApp>` — exactly as if both apps were a single app.
+ * before the app is installed or redeployed the node verifies every named app
+ * is installed locally and owned by the same owner; otherwise the install
+ * fails. Each of the app's component containers is then attached to the
+ * private docker network of every linked app (`fluxDockerNetwork_<linked>`), so
+ * it can reach that app's components by their docker DNS name
+ * `flux<component>_<linkedApp>` — exactly as if both apps were a single app.
  *
  * This is purely node-local behaviour: it does not introduce an app
  * specification field, change validation, or touch any network consensus. An
@@ -30,16 +30,16 @@ const { localAppsInformation } = require('../utils/appConstants');
 const appNameRegex = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
 
 /**
- * Parses the `dependsOn:[...]` token out of an app description.
+ * Parses the `networkWith:[...]` token out of an app description.
  *
  * @param {string} description - app description text
- * @returns {string[]} unique, syntactically valid dependency app names ([] if none)
+ * @returns {string[]} unique, syntactically valid linked app names ([] if none)
  */
-function parseDependsOn(description) {
+function parseNetworkWith(description) {
   if (typeof description !== 'string' || !description) {
     return [];
   }
-  const match = description.match(/\bdependsOn\s*[:=]\s*\[([^\]]*)\]/i);
+  const match = description.match(/\bnetworkWith\s*[:=]\s*\[([^\]]*)\]/i);
   if (!match) {
     return [];
   }
@@ -57,18 +57,18 @@ function parseDependsOn(description) {
 }
 
 /**
- * Returns the dependency app names declared by an app, excluding any self
+ * Returns the linked app names declared by an app, excluding any self
  * reference to the app itself.
  *
  * @param {object} appSpecs - full app specification
- * @returns {string[]} dependency app names
+ * @returns {string[]} linked app names
  */
-function getAppDependencies(appSpecs) {
+function getLinkedApps(appSpecs) {
   if (!appSpecs || !appSpecs.name) {
     return [];
   }
   const selfName = String(appSpecs.name).toLowerCase();
-  return parseDependsOn(appSpecs.description).filter((dep) => dep.toLowerCase() !== selfName);
+  return parseNetworkWith(appSpecs.description).filter((linked) => linked.toLowerCase() !== selfName);
 }
 
 /**
@@ -97,15 +97,15 @@ async function getAppContainerNames(appName) {
 }
 
 /**
- * Verifies every dependency declared by an app is installed locally and owned
- * by the same owner. Throws otherwise, aborting the install/redeploy.
+ * Verifies every app this app is linked to is installed locally and owned by
+ * the same owner. Throws otherwise, aborting the install/redeploy.
  *
  * @param {object} appSpecs - full app specification
- * @returns {Promise<boolean>} true when all dependencies are satisfied
+ * @returns {Promise<boolean>} true when all network links are satisfied
  */
-async function checkAppDependencyRequirements(appSpecs) {
-  const dependencies = getAppDependencies(appSpecs);
-  if (!dependencies.length) {
+async function checkAppNetworkRequirements(appSpecs) {
+  const linkedApps = getLinkedApps(appSpecs);
+  if (!linkedApps.length) {
     return true;
   }
 
@@ -114,60 +114,60 @@ async function checkAppDependencyRequirements(appSpecs) {
   const projection = { projection: { _id: 0, name: 1, owner: 1 } };
 
   // eslint-disable-next-line no-restricted-syntax
-  for (const dependency of dependencies) {
+  for (const linkedApp of linkedApps) {
     // eslint-disable-next-line no-await-in-loop
-    const installed = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: dependency }, projection);
+    const installed = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: linkedApp }, projection);
     if (!installed) {
-      throw new Error(`Dependency '${dependency}' required by '${appSpecs.name}' is not installed on this node. Installation aborted.`);
+      throw new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is not installed on this node. Installation aborted.`);
     }
     if (installed.owner !== appSpecs.owner) {
-      throw new Error(`Dependency '${dependency}' required by '${appSpecs.name}' is owned by a different owner. Installation aborted.`);
+      throw new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is owned by a different owner. Installation aborted.`);
     }
   }
-  log.info(`App dependencies satisfied for ${appSpecs.name}: ${dependencies.join(', ')}`);
+  log.info(`App network links satisfied for ${appSpecs.name}: ${linkedApps.join(', ')}`);
   return true;
 }
 
 /**
  * Attaches a freshly created component container to the private docker network
- * of every app the parent app depends on, so it can reach the dependencies'
+ * of every app the parent app is linked to, so it can reach the linked apps'
  * components. Throws on a real connection failure so the install is rolled back.
  *
  * @param {string} componentContainerName - docker container name (flux<component>_<app>)
  * @param {object} fullAppSpecs - full app specification of the parent app
  * @returns {Promise<void>}
  */
-async function connectComponentToDependencies(componentContainerName, fullAppSpecs) {
-  const dependencies = getAppDependencies(fullAppSpecs);
-  if (!dependencies.length) {
+async function connectComponentToLinkedApps(componentContainerName, fullAppSpecs) {
+  const linkedApps = getLinkedApps(fullAppSpecs);
+  if (!linkedApps.length) {
     return;
   }
 
   // eslint-disable-next-line no-restricted-syntax
-  for (const dependency of dependencies) {
-    const networkName = `fluxDockerNetwork_${dependency}`;
+  for (const linkedApp of linkedApps) {
+    const networkName = `fluxDockerNetwork_${linkedApp}`;
     // eslint-disable-next-line no-await-in-loop
     await dockerService.appDockerNetworkConnect(componentContainerName, networkName);
-    log.info(`Connected ${componentContainerName} to dependency network ${networkName}`);
+    log.info(`Connected ${componentContainerName} to linked app network ${networkName}`);
   }
 }
 
 /**
  * After an app's private network is (re)created, reconnects every locally
- * installed app that declares a dependency on it back onto that network.
- * Best-effort — never throws, so a redeploy is not aborted by a reconnect hiccup.
+ * installed app that is networked with it back onto that network. Best-effort —
+ * never throws, so a redeploy is not aborted by a reconnect hiccup.
  *
  * @param {string} appName - the app whose network was (re)created
  * @returns {Promise<void>}
  */
-async function reconnectDependents(appName) {
+async function reconnectLinkedApps(appName) {
   let installedApps;
   try {
     const dbopen = dbHelper.databaseConnection();
     const appsDatabase = dbopen.db(config.database.appslocal.database);
     installedApps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, {}, { projection: { _id: 0 } });
   } catch (error) {
-    log.error(`reconnectDependents: failed to read installed apps for ${appName}: ${error.message}`);
+    log.error(`reconnectLinkedApps: failed to read installed apps for ${appName}: ${error.message}`);
     return;
   }
 
@@ -180,8 +180,8 @@ async function reconnectDependents(appName) {
       // eslint-disable-next-line no-continue
       continue;
     }
-    const dependencies = getAppDependencies(app);
-    if (!dependencies.some((dep) => dep.toLowerCase() === lowerAppName)) {
+    const linkedApps = getLinkedApps(app);
+    if (!linkedApps.some((linked) => linked.toLowerCase() === lowerAppName)) {
       // eslint-disable-next-line no-continue
       continue;
     }
@@ -192,35 +192,35 @@ async function reconnectDependents(appName) {
       for (const containerName of containerNames) {
         // eslint-disable-next-line no-await-in-loop
         await dockerService.appDockerNetworkConnect(containerName, networkName);
-        log.info(`Reconnected dependent ${containerName} to ${networkName}`);
+        log.info(`Reconnected linked app ${containerName} to ${networkName}`);
       }
     } catch (error) {
-      log.error(`reconnectDependents: failed to reconnect ${app.name} to ${networkName}: ${error.message}`);
+      log.error(`reconnectLinkedApps: failed to reconnect ${app.name} to ${networkName}: ${error.message}`);
     }
   }
 }
 
 /**
- * Boot-time sweep: ensures every installed app that declares dependencies is
- * attached to each dependency's network. Idempotent and best-effort.
+ * Boot-time sweep: ensures every installed app that declares network links is
+ * attached to each linked app's network. Idempotent and best-effort.
  *
  * @returns {Promise<void>}
  */
-async function reconcileAllDependencyNetworks() {
+async function reconcileAllAppNetworkLinks() {
   let installedApps;
   try {
     const dbopen = dbHelper.databaseConnection();
     const appsDatabase = dbopen.db(config.database.appslocal.database);
     installedApps = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, {}, { projection: { _id: 0 } });
   } catch (error) {
-    log.error(`reconcileAllDependencyNetworks: failed to read installed apps: ${error.message}`);
+    log.error(`reconcileAllAppNetworkLinks: failed to read installed apps: ${error.message}`);
     return;
   }
 
   // eslint-disable-next-line no-restricted-syntax
   for (const app of installedApps || []) {
-    const dependencies = getAppDependencies(app);
-    if (!dependencies.length) {
+    const linkedApps = getLinkedApps(app);
+    if (!linkedApps.length) {
       // eslint-disable-next-line no-continue
       continue;
     }
@@ -228,28 +228,28 @@ async function reconcileAllDependencyNetworks() {
       // eslint-disable-next-line no-await-in-loop
       const containerNames = await getAppContainerNames(app.name);
       // eslint-disable-next-line no-restricted-syntax
-      for (const dependency of dependencies) {
-        const networkName = `fluxDockerNetwork_${dependency}`;
+      for (const linkedApp of linkedApps) {
+        const networkName = `fluxDockerNetwork_${linkedApp}`;
         // eslint-disable-next-line no-restricted-syntax
         for (const containerName of containerNames) {
           // eslint-disable-next-line no-await-in-loop
           await dockerService.appDockerNetworkConnect(containerName, networkName).catch((error) => {
-            log.error(`reconcileAllDependencyNetworks: failed to connect ${containerName} to ${networkName}: ${error.message}`);
+            log.error(`reconcileAllAppNetworkLinks: failed to connect ${containerName} to ${networkName}: ${error.message}`);
           });
         }
       }
     } catch (error) {
-      log.error(`reconcileAllDependencyNetworks: failed for ${app.name}: ${error.message}`);
+      log.error(`reconcileAllAppNetworkLinks: failed for ${app.name}: ${error.message}`);
     }
   }
 }
 
 module.exports = {
-  parseDependsOn,
-  getAppDependencies,
+  parseNetworkWith,
+  getLinkedApps,
   getAppContainerNames,
-  checkAppDependencyRequirements,
-  connectComponentToDependencies,
-  reconnectDependents,
-  reconcileAllDependencyNetworks,
+  checkAppNetworkRequirements,
+  connectComponentToLinkedApps,
+  reconnectLinkedApps,
+  reconcileAllAppNetworkLinks,
 };

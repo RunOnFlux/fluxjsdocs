@@ -11,7 +11,7 @@ const benchmarkService = require('../benchmarkService');
 const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const appUninstaller = require('./appUninstaller');
-const appDependencyManager = require('./appDependencyManager');
+const appNetworkLinker = require('./appNetworkLinker');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
 const { storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
@@ -455,9 +455,10 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       await performDockerCleanup(res);
     }
 
-    // Verify declared app dependencies (dependsOn token in the description) are
-    // installed locally and owned by the same owner before any side effects.
-    await appDependencyManager.checkAppDependencyRequirements(appSpecifications);
+    // Verify the apps this app must be networked with (networkWith token in the
+    // description) are installed locally and owned by the same owner before any
+    // side effects.
+    await appNetworkLinker.checkAppNetworkRequirements(appSpecifications);
 
     if (!isComponent) {
       let dockerNetworkAddrValue = Math.floor(Math.random() * 256);
@@ -621,12 +622,12 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       fluxEventBus.publish('app:installed', { name: appSpecifications.name, hash: appSpecifications.hash });
     }
 
-    // Reconnect any locally installed apps that declare a dependency on this
-    // app — its private network was (re)created during this install. Guarded on
+    // Reconnect any locally installed apps that are networked with this app —
+    // its private network was (re)created during this install. Guarded on
     // appComponent (the unmutated entry value) since isComponent is flipped to
     // true inside the component install loop above.
     if (!appComponent && !test) {
-      await appDependencyManager.reconnectDependents(appName);
+      await appNetworkLinker.reconnectLinkedApps(appName);
     }
 
     // all done message
@@ -765,11 +766,12 @@ async function checkOrbitAppHealth(appSpecifications, appName, isComponent, res)
  * @returns {Promise<void>} Installation result
  */
 async function installApplicationHard(appSpecifications, appName, isComponent, res, fullAppSpecs, test = false) {
-  // Verify declared app dependencies (dependsOn token) are installed locally and
-  // owned by the same owner. Enforced here too — not just in registerAppLocally —
-  // so direct callers that bypass it (container health recovery, legacy v<=3
-  // redeploys) cannot create a container without satisfying its dependencies.
-  await appDependencyManager.checkAppDependencyRequirements(fullAppSpecs);
+  // Verify the apps this app must be networked with (networkWith token) are
+  // installed locally and owned by the same owner. Enforced here too — not just
+  // in registerAppLocally — so direct callers that bypass it (container health
+  // recovery, legacy v<=3 redeploys) cannot create a container without its
+  // network links satisfied.
+  await appNetworkLinker.checkAppNetworkRequirements(fullAppSpecs);
 
   // Setup firewall and UPnP ports (fail fast before downloading images)
   await setupApplicationPorts(appSpecifications, appName, isComponent, res, test);
@@ -814,10 +816,10 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
 
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
-  // Attach this component to the private network of every app it depends on
+  // Attach this component to the private network of every app it is linked with
   // so it can reach their components by docker DNS name.
-  const dependencyContainerName = dockerService.getAppIdentifier(isComponent ? `${appSpecifications.name}_${appName}` : appName);
-  await appDependencyManager.connectComponentToDependencies(dependencyContainerName, fullAppSpecs);
+  const componentContainerName = dockerService.getAppIdentifier(isComponent ? `${appSpecifications.name}_${appName}` : appName);
+  await appNetworkLinker.connectComponentToLinkedApps(componentContainerName, fullAppSpecs);
 
   const startStatus = {
     status: isComponent ? `Starting component ${appSpecifications.name} of Flux App ${appName}...` : `Starting Flux App ${appName}...`,
@@ -863,11 +865,12 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs) {
-  // Verify declared app dependencies (dependsOn token) are installed locally and
-  // owned by the same owner. Enforced here too — not just in softRegisterAppLocally —
-  // so direct callers that bypass it (container health recovery, legacy v<=3
-  // redeploys) cannot create a container without satisfying its dependencies.
-  await appDependencyManager.checkAppDependencyRequirements(fullAppSpecs);
+  // Verify the apps this app must be networked with (networkWith token) are
+  // installed locally and owned by the same owner. Enforced here too — not just
+  // in softRegisterAppLocally — so direct callers that bypass it (container
+  // health recovery, legacy v<=3 redeploys) cannot create a container without
+  // its network links satisfied.
+  await appNetworkLinker.checkAppNetworkRequirements(fullAppSpecs);
 
   // Setup firewall and UPnP ports (fail fast before downloading images)
   await setupApplicationPorts(appSpecifications, appName, isComponent, res);
@@ -886,10 +889,10 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
 
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
-  // Attach this component to the private network of every app it depends on
+  // Attach this component to the private network of every app it is linked with
   // so it can reach their components by docker DNS name.
-  const dependencyContainerName = dockerService.getAppIdentifier(isComponent ? `${appSpecifications.name}_${appName}` : appName);
-  await appDependencyManager.connectComponentToDependencies(dependencyContainerName, fullAppSpecs);
+  const componentContainerName = dockerService.getAppIdentifier(isComponent ? `${appSpecifications.name}_${appName}` : appName);
+  await appNetworkLinker.connectComponentToLinkedApps(componentContainerName, fullAppSpecs);
 
   const startStatus = {
     status: isComponent ? `Starting component ${appSpecifications.name} of Flux App ${appName}...` : `Starting Flux App ${appName}...`,

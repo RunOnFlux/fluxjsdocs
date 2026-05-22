@@ -28,7 +28,7 @@ const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
-const appDependencyManager = require('./appDependencyManager');
+const appNetworkLinker = require('./appNetworkLinker');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -1015,9 +1015,10 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       return;
     }
 
-    // Verify declared app dependencies (dependsOn token in the description) are
-    // installed locally and owned by the same owner before any side effects.
-    await appDependencyManager.checkAppDependencyRequirements(appSpecifications);
+    // Verify the apps this app must be networked with (networkWith token in the
+    // description) are installed locally and owned by the same owner before any
+    // side effects.
+    await appNetworkLinker.checkAppNetworkRequirements(appSpecifications);
 
     if (!isComponent) {
       let dockerNetworkAddrValue = Math.floor(Math.random() * 256);
@@ -1157,11 +1158,11 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       }
     }
 
-    // Reconnect any locally installed apps that declare a dependency on this
-    // app. Guarded on appComponent (the unmutated entry value) since isComponent
-    // is flipped to true inside the component install loop above.
+    // Reconnect any locally installed apps that are networked with this app.
+    // Guarded on appComponent (the unmutated entry value) since isComponent is
+    // flipped to true inside the component install loop above.
     if (!appComponent) {
-      await appDependencyManager.reconnectDependents(appName);
+      await appNetworkLinker.reconnectLinkedApps(appName);
     }
 
     // all done message

@@ -15,7 +15,7 @@ const fluxNetworkHelper = require('../fluxNetworkHelper');
 const registryManager = require('../appDatabase/registryManager');
 const advancedWorkflows = require('./advancedWorkflows');
 const appUninstaller = require('./appUninstaller');
-const appDependencyManager = require('./appDependencyManager');
+const appNetworkLinker = require('./appNetworkLinker');
 const globalState = require('../utils/globalState');
 const fluxEventBus = require('../utils/fluxEventBus');
 const nodeConfirmationService = require('../nodeConfirmationService');
@@ -249,10 +249,10 @@ async function reconcileAppsOnBoot() {
       + `Apps failed: ${results.appsFailed.length}`,
     );
 
-    // Re-apply app-to-app dependency network connections (dependsOn token in the
-    // description). Idempotent and best-effort — defensive in case docker did not
-    // restore a secondary network membership across the reboot.
-    await appDependencyManager.reconcileAllDependencyNetworks();
+    // Re-apply app-to-app network links (networkWith token in the description).
+    // Idempotent and best-effort — defensive in case docker did not restore a
+    // secondary network membership across the reboot.
+    await appNetworkLinker.reconcileAllAppNetworkLinks();
 
     return results;
   } catch (error) {
