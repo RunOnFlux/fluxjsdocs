@@ -9,7 +9,6 @@ const {
 } = require('./syncthingMonitorConstants');
 
 const cmdAsync = util.promisify(require('child_process').exec);
-const { extractIp, extractPort } = require('../utils/socketAddressUtils');
 
 /**
  * Helper function to get device ID from remote node with retry capability
@@ -116,9 +115,9 @@ async function buildDeviceConfiguration(
 
   // Parallelize device ID fetching
   const devicePromises = locations.map(async (appInstance) => {
-    const ip = extractIp(appInstance.ip);
-    const port = extractPort(appInstance.ip);
-    const addresses = [`tcp://${ip}:${port + 2}`, `quic://${ip}:${port + 2}`];
+    const ip = appInstance.ip.split(':')[0];
+    const port = appInstance.ip.split(':')[1] || '16127';
+    const addresses = [`tcp://${ip}:${+port + 2}`, `quic://${ip}:${+port + 2}`];
     const name = `${ip}:${port}`;
 
     const deviceID = await getDeviceIDCached(name, deviceCache);

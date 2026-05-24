@@ -1,6 +1,5 @@
 const daemonServiceFluxnodeRpcs = require('./daemonService/daemonServiceFluxnodeRpcs');
 const networkStateManager = require('./utils/networkStateManager');
-const { normalizeSocketAddress, extractIp } = require('./utils/socketAddressUtils');
 
 /**
  * @typedef {import('./utils/networkStateManager').Fluxnode} Fluxnode
@@ -134,21 +133,12 @@ async function getFluxnodesByPubkey(pubkey) {
  * @param {string} socketAddress
  * @returns {Promise<boolean>}
  */
-// TODO: Remove alt-format lookup once all nodes run fluxbench with
-// always-attached port. During the transition, the node list may contain
-// either "ip" or "ip:16127" for default-port nodes.
 async function socketAddressInNetworkState(socketAddress) {
   if (!stateManager) return false;
 
   const found = await stateManager.includes(socketAddress, 'socketAddress');
-  if (found) return true;
 
-  const normalized = normalizeSocketAddress(socketAddress);
-  const bareIp = extractIp(socketAddress);
-  const alt = normalized === socketAddress ? bareIp : normalized;
-  if (alt) return stateManager.includes(alt, 'socketAddress');
-
-  return false;
+  return found;
 }
 
 /**

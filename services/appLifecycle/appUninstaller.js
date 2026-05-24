@@ -875,7 +875,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
     fluxEventBus.publish('app:removed', { name: appName });
 
     if (sendMessage) {
-      const ip = await fluxNetworkHelper.getLocalSocketAddress();
+      const ip = await fluxNetworkHelper.getMyFluxIPandPort();
       if (ip) {
         const broadcastedAt = Date.now();
         const appRemovedMessage = {
