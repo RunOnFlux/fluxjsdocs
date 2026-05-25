@@ -24,7 +24,6 @@ const { CLOSE_CODES, DIRECTION } = require('./utils/FluxPeerSocket');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
 const fluxEventBus = require('./utils/fluxEventBus');
-const { normalizeSocketAddress, extractIp, extractPort, socketAddressesMatch } = require('./utils/socketAddressUtils');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -46,8 +45,8 @@ let maxNumberOfIpChanges = 0;
 const myCache = cacheManager.ipCache;
 const { lruRateLimit } = require('./utils/rateLimit');
 
-// This node's socket address (ip:port) from benchmark
-let localSocketAddress = null;
+// my external Flux IP from benchmark
+let myFluxIP = null;
 
 /**
  * Converts a hexadecimal IP address (as found in /proc/net/route) to dotted decimal format.
@@ -323,7 +322,7 @@ async function isFluxAvailable(ip, port = config.server.apiport) {
     if (!config.server.allowedPorts.includes(+port)) {
       throw new Error('Invalid Port');
     }
-    const socketAddress = normalizeSocketAddress(`${ip}:${port}`);
+    const socketAddress = +port === config.server.apiport ? ip : `${ip}:${port}`;
     const isConfirmedNode = await fluxCommunicationUtils.socketAddressInFluxList(socketAddress);
     if (!isConfirmedNode) {
       return false;
@@ -566,13 +565,13 @@ async function keepUPNPPortsOpen(req, res) {
 }
 
 /**
- * Setter for localSocketAddress.
+ * Setter for myFluxIp.
  * Main goal for this is testing availability.
  *
- * @param {string} value ip or ip:port to be set (normalized to ip:port)
+ * @param {string} value new IP to be set
  */
-function setLocalSocketAddress(value) {
-  localSocketAddress = value ? normalizeSocketAddress(value) : null;
+function setMyFluxIp(value) {
+  myFluxIP = value;
 }
 
 /**
@@ -661,18 +660,23 @@ function isNodeDos() {
 }
 
 /**
- * Get this node's socket address (ip:port).
- * @returns {Promise<string|null>} Normalized socket address (always ip:port) or null.
+ * To get Flux IP adress and port.
+ * @returns {Promise<string>} IP address and port.
  */
-async function getLocalSocketAddress() {
+async function getMyFluxIPandPort() {
+  // I'm not sure of the intent here, but it does what it used to do.
+  // Fetches the ip, sets the ip to the fetched value on success, or sets
+  // it to null on error.
+  //
+  // I'm not sure we should be setting it to null, a bench call could fail
+  // for whatever reason, I believe we should only be setting this on success,
+  // or we should count failures to allow for bad rpc calls.
   const benchmarkResponse = await benchmarkService.getBenchmarks();
   const { status, data: { ipaddress = null } = {} } = benchmarkResponse;
-  if (status !== 'success' || !ipaddress) {
-    setLocalSocketAddress(null);
-    return null;
-  }
-  setLocalSocketAddress(ipaddress);
-  return localSocketAddress;
+  const ip = status === 'success' ? ipaddress : null;
+
+  setMyFluxIp(ip);
+  return ip;
 }
 
 /**
@@ -1132,8 +1136,8 @@ async function adjustExternalIP(ip) {
 
     if (oldUserConfigIp && v4exact.test(oldUserConfigIp) && !myCache.has(ip)) {
       myCache.set(ip, '');
-      const newIP = normalizeSocketAddress(`${ip}:${userconfig.initial.apiport}`);
-      const oldIP = normalizeSocketAddress(`${oldUserConfigIp}:${userconfig.initial.apiport}`);
+      const newIP = userconfig.initial.apiport !== 16127 ? `${ip}:${userconfig.initial.apiport}` : ip;
+      const oldIP = userconfig.initial.apiport !== 16127 ? `${oldUserConfigIp}:${userconfig.initial.apiport}` : oldUserConfigIp;
       log.info(`New public Ip detected: ${newIP}, old Ip: ${oldIP} , updating the FluxNode info on the network`);
       const measuredUptime = fluxUptime();
       if (await ipChangesOverLimit() && measuredUptime.status === 'success' && measuredUptime.data > config.fluxapps.minUpTime) {
@@ -1186,8 +1190,8 @@ async function adjustExternalIP(ip) {
 
           // eslint-disable-next-line no-await-in-loop
           const runningAppList = await registryManager.appLocation(app.name);
-          const duplicateInstance = runningAppList.find((instance) => extractIp(instance.ip) === ip);
-          if (duplicateInstance) {
+          const findMyIP = runningAppList.find((instance) => instance.ip.split(':')[0] === ip);
+          if (findMyIP) {
             log.info(`Aplication: ${app.name}, was found on the network already running under the same ip, uninstalling app`);
             log.warn(`REMOVAL REASON: Duplicate IP detected - ${app.name} already running on network with IP ${ip} (after IP change)`);
             // eslint-disable-next-line no-await-in-loop
@@ -1238,7 +1242,7 @@ async function checkMyFluxAvailability(retryNumber = 0) {
     return false;
   }
 
-  if (localSocketAddress === null) return false;
+  if (myFluxIP === null) return false;
 
   let userBlockedPorts = userconfig.initial.blockedPorts || [];
   userBlockedPorts = serviceHelper.ensureObject(userBlockedPorts);
@@ -1264,20 +1268,18 @@ async function checkMyFluxAvailability(retryNumber = 0) {
   }
 
   const randomSocketAddress = await networkStateService.getRandomSocketAddress(
-    localSocketAddress,
+    myFluxIP,
   );
 
   if (!randomSocketAddress) return false;
 
-  const remoteIp = extractIp(randomSocketAddress);
-  const remotePort = extractPort(randomSocketAddress);
+  const [remoteIp, remotePort = '16127'] = randomSocketAddress.split(':');
 
   const axiosConfig = {
     timeout: 7000,
   };
 
-  const localIp = extractIp(localSocketAddress);
-  const localApiPort = extractPort(localSocketAddress);
+  const [localIp, localApiPort = '16127'] = myFluxIP.split(':');
 
   const url = `http://${remoteIp}:${remotePort}/flux/`
     + `checkfluxavailability?ip=${localIp}&port=${localApiPort}`;
@@ -1313,14 +1315,14 @@ async function checkMyFluxAvailability(retryNumber = 0) {
       if (benchIpResponse.status === 'success') {
         log.info(`FluxBench reported public IP: ${benchIpResponse.data}`);
         const benchMyIP = benchIpResponse.data.length > 5 ? benchIpResponse.data : null;
-        if (benchMyIP && extractIp(benchMyIP) !== localIp) {
+        if (benchMyIP && benchMyIP.split(':')[0] !== localIp) {
           daemonServiceUtils.setStandardCache('getbenchmarks[]', null);
           log.info('New IP found... updating network');
           dosState = 0;
           setDosMessage(null);
-          await adjustExternalIP(extractIp(benchMyIP));
+          await adjustExternalIP(benchMyIP.split(':')[0]);
           return true;
-        } if (benchMyIP && extractIp(benchMyIP) === localIp) {
+        } if (benchMyIP && benchMyIP.split(':')[0] === localIp) {
           log.info('FluxBench reported the same Ip that was already in use');
         } else {
           log.info('FluxBench reported a invalid IP');
@@ -1350,7 +1352,7 @@ async function checkMyFluxAvailability(retryNumber = 0) {
   }
   const measuredUptime = fluxUptime();
   if (measuredUptime.status === 'success' && measuredUptime.data > config.fluxapps.minUpTime) { // node has been running for 30 minutes. Upon starting a node, there can be dos that needs resetting
-    const found = await fluxCommunicationUtils.getFluxnodeFromFluxList(localSocketAddress);
+    const found = await fluxCommunicationUtils.getFluxnodeFromFluxList(myFluxIP);
     const nodeCount = await fluxCommunicationUtils.getNodeCount();
 
     if (nodeCount > config.fluxapps.minIncoming + config.fluxapps.minOutgoing && found) { // our node MUST be in confirmed list in order to have some peers
@@ -1390,8 +1392,8 @@ async function checkDeterministicNodesCollisions() {
     // get node list with filter on this ip address
     // if it returns more than 1 object, shut down.
     // another precatuion might be comparing node list on multiple nodes. evaulate in the future
-    const localSocketAddr = await getLocalSocketAddress();
-    if (localSocketAddr) {
+    const myIP = await getMyFluxIPandPort();
+    if (myIP) {
       const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
       if (!syncStatus.data.synced) {
         setTimeout(() => {
@@ -1400,12 +1402,12 @@ async function checkDeterministicNodesCollisions() {
         return;
       }
       const nodeList = await fluxCommunicationUtils.deterministicFluxList();
-      const result = nodeList.filter((node) => socketAddressesMatch(node.ip, localSocketAddr));
+      const result = nodeList.filter((node) => node.ip === myIP);
       const nodeStatus = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
       if (nodeStatus.status === 'success') { // different scenario is caught elsewhere
         const myCollateral = nodeStatus.data.collateral;
         const myNode = result.find((node) => node.collateral === myCollateral);
-        const nodeCollateralDifferentIp = nodeList.find((node) => node.collateral === myCollateral && !socketAddressesMatch(node.ip, localSocketAddr));
+        const nodeCollateralDifferentIp = nodeList.find((node) => node.collateral === myCollateral && node.ip !== myIP);
         if (result.length > 1) {
           log.warn('Multiple Flux Node instances detected');
           if (myNode) {
@@ -1413,9 +1415,9 @@ async function checkDeterministicNodesCollisions() {
             const filterEarlierSame = result.filter((node) => (node.readded_confirmed_height || node.confirmed_height) <= myBlockHeight);
             // keep running only older collaterals
             if (filterEarlierSame.length >= 1) {
-              log.error(`Flux earlier collision detection on ip:${localSocketAddr}`);
+              log.error(`Flux earlier collision detection on ip:${myIP}`);
               dosState = 100;
-              setDosMessage(`Flux earlier collision detection on ip:${localSocketAddr}`);
+              setDosMessage(`Flux earlier collision detection on ip:${myIP}`);
               setTimeout(() => {
                 checkDeterministicNodesCollisions();
               }, 60 * 1000);
@@ -1436,8 +1438,8 @@ async function checkDeterministicNodesCollisions() {
         }
         if (nodeStatus.data.status === 'CONFIRMED' && nodeCollateralDifferentIp) {
           let errorCall = false;
-          const askingIP = extractIp(nodeCollateralDifferentIp.ip);
-          const askingIpPort = extractPort(nodeCollateralDifferentIp.ip);
+          const askingIP = nodeCollateralDifferentIp.ip.split(':')[0];
+          const askingIpPort = nodeCollateralDifferentIp.ip.split(':')[1] || '16127';
           log.info(`Detected same collateral on different IP: ${askingIP}:${askingIpPort}. Checking if other node is reachable...`);
 
           // First reachability check
@@ -1483,11 +1485,11 @@ async function checkDeterministicNodesCollisions() {
       // check via the confirmed-list gate in isFluxAvailable. Skip to avoid
       // spamming the network with requests that will always fail.
       const isConfirmed = nodeStatus.data?.status === 'CONFIRMED';
-      const inConfirmedList = await fluxCommunicationUtils.socketAddressInFluxList(localSocketAddr);
+      const inConfirmedList = await fluxCommunicationUtils.socketAddressInFluxList(myIP);
       if (!isConfirmed || !inConfirmedList) {
         const reason = !isConfirmed
           ? `Node status is ${nodeStatus.data?.status}`
-          : `Our IP ${localSocketAddr} is not in the confirmed flux list`;
+          : `Our IP ${myIP} is not in the confirmed flux list`;
         log.warn(`${reason}. Skipping remote availability check.`);
         setTimeout(() => {
           checkDeterministicNodesCollisions();
@@ -2218,7 +2220,7 @@ function getNumberOfPeers() {
 module.exports = {
   isFluxAvailable,
   checkFluxAvailability,
-  getLocalSocketAddress,
+  getMyFluxIPandPort,
   getFluxNodePrivateKey,
   getFluxNodePublicKey,
   checkDeterministicNodesCollisions,
@@ -2248,7 +2250,7 @@ module.exports = {
   parseTimesyncOffset,
   setStoredFluxBenchAllowed,
   getStoredFluxBenchAllowed,
-  setLocalSocketAddress,
+  setMyFluxIp,
   getDosMessage,
   setDosMessage,
   setDosStateValue,

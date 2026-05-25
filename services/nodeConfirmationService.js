@@ -132,9 +132,9 @@ async function poll() {
       }
     }
 
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    if (localSocketAddr && ourPubkey) {
-      const node = await networkStateService.getFluxnodeBySocketAddress(localSocketAddr);
+    const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+    if (myIP && ourPubkey) {
+      const node = await networkStateService.getFluxnodeBySocketAddress(myIP);
       if (node && node.pubkey === ourPubkey) {
         newMessageCapable = true;
       }

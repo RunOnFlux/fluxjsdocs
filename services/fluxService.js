@@ -656,8 +656,15 @@ function getNodeJsVersions(req, res) {
  * @returns {Promise<object>} Message.
  */
 async function getFluxIP(req, res) {
-  const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-  const message = messageHelper.createDataMessage(localSocketAddr);
+  const benchmarkResponse = await benchmarkService.getBenchmarks();
+  let myIP = null;
+  if (benchmarkResponse.status === 'success') {
+    const benchmarkResponseData = benchmarkResponse.data;
+    if (benchmarkResponseData.ipaddress) {
+      myIP = benchmarkResponseData.ipaddress.length > 5 ? benchmarkResponseData.ipaddress : null;
+    }
+  }
+  const message = messageHelper.createDataMessage(myIP);
   return res ? res.json(message) : message;
 }
 

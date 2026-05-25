@@ -3,7 +3,6 @@ const config = require('config');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
 const { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES } = require('./FluxPeerSocket');
-const { DEFAULT_API_PORT } = require('./socketAddressUtils');
 const peerCodec = require('./peerCodec');
 const fluxEventBus = require('./fluxEventBus');
 
@@ -804,9 +803,9 @@ class FluxPeerManager extends EventEmitter {
       if (typeof optionalPort === 'object' && optionalPort !== null) {
         // No :port in route — optionalPort is actually the request
         req = optionalPort;
-        port = String(DEFAULT_API_PORT);
+        port = '16127';
       } else {
-        port = optionalPort || String(DEFAULT_API_PORT);
+        port = optionalPort || '16127';
         req = request;
       }
 

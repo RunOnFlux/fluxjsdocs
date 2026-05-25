@@ -2,7 +2,6 @@ const config = require('config');
 const axios = require('axios');
 const dbHelper = require('../dbHelper');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
-const { extractIp, extractPort } = require('../utils/socketAddressUtils');
 const networkStateService = require('../networkStateService');
 const verificationHelper = require('../verificationHelper');
 const log = require('../../lib/log');
@@ -396,12 +395,11 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
   let nextTestingPort = 0;
 
   try {
-    const localSocketAddress = await fluxNetworkHelper.getLocalSocketAddress();
+    const localSocketAddress = await fluxNetworkHelper.getMyFluxIPandPort();
     if (!localSocketAddress) {
       throw new Error('Failed to detect Public IP');
     }
-    const localIp = extractIp(localSocketAddress);
-    const localPort = extractPort(localSocketAddress);
+    const [myIP, myPort = '16127'] = localSocketAddress.split(':');
 
     const pubKey = await fluxNetworkHelper.getFluxNodePublicKey();
     let somePortBanned = false;
@@ -477,8 +475,8 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       timeout,
     };
     const data = {
-      ip: localIp,
-      port: localPort,
+      ip: myIP,
+      port: myPort,
       appname: 'appPortsTest',
       ports: portsToTest,
       pubKey,
@@ -501,8 +499,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
         throw new Error('Unable to get random test connection');
       }
 
-      const askingIP = extractIp(randomSocketAddress);
-      const askingIpPort = extractPort(randomSocketAddress);
+      const [askingIP, askingIpPort = '16127'] = randomSocketAddress.split(':');
 
       // first check against our IP address
       // eslint-disable-next-line no-await-in-loop
@@ -598,20 +595,20 @@ async function callOtherNodeToKeepUpnpPortsOpen() {
   try {
     const userconfig = globalThis.userconfig;
     const apiPort = userconfig.initial.apiport || config.server.apiport;
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    if (!localSocketAddr) {
+    let myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+    if (!myIP) {
       return;
     }
 
-    const randomSocketAddress = await networkStateService.getRandomSocketAddress(localSocketAddr);
+    const randomSocketAddress = await networkStateService.getRandomSocketAddress(myIP);
 
     if (!randomSocketAddress) return;
 
-    const askingIP = extractIp(randomSocketAddress);
-    const askingIpPort = extractPort(randomSocketAddress);
-    const localIp = extractIp(localSocketAddr);
+    const [askingIP, askingIpPort = '16127'] = randomSocketAddress.split(':');
 
-    if (localIp === askingIP) {
+    myIP = myIP.split(':')[0];
+
+    if (myIP === askingIP) {
       callOtherNodeToKeepUpnpPortsOpen();
       return;
     }
@@ -665,7 +662,7 @@ async function callOtherNodeToKeepUpnpPortsOpen() {
     };
 
     const dataUPNP = {
-      ip: localIp,
+      ip: myIP,
       apiPort,
       ports,
       pubKey,

@@ -109,8 +109,8 @@ async function processContainerData(params) {
     containerData,
     identifier,
     installedAppName,
-    localSocketAddr,
-    localDeviceId,
+    myIP,
+    myDeviceId,
     state,
     allFoldersResp,
     allDevicesResp,
@@ -147,13 +147,13 @@ async function processContainerData(params) {
 
   // Get and process app locations
   let locations = await appLocation(installedAppName);
-  locations = sortAndFilterLocations(locations, localSocketAddr);
+  locations = sortAndFilterLocations(locations, myIP);
 
   // Build device configuration (parallelized internally)
   const devices = await buildDeviceConfiguration(
     locations,
-    localSocketAddr,
-    localDeviceId,
+    myIP,
+    myDeviceId,
     state.syncthingDevicesIDCache,
     devicesConfiguration,
     devicesIds,
@@ -174,7 +174,7 @@ async function processContainerData(params) {
       syncthingAppsFirstRun: state.syncthingAppsFirstRun,
       receiveOnlySyncthingAppsCache: state.receiveOnlySyncthingAppsCache,
       appLocation,
-      localSocketAddr,
+      myIP,
       appDockerStopFn,
       appDockerRestartFn,
       appDeleteDataInMountPointFn,
@@ -317,15 +317,15 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn, appDo
     }
 
     // Get required IDs and configurations
-    const localDeviceId = await syncthingService.getDeviceId();
-    if (!localDeviceId) {
-      log.error('syncthingAppsCore - Failed to get localDeviceId');
+    const myDeviceId = await syncthingService.getDeviceId();
+    if (!myDeviceId) {
+      log.error('syncthingAppsCore - Failed to get myDeviceId');
       return;
     }
 
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    if (!localSocketAddr) {
-      log.error('syncthingAppsCore - Failed to get localSocketAddr');
+    const myIP = await fluxNetworkHelper.getMyFluxIPandPort();
+    if (!myIP) {
+      log.error('syncthingAppsCore - Failed to get myIP');
       return;
     }
 
@@ -408,8 +408,8 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn, appDo
 
     // Shared parameters for processing
     const sharedParams = {
-      localSocketAddr,
-      localDeviceId,
+      myIP,
+      myDeviceId,
       state,
       allFoldersResp,
       allDevicesResp,
@@ -467,7 +467,7 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn, appDo
       (syncthingFolder) => !folderIds.includes(syncthingFolder.id),
     );
     const nonUsedDevices = allDevicesResp.data.filter(
-      (syncthingDevice) => !devicesIds.includes(syncthingDevice.deviceID) && syncthingDevice.deviceID !== localDeviceId,
+      (syncthingDevice) => !devicesIds.includes(syncthingDevice.deviceID) && syncthingDevice.deviceID !== myDeviceId,
     );
 
     // Parallelize cleanup operations
