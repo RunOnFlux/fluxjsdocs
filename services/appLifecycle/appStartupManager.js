@@ -15,7 +15,6 @@ const fluxNetworkHelper = require('../fluxNetworkHelper');
 const registryManager = require('../appDatabase/registryManager');
 const advancedWorkflows = require('./advancedWorkflows');
 const appUninstaller = require('./appUninstaller');
-const appNetworkLinker = require('./appNetworkLinker');
 const globalState = require('../utils/globalState');
 const fluxEventBus = require('../utils/fluxEventBus');
 const nodeConfirmationService = require('../nodeConfirmationService');
@@ -126,7 +125,7 @@ async function reconcileAppsOnBoot() {
     log.info(`appStartupManager - Stopped containers belong to ${appsWithStoppedContainers.size} app(s)`);
 
     // Get this node's IP for location checks
-    const myIp = await fluxNetworkHelper.getMyFluxIPandPort();
+    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
 
     // Process each app
     // eslint-disable-next-line no-restricted-syntax
@@ -180,11 +179,11 @@ async function reconcileAppsOnBoot() {
       // Check if the app still has a valid location record for this node
       // If the node was offline longer than the TTL (~7 minutes after sigterm),
       // the location record expired and the app was respawned elsewhere
-      if (myIp) {
+      if (localSocketAddr) {
         // eslint-disable-next-line no-await-in-loop
-        const hasValidLocation = await appHasValidLocationOnNode(appName, myIp);
+        const hasValidLocation = await appHasValidLocationOnNode(appName, localSocketAddr);
         if (!hasValidLocation) {
-          log.warn(`appStartupManager - App ${appName} no longer has a valid location record for this node (${myIp}), removing locally`);
+          log.warn(`appStartupManager - App ${appName} no longer has a valid location record for this node (${localSocketAddr}), removing locally`);
           try {
             // eslint-disable-next-line no-await-in-loop
             await appUninstaller.removeAppLocally(appName, null, true, true, false);
@@ -248,11 +247,6 @@ async function reconcileAppsOnBoot() {
       + `Apps skipped (no spec): ${results.appsSkippedNoSpec.length}, `
       + `Apps failed: ${results.appsFailed.length}`,
     );
-
-    // Re-apply app-to-app network links (networkWith token in the description).
-    // Idempotent and best-effort — defensive in case docker did not restore a
-    // secondary network membership across the reboot.
-    await appNetworkLinker.reconcileAllAppNetworkLinks();
 
     return results;
   } catch (error) {
