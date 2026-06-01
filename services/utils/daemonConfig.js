@@ -138,10 +138,6 @@ class DaemonConfig {
     }
   }
 
-  unset(key) {
-    delete this.configElements[key];
-  }
-
   async write(options = {}) {
     const fileName = options.fileName || null;
 
