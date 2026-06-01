@@ -3,7 +3,6 @@ const os = require('os');
 const path = require('path');
 const config = require('config');
 const log = require('../../lib/log');
-const enterpriseConfig = require('./enterpriseConfig');
 
 let burstSupportCache = null;
 
@@ -13,7 +12,8 @@ let burstSupportCache = null;
  * @returns {boolean}
  */
 function isEnterpriseOwner(owner) {
-  return enterpriseConfig.getEnterpriseAppOwners().includes(owner);
+  const enterpriseAppOwners = config.enterpriseAppOwners || [];
+  return enterpriseAppOwners.includes(owner);
 }
 
 /**
