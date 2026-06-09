@@ -24,9 +24,7 @@ const { CLOSE_CODES, DIRECTION } = require('./utils/FluxPeerSocket');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
 const fluxEventBus = require('./utils/fluxEventBus');
-const {
-  normalizeSocketAddress, extractIp, extractPort, socketAddressesMatch, parseSocketAddress,
-} = require('./utils/socketAddressUtils');
+const { normalizeSocketAddress, extractIp, extractPort, socketAddressesMatch } = require('./utils/socketAddressUtils');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -669,12 +667,7 @@ function isNodeDos() {
 async function getLocalSocketAddress() {
   const benchmarkResponse = await benchmarkService.getBenchmarks();
   const { status, data: { ipaddress = null } = {} } = benchmarkResponse;
-  // The benchmark IP can be a bare IP or ip:port depending on the node's API port,
-  // and while fluxbench is still resolving it the value can be empty or a host-less
-  // ":<port>" - the latter is truthy but useless. parseSocketAddress accepts a real
-  // bare-IP or ip:port and rejects those unresolved forms, so callers (e.g. the
-  // masterSlave election) never act on a bogus own-IP.
-  if (status !== 'success' || !parseSocketAddress(ipaddress)) {
+  if (status !== 'success' || !ipaddress) {
     setLocalSocketAddress(null);
     return null;
   }

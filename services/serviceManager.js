@@ -24,7 +24,6 @@ const peerNotification = require('./appMessaging/peerNotification');
 const syncthingMonitor = require('./appMonitoring/syncthingMonitor');
 const daemonHealthMonitor = require('./appMonitoring/daemonHealthMonitor');
 const containerCrashRecovery = require('./appMonitoring/containerCrashRecovery');
-const appReconciler = require('./appMonitoring/appReconciler');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
@@ -274,12 +273,8 @@ async function startFluxFunctions() {
     // them on future daemon restarts. FluxOS manages container startup after dbReady.
     dockerService.migrateContainerRestartPolicies();
 
-    // Start the reconcile workqueue (the single container actuator) and the
-    // Docker die-event bridge that feeds it. The workqueue holds all triggers
-    // until bootContainerStateSettled, then drains once daemon/DB are ready.
-    appReconciler.start().catch((error) => {
-      log.error(`App reconciler error: ${error.message}`);
-    });
+    // Subscribe to Docker container die events for immediate crash recovery.
+    // Events during boot are queued; drainBootQueue() replays them after boot settles.
     containerCrashRecovery.start();
 
     // Read boot context early — determines startup behavior for container management.
@@ -457,43 +452,31 @@ async function startFluxFunctions() {
     setTimeout(() => {
       nodeStatusMonitor.monitorNodeStatus(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, bootDelay(1.5 * 60 * 1000));
-    // Start the syncthing/masterSlave deciders once boot container state has settled
-    // (the same AsyncGate the reconciler starts on), not after a fixed delay. Each
-    // decider self-gates per cycle on its own prerequisites (mounts, syncthing health,
-    // own-IP, FDM), so an early start is safe - it skips and retries until ready.
-    globalState.waitForBootContainerStateSettled().then(() => {
+    setTimeout(() => {
       syncthingMonitor.syncthingApps(
         globalState,
         appQueryService.installedApps,
         () => globalState,
-        // stop: record the desired run-state, then really stop synchronously so
-        // the folder data wipe that follows happens on a stopped container
-        async (id) => {
-          appReconciler.setControllerDesired(id, 'stopped', 'syncthing sync');
-          await dockerService.appDockerStop(id);
-        },
-        // start: hand the run-state to the reconciler (the single actuator);
-        // permissions are already fixed by the state machine before this point
-        async (id) => { appReconciler.setControllerDesired(id, 'running', 'syncthing synced'); },
+        dockerService.appDockerStop,
+        dockerService.appDockerRestart,
         dockerOperations.appDeleteDataInMountPoint,
         appUninstaller.removeAppLocally,
-      ); // rechecks syncthing configuration each cycle
-      // masterSlave self-gates on syncthingAppsFirstRun (the syncthing monitor's
-      // first-run mount-safety must complete before any g: election), so it starts
-      // concurrently rather than after a timed offset.
-      advancedWorkflows.masterSlaveApps(
-        globalState,
-        appQueryService.installedApps,
-        appQueryService.listRunningApps,
-        globalState.receiveOnlySyncthingAppsCache,
-        globalState.backupInProgress,
-        globalState.restoreInProgress,
-        https,
-      ); // stops and starts g: syncthing apps when a new master is required or changed.
+      ); // rechecks and possibly adjust syncthing configuration every 2 minutes
+      setTimeout(() => {
+        advancedWorkflows.masterSlaveApps(
+          globalState,
+          appQueryService.installedApps,
+          appQueryService.listRunningApps,
+          globalState.receiveOnlySyncthingAppsCache,
+          globalState.backupInProgress,
+          globalState.restoreInProgress,
+          https,
+        ); // stop and starts apps using syncthing g: when a new master is required or was changed.
+      }, 30 * 1000);
       setTimeout(() => {
         appInspector.monitorSharedDBApps(appQueryService.installedApps, appUninstaller.removeAppLocally, globalState); // Monitor SharedDB Apps.
       }, 60 * 1000);
-    });
+    }, bootDelay(3 * 60 * 1000));
     // Hash sync and spawner startup are now managed by the AppSyncOrchestrator (event-driven)
     orchestrator.start(bootContext);
     log.info('AppSyncOrchestrator started');

@@ -8,7 +8,6 @@ const dbHelper = require('../dbHelper');
 const dockerService = require('../dockerService');
 const geolocationService = require('../geolocationService');
 const { getChainParamsPriceUpdates } = require('./chainUtilities');
-const mountParser = require('./mountParser');
 
 const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
 
@@ -1045,10 +1044,10 @@ function appUsesGSyncthingMode(appSpec) {
     return false;
   }
   if (appSpec.compose && appSpec.compose.length > 0) {
-    return appSpec.compose.some((comp) => comp.containerData && mountParser.isGComponent(comp.containerData));
+    return appSpec.compose.some((comp) => comp.containerData && comp.containerData.includes('g:'));
   }
   if (appSpec.containerData) {
-    return mountParser.isGComponent(appSpec.containerData);
+    return appSpec.containerData.includes('g:');
   }
   return false;
 }
@@ -1060,10 +1059,10 @@ function getNonGComponentIdentifiers(appSpec, appName) {
   const resolvedName = appSpec.name || appName;
   if (appSpec.compose && appSpec.compose.length > 0) {
     return appSpec.compose
-      .filter((comp) => !(comp.containerData && mountParser.isGComponent(comp.containerData)))
+      .filter((comp) => !(comp.containerData && comp.containerData.includes('g:')))
       .map((comp) => `${comp.name}_${resolvedName}`);
   }
-  if (appSpec.containerData && mountParser.isGComponent(appSpec.containerData)) {
+  if (appSpec.containerData && appSpec.containerData.includes('g:')) {
     return [];
   }
   return [resolvedName];
