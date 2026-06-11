@@ -34,12 +34,12 @@ const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { findCommonArchitectures } = require('../utils/appUtilities');
 const log = require('../../lib/log');
 const { localAppsInformation, scannedHeightCollection } = require('../utils/appConstants');
-const messageVerifier = require('../appMessaging/messageVerifier');
+const { checkAppTemporaryMessageExistence, checkAppMessageExistence } = require('../appMessaging/messageVerifier');
 const { availableApps, getApplicationGlobalSpecifications } = require('../appDatabase/registryManager');
 const hwRequirements = require('../appRequirements/hwRequirements');
 const config = require('config');
 const fluxEventBus = require('../utils/fluxEventBus');
-const volumeService = require('../utils/volumeService');
+const { verifyAppVolumeMount } = require('../utils/volumeService');
 
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
@@ -793,7 +793,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
     if (res.flush) res.flush();
   }
 
-  await volumeService.verifyAppVolumeMount(appName, isComponent, appSpecifications.name);
+  await verifyAppVolumeMount(appName, isComponent, appSpecifications.name);
 
   const mountVerified = {
     status: isComponent ? `Volume mount verified for component ${appSpecifications.name}` : `Volume mount verified for ${appName}`,
@@ -813,9 +813,6 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
     if (res.flush) res.flush();
   }
 
-  // Mount paths must exist before the container is created (Syncthing cleanup can
-  // remove them while a container is stopped); ensure them at the orchestration layer.
-  await volumeService.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
   // Attach this component to the private network of every app it is linked with
@@ -889,9 +886,6 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
     if (res.flush) res.flush();
   }
 
-  // Mount paths must exist before the container is created (Syncthing cleanup can
-  // remove them while a container is stopped); ensure them at the orchestration layer.
-  await volumeService.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
   // Attach this component to the private network of every app it is linked with
@@ -945,7 +939,7 @@ async function installAppLocally(req, res) {
       let appSpecifications;
       // anyone can deploy temporary app
       // favor temporary to launch test temporary apps
-      const tempMessage = await messageVerifier.checkAppTemporaryMessageExistence(appname);
+      const tempMessage = await checkAppTemporaryMessageExistence(appname);
       if (tempMessage) {
         // eslint-disable-next-line prefer-destructuring
         appSpecifications = tempMessage.appSpecifications;
@@ -972,7 +966,7 @@ async function installAppLocally(req, res) {
       }
       // search in permanent messages for the specific apphash to launch
       if (!appSpecifications) {
-        const permMessage = await messageVerifier.checkAppMessageExistence(appname);
+        const permMessage = await checkAppMessageExistence(appname);
         if (permMessage) {
           // eslint-disable-next-line prefer-destructuring
           appSpecifications = permMessage.appSpecifications;
@@ -1102,7 +1096,7 @@ async function testAppInstall(req, res) {
 
       // anyone can deploy temporary app
       // favor temporary to launch test temporary apps
-      const tempMessage = await messageVerifier.checkAppTemporaryMessageExistence(appname);
+      const tempMessage = await checkAppTemporaryMessageExistence(appname);
       if (tempMessage) {
         // eslint-disable-next-line prefer-destructuring
         appSpecifications = tempMessage.appSpecifications;
@@ -1132,7 +1126,7 @@ async function testAppInstall(req, res) {
 
       // search in permanent messages for the specific apphash to launch
       if (!appSpecifications) {
-        const permMessage = await messageVerifier.checkAppMessageExistence(appname);
+        const permMessage = await checkAppMessageExistence(appname);
         if (permMessage) {
           // eslint-disable-next-line prefer-destructuring
           appSpecifications = permMessage.appSpecifications;

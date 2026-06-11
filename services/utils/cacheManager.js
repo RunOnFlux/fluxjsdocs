@@ -107,6 +107,10 @@ class FluxCacheManager {
       max: 50,
       ttl: 3 * FluxCacheManager.oneHour,
     },
+    stoppedAppsCache: {
+      max: 40,
+      ttl: 1.5 * FluxCacheManager.oneHour,
+    },
     testPortsCache: {
       max: 60,
       ttl: 3 * FluxCacheManager.oneHour,

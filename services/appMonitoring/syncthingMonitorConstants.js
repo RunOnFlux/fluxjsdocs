@@ -1,12 +1,8 @@
 // Syncthing Monitor - Constants
 
-const config = require('config');
-
 // Timeout values (milliseconds)
 const DEVICE_ID_REQUEST_TIMEOUT_MS = 5000;
-// Tunable for tests via config.syncthing (see ZelBack/config/default.js); the
-// literal is the production default when the key is absent.
-const MONITOR_INTERVAL_MS = config.syncthing.monitorIntervalMs ?? 30 * 1000; // 30 seconds
+const MONITOR_INTERVAL_MS = 30 * 1000; // 30 seconds
 const OPERATION_DELAY_MS = 500;
 const ERROR_RETRY_DELAY_MS = 5 * 1000; // 5 seconds
 const SYNC_STATE_LOG_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -16,12 +12,11 @@ const SYNCTHING_RESCAN_INTERVAL_SECONDS = 900; // 15 minutes
 const SYNCTHING_MAX_CONFLICTS = 0;
 
 // Sync monitoring
-const STALLED_SYNC_CHECK_COUNT = config.syncthing.stalledSyncCheckCount ?? 10; // no-progress checks before sync is "stalled" (~5 minutes)
+const MAX_SYNC_WAIT_EXECUTIONS = 120; // ~1 hour at 30s intervals
+const STALLED_SYNC_CHECK_COUNT = 10; // Number of checks with no progress before considering sync stalled (~5 minutes)
 const CLOCK_SKEW_TOLERANCE_MS = 5000; // 5 seconds tolerance for timestamp comparison
-// Consecutive cycles a node must observe itself as the designated leader before
-// acting on it, so a single transient drop of a peer's running-location doesn't
-// flip a follower into self-promoting (and starting the app). Tunable for tests.
-const LEADER_CONFIRM_COUNT = config.syncthing.leaderConfirmCount ?? 2;
+const LEADER_ELECTION_MIN_EXECUTIONS = 2;
+const LEADER_ELECTION_EXECUTIONS_PER_INDEX = 10;
 
 // Sync completion thresholds
 const SYNC_COMPLETE_PERCENTAGE = 100;
@@ -42,9 +37,11 @@ module.exports = {
   SYNC_STATE_LOG_INTERVAL_MS,
   SYNCTHING_RESCAN_INTERVAL_SECONDS,
   SYNCTHING_MAX_CONFLICTS,
+  MAX_SYNC_WAIT_EXECUTIONS,
   STALLED_SYNC_CHECK_COUNT,
   CLOCK_SKEW_TOLERANCE_MS,
-  LEADER_CONFIRM_COUNT,
+  LEADER_ELECTION_MIN_EXECUTIONS,
+  LEADER_ELECTION_EXECUTIONS_PER_INDEX,
   SYNC_COMPLETE_PERCENTAGE,
   HEALTH_STOP_THRESHOLD_MS,
   HEALTH_RESTART_SYNCTHING_THRESHOLD_MS,
