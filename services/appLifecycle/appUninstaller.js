@@ -29,6 +29,17 @@ const appsFolder = `${appsFolderPath}/`;
 const cmdAsync = util.promisify(nodecmd.run);
 const crontabLoad = util.promisify(systemcrontab.load);
 
+// Fired once per component identifier after a successful local removal, beside
+// the durable runtime-state clear (mirrors appInstaller.setOnInstallComplete).
+// serviceManager wires it to appReconciler.clearControllerDesired so the
+// reconciler's in-memory controller verdict dies with the component - a
+// back-require of appReconciler here would capture a stale partial export
+// (appReconciler already requires this module and both replace module.exports).
+let onComponentRemoved = null;
+function setOnComponentRemoved(callback) {
+  onComponentRemoved = callback;
+}
+
 /**
  * Stop Syncthing app and clean up cache
  * @param {string} monitoredName - Monitored app name
@@ -893,6 +904,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
     for (const identifier of removedIdentifiers) {
       // eslint-disable-next-line no-await-in-loop
       await appsRuntimeState.remove(identifier);
+      if (onComponentRemoved) onComponentRemoved(identifier);
     }
 
     fluxEventBus.publish('app:removed', { name: appName });
@@ -1102,6 +1114,24 @@ async function softRemoveAppLocally(app, res, globalStateRef, stopAppMonitoring)
       await softUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring);
     }
 
+    // node-local controller state dies with the components on the soft path too:
+    // a (soft) redeploy is an explicit "make it run", so neither the operator
+    // lock nor a stale controller verdict may survive it
+    let removedIdentifiers;
+    if (appSpecifications.version >= 4 && appSpecifications.compose) {
+      removedIdentifiers = isComponent
+        ? [`${appComponent}_${appSpecifications.name}`]
+        : appSpecifications.compose.map((c) => `${c.name}_${appSpecifications.name}`);
+    } else {
+      removedIdentifiers = [appName];
+    }
+    // eslint-disable-next-line no-restricted-syntax
+    for (const identifier of removedIdentifiers) {
+      // eslint-disable-next-line no-await-in-loop
+      await appsRuntimeState.remove(identifier);
+      if (onComponentRemoved) onComponentRemoved(identifier);
+    }
+
     if (!isComponent) {
       const databaseStatus = {
         status: 'Cleaning up database...',
@@ -1227,4 +1257,5 @@ module.exports = {
   removeAppLocally,
   softRemoveAppLocally,
   removeAppLocallyApi,
+  setOnComponentRemoved,
 };

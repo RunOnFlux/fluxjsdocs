@@ -55,6 +55,7 @@ const cloudUIUpdateService = require('./cloudUIUpdateService');
 const appTamperingBlocklistService = require('./appTamperingBlocklistService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
+const appsRuntimeState = require('./appManagement/appsRuntimeState');
 const imageUpdateService = require('./imageUpdateService');
 const { version: fluxVersion } = require('../../../package.json');
 // const throughputLogger = require('./utils/throughputLogger');
@@ -194,6 +195,9 @@ async function startFluxFunctions() {
       { name: 'appName_detectedAt' },
     );
     await appTamperingDetectionService.checkFrequentRestart();
+    // appsRuntimeState (localzelapps): merge any pre-unique-index duplicate docs,
+    // then enforce one doc per component identifier
+    await appsRuntimeState.prepareCollection();
     log.info('Local database prepared');
     log.info('Preparing temporary database...');
     // no need to drop temporary messages
@@ -322,6 +326,9 @@ async function startFluxFunctions() {
     // app's network presence inside the sigterm TTL window, not at the hourly tick;
     // checkAndNotifyPeersOfRunningApps coalesces bursts
     appReconciler.setOnContainerStarted(() => peerNotification.checkAndNotifyPeersOfRunningApps());
+    // a removed component's in-memory controller verdict dies with it - a
+    // reinstalled g:/r: app must await a fresh election, not inherit a stale one
+    appUninstaller.setOnComponentRemoved((id) => appReconciler.clearControllerDesired(id));
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
@@ -481,7 +488,6 @@ async function startFluxFunctions() {
         // permissions are already fixed by the state machine before this point
         async (id) => { appReconciler.setControllerDesired(id, 'running', 'syncthing synced'); },
         dockerOperations.appDeleteDataInMountPoint,
-        appUninstaller.removeAppLocally,
       ); // rechecks syncthing configuration each cycle
       // masterSlave self-gates on syncthingAppsFirstRun (the syncthing monitor's
       // first-run mount-safety must complete before any g: election), so it starts
