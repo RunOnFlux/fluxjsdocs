@@ -2,7 +2,9 @@ const config = require('config');
 const log = require('../../lib/log');
 const fluxEventBus = require('../utils/fluxEventBus');
 const dbHelper = require('../dbHelper');
+const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
+const dockerOperations = require('../appManagement/dockerOperations');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const globalState = require('../utils/globalState');
@@ -24,12 +26,25 @@ const { AsyncGate } = require('../utils/asyncGate');
 // Desired state inputs:
 //   operatorStopped (durable, appsRuntimeState) - user lock, wins over all.
 //   controllerDesired (in-memory, below)        - election/sync output for g:/r:.
+//   dataDesired       (in-memory, below)        - sync layer's local-appdata reset.
 //   restart policy + actual exit code           - Docker-like restart policy.
 
 // id -> 'running' | 'stopped'. In-memory: re-derived from live truth (FDM
 // election + real syncthing sync state) by the deciders each cycle, so it is
 // intentionally NOT persisted (a stale election after a reboot must not act).
 const controllerDesired = new Map();
+
+// id -> 'clear'. In-memory peer of controllerDesired: a pending request from the
+// sync layer to wipe the component's local appdata before it next runs (the
+// first-run / new-app reset). Also NOT persisted - a stale wipe intent surviving
+// a restart could delete the only good copy (the same data-loss direction B1
+// guards). The reconciler actuates the wipe inside its per-key single-flight, so
+// a start can never race it.
+const dataDesired = new Map();
+
+// brief settle between the stop and the rm -rf so the container has fully released
+// its appdata mount before the wipe (mirrors the sync layer's prior 500ms delay).
+const DATA_CLEAR_SETTLE_MS = 500;
 
 const inFlight = new Set(); // ids currently reconciling (per-key single-flight)
 const dirty = new Set(); // ids re-requested while in flight -> reconcile again
@@ -357,6 +372,30 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
+  // Pending data wipe: the sync layer flagged this component's local appdata as
+  // stale/to-be-reset and to be cleared before it runs again. This is the highest-
+  // priority data action and is resolved here, inside the per-key single-flight and
+  // BEFORE the run decision below, so a start can never race the wipe (the S1 data-
+  // loss window). Stop first - an rm -rf under a live container corrupts it - then
+  // wipe, then drop the flag. The wipe path is keyed by the on-disk (flux-prefixed)
+  // folder name, while the stop takes the bare id (dockerService re-prefixes).
+  if (dataDesired.get(identifier) === 'clear') {
+    if (actual.running) {
+      log.info(`appReconciler - ${identifier} stopping before local appdata clear`);
+      await dockerService.appDockerStop(identifier);
+      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
+    }
+    await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
+    await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
+    dataDesired.delete(identifier);
+    log.info(`appReconciler - ${identifier} local appdata cleared`);
+    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'dataCleared' });
+    // the sync layer flips controllerDesired to 'running' once a synced source is
+    // confirmed; re-enqueue so we converge promptly if it already has.
+    scheduleRetry(identifier, MANAGED_RETRY_MS);
+    return;
+  }
+
   const { desired, reason } = await effectiveDesiredRunning(identifier, spec, actual.exitCode);
 
   // null = no controller opinion yet for a g:/r: component: neither start nor stop,
@@ -536,8 +575,28 @@ function setControllerDesired(rawIdentifier, state, reason) {
   enqueue(identifier);
 }
 
+/**
+ * Declare that a g:/r: component must be stopped and its local appdata cleared
+ * before it next runs - the sync layer's first-run / new-app reset. Sets both
+ * desired inputs and enqueues ONE reconcile: the reconciler (the sole container
+ * and data actuator) performs the stop-then-wipe inside its per-key single-flight,
+ * so a start can never race the wipe. Replaces the sync layer's prior imperative
+ * stop+rm-rf, which ran outside the single-flight (the S1 data-loss window).
+ */
+function requestStopAndClearData(rawIdentifier, reason) {
+  const identifier = canonical(rawIdentifier);
+  controllerDesired.set(identifier, 'stopped');
+  dataDesired.set(identifier, 'clear');
+  log.info(`appReconciler - requesting stop + local appdata clear for ${identifier} (${reason})`);
+  fluxEventBus.publish('reconciler:desiredChanged', { identifier, state: 'stopped', reason });
+  fluxEventBus.publish('reconciler:dataClearRequested', { identifier, reason });
+  enqueue(identifier);
+}
+
 function clearControllerDesired(rawIdentifier) {
-  controllerDesired.delete(canonical(rawIdentifier));
+  const identifier = canonical(rawIdentifier);
+  controllerDesired.delete(identifier);
+  dataDesired.delete(identifier);
 }
 
 // --- lifecycle -----------------------------------------------------------
@@ -583,6 +642,7 @@ module.exports = {
   enqueueAll,
   setControllerDesired,
   clearControllerDesired,
+  requestStopAndClearData,
   setOnContainerStarted,
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,

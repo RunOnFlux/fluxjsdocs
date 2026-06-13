@@ -14,7 +14,6 @@ const {
   LEADER_CONFIRM_COUNT,
   SYNC_COMPLETE_PERCENTAGE,
   OPERATION_DELAY_MS,
-  CLOCK_SKEW_TOLERANCE_MS,
   STALL_NUDGE_AFTER_MS,
   STALL_NUDGE_MAX_INTERVAL_MS,
   STALL_REMOVE_MIN_WINDOW_MS,
@@ -176,7 +175,15 @@ async function getFolderSyncCompletion(folderId) {
         // local additions/modifications in a receiveonly folder; invisible to the
         // completion metrics above (they only count cluster data)
         receiveOnlyChangedFiles,
-        isSynced: syncPercentage === SYNC_COMPLETE_PERCENTAGE,
+        // An EMPTY global index (globalBytes 0) means "unknown / not yet synced",
+        // never "done": a node holding the only copy before its peers reconnect
+        // reads globalBytes 0, and syncPercentage defaults to 100 there (vacuous).
+        // Gating on globalBytes > 0 stops the promotion gate from reverting (which
+        // would delete the only copy) or promoting unverified data against an empty
+        // global; such a folder falls through to the wait branch instead. The
+        // leader/cold-start path (the legitimate empty-folder seed) is exempt and
+        // handled separately above.
+        isSynced: globalBytes > 0 && syncPercentage === SYNC_COMPLETE_PERCENTAGE,
       };
     }
 
@@ -196,15 +203,21 @@ async function getFolderSyncCompletion(folderId) {
  * @param {string} localSocketAddr - The current node's IP address
  * @returns {boolean} True if this node is the designated leader
  */
-function isDesignatedLeader(allPeersList, localSocketAddr) {
+function isDesignatedLeader(allPeersList, localSocketAddr, deferToRunningPeers = true) {
   if (!allPeersList || allPeersList.length === 0) {
     return false; // Be conservative - wait for peers to broadcast
   }
 
-  // Check if any OTHER peer is already running
+  // Defer to a peer that is ALREADY running rather than seed - UNLESS this is a safe
+  // cold start (deferToRunningPeers=false: no peer serves the data AND this node holds
+  // none of its own). runningSince is broadcast on PLACEMENT, not liveness, so on a fresh
+  // multi-node deploy every holder carries it before anyone has started; deferring on
+  // runningSince alone would make every node defer to every other and NOBODY would seed
+  // (the cold-start standoff - the app never starts). On a true cold start we fall through
+  // to the deterministic election below and let exactly one node (lowest IP) seed.
   const runningPeers = allPeersList.filter((peer) => peer.runningSince && !socketAddressesMatch(peer.ip, localSocketAddr));
-  if (runningPeers.length > 0) {
-    return false; // Someone else is already running
+  if (deferToRunningPeers && runningPeers.length > 0) {
+    return false; // defer - a real source is serving, or we hold data to protect
   }
 
   // Special case: single peer deployment
@@ -212,16 +225,13 @@ function isDesignatedLeader(allPeersList, localSocketAddr) {
     return true;
   }
 
-  // Deterministic leader election
+  // Deterministic leader election by IP only. IP is globally consistent - every node
+  // sees every peer's IP identically - and clock-free, so all nodes independently agree
+  // on the same lowest-IP seed. broadcastedAt is NOT a safe key here: it is the latest
+  // re-broadcast time and propagates with per-node delay, so on a fresh cluster each
+  // node can momentarily order the timestamps differently and every node elects itself
+  // (split-brain). The lowest IP is the single, agreed cold-start seed.
   const sortedPeers = [...allPeersList].sort((a, b) => {
-    if (a.broadcastedAt && b.broadcastedAt) {
-      const timeDiff = a.broadcastedAt - b.broadcastedAt;
-      // Only consider significant time differences to avoid clock skew issues
-      if (Math.abs(timeDiff) > CLOCK_SKEW_TOLERANCE_MS) {
-        return timeDiff;
-      }
-    }
-    // Use IP as deterministic tie-breaker
     if (a.ip < b.ip) return -1;
     if (a.ip > b.ip) return 1;
     return 0;
@@ -242,26 +252,23 @@ async function handleFirstRun(params) {
   const {
     appId,
     syncFolder,
-    containerDataFlags,
-    appDockerStopFn,
-    appDeleteDataInMountPointFn,
     syncthingFolder,
     receiveOnlySyncthingAppsCache,
   } = params;
 
   if (!syncFolder) {
-    // No sync folder exists - clean install
-    log.info(`handleFirstRun - First run, no sync folder - stopping and cleaning ${appId}`);
+    // No sync folder exists - clean install. Declare the stop + local appdata clear
+    // to the reconciler (the sole container/data actuator) so the wipe runs inside
+    // its per-key single-flight and a start can never race it (the S1 data-loss
+    // window the old imperative stop+rm-rf left open).
+    log.info(`handleFirstRun - First run, no sync folder - requesting stop + clean of ${appId}`);
     syncthingFolder.type = 'receiveonly';
     const cache = { numberOfExecutions: 1 };
 
-    // Set cache BEFORE stopping/deleting to prevent race condition
+    // Set cache BEFORE requesting the reset to prevent re-processing as "new"
     receiveOnlySyncthingAppsCache.set(appId, cache);
 
-    await appDockerStopFn(appId);
-    await serviceHelper.delay(OPERATION_DELAY_MS);
-    await appDeleteDataInMountPointFn(appId);
-    await serviceHelper.delay(OPERATION_DELAY_MS);
+    appReconciler.requestStopAndClearData(appId, 'syncthing first-run clean install');
 
     return { syncthingFolder, cache };
   }
@@ -306,8 +313,6 @@ async function handleFirstRun(params) {
 async function handleSkippedAppSecondEncounter(params) {
   const {
     appId,
-    appDockerStopFn,
-    appDeleteDataInMountPointFn,
     syncthingFolder,
     receiveOnlySyncthingAppsCache,
   } = params;
@@ -316,13 +321,11 @@ async function handleSkippedAppSecondEncounter(params) {
   syncthingFolder.type = 'receiveonly';
   const cache = { numberOfExecutions: 1 };
 
-  // Set cache BEFORE stopping/deleting to prevent race condition
+  // Set cache BEFORE requesting the reset to prevent re-processing as "new"
   receiveOnlySyncthingAppsCache.set(appId, cache);
 
-  await appDockerStopFn(appId);
-  await serviceHelper.delay(OPERATION_DELAY_MS);
-  await appDeleteDataInMountPointFn(appId);
-  await serviceHelper.delay(OPERATION_DELAY_MS);
+  // stop + local appdata clear is declared to the reconciler (the sole actuator)
+  appReconciler.requestStopAndClearData(appId, 'syncthing skipped-app second encounter');
 
   return { syncthingFolder, cache };
 }
@@ -418,15 +421,29 @@ async function nudgeFolderDevices(folderId) {
     if (!folder) return;
     // eslint-disable-next-line no-restricted-syntax
     for (const device of folder.devices || []) {
+      let paused = false;
       try {
         // eslint-disable-next-line no-await-in-loop
         await syncthingService.systemPause({ params: { device: device.deviceID }, query: {} }, null);
+        paused = true;
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.delay(OPERATION_DELAY_MS);
-        // eslint-disable-next-line no-await-in-loop
-        await syncthingService.systemResume({ params: { device: device.deviceID }, query: {} }, null);
       } catch (error) {
-        log.warn(`nudgeFolderDevices - ${folderId}: pause/resume of device ${device.deviceID.substring(0, 7)} failed: ${error.message}`);
+        log.warn(`nudgeFolderDevices - ${folderId}: pause of device ${device.deviceID.substring(0, 7)} failed: ${error.message}`);
+      } finally {
+        // Resume is mandatory once a pause landed: the pause dropped this device's
+        // connection (device-level, source-confirmed), so leaving it paused keeps
+        // it disconnected and silently degrades every folder shared with it until
+        // some unrelated later nudge happens to resume it. A failed resume is the
+        // genuinely dangerous outcome - log it loudly.
+        if (paused) {
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await syncthingService.systemResume({ params: { device: device.deviceID }, query: {} }, null);
+          } catch (error) {
+            log.error(`nudgeFolderDevices - ${folderId}: RESUME of device ${device.deviceID.substring(0, 7)} FAILED - device left paused (its connection stays suspended): ${error.message}`);
+          }
+        }
       }
     }
   } catch (error) {
@@ -446,29 +463,41 @@ async function handleReceiveOnlyTransition(params) {
     runningAppList,
     localSocketAddr,
     containerDataFlags,
-    appDockerRestartFn,
     syncthingFolder,
   } = params;
 
   log.info(`handleReceiveOnlyTransition - ${appId} in cache and not restarted, processing receive-only logic`);
 
+  // Whether any CONNECTED peer genuinely holds the data. Gates the election (a true
+  // cold start - nobody serving - must still elect one seed instead of standing off)
+  // and is reused by the stall ladder below, so it is computed once per cycle here.
+  const aPeerHasData = await checkIfPeersAreSynced(appId);
+  // Read the local sync status once here (reused by the stall ladder below). A node may
+  // only cold-start SEED - promote an empty folder without a sync check - when it holds
+  // NOTHING: no global, no synced bytes, no receive-only local changes. A node holding
+  // ANY data must instead wait for a connected source; seeding/promoting it on an empty
+  // global is the B1 hazard (promote unverified data, or db/revert deletes the only
+  // copy). An unreadable status (null) counts as "holds data" - never seed without
+  // positive evidence the folder is empty.
+  const syncStatus = await getFolderSyncCompletion(appId);
+  const folderIsEmpty = !!syncStatus && syncStatus.globalBytes === 0
+    && syncStatus.inSyncBytes === 0 && (syncStatus.receiveOnlyChangedFiles || 0) === 0;
   // Designated-leader election, debounced: require leadership to hold for
-  // LEADER_CONFIRM_COUNT consecutive cycles, so a single transient peer-visibility
-  // blip doesn't flip a follower to leader. (The stall ladder below never stops the
-  // container before its atomic removal decision, so leadership needs no recovery
-  // suppression - a confirmed leader simply starts; that is the cold-start fallback.)
-  const electedLeader = isDesignatedLeader(runningAppList, localSocketAddr);
+  // LEADER_CONFIRM_COUNT consecutive cycles, so a single transient peer-visibility blip
+  // doesn't flip a follower to leader. Defer to a running peer UNLESS this is a true,
+  // safe cold start (no peer serving AND this node holds no data) - then elect one seed.
+  const electedLeader = isDesignatedLeader(runningAppList, localSocketAddr, aPeerHasData || !folderIsEmpty);
   cache.leaderStreak = electedLeader ? (cache.leaderStreak || 0) + 1 : 0;
   const isLeader = electedLeader && cache.leaderStreak >= LEADER_CONFIRM_COUNT;
 
-  // KNOWN LIMITATION (pre-existing, intentionally not addressed here): the designated
-  // leader is the cold-start seed source, so it starts and flips to sendreceive WITHOUT
-  // a sync check - it cannot verify against a source because it IS the source. If a node
-  // holding stale or empty data wins leadership on a multi-node app, it seeds that
-  // version as authoritative and can overwrite newer data on peers. The leader-streak
-  // debounce and the recovery guard reduce transient mis-elections but are not a data
-  // check. Closing this requires data-aware leader selection (the deterministic election
-  // here for r:, FDM for g:) - a separate change, out of scope for the reconciler work.
+  // RESIDUAL LIMITATION: a confirmed leader is the cold-start seed and flips to
+  // sendreceive WITHOUT a sync check - it cannot verify against a source because it IS
+  // the source. The gate above only seeds when NO connected peer serves the data AND
+  // this node holds no data of its own, so we never overwrite a reachable source nor
+  // promote a node's own preserved copy; but a peer holding newer data while DISCONNECTED
+  // is not "serving" and an empty local folder cannot know of it, so a fresh seed could
+  // still win over that peer's data when it returns. Fully closing this needs
+  // version-aware selection (or FDM for g:) - a separate change, out of scope here.
   if (isLeader) {
     log.info(`handleReceiveOnlyTransition - ${appId} is the designated leader (elected from ${runningAppList.length} peers, confirmed ${cache.leaderStreak}x), starting immediately`);
 
@@ -478,16 +507,15 @@ async function handleReceiveOnlyTransition(params) {
     syncthingFolder.type = 'sendreceive';
 
     if (containerDataFlags.includes('r')) {
-      log.info(`handleReceiveOnlyTransition - starting ${appId}`);
-      await appDockerRestartFn(appId);
+      log.info(`handleReceiveOnlyTransition - requesting start of ${appId} (leader)`);
+      appReconciler.setControllerDesired(appId, 'running', 'syncthing leader start');
     }
 
     cache.restarted = true;
     return { syncthingFolder, cache };
   }
 
-  // Not the leader - check sync status
-  const syncStatus = await getFolderSyncCompletion(appId);
+  // Not the leader - syncStatus already read above
   syncthingFolder.type = 'receiveonly';
   cache.numberOfExecutions = (cache.numberOfExecutions || 0) + 1;
 
@@ -520,8 +548,8 @@ async function handleReceiveOnlyTransition(params) {
       await fixAppdataPermissions(appId);
       syncthingFolder.type = 'sendreceive';
       if (containerDataFlags.includes('r')) {
-        log.info(`handleReceiveOnlyTransition - starting ${appId}`);
-        await appDockerRestartFn(appId);
+        log.info(`handleReceiveOnlyTransition - requesting start of ${appId} (synced)`);
+        appReconciler.setControllerDesired(appId, 'running', 'syncthing synced start');
       }
       cache.restarted = true;
       return { syncthingFolder, cache };
@@ -546,6 +574,7 @@ async function handleReceiveOnlyTransition(params) {
       cache.lastProgressAt = now;
       cache.nudgeCount = 0;
       cache.evidenceSince = null;
+      cache.lastNudgeAt = null;
       return { syncthingFolder, cache };
     }
 
@@ -557,8 +586,7 @@ async function handleReceiveOnlyTransition(params) {
       return { syncthingFolder, cache };
     }
 
-    const peersAreSynced = await checkIfPeersAreSynced(appId);
-    if (!peersAreSynced) {
+    if (!aPeerHasData) {
       log.warn(`handleReceiveOnlyTransition - ${appId} idle with no sync progress and no CONNECTED synced peer; waiting (syncthing auto-resumes when a source returns)`);
       return { syncthingFolder, cache };
     }
@@ -613,25 +641,20 @@ async function handleReceiveOnlyTransition(params) {
 async function handleNewApp(params) {
   const {
     appId,
-    appDockerStopFn,
-    appDeleteDataInMountPointFn,
     syncthingFolder,
     receiveOnlySyncthingAppsCache,
   } = params;
 
-  log.info(`handleNewApp - ${appId} NOT in cache. stopping and cleaning ${appId}`);
+  log.info(`handleNewApp - ${appId} NOT in cache. requesting stop + clean of ${appId}`);
   syncthingFolder.type = 'receiveonly';
   const cache = { numberOfExecutions: 1 };
 
-  // Set cache BEFORE stopping/deleting to prevent race condition
-  // This matches the old code behavior and ensures subsequent monitoring
-  // cycles don't re-process this app as "new"
+  // Set cache BEFORE requesting the reset so subsequent monitoring cycles don't
+  // re-process this app as "new"
   receiveOnlySyncthingAppsCache.set(appId, cache);
 
-  await appDockerStopFn(appId);
-  await serviceHelper.delay(OPERATION_DELAY_MS);
-  await appDeleteDataInMountPointFn(appId);
-  await serviceHelper.delay(OPERATION_DELAY_MS);
+  // stop + local appdata clear is declared to the reconciler (the sole actuator)
+  appReconciler.requestStopAndClearData(appId, 'syncthing new app clean install');
 
   return { syncthingFolder, cache };
 }
@@ -671,9 +694,6 @@ async function manageFolderSyncState(params) {
     receiveOnlySyncthingAppsCache,
     appLocation,
     localSocketAddr,
-    appDockerStopFn,
-    appDockerRestartFn,
-    appDeleteDataInMountPointFn,
     syncthingFolder,
     installedAppName,
   } = params;
@@ -720,9 +740,6 @@ async function manageFolderSyncState(params) {
     const result = await handleFirstRun({
       appId,
       syncFolder,
-      containerDataFlags,
-      appDockerStopFn,
-      appDeleteDataInMountPointFn,
       syncthingFolder,
       receiveOnlySyncthingAppsCache,
     });
@@ -735,8 +752,6 @@ async function manageFolderSyncState(params) {
   if (cache?.firstEncounterSkipped) {
     const result = await handleSkippedAppSecondEncounter({
       appId,
-      appDockerStopFn,
-      appDeleteDataInMountPointFn,
       syncthingFolder,
       receiveOnlySyncthingAppsCache,
     });
@@ -752,9 +767,6 @@ async function manageFolderSyncState(params) {
       runningAppList,
       localSocketAddr,
       containerDataFlags,
-      appDockerRestartFn,
-      appDockerStopFn,
-      appDeleteDataInMountPointFn,
       syncthingFolder,
     });
     return result;
@@ -768,8 +780,6 @@ async function manageFolderSyncState(params) {
       log.info(`manageFolderSyncState - ${appId} NOT in cache but syncFolder doesn't exist, treating as new app installation`);
       const result = await handleNewApp({
         appId,
-        appDockerStopFn,
-        appDeleteDataInMountPointFn,
         syncthingFolder,
         receiveOnlySyncthingAppsCache,
       });
@@ -787,8 +797,6 @@ async function manageFolderSyncState(params) {
     // First run and not in cache - clean install
     const result = await handleNewApp({
       appId,
-      appDockerStopFn,
-      appDeleteDataInMountPointFn,
       syncthingFolder,
       receiveOnlySyncthingAppsCache,
     });
