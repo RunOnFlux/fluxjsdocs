@@ -41,7 +41,7 @@ async function verifyAppHash(message) {
    * @param timestamp number
    * @param signature string
    */
-  const specifications = message.appSpecifications;
+  const specifications = message.appSpecifications || message.zelAppSpecifications;
   let messToHash = message.type + message.version + JSON.stringify(specifications) + message.timestamp + message.signature;
   let messageHASH = await generalService.messageHash(messToHash);
 
@@ -463,6 +463,7 @@ async function checkAppMessageExistence(hash) {
   // const permanentAppMessage = {
   //   type: messageType,
   //   version: typeVersion,
+  //   zelAppSpecifications: appSpecFormatted,
   //   appSpecifications: appSpecFormatted,
   //   hash: messageHASH,
   //   timestamp,
@@ -629,7 +630,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
       // if we have it in temporary storage, get the temporary message
       const tempMessage = await checkAppTemporaryMessageExistence(hash);
       if (tempMessage && typeof tempMessage === 'object' && !Array.isArray(tempMessage)) {
-        const specifications = tempMessage.appSpecifications;
+        const specifications = tempMessage.appSpecifications || tempMessage.zelAppSpecifications;
         if (!specifications) {
           log.error(`Temp message ${hash} has no specifications! Full message: ${JSON.stringify(tempMessage)}`);
           return false;
@@ -792,7 +793,7 @@ async function checkAndRequestApp(hash, txid, height, valueSat, i = 0) {
               log.error(`Last permanent message for ${specifications.name} not found`);
               return true;
             }
-            const previousSpecs = messageInfo.appSpecifications;
+            const previousSpecs = messageInfo.appSpecifications || messageInfo.zelAppSpecifications;
             // here comparison of height differences and specifications
             // price shall be price for standard registration plus minus already paid price according to old specifics. height remains height valid for 22000 blocks
             let appPrice = await appPricePerMonth(specifications, height, appPrices);
