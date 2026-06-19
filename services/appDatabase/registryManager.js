@@ -1493,9 +1493,7 @@ async function expireGlobalApplications() {
       log.warn(`Application ${appName} is expired, removing`);
       log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (registryManager)`);
       // eslint-disable-next-line no-await-in-loop
-      // cancelGraceful=true: drain components that declared a graceful window before
-      // removing (force-kill the rest) so a cancelled/expired app can flush. TEMP v8 hack.
-      await appUninstaller.removeAppLocally(appName, null, true, false, true, true);
+      await appUninstaller.removeAppLocally(appName, null, true, false, true);
       // eslint-disable-next-line no-await-in-loop
       await serviceHelper.delay(1 * 60 * 1000); // wait for 1 min
     }
@@ -1599,9 +1597,7 @@ async function reindexGlobalAppsInformation() {
         log.warn(`Application ${appName} is expired, removing`);
         log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (reindex)`);
         // eslint-disable-next-line no-await-in-loop
-        // cancelGraceful=true: drain components that declared a graceful window before
-      // removing (force-kill the rest) so a cancelled/expired app can flush. TEMP v8 hack.
-      await appUninstaller.removeAppLocally(appName, null, true, false, true, true);
+        await appUninstaller.removeAppLocally(appName, null, true, false, true);
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.delay(60_000);
       }
@@ -2002,7 +1998,7 @@ async function rescanGlobalAppsInformation(height = 0, removeLastInformation = f
 
     // eslint-disable-next-line no-restricted-syntax
     for (const message of results) {
-      const updateForSpecifications = message.appSpecifications;
+      const updateForSpecifications = message.appSpecifications || message.zelAppSpecifications;
       updateForSpecifications.hash = message.hash;
       updateForSpecifications.height = message.height;
       // eslint-disable-next-line no-await-in-loop
@@ -2073,71 +2069,8 @@ async function rescanGlobalAppsInformationAPI(req, res) {
   }
 }
 
-/**
- * To get previous app specifications from the permanent message log. Used when
- * verifying an app update message: the prior registration/update spec may no
- * longer be in global apps (e.g. the app expired), so the message log is the
- * accurate source. Lives here (not in advancedWorkflows) so message verification
- * does not depend on the lifecycle layer — that was a require cycle.
- * @param {object} specifications App specifications.
- * @param {object} verificationTimestamp Message timestamp.
- * @returns {object|null} App specifications or null if not found.
- */
-async function getPreviousAppSpecifications(specifications, verificationTimestamp) {
-  // we may not have the application in global apps. This can happen when we receive the message
-  // after the app has already expired AND we need to get message right before our message.
-  // Thus using messages system that is accurate
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  const projection = {
-    projection: {
-      _id: 0,
-    },
-  };
-  const appsQuery = {
-    'appSpecifications.name': specifications.name,
-  };
-  const permanentAppMessage = await dbHelper.findInDatabase(database, globalAppsMessages, appsQuery, projection);
-  let latestPermanentRegistrationMessage;
-  permanentAppMessage.forEach((foundMessage) => {
-    // has to be registration message
-    const validTypes = ['zelappregister', 'fluxappregister', 'zelappupdate', 'fluxappupdate'];
-    if (validTypes.includes(foundMessage.type)) {
-      if (!latestPermanentRegistrationMessage && foundMessage.timestamp <= verificationTimestamp) {
-        // no message and found message is not newer than our message
-        latestPermanentRegistrationMessage = foundMessage;
-      } else if (latestPermanentRegistrationMessage && latestPermanentRegistrationMessage.height <= foundMessage.height) {
-        // we have some message and the message is quite new
-        if (latestPermanentRegistrationMessage.timestamp < foundMessage.timestamp
-          && foundMessage.timestamp <= verificationTimestamp) {
-          // but our message is newer. foundMessage has to have lower timestamp than our new message
-          latestPermanentRegistrationMessage = foundMessage;
-        }
-      }
-    }
-  });
-  if (!latestPermanentRegistrationMessage) {
-    return null;
-  }
-  const appSpecs = latestPermanentRegistrationMessage.appSpecifications;
-  if (!appSpecs) {
-    throw new Error(`Previous specifications for ${specifications.name} update message does not exists! This should not happen.`);
-  }
-  if (appSpecs.version >= 8 && appSpecs.enterprise) {
-    try {
-      const heightForDecrypt = latestPermanentRegistrationMessage.height;
-      const decryptedPrev = await checkAndDecryptAppSpecs(appSpecs, { daemonHeight: heightForDecrypt });
-      return specificationFormatter(decryptedPrev);
-    } catch {
-      return specificationFormatter(appSpecs);
-    }
-  }
-  return specificationFormatter(appSpecs);
-}
-
 module.exports = {
   getAppHashes,
-  getPreviousAppSpecifications,
   appLocation,
   appLocationFromEvents,
   appInstallingLocation,

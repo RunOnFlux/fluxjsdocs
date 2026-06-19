@@ -28,10 +28,6 @@ const {
 } = require('../utils/appConstants');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
-const volumeService = require('../utils/volumeService');
-const mountParser = require('../utils/mountParser');
-const appReconciler = require('../appMonitoring/appReconciler');
-const appsRuntimeState = require('../appManagement/appsRuntimeState');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
@@ -378,6 +374,90 @@ async function checkAndRemoveEnterpriseAppsOnNonArcane() {
   } catch (error) {
     log.error('Error in checkAndRemoveEnterpriseAppsOnNonArcane:', error);
   }
+}
+
+/**
+ * To get previous app specifications.
+ * @param {object} specifications App specifications.
+ * @param {object} verificationTimestamp Message timestamp
+ * @returns {object|null} App specifications or null if not found.
+ */
+async function getPreviousAppSpecifications(specifications, verificationTimestamp) {
+  // we may not have the application in global apps. This can happen when we receive the message
+  // after the app has already expired AND we need to get message right before our message.
+  // Thus using messages system that is accurate
+  // eslint-disable-next-line no-shadow, global-require
+  const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
+
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appsglobal.database);
+  const projection = {
+    projection: {
+      _id: 0,
+    },
+  };
+  const appsQuery = {
+    'appSpecifications.name': specifications.name,
+  };
+  const permanentAppMessage = await dbHelper.findInDatabase(database, globalAppsMessages, appsQuery, projection);
+  let latestPermanentRegistrationMessage;
+  permanentAppMessage.forEach((foundMessage) => {
+    // has to be registration message
+    const validTypes = ['zelappregister', 'fluxappregister', 'zelappupdate', 'fluxappupdate'];
+    if (validTypes.includes(foundMessage.type)) {
+      if (!latestPermanentRegistrationMessage && foundMessage.timestamp <= verificationTimestamp) {
+        // no message and found message is not newer than our message
+        latestPermanentRegistrationMessage = foundMessage;
+      } else if (latestPermanentRegistrationMessage && latestPermanentRegistrationMessage.height <= foundMessage.height) {
+        // we have some message and the message is quite new
+        if (latestPermanentRegistrationMessage.timestamp < foundMessage.timestamp
+          && foundMessage.timestamp <= verificationTimestamp) {
+          // but our message is newer. foundMessage has to have lower timestamp than our new message
+          latestPermanentRegistrationMessage = foundMessage;
+        }
+      }
+    }
+  });
+  // some early app have zelAppSepcifications
+  const appsQueryB = {
+    'zelAppSpecifications.name': specifications.name,
+  };
+  const permanentAppMessageB = await dbHelper.findInDatabase(database, globalAppsMessages, appsQueryB, projection);
+  permanentAppMessageB.forEach((foundMessage) => {
+    // has to be registration message
+    const validTypes = ['zelappregister', 'fluxappregister', 'zelappupdate', 'fluxappupdate'];
+    if (validTypes.includes(foundMessage.type)) {
+      if (!latestPermanentRegistrationMessage && foundMessage.timestamp <= verificationTimestamp) {
+        // no message and found message is not newer than our message
+        latestPermanentRegistrationMessage = foundMessage;
+      } else if (latestPermanentRegistrationMessage && latestPermanentRegistrationMessage.height <= foundMessage.height) {
+        // we have some message and the message is quite new
+        if (latestPermanentRegistrationMessage.timestamp < foundMessage.timestamp
+          && foundMessage.timestamp <= verificationTimestamp) {
+          // but our message is newer. foundMessage has to have lower timestamp than our new message
+          latestPermanentRegistrationMessage = foundMessage;
+        }
+      }
+    }
+  });
+  if (!latestPermanentRegistrationMessage) {
+    return null;
+  }
+  const appSpecs = latestPermanentRegistrationMessage.appSpecifications
+    || latestPermanentRegistrationMessage.zelAppSpecifications;
+  if (!appSpecs) {
+    throw new Error(`Previous specifications for ${specifications.name} update message does not exists! This should not happen.`);
+  }
+  if (appSpecs.version >= 8 && appSpecs.enterprise) {
+    try {
+      const heightForDecrypt = latestPermanentRegistrationMessage.height;
+      const decryptedPrev = await checkAndDecryptAppSpecs(appSpecs, { daemonHeight: heightForDecrypt });
+      return specificationFormatter(decryptedPrev);
+    } catch {
+      return specificationFormatter(appSpecs);
+    }
+  }
+  return specificationFormatter(appSpecs);
 }
 
 // Global state management - using globalState module instead of local variables
@@ -2084,7 +2164,7 @@ async function appDockerRestart(appname) {
       if (componentSpec && componentSpec.containerData) {
         // Ensure mount paths exist before restarting (handles Syncthing cleanup)
         // eslint-disable-next-line no-use-before-define
-        await volumeService.ensureMountPathsExist(componentSpec, mainAppName, true, appSpecs);
+        await ensureMountPathsExist(componentSpec, mainAppName, true, appSpecs);
       }
       await dockerService.appDockerRestart(appname);
       startAppMonitoring(appname);
@@ -2097,7 +2177,7 @@ async function appDockerRestart(appname) {
         // Ensure mount paths exist before restarting (handles Syncthing cleanup)
         if (appSpecs.containerData) {
           // eslint-disable-next-line no-use-before-define
-          await volumeService.ensureMountPathsExist(appSpecs, mainAppName, false, null);
+          await ensureMountPathsExist(appSpecs, mainAppName, false, null);
         }
         await dockerService.appDockerRestart(appname);
         startAppMonitoring(appname);
@@ -2108,7 +2188,7 @@ async function appDockerRestart(appname) {
           // eslint-disable-next-line no-await-in-loop
           if (appComponent.containerData) {
             // eslint-disable-next-line no-await-in-loop, no-use-before-define
-            await volumeService.ensureMountPathsExist(appComponent, appSpecs.name, true, appSpecs);
+            await ensureMountPathsExist(appComponent, appSpecs.name, true, appSpecs);
           }
           // eslint-disable-next-line no-await-in-loop
           await dockerService.appDockerRestart(`${appComponent.name}_${appSpecs.name}`);
@@ -2128,35 +2208,41 @@ async function appDockerRestart(appname) {
  * @param {string} appId - Application ID for syncthing folder
  * @returns {Promise<void>}
  */
-async function requestMasterStartWithPermissionsFix(appname, appId) {
+async function appDockerRestartWithPermissionsFix(appname, appId) {
   try {
-    log.info(`Preparing masterSlave primary ${appname}: fixing permissions before start`);
+    log.info(`Starting app ${appname} with permissions fix workflow (new primary)`);
 
-    // sync must be paused while we fix ownership on the persistent data, or
-    // syncthing would propagate the changes mid-fix
+    // Step 1: Move syncthing folder to receiveonly
+    log.info(`Step 1: Moving syncthing folder to receiveonly for ${appname}`);
     const toReceiveOnly = await changeSyncthingFolderType(appId, 'receiveonly');
     if (!toReceiveOnly) {
       log.warn(`Failed to change syncthing folder to receiveonly for ${appname}, continuing anyway...`);
     }
 
+    // Step 2: Apply permissions fix on persistent container data
+    log.info(`Step 2: Applying permissions fix for ${appname}`);
     const permissionsApplied = await applyPermissionsFix(appId);
     if (!permissionsApplied) {
-      log.error(`Failed to apply permissions fix for ${appname}, not requesting start`);
+      log.error(`Failed to apply permissions fix for ${appname}, aborting container start`);
       return;
     }
 
+    // Step 3: Move syncthing folder back to sendreceive
+    log.info(`Step 3: Moving syncthing folder to sendreceive for ${appname}`);
     const toSendReceive = await changeSyncthingFolderType(appId, 'sendreceive');
     if (!toSendReceive) {
-      log.error(`Failed to change syncthing folder to sendreceive for ${appname}, not requesting start - cannot become primary without sendreceive mode`);
+      log.error(`Failed to change syncthing folder to sendreceive for ${appname}, aborting container start - cannot become primary without sendreceive mode`);
       return;
     }
 
-    // hand the run-state decision to the reconciler (the single container actuator)
-    appReconciler.setControllerDesired(appname, 'running', 'masterSlave primary (synced)');
-    log.info(`Requested start for masterSlave primary ${appname}`);
+    // Step 4: Start the container
+    log.info(`Step 4: Starting container for ${appname}`);
+    await appDockerRestart(appname);
+
+    log.info(`Successfully completed permissions fix workflow for ${appname}`);
   } catch (error) {
-    log.error(`Error preparing masterSlave primary ${appname}: ${error.message}`);
-    // leave it stopped if the permissions-fix workflow failed
+    log.error(`Error in appDockerRestartWithPermissionsFix for ${appname}: ${error.message}`);
+    // Do not start the app if there was an error in the workflow
   }
 }
 
@@ -3595,17 +3681,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
       return;
     }
 
-    // Wait for the syncthing monitor's first run to complete before electing any g:
-    // primary. That first run performs the startup mount-safety check - switching any
-    // sendreceive folder whose volume is unsafe/unmounted (e.g. loop devices not ready
-    // after a reboot) to receiveonly. Electing before it runs could start a master on a
-    // sendreceive-but-unmounted folder and lose data. The monitor clears this flag only
-    // after a fully successful cycle, so it is the real readiness signal (not a timer).
-    if (globalStateParam.syncthingAppsFirstRun) {
-      log.info('masterSlaveApps: syncthing first-run mount-safety not complete yet, skipping this cycle');
-      return;
-    }
-
     // Check if syncthing is loaded and working before processing
     try {
       // eslint-disable-next-line global-require
@@ -3652,13 +3727,13 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
     // eslint-disable-next-line no-restricted-syntax
     for (const app of appsInstalled.data) {
       if (app.version <= 3) {
-        if (app.containerData && mountParser.isGComponent(app.containerData)) {
+        if (app.containerData && app.containerData.includes('g:')) {
           validIdentifiers.add(app.name);
         }
       } else if (app.compose) {
         // eslint-disable-next-line no-restricted-syntax
         for (const comp of app.compose) {
-          if (comp.containerData && mountParser.isGComponent(comp.containerData)) {
+          if (comp.containerData && comp.containerData.includes('g:')) {
             validIdentifiers.add(`${comp.name}_${app.name}`);
           }
         }
@@ -3701,9 +3776,9 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
         appId = dockerService.getAppIdentifier(identifier);
         // Check all g: mode apps, not just those in cache with restarted flag
         // The cache tracks sync state, but shouldn't gate primary selection
-        needsToBeChecked = mountParser.isGComponent(installedApp.containerData);
+        needsToBeChecked = installedApp.containerData.includes('g:');
       } else {
-        const componentUsingMasterSlave = installedApp.compose.find((comp) => mountParser.isGComponent(comp.containerData));
+        const componentUsingMasterSlave = installedApp.compose.find((comp) => comp.containerData.includes('g:'));
         if (componentUsingMasterSlave) {
           identifier = `${componentUsingMasterSlave.name}_${installedApp.name}`;
           appId = dockerService.getAppIdentifier(identifier);
@@ -3712,12 +3787,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
         }
       }
       if (needsToBeChecked) {
-        // operator explicitly stopped this g: component; don't elect or act on it
-        // eslint-disable-next-line no-await-in-loop
-        if (await appsRuntimeState.isOperatorStopped(identifier)) {
-          // eslint-disable-next-line no-continue
-          continue;
-        }
         // Get master IP from FDM using the new /appips endpoint
         // eslint-disable-next-line no-await-in-loop
         const fdmResult = await getMasterIpFromFdm(installedApp.name, axiosOptions);
@@ -3860,7 +3929,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
 
                 if (index === 0 && !mastersRunningGSyncthingApps.has(identifier)) {
                   // Index 0: Start immediately if no history
-                  requestMasterStartWithPermissionsFix(identifier, appId);
+                  appDockerRestartWithPermissionsFix(identifier, appId);
                   log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
                 } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && !ipsMatch(mastersRunningGSyncthingApps.get(identifier), localSocketAddr)) {
                   // There was a previous master (not me), and it's no longer on FDM
@@ -3900,7 +3969,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                   // Previous master is not running, determine next primary
                   if (index === 0) {
-                    requestMasterStartWithPermissionsFix(identifier, appId);
+                    appDockerRestartWithPermissionsFix(identifier, appId);
                     log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
                   } else {
                     const previousMasterIndex = runningAppList.findIndex((x) => ipsMatch(x.ip, mastersRunningGSyncthingApps.get(identifier)));
@@ -3920,7 +3989,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                       // eslint-disable-next-line no-await-in-loop
                       const lowerNodeRunning = await checkLowerIndexNodesRunning();
                       if (!lowerNodeRunning) {
-                        requestMasterStartWithPermissionsFix(identifier, appId);
+                        appDockerRestartWithPermissionsFix(identifier, appId);
                         log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
                       }
                     } else {
@@ -3933,7 +4002,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   // eslint-disable-next-line no-await-in-loop
                   const lowerNodeRunning = await checkLowerIndexNodesRunning();
                   if (!lowerNodeRunning) {
-                    requestMasterStartWithPermissionsFix(identifier, appId);
+                    appDockerRestartWithPermissionsFix(identifier, appId);
                     log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index} that was scheduled to start at ${timeTostartNewMasterApp.get(identifier).toString()}`);
                     timeTostartNewMasterApp.delete(identifier);
                   } else {
@@ -3959,8 +4028,8 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
               if (!ipsMatch(localSocketAddr, ip) && runningAppsNames.includes(identifier)) {
                 // Stop only the g: component on this standby node. Non-g siblings (e.g. a DB
                 // cluster component that needs all instances running) must keep running.
-                appReconciler.setControllerDesired(identifier, 'stopped', 'masterSlave standby');
-                log.info(`masterSlaveApps: requesting stop of component:${identifier} - primary runs on ip:${ip}, localSocketAddr is: ${localSocketAddr}`);
+                appDockerStop(identifier);
+                log.info(`masterSlaveApps: stopping docker component:${identifier} it's running on ip:${ip} and localSocketAddr is: ${localSocketAddr}`);
               } else if (ipsMatch(localSocketAddr, ip) && !runningAppsNames.includes(identifier)) {
                 // Check if app is ready (syncthing data is synced) before starting
                 let isReady = receiveOnlySyncthingAppsCache.has(appId) && receiveOnlySyncthingAppsCache.get(appId).restarted;
@@ -3990,7 +4059,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 }
 
                 if (isReady) {
-                  requestMasterStartWithPermissionsFix(identifier, appId);
+                  appDockerRestartWithPermissionsFix(identifier, appId);
                   log.info(`masterSlaveApps: starting docker component:${identifier}`);
                 } else {
                   log.info(`masterSlaveApps: app:${installedApp.name} is registered as primary on FDM but not ready yet (syncthing not synced), skipping start for this cycle`);
@@ -4006,8 +4075,149 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
   } finally {
     // eslint-disable-next-line no-param-reassign
     globalStateParam.masterSlaveAppsRunning = false;
-    await serviceHelper.delay(config.fluxapps.masterSlaveIntervalMs ?? 30 * 1000);
+    await serviceHelper.delay(30 * 1000);
     masterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https);
+  }
+}
+
+/**
+ * Get from another peer the list of apps installing errors or just for a specific application name
+ // eslint-disable-next-line global-require
+ * @returns {Promise<void>}
+ */
+
+/**
+ * Ensures all required local mount paths (files and directories) exist for a component.
+ * This function should be called before creating a container to prevent Docker mount errors
+ * when files or directories have been deleted or don't exist yet.
+ *
+ * @param {object} appSpecifications - Component specifications
+ * @param {string} appName - Application name
+ * @param {boolean} isComponent - Whether this is a component of a compose app
+ * @param {object} fullAppSpecs - Full application specifications (for compose apps)
+ * @returns {Promise<void>}
+ */
+async function ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs) {
+  const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+  const appId = dockerService.getAppIdentifier(identifier);
+
+  // Parse containerData to get required paths
+  // eslint-disable-next-line global-require
+  const mountParser = require('../utils/mountParser');
+  // eslint-disable-next-line global-require
+  const fs = require('fs').promises;
+  let parsedMounts;
+  try {
+    parsedMounts = mountParser.parseContainerData(appSpecifications.containerData);
+  } catch (error) {
+    log.error(`Failed to parse containerData for ${identifier}: ${error.message}`);
+    throw error;
+  }
+
+  const requiredPaths = mountParser.getRequiredLocalPaths(parsedMounts);
+  log.info(`Ensuring ${requiredPaths.length} local path(s) exist for ${appId}`);
+
+  // Create all required directories and files (appdata and additional mounts at same level)
+  // eslint-disable-next-line no-restricted-syntax
+  for (const pathInfo of requiredPaths) {
+    const fullPath = `${appsFolder}${appId}/${pathInfo.name}`;
+
+    // Check if path exists
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await fs.access(fullPath);
+      // Path exists, skip
+      log.info(`Path already exists: ${fullPath}`);
+    } catch (error) {
+      // Path doesn't exist, need to create it
+      log.warn(`Path missing, creating: ${fullPath}`);
+
+      if (pathInfo.isFile) {
+        // For file mounts, create file directly with 777 permissions
+        const execCommands = `sudo touch ${fullPath} && sudo chmod 777 ${fullPath}`;
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(execCommands);
+
+        log.info(`Created file mount with 777 permissions: ${fullPath}`);
+      } else {
+        // Create directory
+        const execDIR = `sudo mkdir -p ${fullPath}`;
+        // eslint-disable-next-line no-await-in-loop
+        await cmdAsync(execDIR);
+        log.info(`Created directory: ${fullPath}`);
+      }
+    }
+  }
+
+  // Also ensure component reference paths exist
+  // These are paths from OTHER components that this component is trying to mount
+  const componentReferenceMounts = parsedMounts.allMounts.filter((mount) => (
+    mount.type === mountParser.MountType.COMPONENT_PRIMARY
+    || mount.type === mountParser.MountType.COMPONENT_DIRECTORY
+    || mount.type === mountParser.MountType.COMPONENT_FILE
+  ));
+
+  if (componentReferenceMounts.length > 0) {
+    log.info(`Ensuring ${componentReferenceMounts.length} component reference path(s) exist for ${appId}`);
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const mount of componentReferenceMounts) {
+      try {
+        // Validate and get the component identifier
+        if (!fullAppSpecs) {
+          throw new Error(`Component reference mount requires full app specifications: ${mount.containerPath}`);
+        }
+
+        let componentIdentifier;
+        if (fullAppSpecs.version >= 4) {
+          if (mount.componentIndex < 0 || mount.componentIndex >= fullAppSpecs.compose.length) {
+            throw new Error(`Invalid component index: ${mount.componentIndex}`);
+          }
+          const componentName = fullAppSpecs.compose[mount.componentIndex].name;
+          componentIdentifier = `${componentName}_${appName}`;
+        } else {
+          componentIdentifier = appName;
+        }
+
+        const componentAppId = dockerService.getAppIdentifier(componentIdentifier);
+
+        // Construct the full path for the component reference
+        let fullPath;
+        if (mount.subdir === 'appdata') {
+          fullPath = `${appsFolder}${componentAppId}/appdata`;
+        } else {
+          fullPath = `${appsFolder}${componentAppId}/${mount.subdir}`;
+        }
+
+        // Check if path exists
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await fs.access(fullPath);
+          log.info(`Component reference path already exists: ${fullPath}`);
+        } catch (error) {
+          // Path doesn't exist, need to create it
+          log.warn(`Component reference path missing, creating: ${fullPath}`);
+
+          if (mount.isFile) {
+            // For component file mounts, create file directly with 777 permissions
+            const execCommands = `sudo touch ${fullPath} && sudo chmod 777 ${fullPath}`;
+            // eslint-disable-next-line no-await-in-loop
+            await cmdAsync(execCommands);
+
+            log.info(`Created file mount with 777 permissions for component reference: ${fullPath}`);
+          } else {
+            // Create directory
+            const execDIR = `sudo mkdir -p ${fullPath}`;
+            // eslint-disable-next-line no-await-in-loop
+            await cmdAsync(execDIR);
+            log.info(`Created directory for component reference: ${fullPath}`);
+          }
+        }
+      } catch (error) {
+        log.error(`Failed to ensure component reference path exists: ${error.message}`);
+        throw error;
+      }
+    }
   }
 }
 
@@ -4029,6 +4239,7 @@ module.exports = {
   removeTestAppMount,
   testAppMount,
   validateApplicationUpdateCompatibility,
+  getPreviousAppSpecifications,
   setInstallationInProgress,
   setRemovalInProgress,
   getInstallationInProgress,
@@ -4044,5 +4255,6 @@ module.exports = {
   checkAndRemoveEnterpriseAppsOnNonArcane,
   forceAppRemovals,
   masterSlaveApps,
+  ensureMountPathsExist,
   appDockerStart,
 };

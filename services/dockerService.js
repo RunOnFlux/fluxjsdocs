@@ -11,10 +11,6 @@ const fluxNetworkHelper = require('./fluxNetworkHelper');
 const { extractIp } = require('./utils/socketAddressUtils');
 const log = require('../lib/log');
 const cpuBurstHelper = require('./utils/cpuBurstHelper');
-const enterpriseConfig = require('./utils/enterpriseConfig');
-// TEMP v8 enterprise stop-gaps (remove at v9) — pure helpers, no requires, cycle-safe.
-const appGracefulShutdown = require('./appLifecycle/appGracefulShutdown');
-const appTelemetryHost = require('./appLifecycle/appTelemetryHost');
 
 const globalState = require('./utils/globalState');
 
@@ -58,27 +54,6 @@ function getAppIdentifier(appName) {
     return `zel${appName}`;
   }
   return `flux${appName}`;
-}
-
-/**
- * Inverse of getAppIdentifier: strips the flux/zel namespace prefix to recover
- * the bare component identifier (`{component}_{app}`, or `{app}` for v1-3) used
- * by app/component specs. Idempotent on an already-bare identifier. Consumers
- * whose canonical form is the bare identifier (e.g. the reconciler) normalise
- * inbound ids through this, mirroring how docker callers normalise through
- * getAppIdentifier.
- *
- * Note: like getAppIdentifier this is not perfectly invertible — a component
- * literally named `flux...`/`zel...` is ambiguous — but that is the existing
- * limitation of the prefix-as-marker convention, not new here.
- *
- * @param {string} idOrName
- * @returns {string} bare identifier
- */
-function getBaseAppName(idOrName) {
-  if (idOrName.startsWith('flux')) return idOrName.slice(4);
-  if (idOrName.startsWith('zel')) return idOrName.slice(3);
-  return idOrName;
 }
 
 /**
@@ -934,7 +909,7 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   // labels in appDockerStart and reapplies burst — no per-caller plumbing.
   const burstOwner = fullAppSpecs?.owner || null;
   const burstEligible = burstOwner
-    && enterpriseConfig.isEnterpriseOwner(burstOwner)
+    && cpuBurstHelper.isEnterpriseOwner(burstOwner)
     && await cpuBurstHelper.isCpuBurstSupported();
   const burstLabels = burstEligible
     ? {
@@ -942,29 +917,8 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       'flux.burst.cores': String(appSpecifications.cpu),
     }
     : null;
-  // --- TEMP v8 enterprise stop-gaps: telemetry + graceful shutdown ----------
-  // Gated to enterprise owners (helpers/enterprisenodes.json) on v8 specs, with
-  // per-component opt-in via tokens in the component `description`. Remove when
-  // v9 lands.
-  const enterpriseV8 = Boolean(
-    fullAppSpecs?.owner
-    && Number(fullAppSpecs?.version) === 8
-    && enterpriseConfig.isEnterpriseOwner(fullAppSpecs.owner),
-  );
-  // Graceful shutdown: stamp the per-component grace window as a label that
-  // appDockerStop reads, so every local stop path honors it without plumbing.
-  const gracefulSeconds = enterpriseV8
-    ? appGracefulShutdown.parseGracefulShutdownSec(appSpecifications.description)
-    : null;
-  const gracefulLabels = gracefulSeconds
-    ? { 'flux.graceful.stop-s': String(gracefulSeconds) }
-    : null;
-  if (gracefulSeconds) {
-    log.info(`Graceful shutdown: ${identifier} stop window = ${gracefulSeconds}s`);
-  }
-
-  const containerLabels = (labels || burstLabels || gracefulLabels)
-    ? { ...(labels || {}), ...(burstLabels || {}), ...(gracefulLabels || {}) }
+  const containerLabels = (labels || burstLabels)
+    ? { ...(labels || {}), ...(burstLabels || {}) }
     : null;
   if (burstEligible) {
     log.info(`CPU burst: marking ${identifier} as burst-eligible (cores=${appSpecifications.cpu})`);
@@ -1017,25 +971,6 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
       },
     }),
   };
-
-  // Telemetry (datadog host access): give the opted-in component the read-only
-  // host mounts a standard Datadog agent uses on AWS — NO privileged, NO pid
-  // host. TEMP v8 enterprise hack; remove at v9.
-  if (enterpriseV8 && appTelemetryHost.wantsHostMetrics(appSpecifications.description)) {
-    // Skip any telemetry bind whose target the app already declares — docker
-    // rejects duplicate mount destinations, which would otherwise redeploy-loop.
-    const existingTargets = new Set(options.HostConfig.Mounts.map((mount) => mount.Target));
-    const hostMounts = appTelemetryHost.HOST_METRIC_MOUNTS.filter((mount) => {
-      if (existingTargets.has(mount.Target)) {
-        log.warn(`Telemetry: ${identifier} already mounts ${mount.Target}; skipping telemetry bind for it`);
-        return false;
-      }
-      return true;
-    });
-    options.HostConfig.Mounts = options.HostConfig.Mounts.concat(hostMounts);
-    options.HostConfig.CgroupnsMode = 'host';
-    log.info(`Telemetry: ${identifier} granted read-only host metric access (docker.sock, /host/proc, cgroup, passwd)`);
-  }
 
   // get docker info about Backing Filesystem
   // eslint-disable-next-line no-use-before-define
@@ -1114,6 +1049,17 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   }
   options.Env.push(`FLUX_APP_NAME=${appName}`);
 
+  // Ensure all required mount paths (files and directories) exist before creating container
+  // This prevents Docker mount errors when files have been deleted or don't exist yet
+  try {
+    // eslint-disable-next-line global-require
+    const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
+    await advancedWorkflows.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
+  } catch (error) {
+    log.error(`Failed to ensure mount paths exist for ${identifier}: ${error.message}`);
+    throw error;
+  }
+
   const app = await docker.createContainer(options).catch((error) => {
     log.error(error);
     throw error;
@@ -1190,20 +1136,6 @@ async function appDockerStart(idOrName) {
 }
 
 /**
- * The per-container graceful-shutdown window (seconds) stamped on the
- * `flux.graceful.stop-s` label at create by the v8 enterprise hack, or undefined
- * when absent/malformed. Honored by both stop and restart when no caller passes
- * an explicit timeout. TEMP v8 enterprise hack — remove at v9.
- *
- * @param {object} containerInfo - docker inspect result
- * @returns {number|undefined}
- */
-function gracefulStopSecondsFromLabels(containerInfo) {
-  const labelSeconds = Number(containerInfo?.Config?.Labels?.['flux.graceful.stop-s']);
-  return Number.isInteger(labelSeconds) && labelSeconds > 0 ? labelSeconds : undefined;
-}
-
-/**
  * Stops app's docker.
  *
  * @param {string} idOrName
@@ -1221,21 +1153,14 @@ async function appDockerStop(idOrName, timeout) {
   }
 
   const dockerName = getDockerName(idOrName);
-  // Held for the duration of the stop operation (legitimately hours under a
-  // graceful shutdown) so the die handler swallows the deliberate stop and the
-  // reconciler defers. Cleared when the operation settles - never left for the
-  // die event to clean up: a lost event (stream outage) would leak the flag
-  // and permanently wedge the reconciler's actuation for this component.
   globalState.stoppingContainers.add(dockerName);
 
   try {
-    // An explicit timeout wins; otherwise honor a per-container graceful-shutdown
-    // window stamped at create (flux.graceful.stop-s) — TEMP v8 enterprise hack.
-    const effectiveTimeout = timeout !== undefined ? timeout : gracefulStopSecondsFromLabels(containerInfo);
-    const opts = effectiveTimeout !== undefined ? { t: effectiveTimeout } : {};
+    const opts = timeout !== undefined ? { t: timeout } : {};
     await dockerContainer.stop(opts);
-  } finally {
+  } catch (err) {
     globalState.stoppingContainers.delete(dockerName);
+    throw err;
   }
   return `Flux App ${idOrName} successfully stopped.`;
 }
@@ -1263,11 +1188,7 @@ async function appDockerRestart(idOrName) {
   const dockerName = getDockerName(idOrName);
   globalState.stoppingContainers.add(dockerName);
   try {
-    // restart() is a stop+start; honor the per-container graceful-shutdown window
-    // for the stop half so every local stop path is consistent — TEMP v8 hack.
-    const gracefulSeconds = gracefulStopSecondsFromLabels(containerInfo);
-    const opts = gracefulSeconds !== undefined ? { t: gracefulSeconds } : {};
-    await dockerContainer.restart(opts);
+    await dockerContainer.restart();
   } finally {
     globalState.stoppingContainers.delete(dockerName);
   }
@@ -1285,52 +1206,15 @@ async function appDockerKill(idOrName) {
   const dockerContainer = await getDockerContainerByIdOrName(idOrName);
 
   const dockerName = getDockerName(idOrName);
-  // same flag lifetime as appDockerStop: operation-scoped, never event-scoped
   globalState.stoppingContainers.add(dockerName);
 
   try {
     await dockerContainer.kill();
-  } finally {
+  } catch (err) {
     globalState.stoppingContainers.delete(dockerName);
+    throw err;
   }
   return `Flux App ${idOrName} successfully killed.`;
-}
-
-/**
- * Cancel/expiry uninstall: drain a component that declared a graceful-shutdown
- * window (flux.graceful.stop-s >= 1), force-kill the rest. The owner's
- * per-component gracefulShutdownSec token is the switch — set it to drain on
- * cancel, omit it (or set 0) to kill. Lets expireGlobalApplications honor the
- * declared window without surrendering force semantics (guard bypass /
- * global-spec fallback) that the expiry sweep relies on. TEMP v8 enterprise hack.
- *
- * @param {string} idOrName
- * @returns {string} message
- */
-async function appDockerStopGracefulOrKill(idOrName) {
-  // container ID or name
-  const dockerContainer = await getDockerContainerByIdOrName(idOrName);
-
-  const containerInfo = await dockerContainer.inspect();
-  if (!containerInfo.State.Running) {
-    return `Flux App ${idOrName} is already stopped.`;
-  }
-
-  const dockerName = getDockerName(idOrName);
-  // same operation-scoped flag lifetime as appDockerStop/appDockerKill
-  globalState.stoppingContainers.add(dockerName);
-
-  try {
-    const gracefulSeconds = gracefulStopSecondsFromLabels(containerInfo);
-    if (gracefulSeconds !== undefined) {
-      await dockerContainer.stop({ t: gracefulSeconds });
-      return `Flux App ${idOrName} successfully stopped.`;
-    }
-    await dockerContainer.kill();
-    return `Flux App ${idOrName} successfully killed.`;
-  } finally {
-    globalState.stoppingContainers.delete(dockerName);
-  }
 }
 
 /**
@@ -1865,7 +1749,6 @@ module.exports = {
   appDockerRestart,
   appDockerStart,
   appDockerStop,
-  appDockerStopGracefulOrKill,
   appDockerTop,
   appDockerUnpause,
   createFluxAppDockerNetwork,
@@ -1891,7 +1774,6 @@ module.exports = {
   dockerVersion,
   getAppDockerNameIdentifier,
   getAppIdentifier,
-  getBaseAppName,
   getDockerContainer,
   getDockerContainerByIdOrName,
   getDockerContainerOnly,

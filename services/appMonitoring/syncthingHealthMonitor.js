@@ -1,19 +1,15 @@
-// Syncthing Health Monitor - observes steady-state cluster sync health.
-// It is a WATCHDOG, not an actuator: it alerts, and at most nudges a folder's
-// devices (pause/resume forces a reconnect + index re-exchange, re-arming a
-// dormant puller). It never stops containers (the reconciler owns container
-// actuation - an unrecorded stop here is drift the reconciler immediately
-// undoes), never restarts syncthing (node-wide collateral, fixes nothing a
-// nudge doesn't - verified live), and never removes apps (removing a RUNNING
-// app because peers are unreachable destroys the healthiest copy; rebalancing
-// belongs to the election/reconciler designs, with evidence).
+// Syncthing Health Monitor - Monitors cluster health and takes corrective actions
 const log = require('../../lib/log');
 const syncthingService = require('../syncthingService');
-const { isPathMounted, nudgeFolderDevices } = require('./syncthingFolderStateMachine');
+const { isPathMounted } = require('./syncthingFolderStateMachine');
 const { appsFolder } = require('../utils/appConstants');
 const {
-  HEALTH_NUDGE_THRESHOLD_MS,
+  HEALTH_STOP_THRESHOLD_MS,
+  HEALTH_RESTART_SYNCTHING_THRESHOLD_MS,
+  HEALTH_REMOVE_THRESHOLD_MS,
   HEALTH_WARNING_THRESHOLD_MS,
+  // eslint-disable-next-line no-unused-vars
+  HEALTH_PEERS_BEHIND_THRESHOLD_MS, // Reserved for future use with more granular peer-behind detection
 } = require('./syncthingMonitorConstants');
 
 /**
@@ -23,9 +19,31 @@ const {
  * @property {number|null} cannotSyncSince - Timestamp when folder cannot sync
  * @property {number|null} peersBehindSince - Timestamp when peers have more data but not syncing
  * @property {number|null} lastHealthyTimestamp - Last time folder was healthy
- * @property {string} lastAction - Last action taken (none, warning, nudged)
- * @property {number|null} lastNudgeAt - Timestamp of the last device nudge
+ * @property {string} lastAction - Last action taken (none, warning, stopped, restarted_syncthing, removed)
+ * @property {boolean} appWasStopped - Whether the app was stopped due to health issues (for auto-restart)
  */
+
+/**
+ * Extract app name from folderId
+ * FolderIds are in format: fluxappname or fluxcomponent_appname
+ * @param {string} folderId - Syncthing folder ID
+ * @returns {string} App name
+ */
+function extractAppNameFromFolderId(folderId) {
+  // Remove 'flux' prefix
+  const withoutFlux = folderId.replace(/^flux/, '');
+
+  // If contains underscore, it's a component: component_appname
+  // We need the main app name (after the underscore)
+  if (withoutFlux.includes('_')) {
+    const parts = withoutFlux.split('_');
+    // Return the app name (last part after component name)
+    return parts.slice(1).join('_');
+  }
+
+  // Otherwise it's just the app name
+  return withoutFlux;
+}
 
 /**
  * Get or create health status for a folder
@@ -41,7 +59,7 @@ function getOrCreateHealthStatus(folderHealthCache, folderId) {
       peersBehindSince: null,
       lastHealthyTimestamp: Date.now(),
       lastAction: 'none',
-      lastNudgeAt: null,
+      appWasStopped: false,
       lastSyncPercentage: null, // Track sync progress for stall detection
     });
   }
@@ -59,31 +77,32 @@ function resetHealthStatus(healthStatus) {
   healthStatus.peersBehindSince = null;
   healthStatus.lastHealthyTimestamp = Date.now();
   healthStatus.lastAction = 'none';
-  healthStatus.lastNudgeAt = null;
+  healthStatus.appWasStopped = false;
   // Note: lastSyncPercentage and lastSyncProgressTime are NOT reset here
   // They track sync progress for stall detection and should persist across health checks
   /* eslint-enable no-param-reassign */
 }
 
 /**
- * Determine what action should be taken based on duration of issue.
- * 'nudge' is only meaningful when the folder has CONNECTED peers (nudgeable:
- * with everyone disconnected there is nothing to pause/resume - reconnection
- * is syncthing's own dialer's job, so we only alert and wait).
+ * Determine what action should be taken based on duration of issue
  * @param {number} issueSince - Timestamp when issue started
  * @param {string} currentAction - Current action status
- * @param {boolean} nudgeable - Whether a device nudge can help (connected peers)
- * @param {number|null} lastNudgeAt - Timestamp of the previous nudge
- * @returns {string} Action to take: 'none', 'warning', 'nudge'
+ * @returns {string} Action to take: 'none', 'warning', 'stop', 'restart_syncthing', 'remove'
  */
-function determineAction(issueSince, currentAction, nudgeable, lastNudgeAt) {
+function determineAction(issueSince, currentAction) {
   if (!issueSince) return 'none';
 
   const duration = Date.now() - issueSince;
 
-  if (nudgeable && duration >= HEALTH_NUDGE_THRESHOLD_MS
-    && (!lastNudgeAt || Date.now() - lastNudgeAt >= HEALTH_NUDGE_THRESHOLD_MS)) {
-    return 'nudge';
+  // Priority order: remove > restart_syncthing > stop > warning
+  if (duration >= HEALTH_REMOVE_THRESHOLD_MS) {
+    return 'remove';
+  }
+  if (duration >= HEALTH_RESTART_SYNCTHING_THRESHOLD_MS && currentAction !== 'restarted_syncthing' && currentAction !== 'removed') {
+    return 'restart_syncthing';
+  }
+  if (duration >= HEALTH_STOP_THRESHOLD_MS && currentAction !== 'stopped' && currentAction !== 'restarted_syncthing' && currentAction !== 'removed') {
+    return 'stop';
   }
   if (duration >= HEALTH_WARNING_THRESHOLD_MS && currentAction === 'none') {
     return 'warning';
@@ -97,6 +116,9 @@ function determineAction(issueSince, currentAction, nudgeable, lastNudgeAt) {
  * @param {Object} params - Parameters
  * @param {Array} params.foldersConfiguration - Array of folder configurations
  * @param {Map} params.folderHealthCache - Cache for health tracking
+ * @param {Function} params.appDockerStopFn - Function to stop docker container
+ * @param {Function} params.appDockerStartFn - Function to start docker container
+ * @param {Function} params.removeAppLocallyFn - Function to remove app locally
  * @param {Object} params.state - Global state object
  * @param {Map} params.receiveOnlySyncthingAppsCache - Cache tracking app initialization state
  * @returns {Promise<Object>} Health monitoring results
@@ -105,6 +127,9 @@ async function monitorFolderHealth(params) {
   const {
     foldersConfiguration,
     folderHealthCache,
+    appDockerStopFn,
+    appDockerStartFn,
+    removeAppLocallyFn,
     state,
     receiveOnlySyncthingAppsCache,
   } = params;
@@ -145,6 +170,9 @@ async function monitorFolderHealth(params) {
     if (isGloballyIsolated) {
       log.warn(`monitorFolderHealth - Node is ISOLATED: No peers connected, ${diagnostics.summary.totalFolders} folders configured`);
     }
+
+    // Track if Syncthing restart was already triggered in this execution to prevent multiple restarts
+    let syncthingRestartTriggered = false;
 
     // Process each folder
     // eslint-disable-next-line no-restricted-syntax
@@ -260,10 +288,7 @@ async function monitorFolderHealth(params) {
         healthStatus.peersBehindSince = null;
       }
 
-      // Determine action based on longest-standing issue. A nudge only helps
-      // when the folder has connected peers (it forces a reconnect + index
-      // re-exchange on them); with everyone disconnected we only alert.
-      const nudgeable = folderDiag.peerStatuses.some((peer) => peer.connected);
+      // Determine action based on longest-standing issue
       let actionToTake = 'none';
       let issueType = '';
 
@@ -278,7 +303,7 @@ async function monitorFolderHealth(params) {
       }
 
       if (healthStatus.cannotSyncSince) {
-        const cannotSyncAction = determineAction(healthStatus.cannotSyncSince, healthStatus.lastAction, nudgeable, healthStatus.lastNudgeAt);
+        const cannotSyncAction = determineAction(healthStatus.cannotSyncSince, healthStatus.lastAction);
         if (cannotSyncAction !== 'none') {
           actionToTake = cannotSyncAction;
           issueType = 'cannot_sync';
@@ -286,33 +311,115 @@ async function monitorFolderHealth(params) {
       }
 
       if (healthStatus.peersBehindSince) {
-        const peersBehindAction = determineAction(healthStatus.peersBehindSince, healthStatus.lastAction, nudgeable, healthStatus.lastNudgeAt);
-        if (peersBehindAction === 'nudge' || (peersBehindAction === 'warning' && actionToTake === 'none')) {
+        const peersBehindAction = determineAction(healthStatus.peersBehindSince, healthStatus.lastAction);
+        // Only escalate if this is a longer-standing issue
+        if (peersBehindAction === 'remove' && actionToTake !== 'remove') {
+          actionToTake = peersBehindAction;
+          issueType = 'peers_behind';
+        } else if (peersBehindAction === 'stop' && actionToTake !== 'remove' && actionToTake !== 'stop') {
           actionToTake = peersBehindAction;
           issueType = 'peers_behind';
         }
       }
 
-      let issueDuration = 0;
-      if (healthStatus.cannotSyncSince) {
-        issueDuration = (now - healthStatus.cannotSyncSince) / (60 * 1000);
-      } else if (healthStatus.peersBehindSince) {
-        issueDuration = (now - healthStatus.peersBehindSince) / (60 * 1000);
-      }
+      // Take action based on severity
+      if (actionToTake === 'remove' && healthStatus.lastAction !== 'removed') {
+        let issueDuration = 0;
+        if (healthStatus.cannotSyncSince) {
+          issueDuration = (now - healthStatus.cannotSyncSince) / (60 * 1000);
+        } else if (healthStatus.peersBehindSince) {
+          issueDuration = (now - healthStatus.peersBehindSince) / (60 * 1000);
+        }
 
-      if (actionToTake === 'nudge') {
-        log.warn(`monitorFolderHealth - NUDGING ${folderId} (device pause/resume) due to ${issueType} for ${issueDuration.toFixed(0)} minutes`);
-        // eslint-disable-next-line no-await-in-loop
-        await nudgeFolderDevices(folderId);
-        healthStatus.lastAction = 'nudged';
-        healthStatus.lastNudgeAt = now;
-        results.actions.push({
-          folderId,
-          action: 'nudge',
-          reason: issueType,
-          durationMinutes: issueDuration,
-        });
+        // Extract app name from folderId (fluxappname -> appname)
+        const appName = extractAppNameFromFolderId(folderId);
+        log.error(`monitorFolderHealth - REMOVING app ${appName} (folder ${folderId}) due to ${issueType} for ${issueDuration.toFixed(0)} minutes`);
+
+        try {
+          // Broadcast fluxappremoved so peers drop this IP from appLocations;
+          // otherwise the next spawner keeps selecting this node and hits the same unreachable peer.
+          // eslint-disable-next-line no-await-in-loop
+          await removeAppLocallyFn(appName, null, true, false, true);
+          healthStatus.lastAction = 'removed';
+          results.actions.push({
+            folderId,
+            appName,
+            action: 'remove',
+            reason: issueType,
+            durationMinutes: issueDuration,
+          });
+        } catch (error) {
+          log.error(`monitorFolderHealth - Failed to remove ${appName}: ${error.message}`);
+        }
+      } else if (actionToTake === 'stop' && healthStatus.lastAction !== 'stopped' && healthStatus.lastAction !== 'restarted_syncthing' && healthStatus.lastAction !== 'removed') {
+        let issueDuration = 0;
+        if (healthStatus.cannotSyncSince) {
+          issueDuration = (now - healthStatus.cannotSyncSince) / (60 * 1000);
+        } else if (healthStatus.peersBehindSince) {
+          issueDuration = (now - healthStatus.peersBehindSince) / (60 * 1000);
+        }
+
+        log.warn(`monitorFolderHealth - STOPPING ${folderId} due to ${issueType} for ${issueDuration.toFixed(0)} minutes`);
+
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await appDockerStopFn(folderId);
+          healthStatus.lastAction = 'stopped';
+          healthStatus.appWasStopped = true; // Track that we stopped the app for auto-restart later
+          results.actions.push({
+            folderId,
+            action: 'stop',
+            reason: issueType,
+            durationMinutes: issueDuration,
+          });
+        } catch (error) {
+          log.error(`monitorFolderHealth - Failed to stop ${folderId}: ${error.message}`);
+        }
+      } else if (actionToTake === 'restart_syncthing' && healthStatus.lastAction !== 'restarted_syncthing' && healthStatus.lastAction !== 'removed') {
+        let issueDuration = 0;
+        if (healthStatus.cannotSyncSince) {
+          issueDuration = (now - healthStatus.cannotSyncSince) / (60 * 1000);
+        } else if (healthStatus.peersBehindSince) {
+          issueDuration = (now - healthStatus.peersBehindSince) / (60 * 1000);
+        }
+
+        // Only actually restart Syncthing once per execution, even if multiple folders need it
+        if (!syncthingRestartTriggered) {
+          log.warn(`monitorFolderHealth - RESTARTING SYNCTHING for ${folderId} due to ${issueType} for ${issueDuration.toFixed(0)} minutes`);
+
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await syncthingService.systemRestart();
+            syncthingRestartTriggered = true;
+            healthStatus.lastAction = 'restarted_syncthing';
+            results.actions.push({
+              folderId,
+              action: 'restart_syncthing',
+              reason: issueType,
+              durationMinutes: issueDuration,
+            });
+          } catch (error) {
+            log.error(`monitorFolderHealth - Failed to restart syncthing for ${folderId}: ${error.message}`);
+          }
+        } else {
+          // Syncthing already restarted in this execution, just mark this folder
+          log.info(`monitorFolderHealth - Syncthing already restarted this cycle, marking ${folderId} as restarted`);
+          healthStatus.lastAction = 'restarted_syncthing';
+          results.actions.push({
+            folderId,
+            action: 'restart_syncthing_skipped',
+            reason: issueType,
+            durationMinutes: issueDuration,
+          });
+        }
       } else if (actionToTake === 'warning' && healthStatus.lastAction === 'none') {
+        let issueDuration = 0;
+        if (healthStatus.cannotSyncSince) {
+          issueDuration = (now - healthStatus.cannotSyncSince) / (60 * 1000);
+        } else if (healthStatus.peersBehindSince) {
+          issueDuration = (now - healthStatus.peersBehindSince) / (60 * 1000);
+        }
+
         log.warn(`monitorFolderHealth - WARNING: ${folderId} has ${issueType} issue for ${issueDuration.toFixed(0)} minutes`);
         healthStatus.lastAction = 'warning';
         results.actions.push({
@@ -323,9 +430,24 @@ async function monitorFolderHealth(params) {
         });
       }
 
-      // Reset health tracking once the folder is healthy again (nothing was
-      // stopped, so there is nothing to start back up)
+      // Reset health if no issues and restart app if it was stopped
       if (!hasIssue) {
+        // If app was stopped due to health issues, restart it now that issues are resolved
+        if (healthStatus.appWasStopped) {
+          log.info(`monitorFolderHealth - Issues resolved for ${folderId}, restarting app`);
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await appDockerStartFn(folderId);
+            results.actions.push({
+              folderId,
+              action: 'restart_app',
+              reason: 'issues_resolved',
+              durationMinutes: 0,
+            });
+          } catch (error) {
+            log.error(`monitorFolderHealth - Failed to restart app ${folderId}: ${error.message}`);
+          }
+        }
         resetHealthStatus(healthStatus);
         results.foldersHealthy += 1;
       } else {
@@ -356,6 +478,35 @@ async function monitorFolderHealth(params) {
 }
 
 /**
+ * Check if a specific app/folder should be removed based on health status
+ * This is a lighter check that can be called from other modules
+ * Note: Does not consider isolatedSince as that only logs warnings
+ * @param {string} folderId - Folder ID to check
+ * @param {Map} folderHealthCache - Health cache
+ * @returns {boolean} True if folder should be removed
+ */
+function shouldRemoveFolder(folderId, folderHealthCache) {
+  const healthStatus = folderHealthCache.get(folderId);
+  if (!healthStatus) return false;
+
+  if (healthStatus.cannotSyncSince) {
+    const duration = Date.now() - healthStatus.cannotSyncSince;
+    if (duration >= HEALTH_REMOVE_THRESHOLD_MS) {
+      return true;
+    }
+  }
+
+  if (healthStatus.peersBehindSince) {
+    const duration = Date.now() - healthStatus.peersBehindSince;
+    if (duration >= HEALTH_REMOVE_THRESHOLD_MS) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Get health summary for all monitored folders
  * @param {Map} folderHealthCache - Health cache
  * @returns {Object} Summary of folder health
@@ -365,13 +516,16 @@ function getHealthSummary(folderHealthCache) {
     totalFolders: folderHealthCache.size,
     healthy: 0,
     warning: 0,
-    nudged: 0,
+    stopped: 0,
+    removed: 0,
     issues: [],
   };
 
   folderHealthCache.forEach((status, folderId) => {
-    if (status.lastAction === 'nudged') {
-      summary.nudged += 1;
+    if (status.lastAction === 'removed') {
+      summary.removed += 1;
+    } else if (status.lastAction === 'stopped') {
+      summary.stopped += 1;
     } else if (status.lastAction === 'warning') {
       summary.warning += 1;
     } else if (!status.isolatedSince && !status.cannotSyncSince && !status.peersBehindSince) {
@@ -394,7 +548,9 @@ function getHealthSummary(folderHealthCache) {
 
 module.exports = {
   monitorFolderHealth,
+  shouldRemoveFolder,
   getHealthSummary,
   getOrCreateHealthStatus,
   resetHealthStatus,
+  extractAppNameFromFolderId,
 };

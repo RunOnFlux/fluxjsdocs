@@ -15,12 +15,10 @@ const config = require('config');
 const upnpService = require('../upnpService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
-const { socketAddressesMatch } = require('../utils/socketAddressUtils');
 const { availableApps } = require('../appDatabase/registryManager');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
-const appsRuntimeState = require('../appManagement/appsRuntimeState');
 const imageManager = require('../appSecurity/imageManager');
 const fluxEventBus = require('../utils/fluxEventBus');
 
@@ -29,17 +27,6 @@ const appsFolderPath = process.env.FLUX_APPS_FOLDER || path.join(fluxDirPath, 'Z
 const appsFolder = `${appsFolderPath}/`;
 const cmdAsync = util.promisify(nodecmd.run);
 const crontabLoad = util.promisify(systemcrontab.load);
-
-// Fired once per component identifier after a successful local removal, beside
-// the durable runtime-state clear (mirrors appInstaller.setOnInstallComplete).
-// serviceManager wires it to appReconciler.clearControllerDesired so the
-// reconciler's in-memory controller verdict dies with the component - a
-// back-require of appReconciler here would capture a stale partial export
-// (appReconciler already requires this module and both replace module.exports).
-let onComponentRemoved = null;
-function setOnComponentRemoved(callback) {
-  onComponentRemoved = callback;
-}
 
 /**
  * Stop Syncthing app and clean up cache
@@ -247,7 +234,7 @@ async function cleanupVolumePath(volumepath, entityName, res) {
  * @returns {Promise<void>}
  */
 // eslint-disable-next-line no-shadow
-async function hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force = false, cancelGraceful = false) {
+async function hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force = false) {
   const componentName = componentSpecifications.name;
 
   // Stop monitoring and container
@@ -262,18 +249,8 @@ async function hardUninstallComponent(appName, appId, componentSpecifications, r
     stopAppMonitoring(monitoredName, true);
   }
 
-  // Cancel/expiry: drain components that declared a graceful window (force-kill the
-  // rest). Otherwise: kill on forced removals, graceful stop on normal removals.
-  if (cancelGraceful) {
-    await dockerService.appDockerStopGracefulOrKill(appId).catch((error) => {
-      log.warn(`Failed to stop/kill container ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else if (force) {
+  // Use kill instead of stop for forced removals
+  if (force) {
     await dockerService.appDockerKill(appId).catch((error) => {
       log.warn(`Failed to kill container ${appId}: ${error.message}`);
       const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
@@ -408,7 +385,7 @@ async function hardUninstallComponent(appName, appId, componentSpecifications, r
  // eslint-disable-next-line no-shadow
  */
 // eslint-disable-next-line no-shadow
-async function hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force = false, cancelGraceful = false) {
+async function hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force = false) {
   // Stop monitoring and container
   log.info(`Stopping Flux App ${appName}...`);
   if (res) {
@@ -420,18 +397,8 @@ async function hardUninstallApplication(appName, appId, appSpecifications, res, 
     stopAppMonitoring(appName, true);
   }
 
-  // Cancel/expiry: drain if the app declared a graceful window (force-kill otherwise).
-  // Otherwise: kill on forced removals, graceful stop on normal removals.
-  if (cancelGraceful) {
-    await dockerService.appDockerStopGracefulOrKill(appId).catch((error) => {
-      log.warn(`Failed to stop/kill container ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else if (force) {
+  // Use kill instead of stop for forced removals
+  if (force) {
     await dockerService.appDockerKill(appId).catch((error) => {
       log.warn(`Failed to kill container ${appId}: ${error.message}`);
       const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
@@ -794,14 +761,8 @@ async function softUninstallApplication(appName, appId, appSpecifications, res, 
  * @param {boolean} sendMessage - Whether to send message to network
  * @returns {Promise<void>}
  */
-async function removeAppLocally(app, res, force = false, endResponse = true, sendMessage = false, cancelGraceful = false) {
+async function removeAppLocally(app, res, force = false, endResponse = true, sendMessage = false) {
   try {
-    // Normalise to the bare identifier this function reasons about: a caller may
-    // pass the flux-prefixed docker name (e.g. the syncthing flow), which would
-    // otherwise mis-derive the component as `flux{component}` below.
-    // eslint-disable-next-line no-param-reassign
-    app = app ? dockerService.getBaseAppName(app) : app;
-
     // Log removal trigger with stack trace to identify caller
     const { stack } = new Error();
     const callerLine = stack.split('\n')[2]?.trim();
@@ -868,7 +829,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
           const projection = { projection: { _id: 0 } };
           const messages = await dbHelper.findInDatabase(database, globalAppsMessages, query, projection);
           const appMessages = messages.filter((message) => {
-            const specifications = message.appSpecifications;
+            const specifications = message.appSpecifications || message.zelAppSpecifications;
             return specifications.name === appName;
           });
           let currentSpecifications;
@@ -878,7 +839,7 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
             }
           });
           if (currentSpecifications && currentSpecifications.height) {
-            ({ appSpecifications } = currentSpecifications);
+            appSpecifications = currentSpecifications.appSpecifications || currentSpecifications.zelAppSpecifications;
           }
         }
       }
@@ -901,52 +862,14 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
         const appComponentSpecifications = appComposedComponent;
         // eslint-disable-next-line no-await-in-loop
-        await hardUninstallComponent(appName, appId, appComponentSpecifications, res, stopAppMonitoring, force, cancelGraceful);
+        await hardUninstallComponent(appName, appId, appComponentSpecifications, res, stopAppMonitoring, force);
       }
     } else if (isComponent) {
       const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
       appId = dockerService.getAppIdentifier(`${componentSpecifications.name}_${appSpecifications.name}`);
-      await hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force, cancelGraceful);
+      await hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force);
     } else {
-      await hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force, cancelGraceful);
-    }
-
-    // clear node-local runtime state (operator stop lock, crash backoff) for the
-    // removed component(s) so a later reinstall starts from a clean slate
-    let removedIdentifiers;
-    if (appSpecifications.version >= 4 && appSpecifications.compose) {
-      removedIdentifiers = isComponent
-        ? [`${appComponent}_${appSpecifications.name}`]
-        : appSpecifications.compose.map((c) => `${c.name}_${appSpecifications.name}`);
-    } else {
-      removedIdentifiers = [appName];
-    }
-    // eslint-disable-next-line no-restricted-syntax
-    for (const identifier of removedIdentifiers) {
-      // eslint-disable-next-line no-await-in-loop
-      await appsRuntimeState.remove(identifier);
-      if (onComponentRemoved) onComponentRemoved(identifier);
-    }
-
-    // A node-pinned app removed via the operator/customer path (force=false) stays
-    // globally registered and still targets this node, so the spawner is obliged to
-    // reinstall it. The spawn-throttle cache (trySpawningGlobalAppCache, default 12h),
-    // set when the app first spawned here, is never cleared on the spawner's success
-    // path and suppresses reselection at appSpawner.js:285 - up to a 12h silent outage
-    // for a single-instance pinned app. Clear it so the next scan reinstalls. Scoped to
-    // whole-app removal of an app that pins THIS node: non-pinned apps keep the throttle
-    // (the network re-places them on another node), and force=true paths are left as-is
-    // (e.g. the over-instance self-removal already clears it; expiry/cancel must not).
-    if (!force && !isComponent && Array.isArray(appSpecifications.nodes) && appSpecifications.nodes.length > 0) {
-      const localSocketAddress = await fluxNetworkHelper.getLocalSocketAddress();
-      if (localSocketAddress && appSpecifications.nodes.some((ip) => socketAddressesMatch(ip, localSocketAddress))) {
-        const globalSpec = await dbHelper.findOneInDatabase(database, globalAppsInformation, { name: appName }, { projection: { _id: 0, hash: 1 } });
-        const { trySpawningGlobalAppCache } = globalState;
-        if (globalSpec && globalSpec.hash && trySpawningGlobalAppCache && trySpawningGlobalAppCache.has(globalSpec.hash)) {
-          trySpawningGlobalAppCache.delete(globalSpec.hash);
-          log.info(`Cleared spawn-throttle cache for node-pinned app ${appName} (hash ${globalSpec.hash}) so the spawner can reinstall it`);
-        }
-      }
+      await hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force);
     }
 
     fluxEventBus.publish('app:removed', { name: appName });
@@ -1156,24 +1079,6 @@ async function softRemoveAppLocally(app, res, globalStateRef, stopAppMonitoring)
       await softUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring);
     }
 
-    // node-local controller state dies with the components on the soft path too:
-    // a (soft) redeploy is an explicit "make it run", so neither the operator
-    // lock nor a stale controller verdict may survive it
-    let removedIdentifiers;
-    if (appSpecifications.version >= 4 && appSpecifications.compose) {
-      removedIdentifiers = isComponent
-        ? [`${appComponent}_${appSpecifications.name}`]
-        : appSpecifications.compose.map((c) => `${c.name}_${appSpecifications.name}`);
-    } else {
-      removedIdentifiers = [appName];
-    }
-    // eslint-disable-next-line no-restricted-syntax
-    for (const identifier of removedIdentifiers) {
-      // eslint-disable-next-line no-await-in-loop
-      await appsRuntimeState.remove(identifier);
-      if (onComponentRemoved) onComponentRemoved(identifier);
-    }
-
     if (!isComponent) {
       const databaseStatus = {
         status: 'Cleaning up database...',
@@ -1299,5 +1204,4 @@ module.exports = {
   removeAppLocally,
   softRemoveAppLocally,
   removeAppLocallyApi,
-  setOnComponentRemoved,
 };

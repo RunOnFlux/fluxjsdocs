@@ -81,11 +81,12 @@ async function storeAppTemporaryMessage(message, options = {}) {
   if (!message || typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number' || typeof message.signature !== 'string' || typeof message.timestamp !== 'number' || typeof message.hash !== 'string') {
     return new Error('Invalid Flux App message for storing');
   }
-  if (typeof message.appSpecifications !== 'object') {
+  // expect one to be present
+  if (typeof message.appSpecifications !== 'object' && typeof message.zelAppSpecifications !== 'object') {
     return new Error('Invalid Flux App message for storing');
   }
 
-  const specifications = message.appSpecifications;
+  const specifications = message.appSpecifications || message.zelAppSpecifications;
   // eslint-disable-next-line no-use-before-define
   const appSpecFormatted = specificationFormatter(specifications);
   const messageTimestamp = serviceHelper.ensureNumber(message.timestamp);
@@ -138,7 +139,7 @@ async function storeAppTemporaryMessage(message, options = {}) {
     // For updates, fetch previous app specs first - if registration doesn't exist yet, queue the update
     let previousAppSpecs = null;
     if (!appRegistration) {
-      previousAppSpecs = await registryManager.getPreviousAppSpecifications(appSpecFormatted, messageTimestamp);
+      previousAppSpecs = await advancedWorkflows.getPreviousAppSpecifications(appSpecFormatted, messageTimestamp);
       if (!previousAppSpecs) {
         // Registration doesn't exist yet - queue this update for later processing
         const appName = appSpecFormatted.name;

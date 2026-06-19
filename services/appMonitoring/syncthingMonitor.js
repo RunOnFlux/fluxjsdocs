@@ -33,7 +33,6 @@ const {
 const {
   monitorFolderHealth,
 } = require('./syncthingHealthMonitor');
-const syncthingEventsConsumer = require('./syncthingEventsConsumer');
 
 // Global collections
 const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
@@ -120,6 +119,9 @@ async function processContainerData(params) {
     folderIds,
     foldersConfiguration,
     newFoldersConfiguration,
+    appDockerStopFn,
+    appDockerRestartFn,
+    appDeleteDataInMountPointFn,
   } = params;
 
   const containersData = containerData.split('|');
@@ -173,6 +175,9 @@ async function processContainerData(params) {
       receiveOnlySyncthingAppsCache: state.receiveOnlySyncthingAppsCache,
       appLocation,
       localSocketAddr,
+      appDockerStopFn,
+      appDockerRestartFn,
+      appDeleteDataInMountPointFn,
       syncthingFolder,
       installedAppName,
     });
@@ -272,9 +277,13 @@ async function logSyncState(foldersConfiguration) {
  * @param {object} state - State object
  * @param {Function} installedAppsFn - Get installed apps function
  * @param {Function} getGlobalStateFn - Get global state function
+ * @param {Function} appDockerStopFn - Stop docker function
+ * @param {Function} appDockerRestartFn - Restart docker function
+ * @param {Function} appDeleteDataInMountPointFn - Delete data function
+ * @param {Function} removeAppLocallyFn - Remove app function
  * @returns {Promise<void>}
  */
-async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
+async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn, appDockerStopFn, appDockerRestartFn, appDeleteDataInMountPointFn, removeAppLocallyFn) {
   // Sync global state before checking
   getGlobalStateFn();
 
@@ -380,9 +389,13 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
       }
 
       if (unsafeFoldersCount > 0) {
-        // The receiveonly PATCH applies live (no restart needed on syncthing v2) -
-        // a process restart here would drop every folder's transfers node-wide.
         log.error(`syncthingAppsCore - STARTUP WARNING: ${unsafeFoldersCount} folders had unsafe mounts and were switched to receiveonly mode. Check loop mounts!`);
+        // Restart Syncthing to apply the receiveonly changes immediately
+        await syncthingService.systemRestart().catch((err) => {
+          log.error(`syncthingAppsCore - Failed to restart Syncthing after safety switch: ${err.message}`);
+        });
+        // Wait for Syncthing to restart before continuing
+        await serviceHelper.delay(5000);
       }
     }
 
@@ -405,6 +418,9 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
       folderIds,
       foldersConfiguration,
       newFoldersConfiguration,
+      appDockerStopFn,
+      appDockerRestartFn,
+      appDeleteDataInMountPointFn,
     };
 
     // Process all installed apps
@@ -518,11 +534,12 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
     if (!state.lastHealthCheckTime || (now - state.lastHealthCheckTime >= HEALTH_CHECK_INTERVAL_MS)) {
       log.info('syncthingAppsCore - Running periodic health check');
       try {
-        // The health monitor is a watchdog only: it alerts and nudges folder
-        // devices - it takes no container or app-lifecycle actions
         const healthResults = await monitorFolderHealth({
           foldersConfiguration,
           folderHealthCache: state.folderHealthCache,
+          appDockerStopFn,
+          appDockerStartFn: dockerService.appDockerStart,
+          removeAppLocallyFn,
           state,
           receiveOnlySyncthingAppsCache: state.receiveOnlySyncthingAppsCache,
         });
@@ -566,9 +583,13 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
  * @param {object} state - State object
  * @param {Function} installedAppsFn - Get installed apps function
  * @param {Function} getGlobalStateFn - Get global state function
+ * @param {Function} appDockerStopFn - Stop docker function
+ * @param {Function} appDockerRestartFn - Restart docker function
+ * @param {Function} appDeleteDataInMountPointFn - Delete data function
+ * @param {Function} removeAppLocallyFn - Remove app function
  * @returns {Object} Control object with stop() method
  */
-function syncthingApps(state, installedAppsFn, getGlobalStateFn) {
+function syncthingApps(state, installedAppsFn, getGlobalStateFn, appDockerStopFn, appDockerRestartFn, appDeleteDataInMountPointFn, removeAppLocallyFn) {
   let intervalId = null;
   let isRunning = false;
 
@@ -584,6 +605,10 @@ function syncthingApps(state, installedAppsFn, getGlobalStateFn) {
         state,
         installedAppsFn,
         getGlobalStateFn,
+        appDockerStopFn,
+        appDockerRestartFn,
+        appDeleteDataInMountPointFn,
+        removeAppLocallyFn,
       );
     } catch (error) {
       log.error(`syncthingApps - Unexpected error in monitoring loop: ${error.message}`);
@@ -596,25 +621,8 @@ function syncthingApps(state, installedAppsFn, getGlobalStateFn) {
   // Run immediately on start
   runMonitoring();
 
-  // Then run at regular intervals (the LEVEL: ground truth, self-healing)
+  // Then run at regular intervals
   intervalId = setInterval(runMonitoring, MONITOR_INTERVAL_MS);
-
-  // Edge accelerator: syncthing folder events trigger an early run of the SAME
-  // monitoring pass the interval drives - events never carry decisions. Debounced
-  // so an event burst coalesces into one evaluation; if the stream dies, behavior
-  // degrades to the interval cadence (latency, never correctness).
-  let earlyEvaluationTimer = null;
-  const requestEarlyEvaluation = () => {
-    if (earlyEvaluationTimer) return;
-    earlyEvaluationTimer = setTimeout(() => {
-      earlyEvaluationTimer = null;
-      runMonitoring();
-    }, 2000);
-  };
-  syncthingEventsConsumer.start({
-    onFolderActivity: () => requestEarlyEvaluation(),
-    onResync: () => requestEarlyEvaluation(),
-  });
 
   // Return control object for graceful shutdown
   return {
@@ -622,11 +630,6 @@ function syncthingApps(state, installedAppsFn, getGlobalStateFn) {
       if (intervalId) {
         clearInterval(intervalId);
         intervalId = null;
-        if (earlyEvaluationTimer) {
-          clearTimeout(earlyEvaluationTimer);
-          earlyEvaluationTimer = null;
-        }
-        syncthingEventsConsumer.stop();
         log.info('syncthingApps - Monitoring service stopped');
       }
     },

@@ -201,7 +201,7 @@ function syncthingController() {
  * @returns {object} Message.
  */
 // eslint-disable-next-line default-param-last
-async function performRequest(method = 'get', urlpath = '', data, config) {
+async function performRequest(method = 'get', urlpath = '', data) {
   // now we cache the axios instance for 15 minutes. Means we don't have to create a new instance
   // on every call. It also means that if the syncthing api key changes, it will refetch it
   // after 15 minutes
@@ -211,10 +211,7 @@ async function performRequest(method = 'get', urlpath = '', data, config) {
   }
 
   try {
-    // axios bodyless methods take the request config as their second argument
-    const response = ['post', 'put', 'patch'].includes(method)
-      ? await instance[method](urlpath, data, config)
-      : await instance[method](urlpath, config ?? data);
+    const response = await instance[method](urlpath, data);
 
     const successResponse = messageHelper.createDataMessage(response.data);
     return successResponse;
@@ -606,7 +603,7 @@ async function systemRestart(req, res) {
 async function systemResume(req, res) {
   let { device } = req.params;
   device = device || req.query.device;
-  let apiPath = '/rest/system/resume';
+  let apiPath = '/rest/system/pause';
   if (device) {
     apiPath += `?device=${device}`;
   }
@@ -1450,12 +1447,10 @@ async function getDbBrowse(req, res) {
  */
 async function getDbCompletion(req, res) {
   try {
-    // tolerate being called internally with only a query (no params): callers like
-    // checkIfPeersAreSynced pass { query: {...} }, so req.params is undefined and a
-    // bare `const { folder } = req.params` would throw. Default the containers.
-    const { params = {}, query = {} } = req || {};
-    const folder = params.folder || query.folder;
-    const device = params.device || query.device;
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { device } = req.params;
+    device = device || req.query.device;
     let apiPath = '/rest/db/completion';
     if (folder || device) apiPath += '?';
     const qq = {
@@ -2044,18 +2039,7 @@ async function getEvents(req, res) {
     };
     const qqStr = qs.stringify(qq);
     apiPath += `${qqStr}`;
-    // the events endpoint long-polls: with a `timeout` hold requested, syncthing
-    // keeps the request open up to that many seconds before answering "nothing
-    // new" - the client-side abort must come strictly after the server-side hold,
-    // not at the shared instance's 5s default
-    const holdS = Number(timeout);
-    const requestConfig = {};
-    if (Number.isFinite(holdS) && holdS > 0) requestConfig.timeout = (holdS + 10) * 1000;
-    // a caller (e.g. the events consumer) may pass an AbortSignal to interrupt the
-    // long-poll on shutdown; axios honours config.signal
-    if (req.signal) requestConfig.signal = req.signal;
-    // 3rd arg is the request body (none for GET); 4th is the axios config
-    const response = await performRequest('get', apiPath, undefined, requestConfig);
+    const response = await performRequest('get', apiPath);
     return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
