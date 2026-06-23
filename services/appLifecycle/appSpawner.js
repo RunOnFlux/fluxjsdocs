@@ -24,7 +24,6 @@ const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { FluxCacheManager } = require('../utils/cacheManager');
 const appInstaller = require('./appInstaller');
 const appUninstaller = require('./appUninstaller');
-const appNetworkLinker = require('./appNetworkLinker');
 const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
 const fluxEventBus = require('../utils/fluxEventBus');
 
@@ -35,24 +34,6 @@ const spawnReconfirmDelayMs = config.fluxapps.spawnReconfirmDelayMs;
 const nonEnterpriseSpawnDelayMs = config.fluxapps.nonEnterpriseSpawnDelayMs ?? 2 * 60 * 1000;
 
 let spawnLoopRunning = false;
-
-/**
- * A node-pinned app whose pin set is no larger than its required instance count has
- * no installation contention: every pinned node is a mandatory installer, so the
- * collision-avoidance election (and the two propagation waits that feed it - the
- * pre-install collision wait and the post-install over-instance self-evict) has
- * nothing to resolve. Owner- and flag-agnostic; provably safe because no overshoot
- * is possible when eligible installers do not exceed required instances.
- * @param {object} appSpecifications - full app spec (carries the `nodes` pin list)
- * @param {number} minInstances - required instance count for the app
- * @returns {boolean}
- */
-function isSoleRequiredInstaller(appSpecifications, minInstances) {
-  const pinnedNodes = appSpecifications && appSpecifications.nodes;
-  return Array.isArray(pinnedNodes)
-    && pinnedNodes.length > 0
-    && pinnedNodes.length <= minInstances;
-}
 
 function initialize() {
   appSyncEvents.on(SYNC_EVENTS.SPAWNER_READY, () => {
@@ -254,7 +235,6 @@ async function trySpawningGlobalApplication() {
           version: '$version',
           enterprise: '$enterprise',
           owner: '$owner',
-          description: { $ifNull: ['$description', ''] },
         },
       },
       { $sort: { name: 1 } },
@@ -320,45 +300,6 @@ async function trySpawningGlobalApplication() {
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('ac')).length === 0 || app.geolocation.find((loc) => loc.startsWith('ac') && `ac${myNodeLocation}`.startsWith(loc))));
       globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
 
-      // Suppress dependencyOnly apps (stats collectors) that no workload assigned
-      // to this node requires - they only install while an app networkWith-links
-      // to them, and must not be respawned after a teardown. Best-effort: on a
-      // registry-read failure, fall back to not suppressing rather than aborting.
-      // Gated off in production: flux console owns the dependency lifecycle.
-      if (config.fluxapps.manageDependencyOnlyLifecycle) {
-        try {
-          const requiredDependencyNames = await appNetworkLinker.getRequiredDependencyNamesForNode(localSocketAddr);
-          globalAppNamesLocation = globalAppNamesLocation.filter((app) => !appNetworkLinker.parseDependencyOnly(app.description) || requiredDependencyNames.has(app.name));
-        } catch (error) {
-          log.error(`trySpawningGlobalApplication - could not compute required dependencies, not suppressing collectors this cycle: ${error.message}`);
-        }
-      }
-
-      // Readiness-ordered selection: drop candidates whose networkWith dependencies
-      // are not ready, so a linked group installs root-first (a dependency before
-      // its consumers) instead of a consumer being selected ahead of its dependency
-      // and then starving the loop from the deferred-retry queue. A not-ready app is
-      // simply skipped this cycle and reconsidered once its deps come up - no
-      // priority deferral, so it can never monopolise the loop, and no error cache,
-      // so it installs the instant its dependency appears (e.g. a dependency that is
-      // registered later). This skip is intentionally ungated: it is general spawner
-      // robustness, not part of the node-managed lifecycle. Only the strictness of
-      // "ready" is flag-gated, inside checkAppNetworkRequirements - lifecycle off:
-      // the dependency must be installed locally; on: also actually running.
-      if (globalAppNamesLocation.length > 0) {
-        const readiness = await Promise.all(globalAppNamesLocation.map(async (app) => {
-          try {
-            await appNetworkLinker.checkAppNetworkRequirements({ name: app.name, description: app.description, owner: app.owner });
-            return true;
-          } catch (error) {
-            // Dependency not ready yet -> skip this cycle. Any other error (e.g.
-            // owner mismatch) is a real misconfig handled at install.
-            return error.code !== 'NETWORK_DEPENDENCY_NOT_READY';
-          }
-        }));
-        globalAppNamesLocation = globalAppNamesLocation.filter((_, i) => readiness[i]);
-      }
-
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
       ({ shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, appsCountAvailableToInstallOnMyNode));
 
@@ -422,25 +363,6 @@ async function trySpawningGlobalApplication() {
     const appSpecifications = await registryManager.getApplicationGlobalSpecifications(appToRun);
     if (!appSpecifications) {
       throw new Error(`trySpawningGlobalApplication - Specifications for application ${appToRun} were not found!`);
-    }
-
-    // A dependencyOnly app (stats collector) installs only while a workload
-    // assigned to this node networkWith-links to it. Re-check here so the deferred
-    // selection path is covered too, and clear the spawn throttle set above so it
-    // is reconsidered promptly once a workload that needs it arrives. Best-effort:
-    // a registry-read failure falls back to allowing the spawn.
-    if (config.fluxapps.manageDependencyOnlyLifecycle && appNetworkLinker.parseDependencyOnly(appSpecifications.description)) {
-      let requiredDeps = null;
-      try {
-        requiredDeps = await appNetworkLinker.getRequiredDependencyNamesForNode(localSocketAddr);
-      } catch (error) {
-        log.error(`trySpawningGlobalApplication - could not check dependency requirement for ${appSpecifications.name}: ${error.message}`);
-      }
-      if (requiredDeps && !requiredDeps.has(appSpecifications.name)) {
-        log.info(`trySpawningGlobalApplication - ${appSpecifications.name} is dependency-only and nothing on this node requires it; skipping spawn`);
-        globalState.trySpawningGlobalAppCache.delete(appHash);
-        return shortDelayTime;
-      }
     }
 
     // eslint-disable-next-line no-restricted-syntax
@@ -741,9 +663,6 @@ async function trySpawningGlobalApplication() {
     }
 
     // an application was selected and checked that it can run on this node. try to install and run it locally
-    // A pinned app with no install contention skips the two propagation waits below
-    // (collision election + post-install over-instance check) - see isSoleRequiredInstaller.
-    const soleRequiredInstaller = isSoleRequiredInstaller(appSpecifications, minInstances);
     // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
     let broadcastedAt = Date.now();
     const newAppInstallingMessage = {
@@ -761,10 +680,7 @@ async function trySpawningGlobalApplication() {
     const fluxCommMessagesSender = require('../fluxCommunicationMessagesSender');
     await fluxCommMessagesSender.broadcastMessageToAll(newAppInstallingMessage);
 
-    if (!soleRequiredInstaller) {
-      // collision election needs peers' installing-broadcasts to propagate first
-      await serviceHelper.delay(collisionWaitMs); // give it 1.5m so messages are propagated on the network
-    }
+    await serviceHelper.delay(collisionWaitMs); // give it 1.5m so messages are propagated on the network
 
     // double check if app is installed in more of the instances requested
     runningAppList = await registryManager.appLocation(appToRun);
@@ -812,31 +728,6 @@ async function trySpawningGlobalApplication() {
     }
 
     // install the app
-    // Dependency readiness gate: if a networkWith dependency is not ready (not
-    // installed yet, or - with the managed lifecycle on - not yet running), this app
-    // cannot install this cycle. Skip it and reconsider on the next pass; crucially
-    // do NOT push it into appsToBeCheckedLater, which is drained ahead of fresh
-    // selection - an app whose dependency never appears would otherwise re-defer
-    // every cycle and starve all other apps from being selected. Skipping keeps the
-    // loop free and is self-correcting: the app is retried the moment its dependency
-    // comes up, with no error cache to expire (so a dependency registered later is
-    // picked up immediately). This reaches an app processed from the deferred queue
-    // too (which bypasses the selection-time readiness filter): it is spliced out
-    // above and, by not being re-pushed here, leaves the queue. Any other failure
-    // (e.g. owner mismatch) falls through to registerAppLocally, which re-checks and
-    // fails it through the normal path.
-    try {
-      await appNetworkLinker.checkAppNetworkRequirements(appSpecifications);
-    } catch (error) {
-      if (error && error.code === 'NETWORK_DEPENDENCY_NOT_READY') {
-        log.info(`trySpawningGlobalApplication - ${appToRun} is waiting on a networkWith dependency; skipping this cycle until it comes up`);
-        globalState.trySpawningGlobalAppCache.delete(appHash);
-        fluxEventBus.publish('spawner:deferred', { appName: appToRun, reason: 'dependency_not_ready', delayMs: 0 });
-        return shortDelayTime;
-      }
-      log.warn(`trySpawningGlobalApplication - dependency precheck for ${appToRun} raised a non-deferrable error: ${error.message}`);
-    }
-
     let registerOk = false;
     try {
       registerOk = await appInstaller.registerAppLocally(appSpecifications, null, null, false); // can throw
@@ -851,10 +742,7 @@ async function trySpawningGlobalApplication() {
       return shortDelayTime;
     }
 
-    if (!soleRequiredInstaller) {
-      // over-instance self-evict needs peers' running-broadcasts to propagate first
-      await serviceHelper.delay(1 * 60 * 1000); // await 1 minute to give time for messages to be propagated on the network
-    }
+    await serviceHelper.delay(1 * 60 * 1000); // await 1 minute to give time for messages to be propagated on the network
     // double check if app is installed in more of the instances requested
     runningAppList = await registryManager.appLocation(appToRun);
     if (runningAppList.length > minInstances) {
@@ -901,5 +789,4 @@ async function trySpawningGlobalApplication() {
 module.exports = {
   initialize,
   trySpawningGlobalApplication,
-  isSoleRequiredInstaller,
 };

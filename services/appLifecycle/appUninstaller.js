@@ -15,13 +15,11 @@ const config = require('config');
 const upnpService = require('../upnpService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
-const { socketAddressesMatch } = require('../utils/socketAddressUtils');
 const { availableApps } = require('../appDatabase/registryManager');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const appsRuntimeState = require('../appManagement/appsRuntimeState');
-const appNetworkLinker = require('./appNetworkLinker');
 const imageManager = require('../appSecurity/imageManager');
 const fluxEventBus = require('../utils/fluxEventBus');
 
@@ -248,7 +246,7 @@ async function cleanupVolumePath(volumepath, entityName, res) {
  * @returns {Promise<void>}
  */
 // eslint-disable-next-line no-shadow
-async function hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force = false, cancelGraceful = false) {
+async function hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force = false) {
   const componentName = componentSpecifications.name;
 
   // Stop monitoring and container
@@ -263,18 +261,8 @@ async function hardUninstallComponent(appName, appId, componentSpecifications, r
     stopAppMonitoring(monitoredName, true);
   }
 
-  // Cancel/expiry: drain components that declared a graceful window (force-kill the
-  // rest). Otherwise: kill on forced removals, graceful stop on normal removals.
-  if (cancelGraceful) {
-    await dockerService.appDockerStopGracefulOrKill(appId).catch((error) => {
-      log.warn(`Failed to stop/kill container ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else if (force) {
+  // Use kill instead of stop for forced removals
+  if (force) {
     await dockerService.appDockerKill(appId).catch((error) => {
       log.warn(`Failed to kill container ${appId}: ${error.message}`);
       const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
@@ -409,7 +397,7 @@ async function hardUninstallComponent(appName, appId, componentSpecifications, r
  // eslint-disable-next-line no-shadow
  */
 // eslint-disable-next-line no-shadow
-async function hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force = false, cancelGraceful = false) {
+async function hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force = false) {
   // Stop monitoring and container
   log.info(`Stopping Flux App ${appName}...`);
   if (res) {
@@ -421,18 +409,8 @@ async function hardUninstallApplication(appName, appId, appSpecifications, res, 
     stopAppMonitoring(appName, true);
   }
 
-  // Cancel/expiry: drain if the app declared a graceful window (force-kill otherwise).
-  // Otherwise: kill on forced removals, graceful stop on normal removals.
-  if (cancelGraceful) {
-    await dockerService.appDockerStopGracefulOrKill(appId).catch((error) => {
-      log.warn(`Failed to stop/kill container ${appId}: ${error.message}`);
-      const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
-      if (res) {
-        res.write(serviceHelper.ensureString(errorResponse));
-        if (res.flush) res.flush();
-      }
-    });
-  } else if (force) {
+  // Use kill instead of stop for forced removals
+  if (force) {
     await dockerService.appDockerKill(appId).catch((error) => {
       log.warn(`Failed to kill container ${appId}: ${error.message}`);
       const errorResponse = messageHelper.createErrorMessage(error.message || error, error.name, error.code);
@@ -786,122 +764,6 @@ async function softUninstallApplication(appName, appId, appSpecifications, res, 
   }
 }
 
-// Guards removeUnrequiredDependencies against overlapping runs (it removes apps,
-// which can re-trigger it).
-let dependencyCleanupInProgress = false;
-
-/**
- * Removes any locally-installed `dependencyOnly` app (e.g. a stats collector)
- * that no installed workload still requires via `networkWith`. Triggered after a
- * workload is removed and at boot. Loops until the set is stable so a chain
- * unwinds fully: removing the datadog that linked to alloy then orphans the alloy.
- * Each removal is a normal (non-forced) removeAppLocally, so the collector's own
- * `gracefulShutdownSec` drain window is honoured; by the time this runs the
- * workload that depended on it has already finished draining and been removed.
- *
- * @returns {Promise<void>}
- */
-async function removeUnrequiredDependencies() {
-  if (dependencyCleanupInProgress) {
-    return;
-  }
-  dependencyCleanupInProgress = true;
-  try {
-    const attempted = new Set();
-    // Bounded: each pass either removes one app or stops. The cap is a backstop.
-    for (let pass = 0; pass < 50; pass += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      const orphans = await appNetworkLinker.findUnrequiredInstalledDependencies();
-      // Remove a consumer before the app it consumes (datadog before the alloy it
-      // links to) so the network/log wiring tears down in dependency order.
-      orphans.sort((a, b) => {
-        if (appNetworkLinker.getLinkedApps(a).some((n) => n.toLowerCase() === b.name.toLowerCase())) return -1;
-        if (appNetworkLinker.getLinkedApps(b).some((n) => n.toLowerCase() === a.name.toLowerCase())) return 1;
-        return 0;
-      });
-      const target = orphans.find((app) => !attempted.has(app.name.toLowerCase()));
-      if (!target) {
-        return;
-      }
-      attempted.add(target.name.toLowerCase());
-      log.info(`Dependency cleanup: removing ${target.name} - no installed app requires it any more`);
-      // force=false honours gracefulShutdownSec; sendMessage=true tells the
-      // network this node dropped it. removeAppLocally swallows its own errors.
-      // eslint-disable-next-line no-await-in-loop
-      await removeAppLocally(target.name, null, false, false, true);
-    }
-    log.warn('Dependency cleanup: reached pass limit, will retry on next trigger');
-  } catch (error) {
-    log.error(`Dependency cleanup failed: ${error.message}`);
-  } finally {
-    dependencyCleanupInProgress = false;
-  }
-}
-
-/**
- * Reverse dependency cascade: before a dependencyOnly app (a stats collector) is
- * removed, gracefully uninstall every installed workload that transitively
- * requires it, so a consumer is never left attached to a torn-down dependency.
- * No-op for components and non-dependencyOnly apps. The caller runs this before
- * acquiring the removal lock so each nested workload removal can acquire it.
- *
- * @param {string} appName - bare app name being removed
- * @returns {Promise<void>}
- */
-async function removeRequiringWorkloadsFirst(appName) {
-  if (!appName || appName.includes('_')) {
-    return; // components don't carry the marker
-  }
-  const dbopen = dbHelper.databaseConnection();
-  const appsDatabase = dbopen.db(config.database.appslocal.database);
-  const spec = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: appName }, { projection: { _id: 0, description: 1 } });
-  if (!spec || !appNetworkLinker.parseDependencyOnly(spec.description)) {
-    return;
-  }
-  const workloads = await appNetworkLinker.findInstalledWorkloadsRequiring(appName);
-  // eslint-disable-next-line no-restricted-syntax
-  for (const workload of workloads) {
-    log.info(`Reverse dependency cascade: uninstalling workload ${workload.name} before its dependency ${appName}`);
-    // force=false honours gracefulShutdownSec; sendMessage=true tells the network.
-    // eslint-disable-next-line no-await-in-loop
-    await removeAppLocally(workload.name, null, false, false, true);
-  }
-}
-
-/**
- * Whether a removal should run the reverse dependency cascade (uninstall the
- * workloads that require a dependencyOnly app before the dependency itself).
- * Fires on a graceful removal (force=false) and on a cancel/expiry, where the
- * expiry sweep sets cancelGraceful=true even though force=true. A plain
- * force-kill (force=true, cancelGraceful=false) does not cascade.
- *
- * @param {boolean} force
- * @param {boolean} cancelGraceful
- * @returns {boolean}
- */
-function shouldReverseCascade(force, cancelGraceful) {
-  return !force || cancelGraceful;
-}
-
-/**
- * Whether a whole-app removal warrants a forward-cascade sweep of now-unrequired
- * dependencyOnly apps. A workload removal stops requiring its deps; a removal that
- * ran the reverse cascade removed workloads that may have required sibling deps.
- * Components never carry the dependency marker, so they are skipped.
- *
- * @param {boolean} isComponent
- * @param {string} description - app-level description (carries the dependencyOnly marker)
- * @param {boolean} force
- * @param {boolean} cancelGraceful
- * @returns {boolean}
- */
-function shouldSweepUnrequiredDependencies(isComponent, description, force, cancelGraceful) {
-  if (isComponent) {
-    return false;
-  }
-  return !appNetworkLinker.parseDependencyOnly(description) || shouldReverseCascade(force, cancelGraceful);
-}
-
 /**
  * Remove application completely from local node
  * @param {string} app - Application name
@@ -911,7 +773,7 @@ function shouldSweepUnrequiredDependencies(isComponent, description, force, canc
  * @param {boolean} sendMessage - Whether to send message to network
  * @returns {Promise<void>}
  */
-async function removeAppLocally(app, res, force = false, endResponse = true, sendMessage = false, cancelGraceful = false) {
+async function removeAppLocally(app, res, force = false, endResponse = true, sendMessage = false) {
   try {
     // Normalise to the bare identifier this function reasons about: a caller may
     // pass the flux-prefixed docker name (e.g. the syncthing flow), which would
@@ -949,15 +811,6 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         }
         return;
       }
-    }
-
-    // Reverse dependency cascade: before tearing down a dependencyOnly app,
-    // gracefully uninstall any installed workload that still requires it - a
-    // consumer must never outlive its dependency (see shouldReverseCascade for when
-    // this fires). Run before the lock below so each nested workload removal can
-    // acquire it. Gated off in production.
-    if (shouldReverseCascade(force, cancelGraceful) && config.fluxapps.manageDependencyOnlyLifecycle) {
-      await removeRequiringWorkloadsFirst(app);
     }
 
     globalState.removalInProgress = true;
@@ -1027,14 +880,14 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
         const appComponentSpecifications = appComposedComponent;
         // eslint-disable-next-line no-await-in-loop
-        await hardUninstallComponent(appName, appId, appComponentSpecifications, res, stopAppMonitoring, force, cancelGraceful);
+        await hardUninstallComponent(appName, appId, appComponentSpecifications, res, stopAppMonitoring, force);
       }
     } else if (isComponent) {
       const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
       appId = dockerService.getAppIdentifier(`${componentSpecifications.name}_${appSpecifications.name}`);
-      await hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force, cancelGraceful);
+      await hardUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, force);
     } else {
-      await hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force, cancelGraceful);
+      await hardUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, force);
     }
 
     // clear node-local runtime state (operator stop lock, crash backoff) for the
@@ -1052,27 +905,6 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       // eslint-disable-next-line no-await-in-loop
       await appsRuntimeState.remove(identifier);
       if (onComponentRemoved) onComponentRemoved(identifier);
-    }
-
-    // A node-pinned app removed via the operator/customer path (force=false) stays
-    // globally registered and still targets this node, so the spawner is obliged to
-    // reinstall it. The spawn-throttle cache (trySpawningGlobalAppCache, default 12h),
-    // set when the app first spawned here, is never cleared on the spawner's success
-    // path and suppresses reselection at appSpawner.js:285 - up to a 12h silent outage
-    // for a single-instance pinned app. Clear it so the next scan reinstalls. Scoped to
-    // whole-app removal of an app that pins THIS node: non-pinned apps keep the throttle
-    // (the network re-places them on another node), and force=true paths are left as-is
-    // (e.g. the over-instance self-removal already clears it; expiry/cancel must not).
-    if (!force && !isComponent && Array.isArray(appSpecifications.nodes) && appSpecifications.nodes.length > 0) {
-      const localSocketAddress = await fluxNetworkHelper.getLocalSocketAddress();
-      if (localSocketAddress && appSpecifications.nodes.some((ip) => socketAddressesMatch(ip, localSocketAddress))) {
-        const globalSpec = await dbHelper.findOneInDatabase(database, globalAppsInformation, { name: appName }, { projection: { _id: 0, hash: 1 } });
-        const { trySpawningGlobalAppCache } = globalState;
-        if (globalSpec && globalSpec.hash && trySpawningGlobalAppCache && trySpawningGlobalAppCache.has(globalSpec.hash)) {
-          trySpawningGlobalAppCache.delete(globalSpec.hash);
-          log.info(`Cleared spawn-throttle cache for node-pinned app ${appName} (hash ${globalSpec.hash}) so the spawner can reinstall it`);
-        }
-      }
     }
 
     fluxEventBus.publish('app:removed', { name: appName });
@@ -1196,19 +1028,6 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
       if (endResponse) {
         res.end();
       }
-    }
-
-    // Removing a workload may orphan a dependencyOnly app (stats collector) that
-    // linked to it; likewise, cancelling a dependencyOnly app reverse-cascades its
-    // workloads above, which can orphan its sibling collectors. Sweep orphans after
-    // this removal's lock clears (the finally below) - see shouldSweepUnrequiredDependencies.
-    // Deferred direct call, not an event subscription - the event bus is
-    // test-observability only. Gated off in production.
-    if (config.fluxapps.manageDependencyOnlyLifecycle
-      && shouldSweepUnrequiredDependencies(isComponent, appSpecifications.description, force, cancelGraceful)) {
-      setImmediate(() => {
-        removeUnrequiredDependencies().catch((error) => log.error(`Dependency cleanup trigger failed: ${error.message}`));
-      });
     }
   } catch (error) {
     log.error(`Error removing app ${app}: ${error.message}`);
@@ -1436,10 +1255,6 @@ module.exports = {
   softUninstallApplication,
   cleanupPorts,
   removeAppLocally,
-  removeUnrequiredDependencies,
-  removeRequiringWorkloadsFirst,
-  shouldReverseCascade,
-  shouldSweepUnrequiredDependencies,
   softRemoveAppLocally,
   removeAppLocallyApi,
   setOnComponentRemoved,

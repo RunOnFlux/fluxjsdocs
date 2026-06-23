@@ -240,14 +240,6 @@ async function reconcileAppsOnBoot() {
     // secondary network membership across the reboot.
     await appNetworkLinker.reconcileAllAppNetworkLinks();
 
-    // Drop any dependencyOnly app (stats collector) left orphaned if its last
-    // workload was removed while this node was down. Based on the local DB, which
-    // still lists the workloads, so collectors with a surviving workload stay.
-    // Gated off in production: flux console owns the dependency lifecycle.
-    if (config.fluxapps.manageDependencyOnlyLifecycle) {
-      await appUninstaller.removeUnrequiredDependencies();
-    }
-
     return results;
   } catch (error) {
     log.error(`appStartupManager - Critical error during recovery: ${error.message}`);
