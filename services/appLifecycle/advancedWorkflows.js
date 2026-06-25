@@ -35,7 +35,12 @@ const appsRuntimeState = require('../appManagement/appsRuntimeState');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
+const { withHostMutationLock } = require('../utils/hostMutationLock');
 const appNetworkLinker = require('./appNetworkLinker');
+const specDiff = require('./specDiff');
+const ComponentRedeployAction = require('./componentRedeployAction');
+const pendingTeardownStore = require('./pendingTeardownStore');
+const InstallResult = require('./installResult');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -500,73 +505,87 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       execDD = `sudo fallocate -l ${appSpecifications.hdd}G ${fluxDirPath}appvolumes/${appId}FLUXFSVOL`; // if root mount then temp file is /flu/appvolumes
     }
 
-    await cmdAsync(execDD);
-    const allocateSpace2 = {
-      status: 'Space allocated',
-    };
-    log.info(allocateSpace2);
-    if (res) {
-      res.write(serviceHelper.ensureString(allocateSpace2));
-      if (res.flush) res.flush();
-    }
+    // Serialize the volume create against a same-app cancel's Phase B teardown, which umounts and
+    // rm -rf's this exact FLUXFSVOL file + mount dir under the same node-wide host-mutation lock.
+    // Unlocked, a register racing a cancel could mke2fs a volume the teardown is mid rm -rf'ing -
+    // byte-level corruption. These are bounded host ops (fallocate/mke2fs/mount, seconds - the
+    // same class the teardown already holds this lock across), so holding it here honours the
+    // lock's "no unbounded wait" rule. Re-check condemned/teardown-owed INSIDE the lock: if the
+    // cancel won the lock first, abort rather than recreate a volume its teardown already passed
+    // (the install's pre-create backstop catches the reverse order, before any container).
+    let execMount;
+    await withHostMutationLock(async () => {
+      if (await appsRuntimeState.isCondemned(identifier) || await pendingTeardownStore.teardownOwedFor(appName)) {
+        throw new Error(`createAppVolume of ${identifier} aborted: a removal/cancel of ${appName} arrived before volume creation`);
+      }
+      await cmdAsync(execDD);
+      const allocateSpace2 = {
+        status: 'Space allocated',
+      };
+      log.info(allocateSpace2);
+      if (res) {
+        res.write(serviceHelper.ensureString(allocateSpace2));
+        if (res.flush) res.flush();
+      }
 
-    const makeFilesystem = {
-      status: 'Creating filesystem...',
-    };
-    log.info(makeFilesystem);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeFilesystem));
-      if (res.flush) res.flush();
-    }
-    let execFS = `sudo mke2fs -t ext4 ${useThisVolume.mount}/${appId}FLUXFSVOL`;
-    if (useThisVolume.mount === '/') {
-      execFS = `sudo mke2fs -t ext4 ${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
-    }
-    await cmdAsync(execFS);
-    const makeFilesystem2 = {
-      status: 'Filesystem created',
-    };
-    log.info(makeFilesystem2);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeFilesystem2));
-      if (res.flush) res.flush();
-    }
+      const makeFilesystem = {
+        status: 'Creating filesystem...',
+      };
+      log.info(makeFilesystem);
+      if (res) {
+        res.write(serviceHelper.ensureString(makeFilesystem));
+        if (res.flush) res.flush();
+      }
+      let execFS = `sudo mke2fs -t ext4 ${useThisVolume.mount}/${appId}FLUXFSVOL`;
+      if (useThisVolume.mount === '/') {
+        execFS = `sudo mke2fs -t ext4 ${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
+      }
+      await cmdAsync(execFS);
+      const makeFilesystem2 = {
+        status: 'Filesystem created',
+      };
+      log.info(makeFilesystem2);
+      if (res) {
+        res.write(serviceHelper.ensureString(makeFilesystem2));
+        if (res.flush) res.flush();
+      }
 
-    const makeDirectory = {
-      status: 'Making directory...',
-    };
-    log.info(makeDirectory);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeDirectory));
-      if (res.flush) res.flush();
-    }
-    const execDIR = `sudo mkdir -p ${appsFolder + appId}`;
-    await cmdAsync(execDIR);
-    const makeDirectory2 = {
-      status: 'Directory made',
-    };
-    log.info(makeDirectory2);
-    if (res) {
-      res.write(serviceHelper.ensureString(makeDirectory2));
-      if (res.flush) res.flush();
-    }
+      const makeDirectory = {
+        status: 'Making directory...',
+      };
+      log.info(makeDirectory);
+      if (res) {
+        res.write(serviceHelper.ensureString(makeDirectory));
+        if (res.flush) res.flush();
+      }
+      const execDIR = `sudo mkdir -p ${appsFolder + appId}`;
+      await cmdAsync(execDIR);
+      const makeDirectory2 = {
+        status: 'Directory made',
+      };
+      log.info(makeDirectory2);
+      if (res) {
+        res.write(serviceHelper.ensureString(makeDirectory2));
+        if (res.flush) res.flush();
+      }
 
-    const mountingStatus = {
-      status: 'Mounting volume...',
-    };
-    log.info(mountingStatus);
-    if (res) {
-      res.write(serviceHelper.ensureString(mountingStatus));
-      if (res.flush) res.flush();
-    }
-    let volumeFile = `${useThisVolume.mount}/${appId}FLUXFSVOL`;
-    if (useThisVolume.mount === '/') {
-      volumeFile = `${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
-    }
-    // Wait for volume file to exist (handles encrypted volumes not yet mounted after reboot)
-    // This ensures @reboot cron jobs don't fail when the encrypted partition isn't ready
-    const execMount = `while [ ! -f ${volumeFile} ]; do sleep 5; done && sudo mount -o loop ${volumeFile} ${appsFolder + appId}`;
-    await cmdAsync(`sudo mount -o loop ${volumeFile} ${appsFolder + appId}`);
+      const mountingStatus = {
+        status: 'Mounting volume...',
+      };
+      log.info(mountingStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(mountingStatus));
+        if (res.flush) res.flush();
+      }
+      let volumeFile = `${useThisVolume.mount}/${appId}FLUXFSVOL`;
+      if (useThisVolume.mount === '/') {
+        volumeFile = `${fluxDirPath}appvolumes/${appId}FLUXFSVOL`;
+      }
+      // Wait for volume file to exist (handles encrypted volumes not yet mounted after reboot)
+      // This ensures @reboot cron jobs don't fail when the encrypted partition isn't ready
+      execMount = `while [ ! -f ${volumeFile} ]; do sleep 5; done && sudo mount -o loop ${volumeFile} ${appsFolder + appId}`;
+      await cmdAsync(`sudo mount -o loop ${volumeFile} ${appsFolder + appId}`);
+    });
     const mountingStatus2 = {
       status: 'Volume mounted',
     };
@@ -849,41 +868,68 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
  * @param {object} res Response.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
+async function softRegisterAppLocally(appSpecs, componentSpecs, res, opts = {}) {
+  // opts.skipPorts: a soft redeploy opens the port delta itself, so the soft reinstall
+  // must NOT open ports here. Defaults false so a plain soft install opens them as before.
+  const skipPorts = opts.skipPorts === true;
+  // Tracks whether THIS call registered its AbortController (below). The finally must only drop
+  // a controller this call actually set: the early DEFERRED bails return BEFORE the set, and an
+  // unconditional delete-by-name there would evict a DIFFERENT in-flight same-name install's
+  // controller, leaving a concurrent cancel unable to abort that install's pull.
+  let controllerRegistered = false;
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
   // register and launch according to specifications in message
   // throw without catching
   try {
-    if (globalState.removalInProgress) {
-      const rStatus = messageHelper.createErrorMessage('Another application is undergoing removal');
-      log.error(rStatus);
+    // Per-app removal gate (mirror registerAppLocally): only THIS app being removed blocks
+    // its own soft reinstall - the node-wide removalInProgress would spuriously fail a soft
+    // redeploy of app A just because an unrelated app B is mid-removal (e.g. a batch cancel).
+    // Return 'deferred' (not undefined) so the tri-state matches the hard path.
+    if (globalState.hasRemovalInProgress(appSpecs.name)) {
+      const rStatus = messageHelper.createWarningMessage(`Flux App ${appSpecs.name} is undergoing removal. Installation deferred.`);
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return;
+      return InstallResult.DEFERRED;
     }
     if (globalState.installationInProgress) {
-      const rStatus = messageHelper.createErrorMessage('Another application is undergoing installation');
-      log.error(rStatus);
+      const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation deferred.');
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return;
+      return InstallResult.DEFERRED;
     }
     globalState.installationInProgress = true;
+    // Register this install's AbortController by app name BEFORE the awaited pre-pull work
+    // (tier, the DB read, the teardownOwedFor gate). A concurrent cancel aborts the in-flight
+    // pull via installingApps.get(name) (verifyAndPullImage threads the signal into docker.pull);
+    // registering only just before the pull left a TOCTOU window where a cancel arriving during
+    // this pre-pull I/O found an empty map and could not abort (the hard path closed this in
+    // appInstaller.js - mirror it here). Keyed on appSpecs.name (appName is not derived until
+    // below); the finally clears it on every return, including the DEFERRED/FAILED bails.
+    globalState.installingApps.set(appSpecs.name, new AbortController());
+    controllerRegistered = true;
     const tier = await generalService.nodeTier().catch((error) => log.error(error));
     if (!tier) {
-      const rStatus = messageHelper.createErrorMessage('Failed to get Node Tier');
-      log.error(rStatus);
+      // Clear the install lock we just set: this `return` bypasses the catch (which
+      // clears it), so a transient nodeTier() failure would otherwise wedge
+      // installationInProgress=true forever and block all future installs.
+      globalState.installationInProgress = false;
+      const rStatus = messageHelper.createWarningMessage('Node tier not yet available; deferring installation');
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return;
+      // 'deferred', NOT undefined/false: a missing tier is transient infra state - matches
+      // registerAppLocally so the two register paths cannot drift.
+      return InstallResult.DEFERRED;
     }
     const appSpecifications = appSpecs;
     const appComponent = componentSpecs;
@@ -935,8 +981,32 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return;
+      // FAILED (a terminal status), distinct from the transient DEFERRED gates above -
+      // completes softRegister's InstallResult tri-state contract.
+      return InstallResult.FAILED;
     }
+
+    // Install-side interlock (cancel-vs-install), mirrored from registerAppLocally: refuse
+    // to (re)install while a teardown of this name is still owed (its pendingAppTeardowns
+    // doc has not cleared). A forced cancel runs background=true, deleting the local row +
+    // clearing removalInProgress in its prelude while the drain + Phase B host teardown
+    // (umount, rm -rf the volume, ufw/UPnP, network) keep running detached - the
+    // "already installed" check above misses it because the row is already gone. Without
+    // this gate a soft redeploy concurrent with a same-name cancel could create a container
+    // on the volume being rm -rf'd. Return DEFERRED (not INSTALLED) so a redeploy caller
+    // skips the port reconcile and does not reinstall on top.
+    if (await pendingTeardownStore.teardownOwedFor(appName)) {
+      globalState.installationInProgress = false;
+      const rStatus = messageHelper.createWarningMessage(`Flux App ${appName} is still being torn down; deferring soft registration until teardown completes.`);
+      log.warn(rStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(rStatus));
+        res.end();
+      }
+      return InstallResult.DEFERRED;
+    }
+
+    // (the install's AbortController was registered earlier, right after the install lock)
 
     // Verify the apps this app must be networked with (networkWith token in the
     // description) are installed locally and owned by the same owner before any
@@ -958,8 +1028,11 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       }
       let fluxNet = null;
       for (let i = 0; i <= 20; i += 1) {
+        // Same host-mutation lock as Phase-B removeAppDockerNetwork: create + removal
+        // both touch the one fluxDockerNetwork_<app> host resource, so serialize them
+        // (a stale same-name removal must not delete a freshly-created network).
         // eslint-disable-next-line no-await-in-loop
-        fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
+        fluxNet = await withHostMutationLock(() => dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue)).catch((error) => log.error(error));
         if (fluxNet || appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
           break;
         }
@@ -1033,6 +1106,9 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
 
     // eslint-disable-next-line global-require
     const appInstaller = require('./appInstaller');
+    // Clear any condemned stamp for what we are installing (shared with registerAppLocally),
+    // so the reconciler does not early-bail on the just-(re)installed component forever.
+    await appInstaller.clearCondemnedStampsForInstall(appSpecifications, isComponent ? appComponent : null);
     if (specificationsToInstall.version >= 4) { // version is undefined for component
       // eslint-disable-next-line no-restricted-syntax
       for (const appComponentSpecs of specificationsToInstall.compose) {
@@ -1044,7 +1120,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
         appComponentSpecs.ram = appComponentSpecs[ramTier] || appComponentSpecs.ram;
         appComponentSpecs.hdd = appComponentSpecs[hddTier] || appComponentSpecs.hdd;
         // eslint-disable-next-line no-await-in-loop
-        await appInstaller.installApplicationSoft(appComponentSpecs, appName, isComponent, res, appSpecifications);
+        await appInstaller.installApplicationSoft(appComponentSpecs, appName, isComponent, res, appSpecifications, skipPorts);
       }
 
       // Restore syncthing cache for apps with syncthing data to prevent data deletion
@@ -1065,7 +1141,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
         }
       }
     } else {
-      await appInstaller.installApplicationSoft(specificationsToInstall, appName, isComponent, res, appSpecifications);
+      await appInstaller.installApplicationSoft(specificationsToInstall, appName, isComponent, res, appSpecifications, skipPorts);
 
       // Restore syncthing cache for non-compose apps with syncthing data
       const hasSyncthingData = specificationsToInstall.containerData && (specificationsToInstall.containerData.includes('g:') || specificationsToInstall.containerData.includes('r:'));
@@ -1096,6 +1172,9 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       res.end();
     }
     globalState.installationInProgress = false;
+    // Signal success so a redeploy caller reconciles its port delta only when the reinstall
+    // actually completed (this is the ONLY INSTALLED-returning path).
+    return InstallResult.INSTALLED;
   } catch (error) {
     globalState.installationInProgress = false;
     const errorResponse = messageHelper.createErrorMessage(
@@ -1108,6 +1187,25 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       res.write(serviceHelper.ensureString(errorResponse));
       if (res.flush) res.flush();
     }
+
+    // Was this throw caused by a concurrent cancel/expiry of THIS app (it aborted the in-flight
+    // pull) rather than a genuine failure? Returning FAILED would make the spawner 7-day-poison
+    // the hash (never cleared), stranding a pinned enterprise app. Defer instead, and do NOT run
+    // our own removeAppLocally - the in-flight cancel already owns the teardown, so a second
+    // removeAppLocally would race it. The PRIMARY signal is this install's own aborted
+    // AbortController, which latches permanently and so cannot be out-raced by a fast detached
+    // teardown clearing the transient removal flag / the durable teardown doc; those remain as
+    // fallbacks (teardownOwedFor also fail-CLOSES on a read blip). Mirrors appInstaller.js.
+    if (globalState.installAborted(appSpecs.name) || globalState.hasRemovalInProgress(appSpecs.name) || await pendingTeardownStore.teardownOwedFor(appSpecs.name)) {
+      const deferStatus = messageHelper.createWarningMessage(`Soft install of ${appSpecs.name} deferred: a concurrent cancel/removal owns its teardown.`);
+      log.warn(deferStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(deferStatus));
+        res.end();
+      }
+      return InstallResult.DEFERRED;
+    }
+
     const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
     log.info(removeStatus);
     log.warn(`REMOVAL REASON: Soft registration failure - ${appSpecs.name} failed during soft registration: ${error.message} (softRegisterAppLocally)`);
@@ -1117,7 +1215,18 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
     }
     // eslint-disable-next-line global-require
     const appUninstaller = require('./appUninstaller');
-    appUninstaller.removeAppLocally(appSpecs.name, res, true);
+    // Await the failure cleanup so the new spec's ports are closed before a redeploy
+    // caller decides what to do with the old ports (was fire-and-forget, which let the
+    // cleanup's close race a reconcile's open). Return FAILED so the caller does NOT
+    // reconcile (open) ports for an app whose reinstall just failed.
+    await appUninstaller.removeAppLocally(appSpecs.name, res, true);
+    return InstallResult.FAILED;
+  } finally {
+    // Drop ONLY this call's AbortController. Guard on controllerRegistered: the early DEFERRED
+    // bails return BEFORE the set, and a bare delete-by-name here would evict a DIFFERENT
+    // in-flight same-name install's controller, leaving a concurrent cancel unable to abort
+    // that install's pull.
+    if (controllerRegistered && appSpecs && appSpecs.name) globalState.installingApps.delete(appSpecs.name);
   }
 }
 
@@ -1128,7 +1237,7 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
  * @param {object} res - Response object for streaming
  * @returns {Promise<void>}
  */
-async function softUninstallComposedApp(appSpecifications, appName, res) {
+async function softUninstallComposedApp(appSpecifications, appName, res, skipPorts = false) {
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
   const appUninstaller = require('./appUninstaller');
@@ -1138,7 +1247,7 @@ async function softUninstallComposedApp(appSpecifications, appName, res) {
   for (const appComposedComponent of appSpecifications.compose.reverse()) {
     const appId = dockerService.getAppIdentifier(`${appComposedComponent.name}_${appSpecifications.name}`);
     // eslint-disable-next-line no-await-in-loop
-    await appUninstaller.softUninstallComponent(appName, appId, appComposedComponent, res, stopAppMonitoring);
+    await appUninstaller.softUninstallComponent(appName, appId, appComposedComponent, res, stopAppMonitoring, skipPorts);
   }
 }
 
@@ -1151,13 +1260,13 @@ async function softUninstallComposedApp(appSpecifications, appName, res) {
  * @param {object} res - Response object for streaming
  * @returns {Promise<void>}
  */
-async function softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res) {
+async function softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res, skipPorts = false) {
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
   const appUninstaller = require('./appUninstaller');
 
   const componentSpecifications = appSpecifications.compose.find((component) => component.name === appComponent);
-  await appUninstaller.softUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring);
+  await appUninstaller.softUninstallComponent(appName, appId, componentSpecifications, res, stopAppMonitoring, skipPorts);
 }
 
 /**
@@ -1168,12 +1277,12 @@ async function softUninstallSingleComponent(appSpecifications, appName, appCompo
  * @param {object} res - Response object for streaming
  * @returns {Promise<void>}
  */
-async function softUninstallSimpleApp(appSpecifications, appName, appId, res) {
+async function softUninstallSimpleApp(appSpecifications, appName, appId, res, skipPorts = false) {
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
   const appUninstaller = require('./appUninstaller');
 
-  await appUninstaller.softUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring);
+  await appUninstaller.softUninstallApplication(appName, appId, appSpecifications, res, stopAppMonitoring, skipPorts);
 }
 
 /**
@@ -1215,30 +1324,38 @@ async function cleanupAppDatabase(appsDatabase, appName, res) {
 }
 
 /**
- * To remove an app locally (including any components) without storage and cache deletion (keeps mounted volumes and cron job). First finds app specifications in database and then deletes the app from database. For app reload. Only for internal usage. We are throwing in functions using this.
+ * To remove an app locally (including any components) without storage and cache deletion (keeps mounted volumes and cron job). First finds app specifications in database and then deletes the app from database. For app reload (soft redeploy). Only for internal usage. We are throwing in functions using this.
+ * Also drops node-local controller state (the durable runtime-state doc - operator lock + condemned stamp - and the reconciler controller verdict, via appUninstaller.dropControllerStateForRedeploy): a soft redeploy is itself an explicit operator "make it run", so a prior operator stop must not survive it. Mirrors the hard path.
  * @param {string} app App name.
  * @param {object} res Response.
  */
-async function softRemoveAppLocally(app, res) {
-  // Validate state
-  if (globalState.removalInProgress) {
-    throw new Error('Another application is undergoing removal');
-  }
-  if (globalState.installationInProgress) {
-    throw new Error('Another application is undergoing installation');
-  }
+async function softRemoveAppLocally(app, res, opts = {}) {
+  // opts.skipPorts: a soft redeploy reconciles the port delta itself, so the soft teardown
+  // must NOT close ports here. Defaults false so a plain soft removal closes them as before.
+  const skipPorts = opts.skipPorts === true;
   if (!app) {
     throw new Error('No Flux App specified');
   }
 
-  globalState.removalInProgress = true;
+  // Parse the bare app name up front: the per-app removal gate below and the
+  // release in the finally both key on it (and appName must outlive the try).
+  const isComponent = app.includes('_'); // component is defined by appComponent.name_appSpecs.name
+  const appName = isComponent ? app.split('_')[1] : app;
+  const appComponent = app.split('_')[0];
+
+  // Per-app gate: serialize a second removal of the SAME app, but let removals of
+  // DIFFERENT apps proceed concurrently (host-mutation lock + condemned stamp carry
+  // the shared/per-container safety).
+  if (globalState.hasRemovalInProgress(appName)) {
+    throw new Error('This application is already undergoing removal');
+  }
+  if (globalState.installationInProgress) {
+    throw new Error('Another application is undergoing installation');
+  }
+
+  globalState.markRemovalInProgress(appName);
 
   try {
-    // Parse app name and component
-    const isComponent = app.includes('_'); // component is defined by appComponent.name_appSpecs.name
-    const appName = isComponent ? app.split('_')[1] : app;
-    const appComponent = app.split('_')[0];
-
     // Fetch app specifications from database
     const dbopen = dbHelper.databaseConnection();
     const appsDatabase = dbopen.db(config.database.appslocal.database);
@@ -1259,21 +1376,38 @@ async function softRemoveAppLocally(app, res) {
     // Determine uninstall strategy based on app type
     if (appSpecifications.version >= 4 && !isComponent) {
       // Composed application - uninstall all components
-      await softUninstallComposedApp(appSpecifications, appName, res);
+      await softUninstallComposedApp(appSpecifications, appName, res, skipPorts);
     } else if (isComponent) {
       // Single component of a composed app
-      await softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res);
+      await softUninstallSingleComponent(appSpecifications, appName, appComponent, appId, res, skipPorts);
     } else {
       // Simple non-composed application
-      await softUninstallSimpleApp(appSpecifications, appName, appId, res);
+      await softUninstallSimpleApp(appSpecifications, appName, appId, res, skipPorts);
     }
+
+    // Node-local controller state dies with the components on the soft path too: a
+    // soft redeploy is an explicit operator "make it run" (it is itself an operator
+    // action), so neither the operator lock nor a stale reconciler verdict may
+    // survive it. Mirrors the hard path - drops the durable runtime-state doc
+    // (operator lock + condemned stamp) and clears the reconciler controller verdict.
+    let removedIdentifiers;
+    if (appSpecifications.version >= 4 && appSpecifications.compose) {
+      removedIdentifiers = isComponent
+        ? [`${appComponent}_${appSpecifications.name}`]
+        : appSpecifications.compose.map((c) => `${c.name}_${appSpecifications.name}`);
+    } else {
+      removedIdentifiers = [appName];
+    }
+    // eslint-disable-next-line global-require
+    const appUninstaller = require('./appUninstaller');
+    await appUninstaller.dropControllerStateForRedeploy(removedIdentifiers);
 
     // Clean up database (only for full app removal, not individual components)
     if (!isComponent) {
       await cleanupAppDatabase(appsDatabase, appName, res);
     }
   } finally {
-    globalState.removalInProgress = false;
+    globalState.removalDone(appName);
   }
 }
 
@@ -1283,6 +1417,13 @@ async function softRemoveAppLocally(app, res) {
  * @param {object} res - Response object
  */
 async function softRedeploy(appSpecs, res) {
+  // Declared out here so the catch can still close the removed ports if the reinstall
+  // fails (the skipPorts soft teardown closed nothing - see the failure handler below).
+  let portsToOpen = [];
+  let portsToClose = [];
+  // Full old port set (see hardRedeploy): closed if the reinstall does not complete.
+  let oldPortsFull = [];
+  let skipPorts = false;
   try {
     if (globalState.removalInProgress) {
       log.warn('Another application is undergoing removal');
@@ -1353,8 +1494,28 @@ async function softRedeploy(appSpecs, res) {
 
     globalState.softRedeployInProgress = true;
     log.info('Starting softRedeploy');
+
+    // Port delta: open only added ports, close only removed ones, leave the rest. v8+
+    // non-enterprise only (resolveInstalledAppForStructureComparison is v8-gated); otherwise
+    // skipPorts stays false and the soft teardown/reinstall flap all ports as before.
+    if (appSpecs.version >= 8) {
+      try {
+        const installedAppsRes = await getInstalledAppsFromDb({ decryptApps: true });
+        const installedApp = installedAppsRes.status === 'success'
+          ? installedAppsRes.data.find((a) => a.name === appSpecs.name) : null;
+        const oldSpec = resolveInstalledAppForStructureComparison(appSpecs, installedApp, 'softRedeploy');
+        if (oldSpec) {
+          ({ toOpen: portsToOpen, toClose: portsToClose } = specDiff.portDelta(oldSpec, appSpecs));
+          oldPortsFull = [...specDiff.appPortSet(oldSpec)];
+          skipPorts = true;
+        }
+      } catch (error) {
+        log.warn(`softRedeploy: port delta unavailable for ${appSpecs.name}, doing a full port setup: ${error.message}`);
+      }
+    }
+
     try {
-      await softRemoveAppLocally(appSpecs.name, res);
+      await softRemoveAppLocally(appSpecs.name, res, { skipPorts });
     } catch (error) {
       log.error(error);
       globalState.softRedeployInProgress = false;
@@ -1371,9 +1532,31 @@ async function softRedeploy(appSpecs, res) {
     // eslint-disable-next-line global-require
     const appInstaller = require('./appInstaller');
     await appInstaller.checkAppRequirements(appSpecs);
-    // register
-    await softRegisterAppLocally(appSpecs, undefined, res);
-    log.info('Application softly redeployed');
+    // register (skipPorts: the reinstall does not open ports - we reconcile the delta below)
+    // Only reconcile (open the added ports) when the reinstall actually succeeded;
+    // softRegisterAppLocally returns an InstallResult (INSTALLED / DEFERRED / FAILED) and
+    // never throws (it cleans up internally), so on anything but INSTALLED we must not leave
+    // freshly-opened ports for an app that is gone (see hardRedeploy for the same logic).
+    const installed = await softRegisterAppLocally(appSpecs, undefined, res, { skipPorts });
+    if (installed === InstallResult.INSTALLED) {
+      if (skipPorts) {
+        // res was already ended by softRegisterAppLocally on success; reconcile with res=null.
+        await reconcileRedeployPorts(appSpecs.name, portsToClose, portsToOpen, null);
+      }
+      log.info('Application softly redeployed');
+    } else {
+      // The reinstall did not complete: close the full old port set so nothing leaks
+      // (skipPorts=false redeploys already full-flapped, leaving oldPortsFull empty) -
+      // but ONLY if the app is confirmed gone, never stripping a row a concurrent
+      // same-name install may have re-adopted.
+      log.warn(`softRedeploy: reinstall of ${appSpecs.name} did not complete (status: ${installed}); closing old ports`);
+      if (skipPorts && oldPortsFull.length && await localAppRowConfirmedAbsent(appSpecs.name)) {
+        // eslint-disable-next-line global-require
+        const appUninstaller = require('./appUninstaller');
+        await withHostMutationLock(() => appUninstaller.cleanupPorts({ ports: oldPortsFull }, appSpecs.name, null, appSpecs.name))
+          .catch((portErr) => log.error(`softRedeploy: closing old ports after incomplete reinstall failed: ${portErr.message}`));
+      }
+    }
     globalState.softRedeployInProgress = false;
   } catch (error) {
     log.info('Error on softRedeploy');
@@ -1383,7 +1566,78 @@ async function softRedeploy(appSpecs, res) {
     // eslint-disable-next-line global-require
     const appUninstaller = require('./appUninstaller');
     await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
+    // The skipPorts soft teardown closed NO ports, and the failure-path removeAppLocally
+    // closes only the new spec's ports - so the removed ports (old-new) would leak. Close
+    // them explicitly (cleanupPorts needs the host-mutation lock held by its caller).
+    if (skipPorts && portsToClose.length) {
+      await withHostMutationLock(() => appUninstaller.cleanupPorts({ ports: portsToClose }, appSpecs.name, null, appSpecs.name))
+        .catch((portErr) => log.error(`softRedeploy failure cleanup: closing removed ports failed: ${portErr.message}`));
+    }
     log.info(`Cleanup completed for ${appSpecs.name} after soft redeploy failure`);
+  }
+}
+
+/**
+ * Whether the app's local DB row is confirmed ABSENT - the precondition for closing
+ * its leftover ports after an incomplete redeploy reinstall. A normal redeploy deleted
+ * the row in its teardown, so an incomplete reinstall leaves the app gone and we close
+ * its old ports. But if a row EXISTS again (a concurrent same-name install re-adopted
+ * the app in the teardown->reinstall delay window), closing would strip a LIVE app's
+ * ufw/UPnP rules - so this returns false on a present row OR a read error, leaving the
+ * ports to that install. Only a confirmed-gone app gets the full-old close.
+ * @param {string} appName
+ * @returns {Promise<boolean>}
+ */
+async function localAppRowConfirmedAbsent(appName) {
+  try {
+    const dbopen = dbHelper.databaseConnection();
+    const appsDatabase = dbopen.db(config.database.appslocal.database);
+    const row = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: appName }, { projection: { _id: 0, name: 1 } });
+    return !row;
+  } catch (error) {
+    log.error(`redeploy: could not read local row for ${appName}; leaving its ports as-is: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Reconcile an app's ufw/UPnP ports during a redeploy: close ONLY the removed ports
+ * (old-new) and open ONLY the added ports (new-old), leaving unchanged ports untouched -
+ * no firewall flap, no ~1s/port UPnP re-map churn. The teardown + reinstall are told to
+ * skipPorts so this is the single place ports move for a redeploy. Reuses the same
+ * cleanupPorts / setupApplicationPorts a normal removal/install use.
+ * @param {string} appName
+ * @param {number[]} toClose - ports present in the old spec but not the new
+ * @param {number[]} toOpen - ports present in the new spec but not the old
+ * @param {object} res
+ */
+async function reconcileRedeployPorts(appName, toClose, toOpen, res) {
+  // eslint-disable-next-line global-require
+  const appUninstaller = require('./appUninstaller');
+  // eslint-disable-next-line global-require
+  const appInstaller = require('./appInstaller');
+  if (toClose && toClose.length) {
+    // cleanupPorts expects its caller to hold the host-mutation lock (runTeardown does);
+    // wrap it here so the removed ports' ufw/UPnP edits serialize the same way.
+    await withHostMutationLock(() => appUninstaller.cleanupPorts({ ports: toClose }, appName, res, appName));
+  }
+  if (toOpen && toOpen.length) {
+    // Cancel-vs-redeploy interlock: a forced cancel of this app (force=true bypasses the per-app
+    // gate) can land after the reinstall returned INSTALLED but before we open the added ports - it
+    // writes a teardown doc, deletes the row, and runs its Phase B port teardown. Opening toOpen for
+    // an app now being torn down orphans those ufw/UPnP rules (there is no periodic deny-sweep, so
+    // they leak until reboot). Gate the open on the SAME teardownOwedFor signal the install side
+    // uses (registerAppLocally); it fails closed and is false for a normal redeploy (this app's own
+    // teardown cleared its doc at FINISH). We cannot make the re-check+open one locked unit -
+    // setupApplicationPorts self-acquires the host-mutation lock per port, so an outer acquisition
+    // would deadlock - but re-checking immediately before the open closes the realistic race, since
+    // the cancel writes its doc before its Phase B port close.
+    if (await pendingTeardownStore.teardownOwedFor(appName)) {
+      log.warn(`reconcileRedeployPorts: teardown owed for ${appName} (a cancel raced the redeploy); skipping the open of ${toOpen.length} added port(s) to avoid orphaned ufw/UPnP rules`);
+      return;
+    }
+    // setupApplicationPorts acquires the lock per port internally.
+    await appInstaller.setupApplicationPorts({ name: appName, ports: toOpen }, appName, false, res);
   }
 }
 
@@ -1395,6 +1649,16 @@ async function softRedeploy(appSpecs, res) {
 async function hardRedeploy(appSpecs, res) {
   // eslint-disable-next-line global-require
   const appUninstaller = require('./appUninstaller');
+  // Declared out here so the catch can still close the removed ports if the reinstall
+  // fails (the skipPorts teardown closed nothing - see the failure handler below).
+  let portsToOpen = [];
+  let portsToClose = [];
+  // The app's full old port set, captured alongside the delta. If the reinstall does
+  // NOT complete (registerAppLocally returns DEFERRED on a concurrent same-name cancel, or
+  // FAILED, rather than throwing), the skipPorts teardown left ALL old ports open and the
+  // app is now gone, so we close the whole set.
+  let oldPortsFull = [];
+  let skipPorts = false;
   try {
     if (globalState.removalInProgress) {
       log.warn('Another application is undergoing removal');
@@ -1434,7 +1698,43 @@ async function hardRedeploy(appSpecs, res) {
     }
     globalState.hardRedeployInProgress = true;
     log.warn(`REMOVAL REASON: Hard redeploy initiated - ${appSpecs.name} being removed as part of hard redeploy process (hardRedeploy)`);
-    await appUninstaller.removeAppLocally(appSpecs.name, res, false, false);
+    // Keep the app's own docker network across the redeploy (it is unchanged for a
+    // same-app redeploy and its networkWith consumers must stay attached - the cascade
+    // flap). Legacy gateway-IP apps must still recreate it. Soft redeploy already keeps
+    // the network; this brings hard into line for everything but the volume.
+    const keepNetwork = !specDiff.mustRecreateNetwork(appSpecs);
+
+    // Port delta: open only added ports, close only removed ones, leave the rest.
+    // resolveInstalledAppForStructureComparison yields the old spec only for v8+ non-enterprise
+    // (or arcane-decryptable) apps - for v1-7 or an undecryptable enterprise spec we fall back
+    // to the full port flap (skipPorts stays false), i.e. exactly the pre-change behaviour.
+    if (appSpecs.version >= 8) {
+      try {
+        const installedAppsRes = await getInstalledAppsFromDb({ decryptApps: true });
+        const installedApp = installedAppsRes.status === 'success'
+          ? installedAppsRes.data.find((a) => a.name === appSpecs.name) : null;
+        const oldSpec = resolveInstalledAppForStructureComparison(appSpecs, installedApp, 'hardRedeploy');
+        if (oldSpec) {
+          ({ toOpen: portsToOpen, toClose: portsToClose } = specDiff.portDelta(oldSpec, appSpecs));
+          oldPortsFull = [...specDiff.appPortSet(oldSpec)];
+          skipPorts = true;
+        }
+      } catch (error) {
+        log.warn(`hardRedeploy: port delta unavailable for ${appSpecs.name}, doing a full port setup: ${error.message}`);
+      }
+    }
+
+    await appUninstaller.removeAppLocally(appSpecs.name, res, false, false, false, false, false, { keepNetwork, skipPorts });
+    // removeAppLocally swallows its own errors and resolves normally even when its prelude
+    // aborts (e.g. the durable teardown doc could not be persisted - C5). Confirm the local
+    // row is actually GONE before claiming "removed" + reinstalling; a present row means the
+    // removal did not complete, so throw and let the catch clean up honestly rather than
+    // streaming a false success and trying to reinstall on top of the still-present app.
+    // (softRemoveAppLocally, used by softRedeploy, propagates its errors, so it needs no such
+    // check.)
+    if (!await localAppRowConfirmedAbsent(appSpecs.name)) {
+      throw new Error(`hardRedeploy: removal of ${appSpecs.name} did not complete (local row still present); aborting redeploy`);
+    }
     const appRedeployResponse = messageHelper.createSuccessMessage('Application removed. Awaiting installation...');
     log.info(appRedeployResponse);
     if (res) {
@@ -1446,15 +1746,46 @@ async function hardRedeploy(appSpecs, res) {
     // eslint-disable-next-line global-require
     const appInstaller = require('./appInstaller');
     await appInstaller.checkAppRequirements(appSpecs);
-    // register
-    await appInstaller.registerAppLocally(appSpecs, undefined, res, false, true); // can throw
-    log.info('Application redeployed');
+    // register (skipPorts: the reinstall does not open ports - we reconcile the delta below)
+    // registerAppLocally returns an InstallResult (INSTALLED / DEFERRED on a transient gate /
+    // FAILED on a real failure it already cleaned up) WITHOUT throwing - so capture it: only
+    // reconcile (which OPENS the added ports) on INSTALLED, else the open would orphan
+    // ufw/UPnP rules for an app that is no longer here.
+    const installed = await appInstaller.registerAppLocally(appSpecs, undefined, res, false, true, { skipPorts }); // can throw
+    if (installed === InstallResult.INSTALLED) {
+      if (skipPorts) {
+        // res was already ended by registerAppLocally on success; reconcile with res=null so
+        // the port-status writes don't hit an ended response (ERR_STREAM_WRITE_AFTER_END).
+        await reconcileRedeployPorts(appSpecs.name, portsToClose, portsToOpen, null);
+      }
+      log.info('Application redeployed');
+    } else {
+      // The reinstall did not complete. The skipPorts teardown left the OLD ports open and
+      // the app is gone, so close the full old set (idempotent: any new-spec ports a failed
+      // install already cleaned up are simply closed again). v1-7/undecryptable redeploys run
+      // skipPorts=false (full flap already closed the old ports) so oldPortsFull stays empty.
+      // Gated on a confirmed-absent row so a concurrent same-name reinstall is never stripped.
+      log.warn(`hardRedeploy: reinstall of ${appSpecs.name} did not complete (status: ${installed}); closing old ports`);
+      if (skipPorts && oldPortsFull.length && await localAppRowConfirmedAbsent(appSpecs.name)) {
+        await withHostMutationLock(() => appUninstaller.cleanupPorts({ ports: oldPortsFull }, appSpecs.name, null, appSpecs.name))
+          .catch((portErr) => log.error(`hardRedeploy: closing old ports after incomplete reinstall failed: ${portErr.message}`));
+      }
+    }
     globalState.hardRedeployInProgress = false;
   } catch (error) {
     log.error(error);
     log.warn(`REMOVAL REASON: Hard redeploy failure - ${appSpecs.name} failed during hard redeploy: ${error.message} (hardRedeploy)`);
     globalState.hardRedeployInProgress = false;
     await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
+    // The skipPorts teardown closed NO ports, and the failure-path removeAppLocally above
+    // closes only the ports of the spec it resolves (the new spec) - so the REMOVED ports
+    // (old-new) would leak as orphaned ufw/UPnP rules (restoreAppsPortsSupport only adds,
+    // never sweeps). Close them explicitly here so a failed port-shrinking redeploy leaks
+    // nothing. cleanupPorts needs the host-mutation lock held by its caller.
+    if (skipPorts && portsToClose.length) {
+      await withHostMutationLock(() => appUninstaller.cleanupPorts({ ports: portsToClose }, appSpecs.name, null, appSpecs.name))
+        .catch((portErr) => log.error(`hardRedeploy failure cleanup: closing removed ports failed: ${portErr.message}`));
+    }
     log.info(`Cleanup completed for ${appSpecs.name} after hard redeploy failure`);
   }
 }
@@ -1553,9 +1884,16 @@ async function softRedeployComponent(appName, componentName, res) {
 
       // Register component
       log.warn(`Continuing Soft Redeployment of component ${fullComponentName}...`);
-      await softRegisterAppLocally(appSpecifications, componentSpec, res);
+      const installed = await softRegisterAppLocally(appSpecifications, componentSpec, res);
 
-      log.info(`Component ${fullComponentName} softly redeployed`);
+      // Only claim success on a real install. A DEFERRED (a same-name cancel still draining, an
+      // unrelated install in progress, or no tier yet) did NOT redeploy - the reconciler/spawner
+      // retries; a FAILED was already cleaned up. Logging success unconditionally would mask both.
+      if (installed === InstallResult.INSTALLED) {
+        log.info(`Component ${fullComponentName} softly redeployed`);
+      } else {
+        log.warn(`Component ${fullComponentName} soft redeploy did not complete (status: ${installed}); will retry`);
+      }
       globalState.softRedeployInProgress = false;
     } catch (error) {
       log.error(error);
@@ -1668,9 +2006,16 @@ async function hardRedeployComponent(appName, componentName, res) {
 
       // Register component
       log.warn(`Continuing Hard Redeployment of component ${fullComponentName}...`);
-      await appInstaller.registerAppLocally(appSpecifications, componentSpec, res);
+      const installed = await appInstaller.registerAppLocally(appSpecifications, componentSpec, res);
 
-      log.info(`Component ${fullComponentName} hard redeployed`);
+      // Only claim success on a real install. A DEFERRED (a same-name cancel still draining, an
+      // unrelated install in progress, or no tier yet) did NOT redeploy - the reconciler/spawner
+      // retries; a FAILED was already cleaned up. Logging success unconditionally would mask both.
+      if (installed === InstallResult.INSTALLED) {
+        log.info(`Component ${fullComponentName} hard redeployed`);
+      } else {
+        log.warn(`Component ${fullComponentName} hard redeploy did not complete (status: ${installed}); will retry`);
+      }
       globalState.hardRedeployInProgress = false;
     } catch (error) {
       log.error(error);
@@ -2653,38 +2998,6 @@ async function validateApplicationUpdateCompatibility(specifications, previousAp
 }
 
 /**
- * Set installation progress state
- * @param {boolean} state - Installation progress state
- */
-function setInstallationInProgress(state) {
-  globalState.installationInProgress = state;
-}
-
-/**
- * Set removal progress state
- * @param {boolean} state - Removal progress state
- */
-function setRemovalInProgress(state) {
-  globalState.removalInProgress = state;
-}
-
-/**
- * Get installation progress state
- * @returns {boolean} Current installation state
- */
-function getInstallationInProgress() {
-  return globalState.installationInProgress;
-}
-
-/**
- * Get removal progress state
- * @returns {boolean} Current removal state
- */
-function getRemovalInProgress() {
-  return globalState.removalInProgress;
-}
-
-/**
  * Add app to restore progress
  * @param {string} appname - App name
  */
@@ -2703,34 +3016,6 @@ function removeFromRestoreProgress(appname) {
   if (index > -1) {
     globalState.restoreInProgress.splice(index, 1);
   }
-}
-
-/**
- * Reset removal progress state
- */
-function removalInProgressReset() {
-  globalState.removalInProgress = false;
-}
-
-/**
- * Set removal in progress to true
- */
-function setRemovalInProgressToTrue() {
-  globalState.removalInProgress = true;
-}
-
-/**
- * Reset installation progress state
- */
-function installationInProgressReset() {
-  globalState.installationInProgress = false;
-}
-
-/**
- * Set installation in progress to true
- */
-function setInstallationInProgressTrue() {
-  globalState.installationInProgress = true;
 }
 
 /**
@@ -3086,24 +3371,8 @@ async function reinstallOldApplications() {
             continue;
           }
 
-          // check if the app spec was changed
-          const auxAppSpecifications = JSON.parse(JSON.stringify(appSpecifications));
-          const auxInstalledApp = JSON.parse(JSON.stringify(installedApp));
-          delete auxAppSpecifications.description;
-          delete auxAppSpecifications.expire;
-          delete auxAppSpecifications.hash;
-          delete auxAppSpecifications.height;
-          delete auxAppSpecifications.instances;
-          delete auxAppSpecifications.owner;
-
-          delete auxInstalledApp.description;
-          delete auxInstalledApp.expire;
-          delete auxInstalledApp.hash;
-          delete auxInstalledApp.height;
-          delete auxInstalledApp.instances;
-          delete auxInstalledApp.owner;
-
-          if (JSON.stringify(auxAppSpecifications) === JSON.stringify(auxInstalledApp)) {
+          // check if the app spec was changed (mask out non-runtime fields - see specDiff)
+          if (!specDiff.specsDiffer(installedApp, appSpecifications)) {
             log.info(`Application ${installedApp.name} was updated without any change on the specifications, updating localAppsInformation db information.`);
             // connect to mongodb
             const dbopen = dbHelper.databaseConnection();
@@ -3194,6 +3463,7 @@ async function reinstallOldApplications() {
             log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (version upgrade path)`);
 
             // Now install components - containers will be created but app is already in DB
+            let allComponentsInstalled = true;
             // eslint-disable-next-line no-restricted-syntax
             for (const appComponent of appSpecifications.compose) {
               log.warn(`Continuing Hard Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
@@ -3201,9 +3471,21 @@ async function reinstallOldApplications() {
               await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
               // install the app
               // eslint-disable-next-line no-await-in-loop
-              await appInstaller.registerAppLocally(appSpecifications, appComponent); // component
+              const installed = await appInstaller.registerAppLocally(appSpecifications, appComponent); // component
+              // Only the whole composed app counts as "updated" when EVERY component installed.
+              // A DEFERRED (concurrent same-name cancel / transient gate) or FAILED here must not
+              // be logged as success: the app row is already inserted, so the spawner's name gate
+              // will NOT re-adopt it - the partial app reconciles on a future update/redeploy.
+              if (installed !== InstallResult.INSTALLED) {
+                allComponentsInstalled = false;
+                log.warn(`Component ${appComponent.name}_${appSpecifications.name} did not complete (status: ${installed})`);
+              }
             }
-            log.warn(`Composed application ${appSpecifications.name} updated.`);
+            if (allComponentsInstalled) {
+              log.warn(`Composed application ${appSpecifications.name} updated.`);
+            } else {
+              log.warn(`Composed application ${appSpecifications.name} update did not fully complete; some components are not installed and will reconcile on a future update/redeploy`);
+            }
             log.warn(`Restarting application ${appSpecifications.name}`);
             // eslint-disable-next-line no-await-in-loop, no-use-before-define
             await appDockerRestart(appSpecifications.name);
@@ -3244,7 +3526,7 @@ async function reinstallOldApplications() {
             // eslint-disable-next-line global-require
             const appInstaller = require('./appInstaller');
 
-            if (appSpecifications.hdd === installedApp.hdd) {
+            if (!specDiff.volumeSpecChanged(installedApp, appSpecifications)) {
               log.warn(`Beginning Soft Redeployment of ${appSpecifications.name}...`);
               // soft redeployment
               // eslint-disable-next-line no-await-in-loop
@@ -3309,6 +3591,16 @@ async function reinstallOldApplications() {
 
               // eslint-disable-next-line no-await-in-loop
               await appUninstaller.removeAppLocally(appSpecifications.name, null, false, false);
+              // removeAppLocally swallows its own errors and resolves normally even when its
+              // prelude aborts (C5); confirm the row is gone before claiming "removed" +
+              // reinstalling. If it is still present the removal did not complete - skip this
+              // app's reinstall this pass (don't report a false success or reinstall on top).
+              // eslint-disable-next-line no-await-in-loop
+              if (!await localAppRowConfirmedAbsent(appSpecifications.name)) {
+                log.error(`reinstallOldApplications: removal of ${appSpecifications.name} did not complete (local row still present); skipping its reinstall this pass`);
+                // eslint-disable-next-line no-continue
+                continue;
+              }
               const appRedeployResponse = messageHelper.createSuccessMessage('Application removed. Awaiting installation...');
               log.info(appRedeployResponse);
 
@@ -3321,8 +3613,15 @@ async function reinstallOldApplications() {
 
               // register
               // eslint-disable-next-line no-await-in-loop
-              await appInstaller.registerAppLocally(appSpecifications, undefined, null, false, true);
-              log.info(`Application ${appSpecifications.name} redeployed with new component structure`);
+              const installed = await appInstaller.registerAppLocally(appSpecifications, undefined, null, false, true);
+              // Only claim success on a real install. The local row was already confirmed gone
+              // above, so a DEFERRED/FAILED simply leaves the app for the spawner to re-adopt -
+              // do not log a false "redeployed" success for a reinstall that did not happen.
+              if (installed === InstallResult.INSTALLED) {
+                log.info(`Application ${appSpecifications.name} redeployed with new component structure`);
+              } else {
+                log.warn(`Application ${appSpecifications.name} structure redeploy did not complete (status: ${installed}); spawner will retry`);
+              }
 
               // eslint-disable-next-line no-continue
               continue;
@@ -3343,9 +3642,15 @@ async function reinstallOldApplications() {
 
                 const installedComponent = installedApp.compose.find((component) => component.name === appComponent.name);
 
-                if (JSON.stringify(installedComponent) === JSON.stringify(appComponent)) {
+                const action = specDiff.classifyComponentRedeploy(installedComponent, appComponent);
+                if (action === ComponentRedeployAction.UNCHANGED) {
                   log.warn(`Component ${appComponent.name}_${appSpecifications.name} specs were not changed, skipping.`);
-                } else if (appComponent.hdd === installedComponent.hdd) {
+                } else if (action === ComponentRedeployAction.NEW) {
+                  // A component ADDED by this update has no installed counterpart to tear down;
+                  // the whole-app re-registration after this loop creates it. (This path used to
+                  // read installedComponent.hdd off undefined and throw.)
+                  log.warn(`Component ${appComponent.name}_${appSpecifications.name} is new in this update; it will be created by the reinstall.`);
+                } else if (action === ComponentRedeployAction.SOFT) {
                   log.warn(`Beginning Soft Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
                   // soft redeployment
                   const appId = dockerService.getAppIdentifier(`${appComponent.name}_${appSpecifications.name}`);
@@ -3355,6 +3660,7 @@ async function reinstallOldApplications() {
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
                 } else {
+                  // HARD: hdd changed -> reset the volume
                   log.warn(`Beginning Hard Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
                   log.warn(`REMOVAL REASON: Hard redeployment (component) - ${appComponent.name}_${appSpecifications.name} HDD changed from ${installedComponent.hdd} to ${appComponent.hdd}`);
                   // hard redeployment
@@ -3404,6 +3710,7 @@ async function reinstallOldApplications() {
               log.info(`Database entry created for ${appSpecifications.name} BEFORE component Docker container creation (composed redeployment path)`);
 
               // Now install components - containers will be created but app is already in DB
+              let allComponentsInstalled = true;
               // eslint-disable-next-line no-restricted-syntax
               for (const appComponent of appSpecifications.compose) {
                 if (appComponent.tiered) {
@@ -3417,25 +3724,47 @@ async function reinstallOldApplications() {
 
                 const installedComponent = installedApp.compose.find((component) => component.name === appComponent.name);
 
-                if (JSON.stringify(installedComponent) === JSON.stringify(appComponent)) {
+                const action = specDiff.classifyComponentRedeploy(installedComponent, appComponent);
+                if (action === ComponentRedeployAction.UNCHANGED) {
                   log.warn(`Component ${appComponent.name}_${appSpecifications.name} specs were not changed, skipping.`);
-                } else if (appComponent.hdd === installedComponent.hdd) {
+                } else if (action === ComponentRedeployAction.SOFT) {
                   log.warn(`Continuing Soft Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
                   // install the app
                   // eslint-disable-next-line no-await-in-loop
-                  await softRegisterAppLocally(appSpecifications, appComponent); // component
+                  const installed = await softRegisterAppLocally(appSpecifications, appComponent); // component
+                  if (installed !== InstallResult.INSTALLED) {
+                    allComponentsInstalled = false;
+                    log.warn(`Component ${appComponent.name}_${appSpecifications.name} did not complete (status: ${installed})`);
+                  }
                 } else {
-                  log.warn(`Continuing Hard Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
+                  // HARD (hdd changed -> volume reset) or NEW (added by this update -> no existing
+                  // volume, install fresh): both need a full hard component install (createAppVolume
+                  // + container). NEW used to read installedComponent.hdd off undefined and throw.
+                  if (action === ComponentRedeployAction.NEW) {
+                    log.warn(`Installing new component ${appComponent.name}_${appSpecifications.name} added by this update...`);
+                  } else {
+                    log.warn(`Continuing Hard Redeployment of component ${appComponent.name}_${appSpecifications.name}...`);
+                  }
                   // eslint-disable-next-line no-await-in-loop
                   await serviceHelper.delay(config.fluxapps.redeploy.composedDelay * 1000);
                   // install the app
                   // eslint-disable-next-line no-await-in-loop
-                  await appInstaller.registerAppLocally(appSpecifications, appComponent); // component
+                  const installed = await appInstaller.registerAppLocally(appSpecifications, appComponent); // component
+                  if (installed !== InstallResult.INSTALLED) {
+                    allComponentsInstalled = false;
+                    log.warn(`Component ${appComponent.name}_${appSpecifications.name} did not complete (status: ${installed})`);
+                  }
                 }
               }
-              log.warn(`Composed application ${appSpecifications.name} updated.`);
+              // Only claim the composed app "updated" when EVERY component installed; a DEFERRED
+              // (concurrent same-name cancel / transient gate) or FAILED must not read as success.
+              if (allComponentsInstalled) {
+                log.warn(`Composed application ${appSpecifications.name} updated.`);
+              } else {
+                log.warn(`Composed application ${appSpecifications.name} update did not fully complete; some components are not installed and will reconcile on a future update/redeploy`);
+              }
               log.warn(`Restarting application ${appSpecifications.name}`);
               // eslint-disable-next-line no-await-in-loop, no-use-before-define
               await appDockerRestart(appSpecifications.name);
@@ -4029,16 +4358,8 @@ module.exports = {
   removeTestAppMount,
   testAppMount,
   validateApplicationUpdateCompatibility,
-  setInstallationInProgress,
-  setRemovalInProgress,
-  getInstallationInProgress,
-  getRemovalInProgress,
   addToRestoreProgress,
   removeFromRestoreProgress,
-  removalInProgressReset,
-  setRemovalInProgressToTrue,
-  installationInProgressReset,
-  setInstallationInProgressTrue,
   checkAndRemoveApplicationInstance,
   reinstallOldApplications,
   checkAndRemoveEnterpriseAppsOnNonArcane,

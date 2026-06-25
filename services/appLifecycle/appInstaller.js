@@ -11,6 +11,9 @@ const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const appUninstaller = require('./appUninstaller');
 const appNetworkLinker = require('./appNetworkLinker');
+const appsRuntimeState = require('../appManagement/appsRuntimeState');
+const pendingTeardownStore = require('./pendingTeardownStore');
+const InstallResult = require('./installResult');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
 const { storeAppInstallingErrorMessage } = require('../appMessaging/messageStore');
@@ -32,6 +35,7 @@ const globalState = require('../utils/globalState');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { findCommonArchitectures } = require('../utils/appUtilities');
+const { withHostMutationLock } = require('../utils/hostMutationLock');
 const log = require('../../lib/log');
 const { localAppsInformation, scannedHeightCollection } = require('../utils/appConstants');
 const messageVerifier = require('../appMessaging/messageVerifier');
@@ -116,7 +120,8 @@ async function performDockerCleanup(res) {
     res.write(serviceHelper.ensureString(dockerImages));
     if (res.flush) res.flush();
   }
-  await dockerService.pruneImages();
+  // serialize the system-wide image prune against concurrent teardown image-removes / pulls
+  await withHostMutationLock(() => dockerService.pruneImages());
   const dockerImages2 = {
     status: 'Docker images cleaned.',
   };
@@ -151,7 +156,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
       // eslint-disable-next-line no-restricted-syntax
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
-        const portResponse = await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
+        const portResponse = await withHostMutationLock(() => fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port)));
         if (portResponse.status === true) {
           const portStatus = {
             status: `Port ${port} OK`,
@@ -174,7 +179,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
       // eslint-disable-next-line no-restricted-syntax
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
-        const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${appName}`);
+        const portResponse = await withHostMutationLock(() => upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${appName}`));
         if (portResponse === true) {
           const portStatus = {
             status: `Port ${port} mapped OK`,
@@ -193,7 +198,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
     // v1 compatibility
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      const portResponse = await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(appSpecifications.port));
+      const portResponse = await withHostMutationLock(() => fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(appSpecifications.port)));
       if (portResponse.status === true) {
         const portStatus = {
           status: `Port ${appSpecifications.port} OK`,
@@ -212,7 +217,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
     const isUPNP = upnpService.isUPNP();
     if (isUPNP) {
       log.info('Custom port specified, mapping ports');
-      const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `Flux_App_${appName}`);
+      const portResponse = await withHostMutationLock(() => upnpService.mapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `Flux_App_${appName}`));
       if (portResponse === true) {
         const portStatus = {
           status: `Port ${appSpecifications.port} mapped OK`,
@@ -291,6 +296,14 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
   // if dockerhub, this is now registry-1.docker.io instead of hub.docker.com
   pullConfig.provider = imgVerifier.provider;
 
+  // Abortable pull: thread this install's AbortController signal (registered by
+  // registerAppLocally, keyed by app name) so a concurrent cancel/removal of the
+  // same app aborts the in-flight pull instead of finishing the download.
+  const inFlightInstall = globalState.installingApps.get(appName);
+  if (inFlightInstall) {
+    pullConfig.abortSignal = inFlightInstall.signal;
+  }
+
   // eslint-disable-next-line no-unused-vars
   await dockerPullStreamPromise(pullConfig, res);
 
@@ -305,48 +318,138 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
 }
 
 /**
+ * Clear the condemned stamp for every component this install will (re)create. Installing
+ * a component is the inverse of condemning it: an installed component must NEVER carry a
+ * condemned stamp or the reconciler's entry gate early-bails on it forever. A prior
+ * teardown of the same identifier may have left a stamp set (e.g. a swallowed DB error
+ * during its finish kept the durable doc for boot recovery); clear it here so this install
+ * is not wedged out of reconciliation until the next reboot. Best-effort per id. Shared by
+ * both register paths (registerAppLocally + softRegisterAppLocally) so they cannot drift.
+ * @param {object} appSpecs - whole-app spec
+ * @param {object} componentSpecs - component spec when installing a single component, else falsy
+ * @returns {Promise<void>}
+ */
+async function clearCondemnedStampsForInstall(appSpecs, componentSpecs) {
+  const appName = appSpecs.name;
+  let identifiers;
+  if (componentSpecs) {
+    identifiers = [`${componentSpecs.name}_${appName}`];
+  } else if (appSpecs.version >= 4 && Array.isArray(appSpecs.compose)) {
+    identifiers = appSpecs.compose.map((c) => `${c.name}_${appName}`);
+  } else {
+    identifiers = [appName];
+  }
+  // eslint-disable-next-line no-restricted-syntax
+  for (const identifier of identifiers) {
+    // eslint-disable-next-line no-await-in-loop
+    await appsRuntimeState.setCondemned(identifier, false).catch((error) => {
+      log.error(`Failed to clear condemned stamp for ${identifier} on install: ${error.message}`);
+    });
+  }
+}
+
+/**
+ * Cancel-during-install backstop. The install registers an AbortController that aborts an
+ * in-flight image PULL, but a cancel that lands AFTER the pull completed (the abort is then
+ * a no-op) would otherwise let createAppVolume/appDockerCreate/appDockerStart run on a
+ * volume the cancel's Phase B is about to rm -rf, leaking a container/volume. Re-check, after
+ * the pull and again before start, whether a cancel arrived; if so, throw so the caller's
+ * catch rolls back the partial state via the idempotent teardown.
+ *
+ * Checks TWO signals: the per-component condemned stamp AND the durable teardown doc. The
+ * stamp alone is insufficient because clearCondemnedStampsForInstall un-condemns up front
+ * (boot-recovery hygiene) with a last-writer-wins write that can ERASE a concurrent cancel's
+ * stamp - but the cancel's pendingAppTeardowns doc is NOT erasable by the install, so it is
+ * the robust signal. isCondemned fails OPEN (a DB blip returns false); teardownOwedFor fails
+ * CLOSED (a DB blip returns true -> abort), which is the safe direction here (better to abort
+ * an install than race a live rm -rf of its volume). This SHRINKS the cancel-during-install
+ * window (the pull abort remains the primary closer); it does not fully eliminate it.
+ * @param {object} appSpecifications - component (or whole-app) spec being installed
+ * @param {string} appName - parent app name
+ * @param {boolean} isComponent - whether installing a compose component
+ * @returns {Promise<void>}
+ */
+async function throwIfCondemnedMidInstall(appSpecifications, appName, isComponent) {
+  const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+  if (await appsRuntimeState.isCondemned(identifier) || await pendingTeardownStore.teardownOwedFor(appName)) {
+    throw new Error(`Install of ${identifier} aborted: a removal/cancel of ${appName} arrived mid-install`);
+  }
+}
+
+/**
  * To register an app locally. Performs pre-installation checks - database in place, Flux Docker network in place and if app already installed. Then registers app in database and performs hard install. If registration fails, the app is removed locally.
  * @param {object} appSpecs App specifications.
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
  * @param {boolean} sendRemovalMessage whether to broadcast removal message to network if installation fails.
- * @returns {Promise<boolean>} Returns true if installation was successful, false otherwise.
+ * @returns {Promise<string>} An InstallResult member: INSTALLED (success), DEFERRED
+ *   (transient - retry, do not cache as a failure), or FAILED (real failure).
  */
-async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false) {
+async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false, opts = {}) {
+  // opts.skipPorts: a redeploy opens the port DELTA itself (new-old) and leaves unchanged
+  // ports untouched, so the install must NOT open this app's ports. A fresh install leaves
+  // it false and opens all ports as before. Only the ufw/UPnP setup is skipped - the
+  // container is still created with its docker port mappings.
+  const skipPorts = opts.skipPorts === true;
+  // Tracks whether THIS call registered its AbortController (below). The finally must only
+  // drop a controller this call actually set: the early DEFERRED bails return BEFORE the set,
+  // and an unconditional delete-by-name there would evict a DIFFERENT in-flight same-name
+  // install's controller, defeating a concurrent cancel's pull-abort.
+  let controllerRegistered = false;
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
   // register and launch according to specifications in message
   try {
-    if (globalState.removalInProgress) {
-      const rStatus = messageHelper.createWarningMessage('Another application is undergoing removal. Installation not possible.');
-      log.error(rStatus);
+    // Per-app: only this app being removed blocks its own (re)install - a removal of a
+    // DIFFERENT app no longer blocks this one (the host-mutation lock serializes the shared
+    // ufw/UPnP/image edits). Returns 'deferred', NOT false: this is a transient "try again"
+    // state, and the spawner must NOT poison its 7-day error cache for it (see appSpawner).
+    if (globalState.hasRemovalInProgress(appSpecs.name)) {
+      const rStatus = messageHelper.createWarningMessage(`Flux App ${appSpecs.name} is undergoing removal. Installation deferred.`);
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return false;
+      return InstallResult.DEFERRED;
     }
     if (globalState.installationInProgress) {
-      const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation not possible');
-      log.error(rStatus);
+      const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation deferred.');
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return false;
+      return InstallResult.DEFERRED;
     }
     globalState.installationInProgress = true;
+    // Register this install's AbortController by app name BEFORE the awaited pre-pull work
+    // (tier, own-IP, the DB reads, the teardownOwedFor gate). A concurrent cancel aborts the
+    // in-flight pull via installingApps.get(name) (verifyAndPullImage threads the signal into
+    // docker.pull); registering only just before the pull left a TOCTOU window where a cancel
+    // arriving during this pre-pull I/O found an empty map and could not abort. The finally
+    // below clears it on every return (including the DEFERRED/FAILED bails below).
+    globalState.installingApps.set(appSpecs.name, new AbortController());
+    controllerRegistered = true;
     const tier = await generalService.nodeTier().catch((error) => log.error(error));
     if (!tier) {
-      const rStatus = messageHelper.createErrorMessage('Failed to get Node Tier');
-      log.error(rStatus);
+      // Clear the install lock we just set: a normal `return` here bypasses the
+      // catch (which clears it), so a transient nodeTier() failure would otherwise
+      // wedge installationInProgress=true forever and block all future installs.
+      globalState.installationInProgress = false;
+      const rStatus = messageHelper.createWarningMessage('Node tier not yet available; deferring installation');
+      log.warn(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
         res.end();
       }
-      return false;
+      // 'deferred', NOT false: nodeTier() reads daemon RPCs that are most blip-prone at
+      // fresh boot (and an enterprise node skips the earlier tier-warming call, so this is
+      // the FIRST tier read). A transient miss is a retry state - returning false makes the
+      // spawner 7-day-poison the hash (never cleared), stranding a pinned enterprise app.
+      return InstallResult.DEFERRED;
     }
 
     const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
@@ -404,8 +507,30 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
         res.write(rStatus);
         res.end();
       }
-      return false;
+      return InstallResult.FAILED;
     }
+
+    // Install-side interlock (cancel-vs-install): refuse to start while a teardown
+    // of this name is still owed (its pendingAppTeardowns doc has not cleared). A
+    // forced cancel runs background=true, so it deletes the local row + clears
+    // removalInProgress in its prelude while the drain + Phase B host teardown
+    // (umount, rm -rf the volume, ufw/UPnP, network) keep running detached - the
+    // "already installed" check above misses it because the row is already gone.
+    // Without this gate a re-registration of the same name would create a fresh
+    // volume that the still-running teardown then rm -rf's. Return 'deferred' (NOT
+    // false): the spawner must treat this as a transient retry, not a 7-day error -
+    // it re-selects on its next cycle/wake, by which time the teardown cleared the doc.
+    if (await pendingTeardownStore.teardownOwedFor(appName)) {
+      globalState.installationInProgress = false;
+      const rStatus = messageHelper.createWarningMessage(`Flux App ${appName} is still being torn down; deferring installation until teardown completes.`);
+      log.warn(rStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(rStatus));
+        res.end();
+      }
+      return InstallResult.DEFERRED;
+    }
+    // (the install's AbortController was registered earlier, right after the install lock)
 
     // Lazy-load appQueryService to avoid circular dependency issues
     // eslint-disable-next-line global-require
@@ -465,8 +590,13 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       }
       let fluxNet = null;
       for (let i = 0; i <= 20; i += 1) {
+        // Take the same host-mutation lock that Phase-B removeAppDockerNetwork holds:
+        // create and removal both touch the one fluxDockerNetwork_<app> host resource, so
+        // they must not run concurrently (a stale same-name removal must not delete a
+        // freshly-created network, nor vice versa). Leaf/per-attempt - a single bounded
+        // docker create, no unbounded wait; neither call site is reached holding the lock.
         // eslint-disable-next-line no-await-in-loop
-        fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
+        fluxNet = await withHostMutationLock(() => dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue)).catch((error) => log.error(error));
         if (fluxNet || appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
           break;
         }
@@ -548,6 +678,9 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
 
     const specificationsToInstall = isComponent ? appComponent : appSpecifications;
 
+    // Clear any condemned stamp for what we are installing (shared with softRegisterAppLocally).
+    await clearCondemnedStampsForInstall(appSpecifications, isComponent ? appComponent : null);
+
     try {
       // Validate database entry exists before creating Docker containers (atomic transaction check)
       // This prevents orphaned Docker containers if DB entry was deleted/corrupted between insert and Docker creation
@@ -572,14 +705,26 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
           appComponentSpecs.ram = test ? 300 : appComponentSpecs[ramTier] || appComponentSpecs.ram;
           appComponentSpecs.hdd = test ? 2 : appComponentSpecs[hddTier] || appComponentSpecs.hdd;
           // eslint-disable-next-line no-await-in-loop, no-use-before-define
-          await installApplicationHard(appComponentSpecs, appName, isComponent, res, appSpecifications, test);
+          await installApplicationHard(appComponentSpecs, appName, isComponent, res, appSpecifications, test, skipPorts);
         }
       } else {
         // eslint-disable-next-line no-use-before-define
-        await installApplicationHard(specificationsToInstall, appName, isComponent, res, appSpecifications, test);
+        await installApplicationHard(specificationsToInstall, appName, isComponent, res, appSpecifications, test, skipPorts);
       }
     } catch (error) {
-      if (!test) {
+      // A concurrent cancel/expiry of THIS app aborts the in-flight install (its image pull, or
+      // the condemned/teardown-owed backstop before container create) and rethrows into here -
+      // BEFORE the outer catch classifies the unwind as DEFERRED. Do NOT publish a network-wide
+      // fluxappinstallingerror for an app we are deliberately tearing down: peers count it as a
+      // real install failure for that hash. Suppress the store + broadcast on the same cancel
+      // signals the outer catch defers on - installAborted latches the instant the cancel fires
+      // (so it is observable here), with the two transient flags as fallbacks - while a genuine
+      // install failure (no cancel) still broadcasts as before. Always rethrow either way so the
+      // outer catch runs its classification.
+      const cancelInFlight = globalState.installAborted(appSpecifications.name)
+        || globalState.hasRemovalInProgress(appSpecifications.name)
+        || await pendingTeardownStore.teardownOwedFor(appSpecifications.name);
+      if (!test && !cancelInFlight) {
         const errorResponse = messageHelper.createErrorMessage(
           error.message || error,
           error.name,
@@ -650,6 +795,29 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       if (res.flush) res.flush();
     }
 
+    // Was this throw caused by a concurrent cancel/expiry of THIS app rather than a genuine
+    // install failure? A cancel aborts the in-flight image pull (it rejects into here) and its
+    // teardown owns anything we created. Returning FAILED would make the spawner 7-day-poison
+    // the hash (never cleared), stranding a pinned enterprise app for ~a week. Defer instead -
+    // and do NOT run our own cleanup removeAppLocally: the in-flight cancel already owns the
+    // teardown, so a second removeAppLocally would race it. The PRIMARY signal is this install's
+    // own aborted AbortController: it latches permanently when the cancel fires, so unlike the
+    // in-memory removal flag (cleared the instant a background teardown is dispatched) and the
+    // durable teardown doc (cleared at FINISH), a fast detached teardown cannot race it clear
+    // before this slower catch runs. The latter two remain as fallbacks (the teardown doc also
+    // fail-CLOSES on a read blip, so a transient DB miss still defers rather than poisons).
+    if (!test && (globalState.installAborted(appSpecs.name) || globalState.hasRemovalInProgress(appSpecs.name) || await pendingTeardownStore.teardownOwedFor(appSpecs.name))) {
+      const deferStatus = messageHelper.createWarningMessage(`Install of ${appSpecs.name} deferred: a concurrent cancel/removal owns its teardown.`);
+      log.warn(deferStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(deferStatus));
+        // End the stream like every other deferred/terminal bail: this path RETURNS (does not
+        // throw), so the REST handler's catch never runs and nothing else closes the response.
+        res.end();
+      }
+      return InstallResult.DEFERRED;
+    }
+
     if (!test) {
       const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
       log.info(removeStatus);
@@ -661,8 +829,13 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       log.info(`Cleanup completed for ${appSpecs.name} after installation failure`);
     }
 
-    return false;
+    return InstallResult.FAILED;
   } finally {
+    // Drop ONLY this call's AbortController. Guard on controllerRegistered: the early
+    // DEFERRED bails (removal-in-progress / another install underway) return BEFORE the set,
+    // and a bare delete-by-name here would evict a DIFFERENT in-flight same-name install's
+    // controller, leaving a concurrent cancel unable to abort that install's pull.
+    if (controllerRegistered && appSpecs && appSpecs.name) globalState.installingApps.delete(appSpecs.name);
     if (test) {
       try {
         await appUninstaller.removeAppLocally(appSpecs.name, null, true, false, false);
@@ -672,7 +845,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       }
     }
   }
-  return true;
+  return InstallResult.INSTALLED;
 }
 
 /**
@@ -764,7 +937,7 @@ async function checkOrbitAppHealth(appSpecifications, appName, isComponent, res)
  * @param {boolean} test - Whether this is a test installation
  * @returns {Promise<void>} Installation result
  */
-async function installApplicationHard(appSpecifications, appName, isComponent, res, fullAppSpecs, test = false) {
+async function installApplicationHard(appSpecifications, appName, isComponent, res, fullAppSpecs, test = false, skipPorts = false) {
   // Verify the apps this app must be networked with (networkWith token) are
   // installed locally and owned by the same owner. Enforced here too — not just
   // in registerAppLocally — so direct callers that bypass it (container health
@@ -772,11 +945,19 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   // network links satisfied.
   await appNetworkLinker.checkAppNetworkRequirements(fullAppSpecs);
 
-  // Setup firewall and UPnP ports (fail fast before downloading images)
-  await setupApplicationPorts(appSpecifications, appName, isComponent, res, test);
+  // Setup firewall and UPnP ports (fail fast before downloading images). A redeploy
+  // passes skipPorts and reconciles the port delta itself (leaving unchanged ports
+  // untouched); a fresh install opens them all.
+  if (!skipPorts) {
+    await setupApplicationPorts(appSpecifications, appName, isComponent, res, test);
+  }
 
   // Verify and pull Docker image
   await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs);
+
+  // Cancel-during-install backstop: a cancel that landed during the (long) pull condemned
+  // this component; bail before creating a volume the cancel's Phase B is about to rm -rf.
+  await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
 
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -816,6 +997,11 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   // Mount paths must exist before the container is created (Syncthing cleanup can
   // remove them while a container is stopped); ensure them at the orchestration layer.
   await volumeService.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
+  // Final cancel-during-install re-check before creating the container: the r:/g: (syncthing/
+  // data) path skips the pre-start backstop below, so without this an aborting cancel could
+  // leave a created container on the volume its Phase B is about to rm -rf. Read-only/idempotent
+  // and a no-op unless a concurrent cancel condemned the app during the pull/volume work.
+  await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
   // Attach this component to the private network of every app it is linked with
@@ -833,6 +1019,8 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   }
   if (test || (!appSpecifications.containerData.includes('r:') && !appSpecifications.containerData.includes('g:'))) {
     const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+    // Final cancel-during-install re-check before starting a container the cancel won't clean up.
+    await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
     const app = await dockerService.appDockerStart(identifier);
     if (!app) {
       throw new Error(`Failed to start ${identifier} container`);
@@ -866,7 +1054,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {object} fullAppSpecs Full app specifications.
  * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs) {
+async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs, skipPorts = false) {
   // Verify the apps this app must be networked with (networkWith token) are
   // installed locally and owned by the same owner. Enforced here too — not just
   // in softRegisterAppLocally — so direct callers that bypass it (container
@@ -874,11 +1062,17 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   // its network links satisfied.
   await appNetworkLinker.checkAppNetworkRequirements(fullAppSpecs);
 
-  // Setup firewall and UPnP ports (fail fast before downloading images)
-  await setupApplicationPorts(appSpecifications, appName, isComponent, res);
+  // Setup firewall and UPnP ports (fail fast before downloading images). A redeploy
+  // passes skipPorts and reconciles the port delta itself; a fresh install opens all.
+  if (!skipPorts) {
+    await setupApplicationPorts(appSpecifications, appName, isComponent, res);
+  }
 
   // Verify and pull Docker image
   await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs);
+
+  // Cancel-during-install backstop: bail if a cancel condemned this component during the pull.
+  await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
 
   const createApp = {
     status: isComponent ? `Creating component ${appSpecifications.name} of local Flux App ${appName}` : `Creating local Flux App ${appName}`,
@@ -892,6 +1086,11 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   // Mount paths must exist before the container is created (Syncthing cleanup can
   // remove them while a container is stopped); ensure them at the orchestration layer.
   await volumeService.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
+  // Final cancel-during-install re-check before creating the container: the g: (syncthing/data)
+  // path skips the pre-start backstop below, so without this an aborting cancel could leave a
+  // created container on the volume its Phase B is about to rm -rf. Read-only/idempotent and a
+  // no-op unless a concurrent cancel condemned the app during the pull.
+  await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
   await dockerService.appDockerCreate(appSpecifications, appName, isComponent, fullAppSpecs);
 
   // Attach this component to the private network of every app it is linked with
@@ -909,6 +1108,8 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   }
   if (!appSpecifications.containerData.includes('g:')) {
     const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+    // Final cancel-during-install re-check before starting a container the cancel won't clean up.
+    await throwIfCondemnedMidInstall(appSpecifications, appName, isComponent);
     const app = await dockerService.appDockerStart(identifier);
     if (!app) {
       throw new Error(`Failed to start ${identifier} container`);
@@ -1229,9 +1430,11 @@ async function testAppInstall(req, res) {
 module.exports = {
   registerAppLocally,
   installApplicationHard,
+  setupApplicationPorts,
   installApplicationSoft,
   installAppLocally,
   checkAppRequirements,
   testAppInstall,
   setOnInstallComplete,
+  clearCondemnedStampsForInstall,
 };

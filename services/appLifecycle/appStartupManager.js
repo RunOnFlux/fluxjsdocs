@@ -240,6 +240,14 @@ async function reconcileAppsOnBoot() {
     // secondary network membership across the reboot.
     await appNetworkLinker.reconcileAllAppNetworkLinks();
 
+    // Drop any dependencyOnly app (stats collector) left orphaned if its last
+    // workload was removed while this node was down. Based on the local DB, which
+    // still lists the workloads, so collectors with a surviving workload stay.
+    // Gated off in production: flux console owns the dependency lifecycle.
+    if (config.fluxapps.manageDependencyOnlyLifecycle) {
+      await appUninstaller.removeUnrequiredDependencies();
+    }
+
     return results;
   } catch (error) {
     log.error(`appStartupManager - Critical error during recovery: ${error.message}`);
@@ -259,6 +267,19 @@ async function removeAllApps(reason) {
 }
 
 async function manageAppsOnBoot(bootContext) {
+  // Boot recovery, phase 1 (synchronous, before the boot gate opens below): a
+  // teardown interrupted by a crash/restart left a durable pendingAppTeardowns
+  // doc. Re-stamp its components condemned NOW so the reconciler (which drains
+  // its queue only after bootContainerStateSettled) can never restart a
+  // recovered-but-unfinished container. Phase 2 (the actual drain replay) runs
+  // in the finally, AFTER the gate settles, so it doesn't compete with the boot
+  // reconciles. Only this stamping step gates the boot.
+  let pendingTeardownDocs = [];
+  try {
+    pendingTeardownDocs = await appUninstaller.stampCondemnedForPendingTeardowns();
+  } catch (error) {
+    log.error(`appStartupManager - failed to re-stamp condemned pending teardowns: ${error.message}`);
+  }
   try {
     if (bootContext.firstBoot) {
       log.info('appStartupManager - First boot (no heartbeat history), waiting for sync');
@@ -322,6 +343,13 @@ async function manageAppsOnBoot(bootContext) {
     globalState.bootContainerStateSettled = true;
     fluxEventBus.publish('boot:settled', {});
     log.info('appStartupManager - Boot container state settled');
+    // Boot recovery, phase 2: replay any interrupted teardown to completion in
+    // the background, now that the gate is open. Fire-and-forget - the durable
+    // doc + condemned stamp keep the containers inert until each replay finishes.
+    if (pendingTeardownDocs.length) {
+      appUninstaller.resumePendingTeardowns(pendingTeardownDocs)
+        .catch((error) => log.error(`appStartupManager - pending teardown recovery failed: ${error.message}`));
+    }
   }
 }
 

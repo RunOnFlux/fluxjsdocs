@@ -27,6 +27,7 @@ const appReconciler = require('./appMonitoring/appReconciler');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
+const registryManager = require('./appDatabase/registryManager');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
@@ -55,6 +56,7 @@ const appTamperingBlocklistService = require('./appTamperingBlocklistService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const appsRuntimeState = require('./appManagement/appsRuntimeState');
+const pendingTeardownStore = require('./appLifecycle/pendingTeardownStore');
 const imageUpdateService = require('./imageUpdateService');
 const { version: fluxVersion } = require('../../../package.json');
 // const throughputLogger = require('./utils/throughputLogger');
@@ -197,6 +199,9 @@ async function startFluxFunctions() {
     // appsRuntimeState (localzelapps): merge any pre-unique-index duplicate docs,
     // then enforce one doc per component identifier
     await appsRuntimeState.prepareCollection();
+    // pendingAppTeardowns (localzelapps): unique index on the teardown key, so a
+    // re-removal can't fork the owed-teardown record
+    await pendingTeardownStore.prepareCollection();
     log.info('Local database prepared');
     log.info('Preparing temporary database...');
     // no need to drop temporary messages
@@ -328,6 +333,11 @@ async function startFluxFunctions() {
     // a removed component's in-memory controller verdict dies with it - a
     // reinstalled g:/r: app must await a fresh election, not inherit a stale one
     appUninstaller.setOnComponentRemoved((id) => appReconciler.clearControllerDesired(id));
+    // wake the spawn loop the instant a spec this node must install is committed,
+    // rather than waiting for the next poll. notifySpecStored self-gates to the
+    // contention-free enterprise-pinned-to-this-node case; every other spec is
+    // ignored and rides the normal cadence.
+    registryManager.setOnSpecStored((spec) => appSpawner.notifySpecStored(spec));
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
