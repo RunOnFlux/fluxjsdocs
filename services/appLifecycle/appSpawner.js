@@ -5,7 +5,6 @@ const serviceHelper = require('../serviceHelper');
 const generalService = require('../generalService');
 const benchmarkService = require('../benchmarkService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
-const fluxCommunicationMessagesSender = require('../fluxCommunicationMessagesSender');
 const geolocationService = require('../geolocationService');
 const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const log = require('../../lib/log');
@@ -25,8 +24,6 @@ const enterpriseNetwork = require('../utils/enterpriseNetwork');
 const { FluxCacheManager } = require('../utils/cacheManager');
 const appInstaller = require('./appInstaller');
 const appUninstaller = require('./appUninstaller');
-const InstallResult = require('./installResult');
-const appNetworkLinker = require('./appNetworkLinker');
 const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
 const fluxEventBus = require('../utils/fluxEventBus');
 
@@ -37,106 +34,6 @@ const spawnReconfirmDelayMs = config.fluxapps.spawnReconfirmDelayMs;
 const nonEnterpriseSpawnDelayMs = config.fluxapps.nonEnterpriseSpawnDelayMs ?? 2 * 60 * 1000;
 
 let spawnLoopRunning = false;
-
-// Last node socket address resolved by a spawn cycle. Cached at module scope
-// so notifySpecStored - which runs outside a spawn cycle, from the spec-store
-// path - can do the pinned-to-this-node check without re-querying benchmark.
-let lastKnownLocalSocketAddr = null;
-
-// One-shot resolver for the inter-cycle idle delay. Set only while the loop is
-// parked in that delay; calling it ends the delay early. Null at every other
-// time, so a wake outside the idle window is a harmless no-op.
-let idleWakeResolve = null;
-// One-bit latch for a wake that arrives while the loop is mid-cycle (idleWakeResolve
-// null): wakeIdleLoop sets it instead of dropping the signal, and spawnLoop checks +
-// clears it before the next idle delay so the wake is honored on the next park rather
-// than lost. Without it a sibling pinned-enterprise spec stored mid-cycle could wait out
-// a ~30s park if the cycle deferred. Single-threaded event loop, so no race.
-let wakePending = false;
-
-/**
- * A node-pinned app whose pin set is no larger than its required instance count has
- * no installation contention: every pinned node is a mandatory installer, so the
- * collision-avoidance election (and the two propagation waits that feed it - the
- * pre-install collision wait and the post-install over-instance self-evict) has
- * nothing to resolve. Owner- and flag-agnostic; provably safe because no overshoot
- * is possible when eligible installers do not exceed required instances.
- * @param {object} appSpecifications - full app spec (carries the `nodes` pin list)
- * @param {number} minInstances - required instance count for the app
- * @returns {boolean}
- */
-function isSoleRequiredInstaller(appSpecifications, minInstances) {
-  const pinnedNodes = appSpecifications && appSpecifications.nodes;
-  return Array.isArray(pinnedNodes)
-    && pinnedNodes.length > 0
-    && pinnedNodes.length <= minInstances;
-}
-
-/**
- * A node-pinned app whose pin set is LARGER than its required instance count has genuine multi-node
- * install contention: more nodes are eligible installers than instances are needed, so a collision-
- * avoidance election must pick the winner(s). Unlike a non-pinned app (open contention), the
- * eligible set is a known, bounded list - which lets such an app run its collision window OFF the
- * serial spawn loop (deferred) instead of via an inline wait that head-of-line-blocks every app
- * queued behind it.
- * @param {object} appSpecifications - full app spec (carries the `nodes` pin list)
- * @param {number} minInstances - required instance count for the app
- * @returns {boolean}
- */
-function isPinnedContended(appSpecifications, minInstances) {
-  const pinnedNodes = appSpecifications && appSpecifications.nodes;
-  return Array.isArray(pinnedNodes)
-    && pinnedNodes.length > 0
-    && pinnedNodes.length > minInstances;
-}
-
-/**
- * Over-instance self-evict check: if more than the required instances are running and this node is
- * the surplus one (newest by runningSince), remove the local instance. Used both inline (sole
- * installer - no propagation wait needed) and detached after a wait (contended app).
- */
-async function overInstanceSelfEvictCheck(appSpecifications, appToRun, appHash, minInstances, localSocketAddr) {
-  const runningAppList = await registryManager.appLocation(appToRun);
-  if (runningAppList.length > minInstances) {
-    runningAppList.sort((a, b) => {
-      if (!a.runningSince && b.runningSince) {
-        return -1;
-      }
-      if (a.runningSince && !b.runningSince) {
-        return 1;
-      }
-      if (a.runningSince < b.runningSince) {
-        return -1;
-      }
-      if (a.runningSince > b.runningSince) {
-        return 1;
-      }
-      return 0;
-    });
-    const index = runningAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
-    log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances, my instance is number ${index + 1}`);
-    if (index + 1 > minInstances) {
-      log.info(`trySpawningGlobalApplication - Application ${appToRun} is going to be removed as already passed the instances required.`);
-      log.warn(`REMOVAL REASON: Exceeded required instances - ${appSpecifications.name} already has sufficient instances, removing local installation (appSpawner)`);
-      globalState.trySpawningGlobalAppCache.delete(appHash);
-      appUninstaller.removeAppLocally(appSpecifications.name, null, true, null, true).catch((error) => log.error(error));
-    }
-  }
-}
-
-/**
- * Detached wrapper for the over-instance self-evict of a contended (non-sole-installer) app. Run
- * fire-and-forget after the install so the post-install propagation wait never blocks the serial
- * spawn loop (an inline 60s sleep would head-of-line-block every queued app). Errors are logged.
- */
-async function scheduleOverInstanceSelfEvict(appSpecifications, appToRun, appHash, minInstances, localSocketAddr) {
-  try {
-    await serviceHelper.delay(1 * 60 * 1000); // give peers' running-broadcasts time to propagate
-    await overInstanceSelfEvictCheck(appSpecifications, appToRun, appHash, minInstances, localSocketAddr);
-  } catch (error) {
-    log.error(error);
-  }
-}
 
 function initialize() {
   appSyncEvents.on(SYNC_EVENTS.SPAWNER_READY, () => {
@@ -156,36 +53,10 @@ function initialize() {
 
 async function spawnLoop() {
   spawnLoopRunning = true;
-  // Start each loop incarnation with a clean latch: a wake can latch wakePending while the
-  // loop is paused (notifySpecStored self-gates on spawnerPaused, but an already-set bit can
-  // carry over), and honoring it after a SPAWNER_READY restart would skip the first cycle's
-  // delay for no reason. Resetting here keeps the latch strictly intra-run.
-  wakePending = false;
   try {
     while (!globalState.spawnerPaused) {
       const delayMs = await trySpawningGlobalApplication();
-      // A wake that fired while we were mid-cycle (idleWakeResolve null) latched
-      // wakePending instead of being dropped; honor it now by skipping this idle
-      // delay so a sibling pinned-enterprise spec stored during the cycle is picked
-      // up immediately instead of waiting out the park. Checked + cleared in exactly
-      // this one place.
-      if (wakePending) {
-        wakePending = false;
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      // Race the inter-cycle delay against a one-shot wake so an app spec this
-      // node must install, landing mid-delay, is picked up now instead of on
-      // the next poll tick. serviceHelper.delay still runs every idle iteration;
-      // the wake stays pending (inert) unless notifySpecStored fires.
-      if (delayMs > 0) {
-        const wake = new Promise((resolve) => { idleWakeResolve = resolve; });
-        try {
-          await Promise.race([serviceHelper.delay(delayMs), wake]);
-        } finally {
-          idleWakeResolve = null;
-        }
-      }
+      if (delayMs > 0) await serviceHelper.delay(delayMs);
     }
   } finally {
     spawnLoopRunning = false;
@@ -268,7 +139,6 @@ async function trySpawningGlobalApplication() {
     if (localSocketAddr === null) {
       throw new Error('Unable to detect Flux IP address');
     }
-    lastKnownLocalSocketAddr = localSocketAddr;
 
     const runningApps = await appQueryService.listRunningApps();
     if (runningApps.status !== 'success') {
@@ -365,7 +235,6 @@ async function trySpawningGlobalApplication() {
           version: '$version',
           enterprise: '$enterprise',
           owner: '$owner',
-          description: { $ifNull: ['$description', ''] },
         },
       },
       { $sort: { name: 1 } },
@@ -387,10 +256,6 @@ async function trySpawningGlobalApplication() {
     let minInstances = null;
     let appFromAppsToBeCheckedLater = false;
     let appFromAppsSyncthingToBeCheckedLater = false;
-    // True when a contended app is pulled back off appsToBeCheckedLater after its collision window
-    // elapsed off-loop: it already broadcast its installing message on the first pass, so it skips
-    // the broadcast + collision wait and goes straight to the over-instance election + install.
-    let collisionWindowElapsed = false;
     const { appsToBeCheckedLater, appsSyncthingToBeCheckedLater } = globalState;
     const appIndex = appsToBeCheckedLater.findIndex((app) => app.timeToCheck <= Date.now());
     const appSyncthingIndex = appsSyncthingToBeCheckedLater.findIndex((app) => app.timeToCheck <= Date.now());
@@ -401,7 +266,6 @@ async function trySpawningGlobalApplication() {
       appToRun = appsToBeCheckedLater[appIndex].appName;
       appHash = appsToBeCheckedLater[appIndex].hash;
       minInstances = appsToBeCheckedLater[appIndex].required;
-      collisionWindowElapsed = appsToBeCheckedLater[appIndex].collisionDeferred === true;
       appsToBeCheckedLater.splice(appIndex, 1);
       appFromAppsToBeCheckedLater = true;
       appsCountAvailableToInstallOnMyNode = Math.max(0, appsCountAvailableToInstallOnMyNode - 1);
@@ -435,45 +299,6 @@ async function trySpawningGlobalApplication() {
       // filter apps that dont have geolocation or have and match my node geolocation
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('ac')).length === 0 || app.geolocation.find((loc) => loc.startsWith('ac') && `ac${myNodeLocation}`.startsWith(loc))));
       globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
-
-      // Suppress dependencyOnly apps (stats collectors) that no workload assigned
-      // to this node requires - they only install while an app networkWith-links
-      // to them, and must not be respawned after a teardown. Best-effort: on a
-      // registry-read failure, fall back to not suppressing rather than aborting.
-      // Gated off in production: flux console owns the dependency lifecycle.
-      if (config.fluxapps.manageDependencyOnlyLifecycle) {
-        try {
-          const requiredDependencyNames = await appNetworkLinker.getRequiredDependencyNamesForNode(localSocketAddr);
-          globalAppNamesLocation = globalAppNamesLocation.filter((app) => !appNetworkLinker.parseDependencyOnly(app.description) || requiredDependencyNames.has(app.name));
-        } catch (error) {
-          log.error(`trySpawningGlobalApplication - could not compute required dependencies, not suppressing collectors this cycle: ${error.message}`);
-        }
-      }
-
-      // Readiness-ordered selection: drop candidates whose networkWith dependencies
-      // are not ready, so a linked group installs root-first (a dependency before
-      // its consumers) instead of a consumer being selected ahead of its dependency
-      // and then starving the loop from the deferred-retry queue. A not-ready app is
-      // simply skipped this cycle and reconsidered once its deps come up - no
-      // priority deferral, so it can never monopolise the loop, and no error cache,
-      // so it installs the instant its dependency appears (e.g. a dependency that is
-      // registered later). This skip is intentionally ungated: it is general spawner
-      // robustness, not part of the node-managed lifecycle. Only the strictness of
-      // "ready" is flag-gated, inside checkAppNetworkRequirements - lifecycle off:
-      // the dependency must be installed locally; on: also actually running.
-      if (globalAppNamesLocation.length > 0) {
-        const readiness = await Promise.all(globalAppNamesLocation.map(async (app) => {
-          try {
-            await appNetworkLinker.checkAppNetworkRequirements({ name: app.name, description: app.description, owner: app.owner });
-            return true;
-          } catch (error) {
-            // Dependency not ready yet -> skip this cycle. Any other error (e.g.
-            // owner mismatch) is a real misconfig handled at install.
-            return error.code !== 'NETWORK_DEPENDENCY_NOT_READY';
-          }
-        }));
-        globalAppNamesLocation = globalAppNamesLocation.filter((_, i) => readiness[i]);
-      }
 
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
       ({ shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, appsCountAvailableToInstallOnMyNode));
@@ -538,25 +363,6 @@ async function trySpawningGlobalApplication() {
     const appSpecifications = await registryManager.getApplicationGlobalSpecifications(appToRun);
     if (!appSpecifications) {
       throw new Error(`trySpawningGlobalApplication - Specifications for application ${appToRun} were not found!`);
-    }
-
-    // A dependencyOnly app (stats collector) installs only while a workload
-    // assigned to this node networkWith-links to it. Re-check here so the deferred
-    // selection path is covered too, and clear the spawn throttle set above so it
-    // is reconsidered promptly once a workload that needs it arrives. Best-effort:
-    // a registry-read failure falls back to allowing the spawn.
-    if (config.fluxapps.manageDependencyOnlyLifecycle && appNetworkLinker.parseDependencyOnly(appSpecifications.description)) {
-      let requiredDeps = null;
-      try {
-        requiredDeps = await appNetworkLinker.getRequiredDependencyNamesForNode(localSocketAddr);
-      } catch (error) {
-        log.error(`trySpawningGlobalApplication - could not check dependency requirement for ${appSpecifications.name}: ${error.message}`);
-      }
-      if (requiredDeps && !requiredDeps.has(appSpecifications.name)) {
-        log.info(`trySpawningGlobalApplication - ${appSpecifications.name} is dependency-only and nothing on this node requires it; skipping spawn`);
-        globalState.trySpawningGlobalAppCache.delete(appHash);
-        return shortDelayTime;
-      }
     }
 
     // eslint-disable-next-line no-restricted-syntax
@@ -857,12 +663,6 @@ async function trySpawningGlobalApplication() {
     }
 
     // an application was selected and checked that it can run on this node. try to install and run it locally
-    // A pinned app with no install contention (pins <= required) skips the propagation waits below
-    // (see isSoleRequiredInstaller). A pinned app with MORE pins than required has genuine multi-node
-    // contention (isPinnedContended) and runs the collision election OFF the loop. A non-pinned app
-    // keeps the legacy inline election.
-    const soleRequiredInstaller = isSoleRequiredInstaller(appSpecifications, minInstances);
-    const pinnedContended = isPinnedContended(appSpecifications, minInstances);
     // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
     let broadcastedAt = Date.now();
     const newAppInstallingMessage = {
@@ -873,53 +673,14 @@ async function trySpawningGlobalApplication() {
       broadcastedAt,
     };
 
-    // Store it in the local DB first (the spawner's own over-instance check below reads
-    // this), then tell peers. The local store stays AWAITED; the broadcast is the part we
-    // can offload on the contention-free path.
-    if (soleRequiredInstaller) {
-      // Contention-free pinned install: the collision/over-instance waits below are skipped
-      // for this path, and nothing local depends on peers having seen the installing message
-      // before we proceed. Fire-and-forget the ~500ms relay so the install starts sooner.
-      // Safe against reordering: the PEER-side consumer (messageStore.storeAppInstallingMessage,
-      // reached via fluxCommunication on receipt - distinct from the local registryManager store
-      // on the line above) applies a fluxappinstalling only if its broadcastedAt is strictly
-      // newer, so a late/duplicate can never clobber a newer state - like the appremoved broadcast.
-      await registryManager.storeAppInstallingMessage(newAppInstallingMessage);
-      fluxCommunicationMessagesSender.broadcastMessageToAll(newAppInstallingMessage)
-        .catch((e) => log.error(`installing broadcast for ${appToRun} failed: ${e.message}`));
-    } else if (pinnedContended && !collisionWindowElapsed) {
-      // Genuine multi-node contention on a pinned app (more pins than required instances): the
-      // collision election needs peers' installing-broadcasts to propagate. Store + broadcast our
-      // intent, then DEFER the propagation window onto appsToBeCheckedLater instead of sleeping on
-      // it inline - an inline delay here freezes the single-threaded spawn loop for the whole window
-      // and head-of-line-blocks every contention-free app queued behind it (e.g. sole-installer apps
-      // pinned only to this node, which have nothing to wait for). It comes back off the queue once
-      // the window has elapsed and proceeds straight to the over-instance election + install below.
-      // The installing message persists in the local registry for installingTtlS (900s, >> the 90s
-      // window), so it is NOT re-stored on the way back, and must not be re-broadcast (which would
-      // reset broadcastedAt and skew the election ordering).
-      await registryManager.storeAppInstallingMessage(newAppInstallingMessage);
-      await fluxCommunicationMessagesSender.broadcastMessageToAll(newAppInstallingMessage);
-      appsToBeCheckedLater.push({
-        appName: appToRun,
-        hash: appHash,
-        required: minInstances,
-        timeToCheck: Date.now() + collisionWaitMs,
-        collisionDeferred: true,
-      });
-      log.info(`trySpawningGlobalApplication - ${appToRun} has multi-node install contention; deferring its ${collisionWaitMs}ms collision window off the spawn loop so contention-free apps queued behind it are not blocked`);
-      return shortDelayTime;
-    } else if (!collisionWindowElapsed) {
-      // Non-pinned app (open contention - any node may install): keep the legacy inline election.
-      // This node population has always paid this wait inline; deferring it too is a broader change
-      // intentionally left out of scope here.
-      await registryManager.storeAppInstallingMessage(newAppInstallingMessage);
-      await fluxCommunicationMessagesSender.broadcastMessageToAll(newAppInstallingMessage);
-      await serviceHelper.delay(collisionWaitMs); // give it 1.5m so messages are propagated on the network
-    }
-    // A pinned-contended app back from the deferred queue (collisionWindowElapsed) already stored +
-    // broadcast its installing message on the first pass, so it falls straight through to the
-    // over-instance election check below.
+    // store it in local database first
+    await registryManager.storeAppInstallingMessage(newAppInstallingMessage);
+    // broadcast messages about running apps to all peers
+    // eslint-disable-next-line global-require
+    const fluxCommMessagesSender = require('../fluxCommunicationMessagesSender');
+    await fluxCommMessagesSender.broadcastMessageToAll(newAppInstallingMessage);
+
+    await serviceHelper.delay(collisionWaitMs); // give it 1.5m so messages are propagated on the network
 
     // double check if app is installed in more of the instances requested
     runningAppList = await registryManager.appLocation(appToRun);
@@ -967,73 +728,50 @@ async function trySpawningGlobalApplication() {
     }
 
     // install the app
-    // Dependency readiness gate: if a networkWith dependency is not ready (not
-    // installed yet, or - with the managed lifecycle on - not yet running), this app
-    // cannot install this cycle. Skip it and reconsider on the next pass; crucially
-    // do NOT push it into appsToBeCheckedLater, which is drained ahead of fresh
-    // selection - an app whose dependency never appears would otherwise re-defer
-    // every cycle and starve all other apps from being selected. Skipping keeps the
-    // loop free and is self-correcting: the app is retried the moment its dependency
-    // comes up, with no error cache to expire (so a dependency registered later is
-    // picked up immediately). This reaches an app processed from the deferred queue
-    // too (which bypasses the selection-time readiness filter): it is spliced out
-    // above and, by not being re-pushed here, leaves the queue. Any other failure
-    // (e.g. owner mismatch) falls through to registerAppLocally, which re-checks and
-    // fails it through the normal path.
+    let registerOk = false;
     try {
-      await appNetworkLinker.checkAppNetworkRequirements(appSpecifications);
-    } catch (error) {
-      if (error && error.code === 'NETWORK_DEPENDENCY_NOT_READY') {
-        log.info(`trySpawningGlobalApplication - ${appToRun} is waiting on a networkWith dependency; skipping this cycle until it comes up`);
-        globalState.trySpawningGlobalAppCache.delete(appHash);
-        fluxEventBus.publish('spawner:deferred', { appName: appToRun, reason: 'dependency_not_ready', delayMs: 0 });
-        return shortDelayTime;
-      }
-      log.warn(`trySpawningGlobalApplication - dependency precheck for ${appToRun} raised a non-deferrable error: ${error.message}`);
-    }
-
-    let registerResult = InstallResult.FAILED;
-    try {
-      registerResult = await appInstaller.registerAppLocally(appSpecifications, null, null, false); // can throw
+      registerOk = await appInstaller.registerAppLocally(appSpecifications, null, null, false); // can throw
     } catch (error) {
       log.error(error);
-      registerResult = InstallResult.FAILED;
+      registerOk = false;
     }
-    if (registerResult === InstallResult.DEFERRED) {
-      // Transient: this app (or another) is mid-removal/install, a same-name teardown is
-      // still owed, or the node tier is not yet resolved. NOT a failure - re-select on the
-      // next cycle/wake once the condition clears. Drop the spawn-throttle entry set
-      // unconditionally at selection time above: left in place it filters this hash out of
-      // candidate selection for the full 12h TTL, turning a seconds-long blip into a half-day
-      // silent outage of a pinned single-instance app. (We likewise never poison the 7-day
-      // spawnErrorsLongerAppCache here - a register->cancel->re-register cycle would otherwise
-      // strand the app for a week; that cache is only for genuine, cleaned-up failures below.)
-      globalState.trySpawningGlobalAppCache.delete(appHash);
-      log.info(`trySpawningGlobalApplication - Install of ${appToRun} deferred (transient), will retry`);
-      return shortDelayTime;
-    }
-    if (registerResult !== InstallResult.INSTALLED) {
-      // FAILED (a real, cleaned-up failure) - cache the hash so we don't immediately retry a
-      // hard failure. (DEFERRED is handled above and never reaches here, so it is never cached.)
+    if (!registerOk) {
       log.info(`trySpawningGlobalApplication - Install failed for ${appToRun}, adding to local error cache`);
       globalState.spawnErrorsLongerAppCache.set(appHash, '');
       fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash });
       return shortDelayTime;
     }
 
-    if (pinnedContended) {
-      // Multi-node contention: the post-install over-instance self-evict needs peers' running-
-      // broadcasts to propagate, but that wait must NOT block the serial spawn loop (an inline 60s
-      // sleep head-of-line-blocks every queued app). Run it detached - the app is already installed,
-      // so this only trims a surplus local instance if the election overshot.
-      scheduleOverInstanceSelfEvict(appSpecifications, appToRun, appHash, minInstances, localSocketAddr);
-    } else {
-      // Non-pinned apps keep the legacy inline propagation wait before the check; sole-installers
-      // can never over-install (pin set <= required) so they need neither the wait nor a real check.
-      if (!soleRequiredInstaller) {
-        await serviceHelper.delay(1 * 60 * 1000); // give running-broadcasts time to propagate
+    await serviceHelper.delay(1 * 60 * 1000); // await 1 minute to give time for messages to be propagated on the network
+    // double check if app is installed in more of the instances requested
+    runningAppList = await registryManager.appLocation(appToRun);
+    if (runningAppList.length > minInstances) {
+      runningAppList.sort((a, b) => {
+        if (!a.runningSince && b.runningSince) {
+          return -1;
+        }
+        if (a.runningSince && !b.runningSince) {
+          return 1;
+        }
+        if (a.runningSince < b.runningSince) {
+          return -1;
+        }
+        if (a.runningSince > b.runningSince) {
+          return 1;
+        }
+        return 0;
+      });
+      const index = runningAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
+      log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned on ${runningAppList.length} instances, my instance is number ${index + 1}`);
+      if (index + 1 > minInstances) {
+        log.info(`trySpawningGlobalApplication - Application ${appToRun} is going to be removed as already passed the instances required.`);
+        log.warn(`REMOVAL REASON: Exceeded required instances - ${appSpecifications.name} already has sufficient instances, removing local installation (appSpawner)`);
+        globalState.trySpawningGlobalAppCache.delete(appHash);
+        // Call appUninstaller.removeAppLocally directly (initialized via initialize())
+        // This needs getGlobalState and stopAppMonitoring callbacks which we don't have here
+        // Since we're removing an app that shouldn't be running, we use basic parameters
+        appUninstaller.removeAppLocally(appSpecifications.name, null, true, null, true).catch((error) => log.error(error));
       }
-      await overInstanceSelfEvictCheck(appSpecifications, appToRun, appHash, minInstances, localSocketAddr);
     }
 
     log.info('trySpawningGlobalApplication - Reinitiating possible app installation');
@@ -1048,64 +786,7 @@ async function trySpawningGlobalApplication() {
   }
 }
 
-/**
- * Wake the spawn loop if it is currently parked in its inter-cycle idle delay.
- * No-op when the loop is mid-cycle (no pending delay) or paused.
- */
-function wakeIdleLoop() {
-  if (idleWakeResolve) {
-    const resolve = idleWakeResolve;
-    idleWakeResolve = null;
-    resolve();
-  } else {
-    // Loop is mid-cycle (no pending delay to interrupt) or between iterations: latch
-    // the wake so spawnLoop skips its NEXT idle delay instead of dropping the signal.
-    wakePending = true;
-  }
-}
-
-/**
- * React to a freshly-stored global app spec by waking the spawn loop early -
- * but ONLY for the contention-free enterprise case where this node is a
- * mandatory installer, so reacting instantly cannot cause an install race:
- *   1. this is an enterprise node,
- *   2. the app is enterprise-owned,
- *   3. its pin set is no larger than its required instances
- *      (isSoleRequiredInstaller - no overshoot, so no install race), and
- *   4. it is pinned to THIS node.
- * Every other spec is left to the normal poll cadence; public/global apps keep
- * their deliberate collision-avoidance latency untouched. Fully synchronous and
- * best-effort: it only ever ends an idle wait early, never installs directly,
- * and never throws into the caller (the spec-store path).
- * @param {object} spec - full app spec just written to globalAppsInformation
- */
-function notifySpecStored(spec) {
-  try {
-    if (!spec || globalState.spawnerPaused) return;
-    // 1. enterprise node only (null = identity not yet resolved -> skip)
-    if (enterpriseNetwork.getCachedEnterpriseIdentity() !== true) return;
-    // 2. enterprise-owned app only
-    if (!enterpriseNetwork.isEnterpriseAppOwner(spec.owner)) return;
-    // 3. contention-free: pinned, with pin set <= required instances. The
-    //    instances default mirrors the globalAppsInformation aggregation's
-    //    `$ifNull: ['$instances', 3]` used to derive required.
-    if (!isSoleRequiredInstaller(spec, spec.instances ?? 3)) return;
-    // 4. pinned to THIS node. lastKnownLocalSocketAddr is null until the first
-    //    spawn cycle resolves this node's address; until then the match yields
-    //    false and the spec simply rides the normal poll cadence.
-    const { nodes } = spec;
-    if (!Array.isArray(nodes) || !nodes.some((ip) => socketAddressesMatch(ip, lastKnownLocalSocketAddr))) return;
-    log.info(`notifySpecStored - ${spec.name} is pinned to this node and contention-free; waking spawn loop`);
-    wakeIdleLoop();
-  } catch (error) {
-    log.error(`notifySpecStored - ${error.message}`);
-  }
-}
-
 module.exports = {
   initialize,
   trySpawningGlobalApplication,
-  isSoleRequiredInstaller,
-  isPinnedContended,
-  notifySpecStored,
 };

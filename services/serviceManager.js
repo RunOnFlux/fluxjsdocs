@@ -27,7 +27,6 @@ const appReconciler = require('./appMonitoring/appReconciler');
 const advancedWorkflows = require('./appLifecycle/advancedWorkflows');
 const imageManager = require('./appSecurity/imageManager');
 const appSpawner = require('./appLifecycle/appSpawner');
-const registryManager = require('./appDatabase/registryManager');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
@@ -56,10 +55,6 @@ const appTamperingBlocklistService = require('./appTamperingBlocklistService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const appsRuntimeState = require('./appManagement/appsRuntimeState');
-const pendingTeardownStore = require('./appLifecycle/pendingTeardownStore');
-const imageCacheStore = require('./appLifecycle/imageCacheStore');
-const imageCacheMaintenance = require('./appLifecycle/imageCacheMaintenance');
-const imageReaper = require('./appLifecycle/imageReaper');
 const imageUpdateService = require('./imageUpdateService');
 const { version: fluxVersion } = require('../../../package.json');
 // const throughputLogger = require('./utils/throughputLogger');
@@ -79,8 +74,6 @@ const {
   cpuCheckIntervalMs,
   imageComplianceIntervalMs,
   forceRemovalIntervalMs,
-  imageReaperIntervalMs,
-  imageCacheEnabled,
   tempMsgTtlS,
 } = config.fluxapps;
 
@@ -137,15 +130,7 @@ async function startFluxFunctions() {
     // resolution, the spawn loop, app-spec validation) have data before they run; the
     // disk read and github fetch are both bounded (10s fetch timeout) so boot is never
     // stuck on this. A failed/invalid sync keeps the last-good value.
-    // De-auth hook: after each successful owner-map refresh, drop image-cache pins owned by a
-    // FluxId no longer allowed on this node. Tied to the refresh (not a blind timer) because the
-    // owner list is the only input and it changes only here. Enterprise-only via imageCacheEnabled;
-    // a no-op elsewhere. (On a node whose github sync is disabled this never fires — boot covers it.)
-    const onOwnerMapRefreshed = imageCacheEnabled
-      ? () => imageCacheMaintenance.cleanupDeauthorizedOwners()
-        .catch((err) => log.error(`imageCache - de-auth cleanup error: ${err.message}`))
-      : undefined;
-    await enterpriseConfig.startSync(onOwnerMapRefreshed).catch((err) => log.error(`enterpriseConfig sync start error: ${err.message}`));
+    await enterpriseConfig.startSync().catch((err) => log.error(`enterpriseConfig sync start error: ${err.message}`));
     // Hard dependencies — nothing starts until these are confirmed.
     await dbHelper.waitForMongo();
     await dockerService.waitForDocker();
@@ -214,12 +199,6 @@ async function startFluxFunctions() {
     // appsRuntimeState (localzelapps): merge any pre-unique-index duplicate docs,
     // then enforce one doc per component identifier
     await appsRuntimeState.prepareCollection();
-    // pendingAppTeardowns (localzelapps): unique index on the teardown key, so a
-    // re-removal can't fork the owed-teardown record
-    await pendingTeardownStore.prepareCollection();
-    // cachedImages (localzelapps): unique index on (fluxId, repotag) so a re-submit
-    // can't fork an owner's pin record, plus a repotag lookup for the retention gate
-    await imageCacheStore.prepareCollection();
     log.info('Local database prepared');
     log.info('Preparing temporary database...');
     // no need to drop temporary messages
@@ -351,11 +330,6 @@ async function startFluxFunctions() {
     // a removed component's in-memory controller verdict dies with it - a
     // reinstalled g:/r: app must await a fresh election, not inherit a stale one
     appUninstaller.setOnComponentRemoved((id) => appReconciler.clearControllerDesired(id));
-    // wake the spawn loop the instant a spec this node must install is committed,
-    // rather than waiting for the next poll. notifySpecStored self-gates to the
-    // contention-free enterprise-pinned-to-this-node case; every other spec is
-    // ignored and rides the normal cadence.
-    registryManager.setOnSpecStored((spec) => appSpawner.notifySpecStored(spec));
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
@@ -384,7 +358,8 @@ async function startFluxFunctions() {
       fluxCommunication.startDiscovery();
       log.info('Flux Discovery started');
     }
-    // Cleanup and fix crontab mount entries (add wait logic, remove stale entries, ensure mounts are active)
+    // Mount every installed app's data volume (derived from the installed-apps
+    // DB) and drop the superseded legacy @reboot remount crontab entries
     log.info('crontab and mounts cleanup...');
     await crontabAndMountsCleanup.cleanupCrontabAndMounts().catch((error) => {
       log.error(`Crontab and mounts cleanup service error: ${error.message}`);
@@ -463,19 +438,6 @@ async function startFluxFunctions() {
       }, portRestoreIntervalMs);
     };
     startDbDependentServices();
-    // Enterprise image-cache boot reconcile (interrupted pulls + de-auth + orphan). Gated on the
-    // same shared awaitables cleanupOwnershipViolations uses — the DB must be loaded and the node
-    // identity resolved (cleanupDeauthorizedOwners reads the allowed-owner list, null until then).
-    // A separate block (not nested in startDbDependentServices) so this pure DB-record bookkeeping
-    // runs concurrently with — not behind — that function's heavy app-teardown work.
-    const runImageCacheBootMaintenance = async () => {
-      await globalState.waitForDbReady();
-      await identityReady;
-      await imageCacheMaintenance.runBootReconcile();
-    };
-    if (imageCacheEnabled) {
-      runImageCacheBootMaintenance().catch((err) => log.error(`imageCache - boot maintenance error: ${err.message}`));
-    }
     log.info('Starting setting Node Geolocation');
     geolocationService.setNodeGeolocation();
     setTimeout(() => {
@@ -542,24 +504,9 @@ async function startFluxFunctions() {
     // Hash sync and spawner startup are now managed by the AppSyncOrchestrator (event-driven)
     orchestrator.start(bootContext);
     log.info('AppSyncOrchestrator started');
-    setInterval(async () => {
-      await imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
-      // Orphan hook: the compliance sweep is the main out-of-band remover of a pinned image
-      // (a blacklisted one), so reconcile cache records against docker right after it runs.
-      if (imageCacheEnabled) {
-        await imageCacheMaintenance.reconcileOrphanedRecords()
-          .catch((err) => log.error(`imageCache - orphan reconcile error: ${err.message}`));
-      }
+    setInterval(() => {
+      imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
     }, imageComplianceIntervalMs);
-    // Cold-image reaper (ALL nodes — deliberately NOT gated on imageCacheEnabled): reclaim
-    // unused tagged images. Delayed first run so docker has loaded its container objects, then
-    // daily. Also triggered at the end of every image update (imageUpdateService).
-    setTimeout(() => {
-      imageReaper.pruneUnusedImages().catch((err) => log.error(`imageReaper boot run error: ${err.message}`));
-      setInterval(() => {
-        imageReaper.pruneUnusedImages().catch((err) => log.error(`imageReaper error: ${err.message}`));
-      }, imageReaperIntervalMs);
-    }, bootDelay(10 * 60 * 1000));
     setTimeout(() => {
       advancedWorkflows.forceAppRemovals();
       setInterval(() => {

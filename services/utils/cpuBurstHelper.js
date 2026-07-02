@@ -3,8 +3,18 @@ const os = require('os');
 const path = require('path');
 const config = require('config');
 const log = require('../../lib/log');
+const enterpriseConfig = require('./enterpriseConfig');
 
 let burstSupportCache = null;
+
+/**
+ * Checks if an app owner is in the enterprise app owners whitelist.
+ * @param {string} owner - The app owner address
+ * @returns {boolean}
+ */
+function isEnterpriseOwner(owner) {
+  return enterpriseConfig.getEnterpriseAppOwners().includes(owner);
+}
 
 /**
  * Checks if the system supports CFS CPU burst (cgroups v2 + kernel >= 5.14).
@@ -192,6 +202,7 @@ function resetBurstSupportCache() {
 }
 
 module.exports = {
+  isEnterpriseOwner,
   isCpuBurstSupported,
   getCgroupBurstPath,
   calculateBurstParams,

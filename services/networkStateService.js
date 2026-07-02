@@ -168,19 +168,6 @@ async function getRandomSocketAddress(socketAddress) {
 }
 
 /**
- * Returns up to `count` random socket addresses from the network state, honouring
- * the diversity/exclusion options of NetworkStateManager.getRandomSocketAddresses.
- * @param {number} count
- * @param {{excludeSocketAddress?: string, distinctPrefixes?: boolean}} [options]
- * @returns {Promise<string[]>}
- */
-async function getRandomSocketAddresses(count, options) {
-  if (!stateManager) return [];
-
-  return stateManager.getRandomSocketAddresses(count, options);
-}
-
-/**
  *
  * @param {string} socketAddress
  * @returns {Promise<Fluxnode | null>}
@@ -213,7 +200,6 @@ module.exports = {
   getFluxnodeBySocketAddress,
   getFluxnodesByPubkey,
   getRandomSocketAddress,
-  getRandomSocketAddresses,
   networkState,
   nodeCount,
   pubkeyInNetworkState,

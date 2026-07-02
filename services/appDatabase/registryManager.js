@@ -25,37 +25,6 @@ const {
 
 let reindexRunning = false;
 
-// Control-plane hook fired after an app spec is committed to
-// globalAppsInformation. Wired by serviceManager to the spawner so a spec this
-// node must install can wake the spawn loop immediately instead of waiting for
-// the next poll. Distinct from the fluxEventBus 'app:specStored' event beside
-// each call site, which is test-observability only (a no-op in production).
-let onSpecStored = null;
-
-/**
- * Register the spec-stored control hook. Single-slot (last wins), matching the
- * setOn* idiom used by appInstaller/appReconciler/appUninstaller.
- * @param {(spec: object) => void} callback
- */
-function setOnSpecStored(callback) {
-  onSpecStored = callback;
-}
-
-/**
- * Fire the spec-stored hook with the full committed spec. Best-effort and
- * synchronous; a throwing hook is logged and swallowed so it can never break
- * the spec-store path.
- * @param {object} spec - the app spec just written to globalAppsInformation
- */
-function emitSpecStored(spec) {
-  if (!onSpecStored) return;
-  try {
-    onSpecStored(spec);
-  } catch (error) {
-    log.error(`emitSpecStored callback error: ${error.message}`);
-  }
-}
-
 /**
  * Get all app hashes from the blockchain
  * @param {object} _req - Request object (unused)
@@ -1191,12 +1160,10 @@ async function updateAppSpecsForRescanReindex(appSpecs) {
     if (appInfo.height < appSpecs.height) {
       await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
       fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-      emitSpecStored(appSpecs);
     }
   } else {
     await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
     fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    emitSpecStored(appSpecs);
   }
   return true;
 }
@@ -1214,7 +1181,6 @@ async function storeAppSpecificationInPermanentStorage(appSpec) {
     await dbHelper.insertOneToDatabase(database, globalAppsInformation, appSpec);
 
     fluxEventBus.publish('app:specStored', { name: appSpec.name, hash: appSpec.hash });
-    emitSpecStored(appSpec);
     log.info(`App specification stored permanently for ${appSpec.name}`);
     return { status: 'success', message: 'App specification stored' };
   } catch (error) {
@@ -1393,150 +1359,6 @@ async function getAllGlobalApplications(proj = []) {
 }
 
 /**
- * The block height at which an app's registration expires, applying the PON-fork
- * 4x-speed adjustment for apps registered before the fork that expire after it.
- * @param {{height: number, expire?: number}} app - app spec (registration height + expire)
- * @param {number} explorerHeight - current scanned height (for the fork-active check)
- * @returns {number} the effective expiration height
- */
-function expirationHeightOf(app, explorerHeight) {
-  // Determine default expire based on whether app was registered after PON fork
-  const defaultExpire = app.height >= config.fluxapps.daemonPONFork
-    ? config.fluxapps.blocksLasting * 4
-    : config.fluxapps.blocksLasting;
-  const expireIn = app.expire || defaultExpire;
-  let actualExpirationHeight = app.height + expireIn;
-
-  // If app was registered before fork block and we are past fork block the chain
-  // moves 4x faster, so adjust the expiration accordingly.
-  if (app.height < config.fluxapps.daemonPONFork && explorerHeight >= config.fluxapps.daemonPONFork) {
-    const originalExpirationHeight = app.height + expireIn;
-    if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
-      const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
-      const adjustedBlocksAfterFork = blocksAfterFork * 4;
-      actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
-    }
-  }
-
-  return actualExpirationHeight;
-}
-
-/**
- * Expire a single application by name: delete its global spec row + the two
- * installing-error collections, then remove it locally (cancel/expiry semantics:
- * force, no streamed response, broadcast removed, and graceful-drain the
- * components that declared a window). The ONE shared per-app expiry body for the
- * periodic sweep, the reindex/IBD path, and the detect-at-tip hook. Every delete
- * is idempotent, so it is safe to call whether or not the app is still globally
- * registered or locally installed.
- *
- * @param {string} appName
- * @param {{async?: boolean}} [opts] - async=true (default) backgrounds the local
- *   teardown so the prelude enforces promptly while the slow drain runs detached
- *   (at-tip sweep + detect-at-tip); false awaits the full teardown (the throttled
- *   reindex/IBD path, where a backgrounded drain mid-catch-up is undesirable).
- * @returns {Promise<void>}
- */
-async function expireSingleApplication(appName, { async: background = true } = {}) {
-  const db = dbHelper.databaseConnection();
-  const databaseApps = db.db(config.database.appsglobal.database);
-  // global cleanup (idempotent: delete-if-present)
-  await dbHelper.findOneAndDeleteInDatabase(databaseApps, globalAppsInformation, { name: appName }, {});
-  await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsLocations, { name: appName });
-  await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsBroadcasts, { 'data.name': appName });
-  // Local teardown ONLY if the app is actually installed here - otherwise a
-  // globally-expired app this node never ran would force a spurious teardown +
-  // fluxappremoved broadcast (removeAppLocally's force path falls back to the
-  // permanent-message spec). force (skip the in-progress gate), no res, broadcast
-  // removed, cancelGraceful drain, background per the param.
-  const databaseLocal = db.db(config.database.appslocal.database);
-  const installed = await dbHelper.findOneInDatabase(databaseLocal, localAppsInformation, { name: appName }, { projection: { _id: 0, name: 1 } });
-  if (installed) {
-    // Dynamic require avoids the registryManager<->appUninstaller cycle.
-    // eslint-disable-next-line global-require
-    const appUninstaller = require('../appLifecycle/appUninstaller');
-    await appUninstaller.removeAppLocally(appName, null, true, false, true, true, background);
-  }
-}
-
-/**
- * Prompt at-tip expiry of this node's LOCALLY-installed apps. Runs EVERY block at
- * the chain tip (vs the periodic %8 global sweep), so a cancel/expiry is enforced
- * the instant the app becomes eligible (~H+1, one block, ~30 s) instead of waiting
- * up to 4 min for the next sweep tick. The local rows only scope WHICH apps this
- * node runs; the expiry-driving height/expire are read from the AUTHORITATIVE
- * global registry (name/height/expire are plaintext even for enterprise apps, so
- * the per-block read is cheap and decrypt-free). Eligibility uses <= (not the %8
- * backstop's strict <) to match detect-at-tip in messageVerifier (actualExpiration
- * Height <= daemonHeight), so an app is torn down the block its term ends rather
- * than one block later. The %8 expireGlobalApplications stays the global-collection
- * cleanup + the deterministic strict-< backstop; detect-at-tip covers re-processed
- * messages.
- *
- * @param {number} explorerHeight - current scanned tip height
- * @returns {Promise<void>}
- */
-async function expireInstalledApplications(explorerHeight) {
-  try {
-    // A reindex empties globalAppsInformation mid-rebuild, so reading the registry
-    // now would make every installed app look unregistered and force a mass
-    // teardown. Skip this tick; the next block (or the %8 backstop) re-evaluates
-    // once the rebuild has repopulated it.
-    if (reindexRunning) return;
-
-    const db = dbHelper.databaseConnection();
-    const appsLocalDb = db.db(config.database.appslocal.database);
-    const appsGlobalDb = db.db(config.database.appsglobal.database);
-
-    // The local rows are runtime state: they only tell us WHICH apps this node
-    // runs (the decision scope). They are NOT the expiry authority.
-    const installed = await dbHelper.findInDatabase(appsLocalDb, localAppsInformation, {}, { projection: { _id: 0, name: 1, height: 1, expire: 1 } });
-    if (!installed.length) return;
-
-    // Expiry is a property of the network-confirmed spec, so its one authoritative
-    // source is the global registry. name/height/expire are plaintext top-level
-    // even for enterprise apps (only compose/contacts are encrypted), so this is a
-    // no-decrypt, this-node-scoped projection.
-    const names = installed.map((app) => app.name);
-    const globalRows = await dbHelper.findInDatabase(appsGlobalDb, globalAppsInformation, { name: { $in: names } }, { projection: { _id: 0, name: 1, height: 1, expire: 1 } });
-    const globalByName = new Map(globalRows.map((row) => [row.name, row]));
-
-    const expired = [];
-    installed.forEach((localApp) => {
-      // Prefer the authoritative global spec; fall back to the local row only when
-      // the app has no global registration (forever/manual installs, or a row a
-      // prior sweep already deleted - the %8 installedApps backstop still reaps those).
-      const authoritative = globalByName.get(localApp.name) || localApp;
-      // forever-lasting app - never expires. Checked FIRST so height===0 is not
-      // swallowed by the !height branch below (which would otherwise force-expire it).
-      if (authoritative.height === 0) return;
-      // genuinely missing height (corrupt/legacy row) - treat as expired.
-      if (!authoritative.height) {
-        expired.push({ name: localApp.name, expirationHeight: 0 });
-        return;
-      }
-      // <= (not the %8 sweep's <) tears the app down at H+1 instead of H+2, matching
-      // detect-at-tip so this prompt path no longer lags the message path by a block.
-      const expirationHeight = expirationHeightOf(authoritative, explorerHeight);
-      if (expirationHeight <= explorerHeight) {
-        expired.push({ name: localApp.name, expirationHeight });
-      }
-    });
-    if (!expired.length) return;
-    // earliest-expired first (mirrors the sweep)
-    expired.sort((a, b) => a.expirationHeight - b.expirationHeight);
-    // eslint-disable-next-line no-restricted-syntax
-    for (const { name } of expired) {
-      log.warn(`REMOVAL REASON: App expired - ${name} reached expiration date (at-tip prompt enforcement)`);
-      // eslint-disable-next-line no-await-in-loop
-      await expireSingleApplication(name, { async: true });
-    }
-  } catch (error) {
-    log.error(`expireInstalledApplications failed: ${error.message}`);
-  }
-}
-
-/**
  * Remove expired applications from global database and local installations
  * @returns {Promise<void>} Completion status
  */
@@ -1569,8 +1391,28 @@ async function expireGlobalApplications() {
     const results = await dbHelper.findInDatabase(databaseApps, globalAppsInformation, queryApps, projectionApps);
     const appsToExpire = [];
     results.forEach((appSpecs) => {
-      // registered/updated on height, expires in expireIn is lower than current height
-      if (expirationHeightOf(appSpecs, explorerHeight) < explorerHeight) {
+      // Determine default expire based on whether app was registered after PON fork
+      const defaultExpire = appSpecs.height >= config.fluxapps.daemonPONFork
+        ? config.fluxapps.blocksLasting * 4
+        : config.fluxapps.blocksLasting;
+      const expireIn = appSpecs.expire || defaultExpire;
+      let actualExpirationHeight = appSpecs.height + expireIn;
+
+      // If app was registered before fork block and we are past fork block
+      // the chain moves 4x faster, so we need to adjust the expiration
+      if (appSpecs.height < config.fluxapps.daemonPONFork && explorerHeight >= config.fluxapps.daemonPONFork) {
+        const originalExpirationHeight = appSpecs.height + expireIn;
+        if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
+          // Calculate blocks that were supposed to live after fork block
+          const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
+          // Multiply by 4 to account for 4x faster chain
+          const adjustedBlocksAfterFork = blocksAfterFork * 4;
+          // New expiration = fork block + adjusted blocks
+          actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
+        }
+      }
+
+      if (actualExpirationHeight < explorerHeight) { // registered/updated on height, expires in expireIn is lower than current height
         appsToExpire.push(appSpecs);
       }
     });
@@ -1599,53 +1441,56 @@ async function expireGlobalApplications() {
       throw new Error('Failed to get installed Apps');
     }
     const appsInstalled = installedAppsRes.data;
-    // Expiry is a property of the network-confirmed spec, so evaluate each installed
-    // app against the AUTHORITATIVE global row, not the local install row - a lazy
-    // local refresh can leave the local row carrying a stale shorter expire, and a
-    // renewal that extended the global expire would otherwise wrongly remove a
-    // still-paid app. Reuse the already-fetched global `results` (zero extra reads).
-    const globalByName = new Map(results.map((row) => [row.name, row]));
-    // remove any installed app which is expired (or has no/forever height) per the
-    // authoritative spec; fall back to the local row only when there is no global one.
+    // remove any installed app which height is lower (or not present) but is not infinite app
     const appsToRemove = [];
     appsInstalled.forEach((app) => {
-      // Prefer the authoritative global spec; fall back to the local row only when
-      // the app has no global registration (forever/manual installs, or one a prior
-      // sweep already removed from global).
-      const authoritative = globalByName.get(app.name) || app;
       if (appNamesToExpire.includes(app.name)) {
-        appsToRemove.push({ app, expirationHeight: authoritative.height ? expirationHeightOf(authoritative, explorerHeight) : 0 });
-        return;
-      }
-      // forever-lasting app - never expires. Checked FIRST so height===0 is not
-      // swallowed by the !height branch (which would otherwise force-expire it).
-      if (authoritative.height === 0) return;
-      if (!authoritative.height) {
-        appsToRemove.push({ app, expirationHeight: 0 });
-        return;
-      }
-      const expirationHeight = expirationHeightOf(authoritative, explorerHeight);
-      if (expirationHeight < explorerHeight) {
-        appsToRemove.push({ app, expirationHeight });
+        appsToRemove.push(app);
+      } else if (!app.height) {
+        appsToRemove.push(app);
+      } else if (app.height === 0) {
+        // do nothing, forever lasting local app
+      } else {
+        // Determine default expire based on whether app was registered after PON fork
+        const defaultExpire = app.height >= config.fluxapps.daemonPONFork
+          ? config.fluxapps.blocksLasting * 4
+          : config.fluxapps.blocksLasting;
+        const expireIn = app.expire || defaultExpire;
+        let actualExpirationHeight = app.height + expireIn;
+
+        // If app was registered before fork block and we are past fork block
+        // the chain moves 4x faster, so we need to adjust the expiration
+        if (app.height < config.fluxapps.daemonPONFork && explorerHeight >= config.fluxapps.daemonPONFork) {
+          const originalExpirationHeight = app.height + expireIn;
+          if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
+            // Calculate blocks that were supposed to live after fork block
+            const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
+            // Multiply by 4 to account for 4x faster chain
+            const adjustedBlocksAfterFork = blocksAfterFork * 4;
+            // New expiration = fork block + adjusted blocks
+            actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
+          }
+        }
+
+        if (actualExpirationHeight < explorerHeight) {
+          appsToRemove.push(app);
+        }
       }
     });
-    // Remove earliest-expired first - the iteration order is otherwise the DB's,
-    // unrelated to how long each app has actually been expired.
-    appsToRemove.sort((a, b) => a.expirationHeight - b.expirationHeight);
-    const appsToRemoveNames = appsToRemove.map((entry) => entry.app.name);
+    const appsToRemoveNames = appsToRemove.map((app) => app.name);
 
-    // remove appsToRemoveNames apps locally via the shared per-app expiry body.
-    // async=true: the prelude (stamp condemned + stop fighting it + delete the row
-    // + broadcast) runs promptly and the slow drain + host teardown run in the
-    // background, so one app's 65-min graceful window can't stall the whole sweep.
-    // expireSingleApplication also re-deletes the global row (idempotent no-op here,
-    // already removed by the loop above).
+    // remove appsToRemoveNames apps from locally running
+    // Use dynamic require to avoid circular dependency
+    // eslint-disable-next-line global-require
+    const appUninstaller = require('../appLifecycle/appUninstaller');
     // eslint-disable-next-line no-restricted-syntax
     for (const appName of appsToRemoveNames) {
       log.warn(`Application ${appName} is expired, removing`);
       log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (registryManager)`);
       // eslint-disable-next-line no-await-in-loop
-      await expireSingleApplication(appName, { async: true });
+      await appUninstaller.removeAppLocally(appName, null, true, false, true);
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(1 * 60 * 1000); // wait for 1 min
     }
   } catch (error) {
     log.error(error);
@@ -1665,7 +1510,6 @@ async function insertAppSpecifications(appSpecs) {
     if (existing && existing.height >= appSpecs.height) return true;
     await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: true });
     fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    emitSpecStored(appSpecs);
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
     return true;
@@ -1685,7 +1529,6 @@ async function updateAppSpecifications(appSpecs) {
     if (!appInfo || appInfo.height >= appSpecs.height) return true;
     await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: false });
     fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    emitSpecStored(appSpecs);
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
     await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
     return true;
@@ -1749,9 +1592,7 @@ async function reindexGlobalAppsInformation() {
         log.warn(`Application ${appName} is expired, removing`);
         log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (reindex)`);
         // eslint-disable-next-line no-await-in-loop
-        // cancelGraceful=true: drain components that declared a graceful window before
-      // removing (force-kill the rest) so a cancelled/expired app can flush. TEMP v8 hack.
-      await appUninstaller.removeAppLocally(appName, null, true, false, true, true);
+        await appUninstaller.removeAppLocally(appName, null, true, false, true);
         // eslint-disable-next-line no-await-in-loop
         await serviceHelper.delay(60_000);
       }
@@ -2286,7 +2127,6 @@ async function getPreviousAppSpecifications(specifications, verificationTimestam
 }
 
 module.exports = {
-  setOnSpecStored,
   getAppHashes,
   getPreviousAppSpecifications,
   appLocation,
@@ -2323,9 +2163,6 @@ module.exports = {
   registrationInformation,
   getAllGlobalApplications,
   expireGlobalApplications,
-  expireInstalledApplications,
-  expireSingleApplication,
-  expirationHeightOf,
   reindexGlobalAppsInformation,
   reindexGlobalAppsLocation,
   rescanGlobalAppsInformation,

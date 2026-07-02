@@ -24,9 +24,7 @@ const config = require('config');
 const dbHelper = require('../dbHelper');
 const dockerService = require('../dockerService');
 const log = require('../../lib/log');
-const { withHostMutationLock } = require('../utils/hostMutationLock');
-const { socketAddressesMatch } = require('../utils/socketAddressUtils');
-const { localAppsInformation, globalAppsInformation, APP_NAME_REGEX } = require('../utils/appConstants');
+const { localAppsInformation, APP_NAME_REGEX } = require('../utils/appConstants');
 
 /**
  * Parses the `networkWith:[...]` token out of an app description.
@@ -71,193 +69,8 @@ function getLinkedApps(appSpecs) {
 }
 
 /**
- * Whether an app opts out of standalone spawning via `dependencyOnly=true` in its
- * description. Such an app (e.g. a stats collector) is the *target* of other
- * apps' `networkWith` links: it is installed only while at least one app that
- * links to it is present, and removed once nothing links to it any more. The
- * literal `:true`/`=true` is required so the marker can't be tripped by the word
- * appearing in prose.
- *
- * @param {string} description - app description text
- * @returns {boolean}
- */
-function parseDependencyOnly(description) {
-  if (typeof description !== 'string' || !description) {
-    return false;
-  }
-  return /\bdependencyOnly\s*[:=]\s*true\b/i.test(description);
-}
-
-/**
- * Given a set of app specs (each at least `{ name, owner, description }`), returns
- * the set of dependency-app names that are *required*: the transitive
- * `networkWith` closure starting from the workload apps (those NOT marked
- * `dependencyOnly`). Links are only followed between apps of the same owner.
- * Original-cased names are returned; matching is case-insensitive.
- *
- * Starting the closure from workloads only (not every app in the set) is what
- * lets a dependency-only app fall out of the required set once nothing links to
- * it — otherwise a collector, being present itself, would keep itself alive.
- *
- * @param {Array<object>} apps - app specs to reason over
- * @returns {Set<string>} required dependency app names
- */
-function computeRequiredDependencyNames(apps) {
-  const required = new Set();
-  if (!Array.isArray(apps) || !apps.length) {
-    return required;
-  }
-  const byName = new Map();
-  apps.forEach((app) => {
-    if (app && app.name) byName.set(app.name.toLowerCase(), app);
-  });
-
-  const roots = apps.filter((app) => app && app.name && !parseDependencyOnly(app.description));
-  const queue = [...roots];
-  const visited = new Set(roots.map((app) => app.name.toLowerCase()));
-
-  while (queue.length) {
-    const current = queue.shift();
-    // eslint-disable-next-line no-restricted-syntax
-    for (const linkedName of getLinkedApps(current)) {
-      const dep = byName.get(linkedName.toLowerCase());
-      if (dep && dep.owner === current.owner) {
-        required.add(dep.name);
-        const key = dep.name.toLowerCase();
-        if (!visited.has(key)) {
-          visited.add(key);
-          queue.push(dep);
-        }
-      }
-    }
-  }
-  return required;
-}
-
-/**
- * Whether a workload transitively `networkWith`-depends on `depNameLower`,
- * following same-owner links only. Breadth-first over the link graph.
- *
- * @param {object} workload - root app spec
- * @param {string} depNameLower - lowercased dependency name to look for
- * @param {Map<string, object>} byName - lowercased-name -> app spec
- * @returns {boolean}
- */
-function appTransitivelyRequires(workload, depNameLower, byName) {
-  const visited = new Set([workload.name.toLowerCase()]);
-  const queue = [workload];
-  while (queue.length) {
-    const current = queue.shift();
-    // eslint-disable-next-line no-restricted-syntax
-    for (const linkedName of getLinkedApps(current)) {
-      const key = linkedName.toLowerCase();
-      const dep = byName.get(key);
-      // Only same-owner links to installed apps are real dependencies (mirrors
-      // computeRequiredDependencyNames); a cross-owner/dangling link is ignored.
-      if (!dep || dep.owner !== workload.owner) {
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-      if (key === depNameLower) {
-        return true;
-      }
-      if (!visited.has(key)) {
-        visited.add(key);
-        queue.push(dep);
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Locally-installed workloads (apps NOT marked `dependencyOnly`) that
- * transitively `networkWith`-require the given dependency, same-owner only. The
- * inverse of `computeRequiredDependencyNames`: used to uninstall the consumers
- * before the dependency they rely on is torn down.
- *
- * @param {string} depName - dependency app name
- * @returns {Promise<Array<object>>} requiring workload specs (name, owner, description)
- */
-async function findInstalledWorkloadsRequiring(depName) {
-  const dbopen = dbHelper.databaseConnection();
-  const appsDatabase = dbopen.db(config.database.appslocal.database);
-  const projection = { projection: { _id: 0, name: 1, owner: 1, description: 1 } };
-  const installed = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, {}, projection);
-  if (!installed || !installed.length) {
-    return [];
-  }
-  const byName = new Map();
-  installed.forEach((app) => {
-    if (app && app.name) byName.set(app.name.toLowerCase(), app);
-  });
-  const target = depName.toLowerCase();
-  return installed.filter((app) => app && app.name && !parseDependencyOnly(app.description)
-    && appTransitivelyRequires(app, target, byName));
-}
-
-/**
- * The dependency-app names that should be present on this node, computed from
- * every app the global registry assigns to this node (pinned via `nodes`). Used
- * by the spawner to suppress a `dependencyOnly` app that nothing here requires.
- *
- * @param {string} localSocketAddr - this node's socket address
- * @returns {Promise<Set<string>>}
- */
-async function getRequiredDependencyNamesForNode(localSocketAddr) {
-  if (!localSocketAddr) {
-    return new Set();
-  }
-  const dbopen = dbHelper.databaseConnection();
-  const database = dbopen.db(config.database.appsglobal.database);
-  const projection = { projection: { _id: 0, name: 1, owner: 1, description: 1, nodes: 1 } };
-  const apps = await dbHelper.findInDatabase(database, globalAppsInformation, {}, projection);
-  const assigned = (apps || []).filter((app) => Array.isArray(app.nodes)
-    && app.nodes.some((ip) => socketAddressesMatch(ip, localSocketAddr)));
-  return computeRequiredDependencyNames(assigned);
-}
-
-/**
- * Locally-installed apps that are `dependencyOnly` but no longer required by any
- * installed workload (transitive `networkWith`). These should be removed. Based
- * on what is actually installed here now, so removing the last workload orphans
- * the collectors it linked to.
- *
- * @returns {Promise<Array<object>>} orphaned dependency app specs
- */
-async function findUnrequiredInstalledDependencies() {
-  const dbopen = dbHelper.databaseConnection();
-  const appsDatabase = dbopen.db(config.database.appslocal.database);
-  const projection = { projection: { _id: 0, name: 1, owner: 1, description: 1 } };
-  const installed = await dbHelper.findInDatabase(appsDatabase, localAppsInformation, {}, projection);
-  if (!installed || !installed.length) {
-    return [];
-  }
-  const required = computeRequiredDependencyNames(installed);
-  return installed.filter((app) => parseDependencyOnly(app.description) && !required.has(app.name));
-}
-
-/**
- * Whether every container belonging to an installed app is currently running.
- * Docker-listing based (the local DB blanks enterprise compose, so iterating the
- * spec would miss components), so it works for enterprise apps too. False when
- * the app has no containers.
- *
- * @param {string} appName
- * @returns {Promise<boolean>}
- */
-async function isAppRunning(appName) {
-  const containers = await dockerService.getAppContainerObjects(appName);
-  if (!containers || !containers.length) {
-    return false;
-  }
-  return containers.every((container) => container && container.State === 'running');
-}
-
-/**
- * Verifies every app this app is linked to is installed locally and owned by the
- * same owner; when the node-managed lifecycle is enabled, also that each linked
- * app is actually running. Throws otherwise, aborting/deferring the install.
+ * Verifies every app this app is linked to is installed locally and owned by
+ * the same owner. Throws otherwise, aborting the install/redeploy.
  *
  * @param {object} appSpecs - full app specification
  * @returns {Promise<boolean>} true when all network links are satisfied
@@ -277,28 +90,10 @@ async function checkAppNetworkRequirements(appSpecs) {
     // eslint-disable-next-line no-await-in-loop
     const installed = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: linkedApp }, projection);
     if (!installed) {
-      // Transient ordering condition, not a misconfiguration: the dependency may
-      // simply not be installed yet. Tagged so the spawner can retry shortly
-      // instead of treating it as a hard install failure.
-      const error = new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is not installed on this node. Installation aborted.`);
-      error.code = 'NETWORK_DEPENDENCY_NOT_READY';
-      throw error;
+      throw new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is not installed on this node. Installation aborted.`);
     }
     if (installed.owner !== appSpecs.owner) {
       throw new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is owned by a different owner. Installation aborted.`);
-    }
-    // When the node-managed lifecycle is on, require the dependency to be actually
-    // running - not merely installed - so this app's docker-network attach and log
-    // routing land on a live container. Tagged transient so the spawner defers and
-    // retries rather than hard-failing.
-    if (config.fluxapps.manageDependencyOnlyLifecycle) {
-      // eslint-disable-next-line no-await-in-loop
-      const running = await isAppRunning(linkedApp);
-      if (!running) {
-        const error = new Error(`App '${linkedApp}' that '${appSpecs.name}' must be networked with is installed but not running yet. Installation deferred.`);
-        error.code = 'NETWORK_DEPENDENCY_NOT_READY';
-        throw error;
-      }
     }
   }
   log.info(`App network links satisfied for ${appSpecs.name}: ${linkedApps.join(', ')}`);
@@ -323,14 +118,8 @@ async function connectComponentToLinkedApps(componentContainerName, fullAppSpecs
   // eslint-disable-next-line no-restricted-syntax
   for (const linkedApp of linkedApps) {
     const networkName = `fluxDockerNetwork_${linkedApp}`;
-    // The linked app's network is a CROSS-APP host resource: its removal runs in
-    // the linked app's Phase-B teardown under the node-wide hostMutationLock. Take
-    // the same lock per attach so this connect either lands before that network is
-    // torn down or fails cleanly (rolling back this install) - never racing a
-    // half-removed network. Per-call (leaf) granularity, matching the install
-    // port-open loop; the connect is a single bounded docker call.
     // eslint-disable-next-line no-await-in-loop
-    await withHostMutationLock(() => dockerService.appDockerNetworkConnect(componentContainerName, networkName));
+    await dockerService.appDockerNetworkConnect(componentContainerName, networkName);
     log.info(`Connected ${componentContainerName} to linked app network ${networkName}`);
   }
 }
@@ -373,9 +162,8 @@ async function reconnectLinkedApps(appName) {
       const containerNames = await dockerService.getAppContainerNames(app.name);
       // eslint-disable-next-line no-restricted-syntax
       for (const containerName of containerNames) {
-        // cross-app network: serialize the attach against its Phase-B removal (same lock)
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => dockerService.appDockerNetworkConnect(containerName, networkName));
+        await dockerService.appDockerNetworkConnect(containerName, networkName);
         log.info(`Reconnected linked app ${containerName} to ${networkName}`);
       }
     } catch (error) {
@@ -416,9 +204,8 @@ async function reconcileAllAppNetworkLinks() {
         const networkName = `fluxDockerNetwork_${linkedApp}`;
         // eslint-disable-next-line no-restricted-syntax
         for (const containerName of containerNames) {
-          // cross-app network: serialize the attach against its Phase-B removal (same lock)
           // eslint-disable-next-line no-await-in-loop
-          await withHostMutationLock(() => dockerService.appDockerNetworkConnect(containerName, networkName)).catch((error) => {
+          await dockerService.appDockerNetworkConnect(containerName, networkName).catch((error) => {
             log.error(`reconcileAllAppNetworkLinks: failed to connect ${containerName} to ${networkName}: ${error.message}`);
           });
         }
@@ -482,12 +269,6 @@ async function findLinkedAppLogCollector(fullAppSpecs) {
 module.exports = {
   parseNetworkWith,
   getLinkedApps,
-  parseDependencyOnly,
-  computeRequiredDependencyNames,
-  getRequiredDependencyNamesForNode,
-  findUnrequiredInstalledDependencies,
-  findInstalledWorkloadsRequiring,
-  isAppRunning,
   checkAppNetworkRequirements,
   connectComponentToLinkedApps,
   reconnectLinkedApps,

@@ -12,7 +12,6 @@ const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const { extractIp, extractPort } = require('../utils/socketAddressUtils');
-const { withHostMutationLock } = require('../utils/hostMutationLock');
 
 // Helper function to sign check app data
 async function signCheckAppData(message) {
@@ -33,15 +32,15 @@ async function handleTestShutdown(testingPort, testHttpServer, isArcane, options
     || await fluxNetworkHelper.isFirewallActive().catch(() => true);
 
   if (updateFirewall) {
-    await withHostMutationLock(() => fluxNetworkHelper
+    await fluxNetworkHelper
       .deleteAllowPortRule(testingPort)
-      .catch((e) => log.error(e)));
+      .catch((e) => log.error(e));
   }
 
   if (!skipUpnp) {
-    await withHostMutationLock(() => upnpService
+    await upnpService
       .removeMapUpnpPort(testingPort, 'Flux_Test_App')
-      .catch((e) => log.error(e)));
+      .catch((e) => log.error(e));
   }
 
   if (!skipHttpServer) {
@@ -231,11 +230,11 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
 
     const firewallActive = isArcane ? true : await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      await withHostMutationLock(() => fluxNetworkHelper.allowPort(dosState.testingPort));
+      await fluxNetworkHelper.allowPort(dosState.testingPort);
     }
 
     if (isUpnp) {
-      const upnpMapResult = await withHostMutationLock(() => upnpService.mapUpnpPort(dosState.testingPort, 'Flux_Test_App'));
+      const upnpMapResult = await upnpService.mapUpnpPort(dosState.testingPort, 'Flux_Test_App');
       if (!upnpMapResult) {
         if (dosState.lastUPNPMapFailed) {
           // eslint-disable-next-line no-param-reassign

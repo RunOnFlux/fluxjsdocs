@@ -78,31 +78,14 @@ async function syncFromGithub() {
  * github fetch are both async and bounded, so awaiting this in startFluxFunctions
  * never blocks boot for more than the fetch timeout. Initialization is performed
  * here (not as a side effect of require) so module loading stays pure.
- *
- * @param {() => void} [onSyncSuccess] Optional observer invoked after every successful
- *   github sync (the allowed-owner map may have changed). Lets a caller react to the
- *   refresh — e.g. reclaiming resources owned by a now-de-authorized owner — without this
- *   module knowing anything about those consumers. Its own errors are isolated.
  */
-async function startSync(onSyncSuccess) {
+async function startSync() {
   if (syncInterval) return;
-  const notify = () => {
-    if (!onSyncSuccess) return;
-    try {
-      onSyncSuccess();
-    } catch (error) {
-      log.error(`enterpriseConfig - onSyncSuccess handler error: ${error.message}`);
-    }
-  };
   const onDisk = await readMapFromDisk();
   if (onDisk) nodeOwnerMap = onDisk;
-  if (await syncFromGithub()) notify();
-  syncInterval = setInterval(async () => {
-    const refreshed = await syncFromGithub().catch((error) => {
-      log.error(`enterpriseConfig - sync error: ${error.message}`);
-      return false;
-    });
-    if (refreshed) notify();
+  await syncFromGithub();
+  syncInterval = setInterval(() => {
+    syncFromGithub().catch((error) => log.error(`enterpriseConfig - sync error: ${error.message}`));
   }, SYNC_INTERVAL_MS);
 }
 
@@ -143,22 +126,9 @@ function getEnterpriseAppOwners() {
   return ownersUnionCache;
 }
 
-/**
- * Whether an app owner is in the enterprise app owners whitelist (the deduped
- * union of every node's allowed owners). A convenience predicate over
- * getEnterpriseAppOwners(); called by the CPU-burst eligibility gate and the v8
- * enterprise stop-gaps (telemetry + graceful shutdown) in dockerService.appDockerCreate.
- * @param {string} owner - app owner address
- * @returns {boolean}
- */
-function isEnterpriseOwner(owner) {
-  return getEnterpriseAppOwners().includes(owner);
-}
-
 module.exports = {
   getAllowedOwnersForNode,
   getEnterpriseAppOwners,
-  isEnterpriseOwner,
   getEnterpriseNodeOwnerMap,
   getEnterpriseNodesPublicKeys,
   startSync,

@@ -11,11 +11,23 @@ const serviceHelper = require('../serviceHelper');
 const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
-const { withHostMutationLock } = require('../utils/hostMutationLock');
 const { localAppsInformation, globalAppsInformation } = require('../utils/appConstants');
 
 // Global cache for failed nodes
 const failedNodesTestPortsCache = new Map();
+
+// A single UPnP map failure is routine on consumer routers (busy router, a
+// node network blip) and the app itself keeps running regardless - it must
+// NEVER escalate straight to a force-removal + network broadcast. Removal
+// requires the failure to be sustained: consecutive restore cycles AND a
+// minimum wall-clock window, measured on the monotonic clock.
+const UPNP_REMOVAL_MIN_CONSECUTIVE_CYCLES = 3;
+const UPNP_REMOVAL_MIN_WINDOW_MS = 30 * 60 * 1000;
+const UPNP_MAP_RETRY_DELAY_MS = 30 * 1000;
+// appName -> { cycles, firstFailureAtMs } (monotonic ms)
+const upnpMapFailures = new Map();
+
+const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n);
 
 /**
  * Check if ports in array are unique
@@ -229,7 +241,7 @@ async function restoreFluxPortsSupport() {
   try {
     const isUPNP = upnpService.isUPNP();
 
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     const apiPort = userconfig.initial.apiport || config.server.apiport;
     const homePort = +apiPort - 1;
     const apiPortSSL = +apiPort + 1;
@@ -264,16 +276,14 @@ async function restoreAppsPortsSupport() {
     const isUPNP = upnpService.isUPNP();
 
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
-    // setup UFW for apps. Each ufw allow is a leaf host mutation taken under the
-    // node-wide host-mutation lock per port (matching the install port-open loop), so
-    // it serializes with concurrent install/removal ufw edits without head-of-lining.
+    // setup UFW for apps
     if (firewallActive) {
       // eslint-disable-next-line no-restricted-syntax
       for (const application of currentAppsPorts) {
         // eslint-disable-next-line no-restricted-syntax
         for (const port of application.ports) {
           // eslint-disable-next-line no-await-in-loop
-          await withHostMutationLock(() => fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port)));
+          await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
         }
       }
     }
@@ -283,26 +293,52 @@ async function restoreAppsPortsSupport() {
       // map application ports
       // eslint-disable-next-line no-restricted-syntax
       for (const application of currentAppsPorts) {
+        let failedPort = null;
         // eslint-disable-next-line no-restricted-syntax
         for (const port of application.ports) {
-          // Lock wraps ONLY the leaf UPnP map. The removeAppLocally + delay(3min)
-          // below MUST stay OUTSIDE it: removeAppLocally acquires this same lock in
-          // its Phase-B teardown (the non-re-entrant AsyncLock(1) would deadlock), and
-          // a 3-minute delay must never hold the node-wide lock (head-of-line).
           // eslint-disable-next-line no-await-in-loop
-          const upnpOk = await withHostMutationLock(() => upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`));
+          let upnpOk = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
           if (!upnpOk) {
-            log.warn(`REMOVAL REASON: UPNP port mapping failure - ${application.name} failed to map port ${port} via UPNP (portManager)`);
-            // Import locally to avoid circular dependency
-            // eslint-disable-next-line global-require
-            const appUninstaller = require('../appLifecycle/appUninstaller');
             // eslint-disable-next-line no-await-in-loop
-            await appUninstaller.removeAppLocally(application.name, null, true, true, true).catch((error) => log.error(error)); // remove entire app
+            await serviceHelper.delay(UPNP_MAP_RETRY_DELAY_MS);
             // eslint-disable-next-line no-await-in-loop
-            await serviceHelper.delay(3 * 60 * 1000); // 3 mins
+            upnpOk = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${application.name}`);
+          }
+          if (!upnpOk) {
+            failedPort = port;
             break;
           }
         }
+
+        if (failedPort === null) {
+          upnpMapFailures.delete(application.name);
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+
+        const now = monotonicMs();
+        const tracker = upnpMapFailures.get(application.name) || { cycles: 0, firstFailureAtMs: now };
+        tracker.cycles += 1;
+        upnpMapFailures.set(application.name, tracker);
+        const sustainedMs = now - tracker.firstFailureAtMs;
+
+        if (tracker.cycles < UPNP_REMOVAL_MIN_CONSECUTIVE_CYCLES || sustainedMs < UPNP_REMOVAL_MIN_WINDOW_MS) {
+          log.warn(`restoreAppsPortsSupport - ${application.name} failed to map port ${failedPort} via UPNP `
+            + `(failure ${tracker.cycles}, ${Math.round(sustainedMs / 60000)}m sustained); not removing - removal requires `
+            + `${UPNP_REMOVAL_MIN_CONSECUTIVE_CYCLES} consecutive cycles over ${UPNP_REMOVAL_MIN_WINDOW_MS / 60000}m`);
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+
+        log.warn(`REMOVAL REASON: UPNP port mapping failure - ${application.name} failed to map port ${failedPort} via UPNP for ${tracker.cycles} consecutive cycles over ${Math.round(sustainedMs / 60000)}m (portManager)`);
+        upnpMapFailures.delete(application.name);
+        // Import locally to avoid circular dependency
+        // eslint-disable-next-line global-require
+        const appUninstaller = require('../appLifecycle/appUninstaller');
+        // eslint-disable-next-line no-await-in-loop
+        await appUninstaller.removeAppLocally(application.name, null, true, true, true).catch((error) => log.error(error)); // remove entire app
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(3 * 60 * 1000); // 3 mins
       }
     }
   } catch (error) {
@@ -394,126 +430,13 @@ async function signCheckAppData(message) {
  * @param {Array} portsToTest Array of ports to test
  * @returns {Promise<boolean>} True if ports are available, false otherwise
  */
-/**
- * Bind a throwaway HTTP listener on a port to prove this node can currently hold it
- * (the local half of the port check, before asking peers about public reachability).
- * Resolves once the socket is listening; rejects on a bind error (e.g. EADDRINUSE).
- * The server is pushed onto `trackingServers` SYNCHRONOUSLY - before listen() and
- * before this returns - so the caller's cleanup closes it even when a sibling port's
- * bind rejects first and fail-fasts the concurrent Promise.all.
- * @param {number} portToTest
- * @param {Array} trackingServers - collector the caller closes during cleanup
- * @returns {Promise<null>}
- */
-function bindPortTestServer(portToTest, trackingServers) {
-  return new Promise((resolve, reject) => {
-    const testHttpServer = new fluxHttpTestServer.FluxHttpTestServer();
-    trackingServers.push(testHttpServer);
-    // Tested: the 'error' handler catches EADDRINUSE. Previously this crashed the app.
-    // note - if you kill the port with `ss --kill state listening src :<the port>`
-    // nodeJS does not raise an error.
-    testHttpServer
-      .once('error', (err) => {
-        testHttpServer.removeAllListeners('listening');
-        reject(err.message);
-      })
-      .once('listening', () => {
-        testHttpServer.removeAllListeners('error');
-        resolve(null);
-      });
-    testHttpServer.listen(portToTest);
-  });
-}
-
-/**
- * Ask a single remote node to connect back to our IP:port(s) and report whether
- * they are publicly reachable.
- *   answered=false  -> the peer itself did not respond (says nothing about our port)
- *   reachable=true  -> the peer reached our port(s) (proves public reachability)
- *   reachable=false -> the peer answered but could not reach a port (failedPort set)
- * @param {string} peerSocketAddress - 'ip:port' of the node to ask
- * @param {string} payload - signed, JSON-stringified port-test request body
- * @param {object} axiosConfig - axios config (carries the per-peer timeout)
- * @returns {Promise<{answered: boolean, reachable?: boolean, failedPort?: number}>}
- */
-async function askPeerPortReachability(peerSocketAddress, payload, axiosConfig) {
-  const askingIP = extractIp(peerSocketAddress);
-  const askingIpPort = extractPort(peerSocketAddress);
-  const res = await axios
-    .post(`http://${askingIP}:${askingIpPort}/flux/checkappavailability`, payload, axiosConfig)
-    .catch(() => {
-      // peer unreachable from us -> says nothing about OUR port; it is just a non-answer
-      log.info(`askPeerPortReachability - peer ${askingIP}:${askingIpPort} did not answer port test`);
-      return null;
-    });
-  if (!res || !res.data) return { answered: false };
-  if (res.data.status === 'success') return { answered: true, reachable: true };
-  if (res.data.status === 'error') {
-    let failedPort = null;
-    const msg = res.data.data && res.data.data.message;
-    if (msg && msg.includes('Failed port: ')) {
-      failedPort = serviceHelper.ensureNumber(msg.split('Failed port: ')[1]);
-    }
-    return { answered: true, reachable: false, failedPort };
-  }
-  return { answered: false };
-}
-
-/**
- * Verify the given ports are publicly reachable by asking remote nodes to connect
- * back. Reachability is external, so the peer round-trip is the only real signal -
- * there is nothing local to wait for (firewall/UPnP are already applied by the
- * caller). Each round queries portTestPeerQueryCount nodes from DISTINCT /16s (and
- * never our own /16) concurrently:
- *   - the first peer that reaches us proves reachability -> true;
- *   - >=2 distinct-subnet peers agreeing it is unreachable -> false;
- *   - an inconclusive round (peers did not answer) retries with fresh diverse peers,
- *     bounded by portTestMaxRounds rounds.
- * Same-network peers are excluded because a local-path connect-back can give a false
- * pass and same-subnet peers share fate (their votes are not independent). Never
- * confirmed reachable -> false (fail-closed: do not install an unverifiable port).
- * @param {object} data - signed port-test request body
- * @param {string} localSocketAddress - our own socket address (excluded from peers)
- * @returns {Promise<boolean>}
- */
-async function arePortsReachableViaPeers(data, localSocketAddress) {
-  const axiosConfig = { timeout: config.fluxapps.portTestPeerTimeoutMs };
-  const peerQueryCount = config.fluxapps.portTestPeerQueryCount;
-  const payload = JSON.stringify(data);
-  let failVotes = 0;
-
-  for (let round = 0; round < config.fluxapps.portTestMaxRounds; round += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    const peers = await networkStateService.getRandomSocketAddresses(peerQueryCount, {
-      excludeSocketAddress: localSocketAddress,
-      distinctPrefixes: true,
-    });
-    if (!peers || peers.length === 0) {
-      // no eligible peers this round (tiny / just-booted network state) - retry
-      // eslint-disable-next-line no-continue
-      continue;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    const results = await Promise.all(
-      peers.map((peer) => askPeerPortReachability(peer, payload, axiosConfig)),
-    );
-    if (results.some((r) => r.reachable)) return true;
-    failVotes += results.filter((r) => r.answered && r.reachable === false).length;
-    if (failVotes >= 2) return false;
-    // else inconclusive (peers did not answer) -> next round of fresh diverse peers
-  }
-  return false;
-}
-
 async function checkInstallingAppPortAvailable(portsToTest = []) {
-  // No ports to verify -> nothing to probe. A portless app's install must not
-  // hinge on reaching a random peer (which can time out and falsely fail it).
-  if (!Array.isArray(portsToTest) || portsToTest.length === 0) {
-    return true;
-  }
   const beforeAppInstallTestingServers = [];
   const isUPNP = upnpService.isUPNP();
   let portsStatus = false;
+  const portsNotWorking = new Set();
+  let originalPortFailed = null;
+  let nextTestingPort = 0;
 
   try {
     const localSocketAddress = await fluxNetworkHelper.getLocalSocketAddress();
@@ -547,32 +470,55 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       }
     }
     const firewallActive = await fluxNetworkHelper.isFirewallActive();
-    // Open the firewall + UPnP mapping for every port (sequentially - avoids ufw/UPnP
-    // lock races), then bind a test listener on every port concurrently. allowPort /
-    // mapUpnpPort are awaited (the rule/mapping is live the moment they resolve) and
-    // each bind is confirmed by its 'listening' event, so there is nothing to "settle"
-    // - no blind bind delay, and a multi-port app is no longer bound one port at a time.
     // eslint-disable-next-line no-restricted-syntax
     for (const portToTest of portsToTest) {
+      // now open this port properly and launch listening on it
       if (firewallActive) {
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => fluxNetworkHelper.allowPort(portToTest));
+        await fluxNetworkHelper.allowPort(portToTest);
       }
       if (isUPNP) {
         // eslint-disable-next-line no-await-in-loop
-        const upnpMapResult = await withHostMutationLock(() => upnpService.mapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`));
+        const upnpMapResult = await upnpService.mapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
         if (!upnpMapResult) {
           throw new Error('Failed to create map UPNP port');
         }
       }
-    }
-    // Bind a throwaway listener on each port concurrently to prove this node can hold
-    // them. Each server is tracked synchronously (see bindPortTestServer) so a sibling
-    // bind failure still tears every one of them down via the catch below.
-    await Promise.all(
-      portsToTest.map((portToTest) => bindPortTestServer(portToTest, beforeAppInstallTestingServers)),
-    );
+      const testHttpServer = new fluxHttpTestServer.FluxHttpTestServer();
 
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(config.fluxapps.portTestBindDelayMs);
+
+      beforeAppInstallTestingServers.push(testHttpServer);
+
+      // Tested: This catches EADDRINUSE. Previously, this was crashing the entire app
+      // note - if you kill the port with:
+      //    ss --kill state listening src :<the port>
+      // nodeJS does not raise an error.
+      const listening = new Promise((resolve, reject) => {
+        testHttpServer
+          .once('error', (err) => {
+            testHttpServer.removeAllListeners('listening');
+            reject(err.message);
+          })
+          .once('listening', () => {
+            testHttpServer.removeAllListeners('error');
+            resolve(null);
+          });
+        testHttpServer.listen(portToTest);
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      const error = await listening.catch((err) => err);
+
+      if (error) throw error;
+    }
+
+    await serviceHelper.delay(config.fluxapps.portTestPropagationDelayMs);
+    const timeout = config.fluxapps.portTestPeerTimeoutMs;
+    const axiosConfig = {
+      timeout,
+    };
     const data = {
       ip: localIp,
       port: localPort,
@@ -580,19 +526,63 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       ports: portsToTest,
       pubKey,
     };
-    const signature = await signCheckAppData(JSON.stringify(data));
+    const stringData = JSON.stringify(data);
+    // eslint-disable-next-line no-await-in-loop
+    const signature = await signCheckAppData(stringData);
     data.signature = signature;
-    portsStatus = await arePortsReachableViaPeers(data, localSocketAddress);
+    let i = 0;
+    let finished = false;
+    while (!finished && i < config.fluxapps.portTestMaxAttempts) {
+      i += 1;
+      // eslint-disable-next-line no-await-in-loop
+      const randomSocketAddress = await networkStateService.getRandomSocketAddress(
+        localSocketAddress,
+      );
+
+      // this should never happen as the list should be populated here
+      if (!randomSocketAddress) {
+        throw new Error('Unable to get random test connection');
+      }
+
+      const askingIP = extractIp(randomSocketAddress);
+      const askingIpPort = extractPort(randomSocketAddress);
+
+      // first check against our IP address
+      // eslint-disable-next-line no-await-in-loop
+      const resMyAppAvailability = await axios.post(`http://${askingIP}:${askingIpPort}/flux/checkappavailability`, JSON.stringify(data), axiosConfig).catch((error) => {
+        log.error(`${askingIP} for app availability is not reachable`);
+        log.error(error);
+      });
+      if (resMyAppAvailability && resMyAppAvailability.data.status === 'error') {
+        if (resMyAppAvailability.data.data && resMyAppAvailability.data.data.message && resMyAppAvailability.data.data.message.includes('Failed port: ')) {
+          const portToRetest = serviceHelper.ensureNumber(resMyAppAvailability.data.data.message.split('Failed port: ')[1]);
+          if (portToRetest > 0) {
+            portsNotWorking.add(portToRetest);
+            // if we aren't already testing ports, we set it here, otherwise, just continue
+            if (!originalPortFailed) {
+              originalPortFailed = portToRetest;
+              // eslint-disable-next-line no-unused-vars
+              nextTestingPort = portToRetest < 65535 ? portToRetest + 1 : portToRetest - 1;
+            }
+          }
+        }
+        portsStatus = false;
+        finished = true;
+      } else if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
+        portsStatus = true;
+        finished = true;
+      }
+    }
     // stop listening on the port, close the port
     // eslint-disable-next-line no-restricted-syntax
     for (const portToTest of portsToTest) {
       if (firewallActive) {
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => fluxNetworkHelper.deleteAllowPortRule(portToTest));
+        await fluxNetworkHelper.deleteAllowPortRule(portToTest);
       }
       if (isUPNP) {
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`));
+        await upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`);
       }
     }
     // Close all test servers and wait for them to finish
@@ -615,11 +605,11 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
     for (const portToTest of portsToTest) {
       if (firewallActive) {
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => fluxNetworkHelper.deleteAllowPortRule(portToTest).catch((e) => log.error(e)));
+        await fluxNetworkHelper.deleteAllowPortRule(portToTest).catch((e) => log.error(e));
       }
       if (isUPNP) {
         // eslint-disable-next-line no-await-in-loop
-        await withHostMutationLock(() => upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`).catch((e) => log.error(e)));
+        await upnpService.removeMapUpnpPort(portToTest, `Flux_Prelaunch_App_${portToTest}`).catch((e) => log.error(e));
       }
     }
     // Close all test servers and wait for them to finish
@@ -649,7 +639,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
  */
 async function callOtherNodeToKeepUpnpPortsOpen() {
   try {
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     const apiPort = userconfig.initial.apiport || config.server.apiport;
     const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
     if (!localSocketAddr) {
@@ -754,9 +744,8 @@ module.exports = {
   isPortAvailable,
   findNextAvailablePort,
   signCheckAppData,
-  askPeerPortReachability,
-  arePortsReachableViaPeers,
   checkInstallingAppPortAvailable,
   callOtherNodeToKeepUpnpPortsOpen,
   failedNodesTestPortsCache,
+  upnpMapFailures,
 };
