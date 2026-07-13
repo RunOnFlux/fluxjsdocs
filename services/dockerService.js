@@ -3,7 +3,6 @@ const stream = require('stream');
 const Docker = require('dockerode');
 const path = require('path');
 const serviceHelper = require('./serviceHelper');
-const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
 const pgpService = require('./pgpService');
 const deviceHelper = require('./deviceHelper');
 const generalService = require('./generalService');
@@ -11,6 +10,7 @@ const fluxNetworkHelper = require('./fluxNetworkHelper');
 const { extractIp } = require('./utils/socketAddressUtils');
 const log = require('../lib/log');
 const cpuBurstHelper = require('./utils/cpuBurstHelper');
+const { obtainPayloadFromStorage } = require('./utils/fluxStorageResolver');
 
 const globalState = require('./utils/globalState');
 
@@ -533,33 +533,6 @@ async function dockerContainerLogsPolling(idOrName, lineCount, sinceTimestamp, c
       callback(error);
     }
     throw error;
-  }
-}
-
-async function obtainPayloadFromStorage(url, appName) {
-  try {
-    // do a signed request in headers
-    // we want to be able to fetch even from unsecure storages that may not have all the auths
-    // and so this is only basic auth where timestamp is important
-    // server should verify valid signature based on publicKey that server can get from
-    // deterministic node list of ip address that did this request
-    const version = 1;
-    const timestamp = Date.now();
-    const message = version + url + timestamp;
-    const signature = await fluxCommunicationMessagesSender.getFluxMessageSignature(message);
-    const axiosConfig = {
-      headers: {
-        'flux-message': message,
-        'flux-signature': signature,
-        'flux-app': appName,
-      },
-      timeout: 20000,
-    };
-    const response = await serviceHelper.axiosGet(url, axiosConfig);
-    return response.data;
-  } catch (error) {
-    log.error(error);
-    throw new Error(`Parameters from Flux Storage ${url} failed to be obtained`);
   }
 }
 
@@ -1276,76 +1249,6 @@ async function appDockerImageRemove(idOrName) {
 }
 
 /**
- * Reads a container's network attachment against its own configured NetworkMode.
- *
- * A Flux app component container is created with NetworkMode =
- * fluxDockerNetwork_<app> and a matching endpoint in NetworkSettings.Networks
- * (see appDockerCreate). A start that fails "programming external connectivity"
- * - e.g. a host-port bind conflict during a restart after an unclean reboot -
- * can leave libnetwork holding a stale endpoint for that container: the next
- * `docker start` then brings the task up attached to NO network at all.
- * NetworkMode still names the network, but NetworkSettings.Networks no longer
- * carries it (or carries it without an IP). Such a container runs with no IP, no
- * embedded DNS (it cannot resolve sibling components by name) and no published
- * ports, and a plain start never repairs it - only a recreate, which allocates a
- * fresh endpoint, clears the stale state. This pure classifier over a Docker
- * inspect object surfaces that condition so callers (the reconciler, which
- * already holds the inspect) can detect and heal it.
- *
- * @param {object} info - a Docker container inspect object
- * @returns {{managed: boolean, running: boolean, networkMode: (string|null), attached: boolean}}
- *   managed  - NetworkMode is a fluxDockerNetwork_* (we own its networking)
- *   running  - the container task is running
- *   attached - the NetworkMode network is present in Networks with an IP
- */
-function parseContainerNetworkAttachment(info) {
-  const networkMode = info && info.HostConfig ? info.HostConfig.NetworkMode || null : null;
-  const running = !!(info && info.State && info.State.Running);
-  const managed = typeof networkMode === 'string' && networkMode.startsWith('fluxDockerNetwork_');
-  let attached = false;
-  if (managed) {
-    const networks = (info && info.NetworkSettings && info.NetworkSettings.Networks) || {};
-    const endpoint = networks[networkMode];
-    attached = !!(endpoint && endpoint.IPAddress);
-  }
-  return {
-    managed, running, networkMode, attached,
-  };
-}
-
-/**
- * Whether a container is running but not attached to its own managed network -
- * the unrecoverable-by-restart state described in parseContainerNetworkAttachment.
- * A non-managed (host/none/bridge) container is never considered detached.
- *
- * @param {{managed: boolean, running: boolean, attached: boolean}} attachment
- * @returns {boolean}
- */
-function isContainerDetachedFromNetwork(attachment) {
-  if (!attachment) return false;
-  return !!(attachment.managed && attachment.running && !attachment.attached);
-}
-
-/**
- * Whether a docker network exists, by name. Used to distinguish a stale endpoint
- * (network present, container not attached - recreatable) from a pruned network
- * (network gone - a recreate would fail on a missing NetworkMode). Any inspect
- * failure is treated as "does not exist".
- *
- * @param {string} networkName
- * @returns {Promise<boolean>}
- */
-async function dockerNetworkExists(networkName) {
-  if (!networkName) return false;
-  try {
-    await docker.getNetwork(networkName).inspect();
-    return true;
-  } catch (err) {
-    return false;
-  }
-}
-
-/**
  * Pauses app's docker.
  *
  * @param {string} idOrName
@@ -1875,8 +1778,5 @@ module.exports = {
   getAppContainerNames,
   getAppContainerObjects,
   getAppNameByContainerIp,
-  parseContainerNetworkAttachment,
-  isContainerDetachedFromNetwork,
-  dockerNetworkExists,
   waitForDocker,
 };
