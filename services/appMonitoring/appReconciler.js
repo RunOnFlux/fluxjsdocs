@@ -49,6 +49,14 @@ const dataDesired = new Map();
 const DATA_CLEAR_SETTLE_MS = 500;
 
 const inFlight = new Set(); // ids currently reconciling (per-key single-flight)
+// When each in-flight pass started, and when we last complained about it. A pass
+// that never settles never leaves inFlight, and from then on every enqueue for that
+// component is dropped silently - crash events, hourly sweeps, and the masterSlave
+// election's setControllerDesired alike. Production lost a component that way for
+// 18.5 hours without a single log line. This does not cancel or release anything;
+// it only makes the condition audible. Monotonic so a clock step cannot hide it.
+const inFlightSince = new Map();
+const inFlightWarnedAt = new Map();
 const dirty = new Set(); // ids re-requested while in flight -> reconcile again
 const bootPending = new Set(); // ids enqueued before the boot gate opened
 const backoffTimers = new Map(); // id -> scheduled retry timeout
@@ -104,6 +112,20 @@ const MANAGED_RETRY_MS = 5000;
 // (e.g. the encrypted data partition after a reboot) - retry on a pace that
 // won't spam, and keep deferring until it mounts
 const VOLUME_MOUNT_RETRY_MS = 30 * 1000;
+
+// A recreate is a full provision (registry verify + image pull), and a registry can
+// black-hole rather than refuse (dead IP behind a stale DNS cache): unbounded, one
+// hung pull wedges this component's reconcile single-flight forever - every later
+// trigger coalesces into a pass that never runs. Cap the provision so the pass
+// always terminates; the cap is a recreate failure like any other and the paced
+// retry re-drives it. A capped provision that completes detached later is harmless:
+// the next pass finds the container and starts it (the same level-based contract as
+// the recreate-failed-but-container-exists re-check).
+const RECREATE_PROVISION_CAP_MS = config.fluxapps.recreateProvisionCapMs ?? 3 * 60 * 1000;
+
+// An in-flight pass older than this is stuck, not slow: it must sit above the
+// recreate ceiling above, which bounds the longest legitimate pass.
+const STUCK_RECONCILE_MS = config.fluxapps.reconcileStuckWarnMs ?? 20 * 60 * 1000;
 
 // identifiers whose missing backing image was already recorded as a tampering
 // event, so the paced retries don't re-record it every cycle
@@ -284,10 +306,44 @@ async function getLocalComponentSpec(identifier) {
  *                               healthy app.
  *   - container NOT listed   -> docker itself confirms absence: vanished.
  */
+// Marking is durable, so it only ever needs to happen once per component per
+// process; the set keeps a steady-state reconcile from writing on every pass.
+const everStartedMarked = new Set();
+
+// A provision abandoned by the ceiling keeps running: Promise.race ends the PASS,
+// not the work. The pass's single-flight key is released, so without this the next
+// pass can take the appdata-clear branch and rm -rf the very directory the detached
+// provision is building into - or create a container the current desired state says
+// must be stopped. Membership defers the whole actuation (stops included - a stop
+// issued mid-provision races the provision's own create/start step) until the
+// detached work settles and re-enqueues; every deferred pass says so in the log.
+const detachedProvisions = new Set();
+
+/**
+ * Record that docker has run this component here. Called from every point that
+ * observes it running - not just the reconciler's own start - because an app that
+ * has been up since installation would otherwise never be marked, and would stay
+ * eligible for deletion by a failed rebuild.
+ */
+async function markEverStarted(identifier) {
+  if (everStartedMarked.has(identifier)) return;
+  // Memoise only a write that landed. setEverStarted swallows a DB failure to
+  // false, and memoising that failure would block every later attempt for the
+  // life of the process - leaving an established component deletable by a
+  // failed rebuild, which is exactly what the flag exists to prevent. Left
+  // un-memoised, the next observation pass retries the write.
+  if (await appsRuntimeState.setEverStarted(identifier)) {
+    everStartedMarked.add(identifier);
+  }
+}
+
 async function dockerActual(identifier) {
   try {
     const info = await dockerService.dockerContainerInspect(identifier);
     const everRan = info.State && info.State.Status !== 'created';
+    // docker's own record that this component has run here: covers an app that has
+    // been up since install and would otherwise never be marked established
+    if (everRan) markEverStarted(identifier).catch(() => {});
     // docker's record of the last death - the truth even when the die event was
     // missed (reboot, FluxOS restart, stream gap). Zero value (0001-01-01) means
     // the container never finished.
@@ -357,6 +413,56 @@ async function effectiveDesiredRunning(identifier, spec, exitCode) {
 }
 
 /**
+ * Runs a container (re)provision under the recreate ceiling: the PASS ends at
+ * RECREATE_PROVISION_CAP_MS even if a sub-step ignores the abort signal, so a
+ * hung provision can never hold the per-key single-flight. The abandoned
+ * provision keeps running detached; it is tracked in detachedProvisions so no
+ * later pass can wipe or double-provision under it, and its eventual settlement
+ * re-enqueues the component so the current desired state decides what happens
+ * to whatever it built. A pass ended by the ceiling throws with
+ * provisionTimedOut set — a statement about this node right now, never a
+ * verdict on the app (the ceiling wraps the whole provision, image pull
+ * included, so it can fire on a large image that is downloading perfectly well).
+ */
+async function runCappedProvision(identifier, startProvision) {
+  const abortController = new AbortController();
+  const capTimer = setTimeout(() => abortController.abort(), RECREATE_PROVISION_CAP_MS);
+  if (capTimer.unref) capTimer.unref();
+  const provision = startProvision();
+  // a capped provision keeps running detached; its eventual rejection must land
+  // here, not as an unhandledRejection
+  provision.catch(() => {});
+  try {
+    // the race ends the PASS at the cap even if a sub-step ignores the signal
+    await Promise.race([
+      provision,
+      new Promise((_, reject) => {
+        abortController.signal.addEventListener('abort', () => {
+          const capError = new Error(`recreate provisioning exceeded ${Math.round(RECREATE_PROVISION_CAP_MS / 1000)}s, aborted`);
+          capError.provisionTimedOut = true;
+          reject(capError);
+        }, { once: true });
+      }),
+    ]);
+  } catch (raceError) {
+    // Only a pass the ceiling ABANDONED leaves work running behind it. Track that
+    // one, and re-reconcile when it eventually lands so the current desired state
+    // decides what happens to whatever it built. Doing this for a provision that
+    // completed inside its pass would re-enqueue every successful recreate.
+    if (raceError.provisionTimedOut) {
+      detachedProvisions.add(identifier);
+      provision.finally(() => {
+        detachedProvisions.delete(identifier);
+        enqueue(identifier);
+      }).catch(() => {});
+    }
+    throw raceError;
+  } finally {
+    clearTimeout(capTimer);
+  }
+}
+
+/**
  * Recreates a vanished container (no Docker event fires for absence), recording
  * the tampering signals and falling back to local removal on failure — the
  * behavior previously in containerHealthMonitor.monitorAndRecoverApps.
@@ -366,7 +472,8 @@ async function recreateMissing(identifier) {
 
   await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
   try {
-    await containerHealthMonitor.recreateMissingContainers(identifier);
+    await runCappedProvision(identifier, () => containerHealthMonitor.recreateMissingContainers(identifier));
+    await markEverStarted(identifier);
     appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.info(`appReconciler - recreated missing container ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated' });
@@ -392,7 +499,36 @@ async function recreateMissing(identifier) {
     if (appTamperingDetectionService.isNetworkMissingError(err.message)) {
       await appTamperingDetectionService.recordEvent(mainAppName, 'network_pruned', `Docker network missing during recreation: ${err.message}`);
     }
-    log.warn(`REMOVAL REASON: Container recreation failure - ${mainAppName} (appReconciler)`);
+    // A component that docker has started here before is NOT destroyed over a
+    // failed rebuild - an image that has become unpullable, a bad update, or a
+    // registry that is merely unreachable right now. It degrades to DOWN and backs
+    // off, so a transient registry problem can never delete an established app and
+    // its data across the fleet. Only a fresh install that vanished before it ever
+    // ran is removed, which is the case this removal was written for.
+    // The read is strict because the null branch here deletes the app: through
+    // getState a DB error reads as "never started". A failed read defers instead.
+    let runtimeState;
+    try {
+      runtimeState = await appsRuntimeState.getStateStrict(identifier);
+    } catch (stateReadError) {
+      log.warn(`appReconciler - cannot read runtime state for ${identifier} (${stateReadError.message}); keeping it and retrying in ${Math.round(MANAGED_RETRY_MS / 1000)}s`);
+      scheduleRetry(identifier, MANAGED_RETRY_MS);
+      return;
+    }
+    // dockerRuntimeTimedOut joins provisionTimedOut here: a bounded docker call
+    // timing out INSIDE the provision settles the pass early with the same
+    // meaning as the ceiling - the daemon did not answer. Reading it as a
+    // recreate failure would let a wedged daemon delete a never-started app.
+    if (err.provisionTimedOut || err.dockerRuntimeTimedOut || (runtimeState && runtimeState.hasEverStarted)) {
+      await appsRuntimeState.recordRestart(identifier);
+      const wait = Math.max(await appsRuntimeState.restartWaitMs(identifier), MANAGED_RETRY_MS);
+      const keepReason = (runtimeState && runtimeState.hasEverStarted) ? 'it has run here before' : 'the failure is a node condition';
+      log.warn(`appReconciler - ${identifier} could not be recreated but ${keepReason}; keeping it (down) and retrying in ${Math.round(wait / 1000)}s`);
+      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreateFailedKept', waitMs: wait });
+      scheduleRetry(identifier, wait);
+      return;
+    }
+    log.warn(`REMOVAL REASON: Container recreation failure (never ran here) - ${mainAppName} (appReconciler)`);
     await appUninstaller.removeAppLocally(mainAppName, null, false, true, true);
   }
 }
@@ -413,7 +549,10 @@ async function recreateForNetworkHeal(identifier) {
     // softOnly: a hard install would REFORMAT the app's data volume (createAppVolume
     // fallocates + mke2fs). We removed a live container whose data was intact, so a
     // recreate that cannot verify the volume must fail and be retried - never wipe it.
-    await containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true });
+    // Capped like the vanished-path recreate: the container is already force-removed
+    // by this point, so a provision wedged on an unanswering daemon would otherwise
+    // hold this component's single-flight forever with no container and no way back.
+    await runCappedProvision(identifier, () => containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true }));
     appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.info(`appReconciler - recreated ${identifier} to clear a detached network endpoint`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated', reason: 'networkDetached' });
@@ -754,6 +893,17 @@ async function reconcile(rawIdentifier) {
   // loss window). Stop first - an rm -rf under a live container corrupts it - then
   // wipe, then drop the flag. The wipe path is keyed by the on-disk (flux-prefixed)
   // folder name, while the stop takes the bare id (dockerService re-prefixes).
+  // A provision from an abandoned pass may be creating volumes and containers under
+  // this very path right now. Wiping it, or launching a second provision alongside
+  // the first, is exactly the race the single-flight exists to prevent - defer until
+  // the detached one lands, which re-enqueues us.
+  if (detachedProvisions.has(identifier)) {
+    log.warn(`appReconciler - ${identifier} has a provision still running from an abandoned pass; deferring`);
+    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'provisionDetached' });
+    scheduleRetry(identifier, MANAGED_RETRY_MS);
+    return;
+  }
+
   if (dataDesired.get(identifier) === 'clear') {
     try {
       if (actual.running) {
@@ -762,6 +912,18 @@ async function reconcile(rawIdentifier) {
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
+      // `actual` was sampled before the stop and the settle delay; re-read rather
+      // than delete under whatever is true now. An rm -rf beneath a live container
+      // corrupts it, so an unexpected runner aborts the wipe instead of racing it.
+      // "Cannot tell" (docker unreachable, or inspect failed with the container
+      // still listed) aborts too: the wipe needs a positive answer that nothing
+      // is running, not the absence of one.
+      const beforeWipe = await dockerActual(identifier);
+      if (beforeWipe.running || !beforeWipe.reachable || beforeWipe.indeterminate) {
+        log.error(`appReconciler - ${identifier} is running again (or docker cannot confirm it stopped) at the point of the appdata clear; aborting the wipe and retrying`);
+        scheduleRetry(identifier, MANAGED_RETRY_MS);
+        return;
+      }
       await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
     } catch (err) {
       // A failed stop/wipe is the only actuation path here that would otherwise drop
@@ -893,6 +1055,7 @@ async function reconcile(rawIdentifier) {
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
+  await markEverStarted(identifier);
   appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
@@ -921,6 +1084,8 @@ function runReconcile(identifier) {
     .catch((err) => log.error(`appReconciler - reconcile ${identifier} failed: ${err.message}`))
     .finally(() => {
       inFlight.delete(identifier);
+      inFlightSince.delete(identifier);
+      inFlightWarnedAt.delete(identifier);
       // one completed pass (actuated or deferred) is all the boot drain needs
       if (bootDraining.delete(identifier) && bootDraining.size === 0) {
         settleBootDrain('all boot reconciles completed a pass');
@@ -930,6 +1095,26 @@ function runReconcile(identifier) {
         setImmediate(() => enqueue(identifier));
       }
     });
+}
+
+/**
+ * Report an in-flight pass that has outlived any legitimate one, so a component
+ * whose reconciles are being silently coalesced away is visible. Deliberately
+ * inert: the pass keeps its guard (reconcile mutates data, so releasing it early
+ * would let a start race a wipe) - the point is that the operator finds out in
+ * minutes rather than never. Re-warns once per window so a long stall keeps
+ * signalling instead of scrolling past once.
+ */
+function warnIfStuck(identifier) {
+  const startedAt = inFlightSince.get(identifier);
+  if (!startedAt) return;
+  const elapsedMs = Number((process.hrtime.bigint() - startedAt) / 1000000n);
+  if (elapsedMs < STUCK_RECONCILE_MS) return;
+  const lastWarned = inFlightWarnedAt.get(identifier);
+  if (lastWarned && elapsedMs - lastWarned < STUCK_RECONCILE_MS) return;
+  inFlightWarnedAt.set(identifier, elapsedMs);
+  log.error(`appReconciler - ${identifier} has been reconciling for ${Math.round(elapsedMs / 1000)}s; reconcile requests for it are being dropped`);
+  fluxEventBus.publish('reconciler:stuck', { identifier, elapsedMs });
 }
 
 /**
@@ -944,10 +1129,12 @@ function enqueue(rawIdentifier) {
     return;
   }
   if (inFlight.has(identifier)) {
+    warnIfStuck(identifier);
     dirty.add(identifier);
     return;
   }
   inFlight.add(identifier);
+  inFlightSince.set(identifier, process.hrtime.bigint());
   runReconcile(identifier);
 }
 
@@ -1037,6 +1224,12 @@ function clearControllerDesired(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   controllerDesired.delete(identifier);
   dataDesired.delete(identifier);
+  // The uninstall that triggers this also deleted the component's durable runtime
+  // state, including the hasEverStarted flag the memo below stands in for. Keeping
+  // the memo would stop a reinstalled component from ever being re-marked, so it
+  // would spend the rest of this process eligible for deletion by a failed rebuild -
+  // silently undoing the protection, for every app redeployed since FluxOS started.
+  everStartedMarked.delete(identifier);
 }
 
 // --- lifecycle -----------------------------------------------------------

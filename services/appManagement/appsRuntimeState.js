@@ -53,6 +53,23 @@ async function getState(rawIdentifier) {
   }
 }
 
+/**
+ * Returns the runtime-state document like getState, but a read failure THROWS
+ * instead of degrading to null. For callers whose null branch is destructive:
+ * through getState a DB error is indistinguishable from "no document", so a
+ * transient read blip would read as "this component never ran here" and
+ * authorise destroying it. A read failure must be a failure, so the caller
+ * can defer instead of guess.
+ *
+ * @param {string} identifier
+ * @returns {Promise<object|null>} - throws if the state cannot be read
+ */
+async function getStateStrict(rawIdentifier) {
+  const identifier = canonical(rawIdentifier);
+  const database = collection();
+  return dbHelper.findOneInDatabase(database, appsRuntimeState, { identifier }, { projection: { _id: 0 } });
+}
+
 function isDuplicateKeyError(err) {
   return err && (err.code === 11000 || /E11000/.test(err.message || ''));
 }
@@ -76,6 +93,31 @@ async function setFields(rawIdentifier, fields) {
     // loser's write (possibly the operator stop lock) would be silently dropped.
     if (!isDuplicateKeyError(err)) throw err;
     await write();
+  }
+}
+
+/**
+ * Marks that docker has accepted at least one start of this component on this
+ * node. Durable, and cleared only by remove().
+ *
+ * This is what separates an established component from a fresh install that
+ * vanished before it ever ran — the distinction the reconciler needs before it
+ * will destroy an app and its data over a failed rebuild.
+ *
+ * Returns whether the write landed: the reconciler memoises the mark per
+ * process, and memoising a write that was swallowed here would leave the
+ * component deletable for the life of the process with no retry.
+ *
+ * @param {string} identifier
+ * @returns {Promise<boolean>}
+ */
+async function setEverStarted(identifier) {
+  try {
+    await setFields(identifier, { hasEverStarted: true });
+    return true;
+  } catch (err) {
+    log.error(`appsRuntimeState - failed to record start for ${identifier}: ${err.message}`);
+    return false;
   }
 }
 
@@ -354,6 +396,8 @@ async function prepareCollection() {
 module.exports = {
   prepareCollection,
   getState,
+  getStateStrict,
+  setEverStarted,
   setOperatorStopped,
   isOperatorStopped,
   recordRestart,

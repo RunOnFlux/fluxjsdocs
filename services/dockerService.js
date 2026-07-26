@@ -25,6 +25,46 @@ const appsFolder = `${appsFolderPath}/`;
 const docker = new Docker();
 
 /**
+ * Bound a short docker control-plane call so a wedged daemon cannot hold a caller
+ * forever. Mirrors kubelet's --runtime-request-timeout: it covers the quick runtime
+ * operations and deliberately exempts the long-running ones (pull has its own
+ * progress-based stall detection; stop legitimately runs for hours under a graceful
+ * shutdown and declares its own grace via `t`).
+ *
+ * The race frees the CALLER; it cannot cancel the underlying HTTP request, which
+ * may still land later. The reads are safe to repeat; the creates are NOT - a
+ * create that lands after its timeout makes a blind retry collide (or worse,
+ * duplicate: dockerd accepts a second network with the same name). Callers on
+ * create paths must re-check for the thing by name before retrying, and every
+ * consumer of the rejection must read it as dockerRuntimeTimedOut says: the
+ * daemon did not ANSWER - a statement about this node right now, never a
+ * refusal and never a verdict on the app.
+ *
+ * @param {Promise} operation
+ * @param {string} label used in the timeout error
+ * @returns {Promise}
+ */
+async function withRuntimeOpTimeout(operation, label) {
+  const timeoutMs = config.fluxapps.dockerRuntimeOpTimeoutMs ?? 2 * 60 * 1000;
+  let timer = null;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutError = new Error(`docker ${label} exceeded ${Math.round(timeoutMs / 1000)}s`);
+          timeoutError.dockerRuntimeTimedOut = true;
+          reject(timeoutError);
+        }, timeoutMs);
+        if (timer.unref) timer.unref();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Creates a docker container object with a given ID.
  *
  * @param {string} id
@@ -116,6 +156,15 @@ function getAppDockerNameIdentifier(appName) {
  * @returns {object} Network
  */
 async function dockerCreateNetwork(options) {
+  // Deliberately NOT under the runtime-op timeout: a create that times out
+  // client-side can still land in the daemon, and the octet-retry loop above
+  // this (ensureAppDockerNetwork) advances on rejection - a second create for
+  // the same name would then DUPLICATE it (dockerd accepts duplicate names),
+  // leaving the app unstartable. A rejection from here must always mean the
+  // daemon answered. On the reconciler's recreate paths a wedge is bounded by
+  // the provision ceiling; on the install paths it is not bounded at all - a
+  // pre-existing gap (the global installationInProgress flag has no watchdog)
+  // owned by the operation-registry redesign, not fixable at this call.
   const network = await docker.createNetwork(options);
   return network;
 }
@@ -161,7 +210,11 @@ async function dockerListContainers(all, limit, size, filter) {
     size,
     filter,
   };
-  const containers = await docker.listContainers(options);
+  // Bounded like the other short control-plane calls: the reconciler's own
+  // reachability probe lands here when an inspect times out, so an unbounded
+  // list would hand the wedged daemon back the single-flight the inspect
+  // ceiling just freed.
+  const containers = await withRuntimeOpTimeout(docker.listContainers(options), 'list containers');
   return containers;
 }
 
@@ -210,10 +263,17 @@ async function getDockerContainerByIdOrName(idOrName) {
  * @returns {object}
  */
 async function dockerContainerInspect(idOrName, options = {}) {
-  // container ID or name
-  const dockerContainer = await getDockerContainerByIdOrName(idOrName);
-  const response = await dockerContainer.inspect(options);
-  return response;
+  // The name lookup is itself a docker call (listContainers), so it has to be
+  // bounded too - a ceiling that starts only after it would never fire against the
+  // wedged daemon it exists to defend against.
+  const dockerContainer = await withRuntimeOpTimeout(getDockerContainerByIdOrName(idOrName), `lookup ${idOrName}`);
+  // A plain inspect reads local metadata and is bounded. `size: true` is a
+  // different operation: docker walks the container's whole filesystem to compute
+  // SizeRw/SizeRootFs, which on a large app volume legitimately takes minutes.
+  // Bounding that would report a storage figure of zero for exactly the apps whose
+  // usage matters most, so it keeps the daemon's own pace.
+  if (options.size) return dockerContainer.inspect(options);
+  return withRuntimeOpTimeout(dockerContainer.inspect(options), `inspect ${idOrName}`);
 }
 
 /**
@@ -290,6 +350,39 @@ async function dockerContainerChanges(idOrName) {
  * @param {object} res Response.
  * @param {function} callback Callback.
  */
+// Could the registry not be REACHED, as opposed to answering that the image is
+// bad? Only the former is safe to ride out on a local copy: an unreachable
+// registry is a condition of this node right now, while a rejected manifest is a
+// statement about the image. Anything unrecognised stays unclassified, so the
+// caller treats it as permanent - the conservative direction.
+const TRANSIENT_REGISTRY_CODES = ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'EAI_AGAIN', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE'];
+
+function classifyRegistryError(error) {
+  if (!error) return error;
+  if (TRANSIENT_REGISTRY_CODES.includes(error.code)) error.registryErrorClass = 'transient';
+  return error;
+}
+
+/**
+ * Bytes of a locally-held image, or 0 when it is not present. Used to decide
+ * whether a recreate can proceed on the copy already on disk when the registry
+ * cannot be reached.
+ *
+ * @param {string} repoTag
+ * @returns {Promise<number>}
+ */
+async function appDockerImageSize(repoTag) {
+  try {
+    // Bounded: this sits on the recreate path's local-image fallback decision, so
+    // a wedged daemon must produce an answer, not a hang. A timeout reads as 0 -
+    // "no usable local image" - which refuses the fallback, the conservative side.
+    const image = await withRuntimeOpTimeout(docker.getImage(repoTag).inspect(), `image inspect ${repoTag}`);
+    return image?.Size ?? 0;
+  } catch (error) {
+    return 0;
+  }
+}
+
 function dockerPullStream(pullConfig, res, callback) {
   const { repoTag, provider, authToken } = pullConfig;
   let pullOptions;
@@ -310,15 +403,53 @@ function dockerPullStream(pullConfig, res, callback) {
       throw new Error('Invalid login credentials for docker provided');
     }
   }
+  // A registry can black-hole rather than refuse (a dead IP behind a stale DNS
+  // cache), and an unbounded pull wedges whatever awaits it. A duration cap cannot
+  // tell a dead transfer from a large one - docker resumes completed layers but not
+  // partial ones, so any layer bigger than the cap's window could never finish.
+  // Silence is the signal, not elapsed time: every progress event re-arms the timer,
+  // so total pull time stays unbounded for as long as bytes are moving.
+  const stallWindowMs = config.fluxapps.pullStallMs ?? 90 * 1000;
+  const stallController = new AbortController();
+  let stallTimer = null;
+  let settled = false;
+
+  function done(error, output) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(stallTimer);
+    callback(error, output);
+  }
+
+  function armStall() {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      const stallError = new Error(`Pull of ${repoTag} stalled: no progress for ${Math.round(stallWindowMs / 1000)}s`);
+      // the registry is not answering; the image itself may be perfectly fine
+      stallError.registryErrorClass = 'transient';
+      done(stallError);
+      stallController.abort();
+    }, stallWindowMs);
+    if (stallTimer.unref) stallTimer.unref();
+  }
+
+  pullOptions = { ...(pullOptions ?? {}), abortSignal: stallController.signal };
+
+  // Armed before the request, not from its callback: a dockerd that never answers
+  // the pull request at all is the same silence as a stalled transfer, and arming
+  // only on the answer would leave that phase unbounded.
+  armStall();
   docker.pull(repoTag, pullOptions, (err, mystream) => {
     function onFinished(error, output) {
-      if (error) {
-        callback(err);
-      } else {
-        callback(null, output);
-      }
+      // report the followProgress error itself; this used to pass the outer `err`,
+      // which is always null here, so a failed pull was reported as a success. It
+      // needs the same reachability classification as the request-level error: a
+      // transfer that dies mid-stream is the registry going away, not a verdict on
+      // the image.
+      done(error ? classifyRegistryError(error) : null, output);
     }
     function onProgress(event) {
+      armStall();
       if (res) {
         res.write(serviceHelper.ensureString(event));
         if (res.flush) res.flush();
@@ -326,8 +457,9 @@ function dockerPullStream(pullConfig, res, callback) {
       log.info(event);
     }
     if (err) {
-      callback(err);
+      done(classifyRegistryError(err));
     } else {
+      armStall();
       docker.modem.followProgress(mystream, onFinished, onProgress);
     }
   });
@@ -1070,6 +1202,14 @@ async function appDockerCreate(appSpecifications, appName, isComponent, fullAppS
   }
   options.Env.push(`FLUX_APP_NAME=${appName}`);
 
+  // Deliberately NOT under the runtime-op timeout: settling the provision with
+  // a plain timeout would bypass the recreate ceiling's classification - the
+  // ceiling ends a wedged pass with provisionTimedOut (a node condition, kept)
+  // and tracks the still-running work in detachedProvisions; a lower bound here
+  // settles early without either, which once turned a create-wedged daemon into
+  // a local uninstall of a never-started app. The ceiling covers only the
+  // reconciler's recreate paths; on the install paths a wedge here is unbounded
+  // - a pre-existing gap owned by the operation-registry redesign.
   const app = await docker.createContainer(options).catch((error) => {
     log.error(error);
     throw error;
@@ -1111,10 +1251,10 @@ async function appDockerUpdateCpu(idOrName, nanoCpus) {
 async function appDockerStart(idOrName) {
   try {
     // container ID or name
-    const dockerContainer = await getDockerContainerByIdOrName(idOrName);
+    const dockerContainer = await withRuntimeOpTimeout(getDockerContainerByIdOrName(idOrName), `lookup ${idOrName}`);
 
     globalState.stoppingContainers.delete(getDockerName(idOrName));
-    await dockerContainer.start(); // may throw
+    await withRuntimeOpTimeout(dockerContainer.start(), `start ${idOrName}`); // may throw
 
     // Apply CFS burst after start — cgroup paths only exist once the container
     // is running. Eligibility was decided at appDockerCreate time and stamped
@@ -1122,7 +1262,7 @@ async function appDockerStart(idOrName) {
     // is reapplied on every start path (initial install, restart, recovery)
     // without each caller having to know about burst.
     try {
-      const containerInspect = await dockerContainer.inspect();
+      const containerInspect = await withRuntimeOpTimeout(dockerContainer.inspect(), `burst inspect ${idOrName}`);
       const dockerLabels = containerInspect.Config?.Labels || {};
       if (dockerLabels['flux.burst.eligible'] === 'true') {
         const cpuCores = parseFloat(dockerLabels['flux.burst.cores']);
@@ -1896,6 +2036,7 @@ module.exports = {
   dockerLogsFix,
   dockerNetworkInspect,
   dockerPullStream,
+  appDockerImageSize,
   dockerRemoveNetwork,
   dockerVersion,
   getAppDockerNameIdentifier,
