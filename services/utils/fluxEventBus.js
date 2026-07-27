@@ -23,13 +23,7 @@ class FluxEventBus extends EventEmitter {
     super();
     this.#buffer = new Array(RING_BUFFER_SIZE);
     this.#writeIndex = 0;
-    // Seeded from the monotonic clock (microseconds since boot) so event ids
-    // stay monotonic across a FluxOS restart on a running host: a fresh
-    // process mints ids larger than anything the previous one served, so a
-    // consumer filtering on last-seen-id (the harness's afterId) does not
-    // silently discard every post-restart event. Not monotonic across a HOST
-    // reboot (the clock restarts near zero) - consumers do not survive one.
-    this.#nextId = Number(process.hrtime.bigint() / 1000n);
+    this.#nextId = 1;
     this.#enabled = enabled ?? (config.has('testEventStream') && config.get('testEventStream') === true);
   }
 

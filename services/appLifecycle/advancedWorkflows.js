@@ -3,6 +3,7 @@ const util = require('util');
 const df = require('node-df');
 const fs = require('node:fs');
 const path = require('node:path');
+const nodecmd = require('node-cmd');
 const axios = require('axios');
 const dbHelper = require('../dbHelper');
 const log = require('../../lib/log');
@@ -40,18 +41,7 @@ const appNetworkLinker = require('./appNetworkLinker');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
-// Monotonic milliseconds for durations/heartbeats: wall-clock (Date.now) steps
-// under NTP, and a stepped clock must never fake or hide a pass's progress.
-const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n);
-
 // Master/slave app tracking
-// The election pass the scheduler's watchdog is currently racing. Abandonment is
-// per-pass: the watchdog marks the pass it raced, and only that pass's pending
-// superseded()-guarded actions (the controller-state writes and folder flips) go
-// inert. A single shared epoch here would also invalidate still-in-flight start
-// chains dispatched by passes that completed normally - dropping the very start
-// the election exists to issue.
-let currentMasterSlavePass = null;
 const mastersRunningGSyncthingApps = new Map();
 const timeTostartNewMasterApp = new Map();
 // Components already reported as operator-stopped, so the exclusion is announced
@@ -61,12 +51,9 @@ const timeTostartNewMasterApp = new Map();
 // in the logs from a loop that has died, which is exactly how it has been
 // misread. Cleared when the lock lifts so a later stop announces again.
 const operatorStoppedNoted = new Set();
-// One primary-promotion chain (folder flips + recursive permissions fix) per
-// component at a time - the 30s scheduler dispatches without await, and the fix
-// legitimately runs for minutes on a large tree.
-const permissionsFixInFlight = new Set();
 
 // Promisified functions
+const cmdAsync = util.promisify(nodecmd.run);
 
 /**
  * Runs a command as root via execFile (no shell, args passed as params) and
@@ -531,16 +518,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       volumeFile = path.join(appVolumesPath, `${appId}FLUXFSVOL`);
     }
 
-    // The point of no return: past here the previous incarnation's on-disk
-    // state is gone, so a surviving cache entry for this id is stale by
-    // definition (e.g. a redeploy keep-mark re-planted while a same-app
-    // removal raced it) and would let this empty fresh install skip the
-    // new-install receiveonly protection and read as instantly ready for g:
-    // primary. Dropped HERE and not at entry: a pre-flight abort (resources
-    // query, space checks) leaves the existing volume and its data untouched,
-    // and stripping the mark there would hand intact data to the
-    // not-in-cache skip/second-encounter chain, which clears it.
-    globalState.receiveOnlySyncthingAppsCache.delete(appId);
     await execAsRoot('fallocate', ['-l', `${appSpecifications.hdd}G`, volumeFile]);
     const allocateSpace2 = {
       status: 'Space allocated',
@@ -846,80 +823,6 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
   }
 }
 
-// Whether this app still has its local spec row. The keep-on-failure path is
-// only coherent while the reconciler can SEE the app: a soft redeploy that
-// failed after the soft uninstall deleted the row but before the register
-// re-inserted it must fall back to the full local removal - keeping without a
-// row would orphan the still-mounted volume with no owner (nothing converges
-// an app that is not in the local DB), while removeAppLocally re-resolves the
-// spec globally and cleans volume, network and broadcast. An indeterminate
-// read keeps: never destroy on a guess.
-async function localAppSpecExists(appName) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-    const appsDatabase = dbopen.db(config.database.appslocal.database);
-    const app = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, { name: appName }, {});
-    return !!app;
-  } catch (error) {
-    return true;
-  }
-}
-
-// Restore the app's local spec row after this flow's own teardown deleted it
-// (the soft uninstall removes the row; the register's insert is what puts it
-// back). Keeping a failed redeploy is only coherent with the row present -
-// the reconciler converges what it can see - so a failure landing in that
-// window re-inserts the spec the flow was applying. The write mirrors the
-// register's insert (enterprise specs store blanked compose/contacts).
-// Returns false when the insert failed; the caller then leaves the app as an
-// orphan rather than destroying data - a mounted volume with no row is
-// recoverable, a deleted one is not.
-async function restoreLocalAppSpecRow(appSpecs) {
-  try {
-    const dbopen = dbHelper.databaseConnection();
-    const appsDatabase = dbopen.db(config.database.appslocal.database);
-    const isEnterprise = Boolean(appSpecs.version >= 8 && appSpecs.enterprise);
-    const dbSpecs = JSON.parse(JSON.stringify(appSpecs));
-    if (isEnterprise) {
-      dbSpecs.compose = [];
-      dbSpecs.contacts = [];
-    }
-    const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
-    return !!insertResult;
-  } catch (error) {
-    log.error(`restoreLocalAppSpecRow - failed to restore the local record of ${appSpecs.name}: ${error.message}`);
-    return false;
-  }
-}
-
-// During a soft redeploy the app's synced data is preserved on disk, so the
-// components the redeploy touched are marked already-synced in
-// receiveOnlySyncthingAppsCache (the same marking the success path performs).
-// The cache is in-memory (empty after a FluxOS restart), and without an entry
-// the syncthing state machine treats the surviving folder as a first encounter
-// - whose second-encounter handling REQUESTS A DATA CLEAR. So a failed redeploy
-// that keeps the app installed must mark the same scope the success path would
-// have: one component when the redeploy was per-component, all of them when it
-// was app-wide.
-function markSyncthingAppsSynced(appSpecs, componentSpecs) {
-  const components = appSpecs.version >= 4 && Array.isArray(appSpecs.compose)
-    ? (componentSpecs ? [componentSpecs] : appSpecs.compose).map((comp) => ({ containerData: comp.containerData, identifier: `${comp.name}_${appSpecs.name}` }))
-    : [{ containerData: appSpecs.containerData, identifier: appSpecs.name }];
-  // eslint-disable-next-line no-restricted-syntax
-  for (const comp of components) {
-    const hasSyncthingData = comp.containerData && (comp.containerData.includes('g:') || comp.containerData.includes('r:'));
-    if (hasSyncthingData) {
-      const appId = dockerService.getAppIdentifier(comp.identifier);
-      globalState.receiveOnlySyncthingAppsCache.set(appId, {
-        restarted: true,
-        numberOfExecutionsRequired: 4,
-        numberOfExecutions: 10,
-      });
-      log.info(`Restored syncthing cache for ${appId} during soft redeploy`);
-    }
-  }
-}
-
 /**
  * To soft register an app locally (with data volume already in existence). Performs pre-installation checks - database in place, Flux Docker network in place and if app already installed. Then registers app in database and performs soft install. If registration fails, the app is removed locally.
  * @param {object} appSpecs App specifications.
@@ -932,38 +835,36 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
   // get applications specifics from app messages database
   // check if hash is in blockchain
   // register and launch according to specifications in message
-  //
-  // The busy guards sit OUTSIDE the try and THROW: a soft register runs in
-  // the window where the caller's teardown already deleted the local row, so
-  // a bare return here would let the redeploy log success around an app with
-  // no row, no containers and an orphaned volume (the spawner is not gated on
-  // softRedeployInProgress, so a racing install can take the flag during the
-  // redeploy delay). Throwing from outside the try also keeps the catch below
-  // from clearing installationInProgress - the flag belongs to the OTHER
-  // operation here, not to this flow.
-  if (globalState.removalInProgress) {
-    const busyError = new Error('Another application is undergoing removal');
-    // typed so callers can tell a transient flag collision (defer, the next
-    // pass retries) from a real registration failure - the reinstall path's
-    // catch removes the whole app on a real failure and must not on this
-    busyError.busyCollision = 'removal';
-    throw busyError;
-  }
-  if (globalState.installationInProgress) {
-    const busyError = new Error('Another application is undergoing installation');
-    busyError.busyCollision = 'installation';
-    throw busyError;
-  }
+  // throw without catching
   try {
+    if (globalState.removalInProgress) {
+      const rStatus = messageHelper.createErrorMessage('Another application is undergoing removal');
+      log.error(rStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(rStatus));
+        res.end();
+      }
+      return;
+    }
+    if (globalState.installationInProgress) {
+      const rStatus = messageHelper.createErrorMessage('Another application is undergoing installation');
+      log.error(rStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(rStatus));
+        res.end();
+      }
+      return;
+    }
     globalState.installationInProgress = true;
     const tier = await generalService.nodeTier().catch((error) => log.error(error));
     if (!tier) {
-      // routed through the catch below: the caller's teardown may already
-      // have deleted the local row at this point, so a bare return would
-      // strand the app half-redeployed - no row, nothing keeping, removing,
-      // or converging it. The catch clears the flag, restores the row and
-      // keeps, like any other mid-registration failure.
-      throw new Error('Failed to get Node Tier');
+      const rStatus = messageHelper.createErrorMessage('Failed to get Node Tier');
+      log.error(rStatus);
+      if (res) {
+        res.write(serviceHelper.ensureString(rStatus));
+        res.end();
+      }
+      return;
     }
     const appSpecifications = appSpecs;
     const appComponent = componentSpecs;
@@ -1155,38 +1056,16 @@ async function softRegisterAppLocally(appSpecs, componentSpecs, res) {
       res.write(serviceHelper.ensureString(errorResponse));
       if (res.flush) res.flush();
     }
-    // A failed soft redeploy NEVER removes the app. The data volume was
-    // deliberately preserved (that is what makes the redeploy soft), so
-    // removal destroys established data over what is usually a node-local
-    // failure - a wedged daemon, a port that would not map, a resource query
-    // that blipped. The spec and volume stay; the reconciler retries the
-    // install with the CURRENT spec on its backoff ladder, so a transient
-    // failure self-heals and a genuinely bad update converges to
-    // kept-down-with-data, the same contract as a failed recreate. A down
-    // instance stops broadcasting apprunning, so the network replaces it
-    // elsewhere through the normal spawner machinery. Keeping is only
-    // coherent with the local row present (the reconciler converges what it
-    // can see), and every soft register runs over an app that was installed
-    // here - so when this catch fires in the window between the caller's
-    // teardown deleting the row and the re-insert above, restore the row.
-    // The kept app's g:/r: components are then re-marked synced, or the sync
-    // layer's first-encounter handling clears their data.
-    if (!(await localAppSpecExists(appSpecs.name))) {
-      if (!(await restoreLocalAppSpecRow(appSpecs))) {
-        // no row and no way to write one: leave the app alone. An orphaned
-        // volume is recoverable (a later redeploy or reinstall re-adopts it);
-        // removing it here would destroy the only copy over a DB failure. No
-        // synced-mark either - a mark without a row would make an empty later
-        // install eligible for g: primary.
-        log.error(`softRegisterAppLocally - CRITICAL: ${appSpecs.name} failed during soft registration (${error.message}) and its local record could not be restored; leaving the app and its data untouched`);
-        if (res) res.end();
-        return;
-      }
-      log.warn(`softRegisterAppLocally - restored the local record of ${appSpecs.name} deleted by this redeploy's teardown`);
+    const removeStatus = messageHelper.createErrorMessage(`Error occured. Initiating Flux App ${appSpecs.name} removal`);
+    log.info(removeStatus);
+    log.warn(`REMOVAL REASON: Soft registration failure - ${appSpecs.name} failed during soft registration: ${error.message} (softRegisterAppLocally)`);
+    if (res) {
+      res.write(serviceHelper.ensureString(removeStatus));
+      if (res.flush) res.flush();
     }
-    log.warn(`softRegisterAppLocally - ${appSpecs.name} failed during soft registration (${error.message}); keeping the app and its data for the reconciler, NOT removing`);
-    markSyncthingAppsSynced(appSpecs, componentSpecs);
-    if (res) res.end();
+    // eslint-disable-next-line global-require
+    const appUninstaller = require('./appUninstaller');
+    appUninstaller.removeAppLocally(appSpecs.name, res, true);
   }
 }
 
@@ -1352,14 +1231,13 @@ async function softRemoveAppLocally(app, res) {
  * @param {object} res - Response object
  */
 async function softRedeploy(appSpecs, res) {
-  let hadLocalRow = false;
   try {
     if (globalState.removalInProgress) {
       log.warn('Another application is undergoing removal');
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1368,7 +1246,7 @@ async function softRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1377,7 +1255,7 @@ async function softRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1386,7 +1264,7 @@ async function softRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1421,12 +1299,6 @@ async function softRedeploy(appSpecs, res) {
       }
     }
 
-    // Read before the teardown so the catch can tell "this redeploy's own
-    // teardown deleted the row" (restore and keep - the data volume is still
-    // mounted) from "the app was never here" (fall back to removal). The
-    // keep-biased error default of the read is right here too: restoring
-    // beats removing on a guess.
-    hadLocalRow = await localAppSpecExists(appSpecs.name);
     globalState.softRedeployInProgress = true;
     log.info('Starting softRedeploy');
     try {
@@ -1454,48 +1326,12 @@ async function softRedeploy(appSpecs, res) {
   } catch (error) {
     log.info('Error on softRedeploy');
     log.error(error);
+    log.warn(`REMOVAL REASON: Soft redeploy failure - ${appSpecs.name} failed during soft redeploy: ${error.message} (softRedeploy)`);
     globalState.softRedeployInProgress = false;
-    // surface the failure on the streamed response; every branch below either
-    // ends it here or hands it to removeAppLocally, which ends it - a keep
-    // that leaves the stream open hangs the API client to a gateway timeout
-    if (res) {
-      const errorResponse = messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      );
-      res.write(serviceHelper.ensureString(errorResponse));
-      if (res.flush) res.flush();
-    }
-    // A failed soft redeploy never removes an app this node holds (see
-    // softRegisterAppLocally's catch for the full contract). This catch spans
-    // the whole flow, so it can fire in the rowless window between the
-    // teardown's row delete and the register's re-insert (the redeploy delay,
-    // the requirements check) - restore the row and keep, exactly as the
-    // register's catch does. Only an app that was never locally installed
-    // (hadLocalRow false: 'Flux App not found', spec formatting) falls back
-    // to the full removal, which re-resolves the spec globally and cleans up
-    // local remnants - nothing of value exists here to keep.
-    if (await localAppSpecExists(appSpecs.name)) {
-      log.warn(`softRedeploy - ${appSpecs.name} failed (${error.message}); keeping the app and its data for the reconciler, NOT removing`);
-      markSyncthingAppsSynced(appSpecs, undefined);
-      if (res) res.end();
-      return;
-    }
-    if (hadLocalRow) {
-      if (await restoreLocalAppSpecRow(appSpecs)) {
-        log.warn(`softRedeploy - ${appSpecs.name} failed (${error.message}); restored the local record deleted by this redeploy's teardown, keeping the app and its data, NOT removing`);
-        markSyncthingAppsSynced(appSpecs, undefined);
-      } else {
-        log.error(`softRedeploy - CRITICAL: ${appSpecs.name} failed (${error.message}) and its local record could not be restored; leaving the app and its data untouched`);
-      }
-      if (res) res.end();
-      return;
-    }
-    log.warn(`softRedeploy - ${appSpecs.name} failed and was never locally installed (${error.message}); removing local remnants`);
     // eslint-disable-next-line global-require
     const appUninstaller = require('./appUninstaller');
     await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, true);
+    log.info(`Cleanup completed for ${appSpecs.name} after soft redeploy failure`);
   }
 }
 
@@ -1513,7 +1349,7 @@ async function hardRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1522,7 +1358,7 @@ async function hardRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1531,7 +1367,7 @@ async function hardRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1540,7 +1376,7 @@ async function hardRedeploy(appSpecs, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1589,7 +1425,7 @@ async function softRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1598,7 +1434,7 @@ async function softRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1607,7 +1443,7 @@ async function softRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1616,7 +1452,7 @@ async function softRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1671,15 +1507,10 @@ async function softRedeployComponent(appName, componentName, res) {
       globalState.softRedeployInProgress = false;
     } catch (error) {
       log.error(error);
+      log.warn(`REMOVAL REASON: Soft redeploy failure - ${appName} being removed after component ${fullComponentName} failed during soft redeploy: ${error.message} (softRedeployComponent)`);
       globalState.softRedeployInProgress = false;
-      // A failed soft redeploy NEVER removes - and especially not the WHOLE app
-      // over one component. The data volumes were deliberately preserved; the
-      // reconciler retries the component's install with the current spec on its
-      // backoff ladder. Re-marked synced so the sync layer's first-encounter
-      // handling cannot clear the surviving data. The error still surfaces to
-      // the caller - the redeploy did fail.
-      log.warn(`softRedeployComponent - ${fullComponentName} failed (${error.message}); keeping ${appName} and its data for the reconciler, NOT removing`);
-      markSyncthingAppsSynced(appSpecifications, componentSpec);
+      await appUninstaller.removeAppLocally(appName, res, true, true, true);
+      log.info(`Cleanup completed for ${appName} after component ${fullComponentName} soft redeploy failure`);
       throw error;
     }
   } catch (error) {
@@ -1708,7 +1539,7 @@ async function hardRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing removal');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1717,7 +1548,7 @@ async function hardRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing installation');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1726,7 +1557,7 @@ async function hardRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing soft redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -1735,7 +1566,7 @@ async function hardRedeployComponent(appName, componentName, res) {
       const appRedeployResponse = messageHelper.createWarningMessage('Another application is undergoing hard redeploy');
       if (res) {
         res.write(serviceHelper.ensureString(appRedeployResponse));
-        res.end();
+        if (res.flush) res.flush();
       }
       return;
     }
@@ -2085,15 +1916,9 @@ async function applyPermissionsFix(appId) {
     log.info(`Applying permissions fix for app: ${appId}`);
 
     // Apply 777 permissions to entire app directory recursively
-    // This covers both appdata (primary mount) and all additional mounts at the same level.
-    // runCommand never rejects - failure comes back as result.error - and this result
-    // is the gate that keeps a node from being elected primary over data it could not
-    // fix. The budget is generous (a cold walk of a huge tree outruns runCommand's
-    // 15-minute default legitimately) but finite: a wedged walk must eventually
-    // surface as a failed fix, and a killed half-applied fix must read as failure.
-    const timeout = config.fluxapps.permissionsFixTimeoutMs ?? 60 * 60 * 1000;
-    const result = await serviceHelper.runCommand('chmod', { params: ['-R', '777', appPath], runAsRoot: true, timeout });
-    if (result.error) throw result.error;
+    // This covers both appdata (primary mount) and all additional mounts at the same level
+    const execPERM = `sudo chmod -R 777 ${appPath}`;
+    await cmdAsync(execPERM);
 
     log.info(`Successfully applied permissions fix for app: ${appId} (includes appdata and all mount points)`);
     return true;
@@ -2251,16 +2076,7 @@ async function appDockerRestart(appname) {
  * @param {string} appId - Application ID for syncthing folder
  * @returns {Promise<void>}
  */
-async function requestMasterStartWithPermissionsFix(appname, appId, superseded = () => false) {
-  // The scheduler re-decides every 30s and dispatches this chain without await,
-  // and the permissions fix legitimately runs for minutes on a large tree - so
-  // without this guard every tick would stack another full-tree chmod on top of
-  // the one still walking, each dirtying the inodes the previous is fixing.
-  if (permissionsFixInFlight.has(appId)) {
-    log.info(`Preparing masterSlave primary ${appname}: previous permissions-fix chain still running, skipping this dispatch`);
-    return;
-  }
-  permissionsFixInFlight.add(appId);
+async function requestMasterStartWithPermissionsFix(appname, appId) {
   try {
     log.info(`Preparing masterSlave primary ${appname}: fixing permissions before start`);
 
@@ -2283,19 +2099,12 @@ async function requestMasterStartWithPermissionsFix(appname, appId, superseded =
       return;
     }
 
-    // This chain is dispatched without await, so it outlives the pass that started
-    // it: the permissions fix and two syncthing folder flips take real time, and the
-    // watchdog can abandon that pass meanwhile. Guarding only the dispatch would let
-    // this stale write land on top of the decision that replaced it.
-    if (superseded()) return;
     // hand the run-state decision to the reconciler (the single container actuator)
     appReconciler.setControllerDesired(appname, 'running', 'masterSlave primary (synced)');
     log.info(`Requested start for masterSlave primary ${appname}`);
   } catch (error) {
     log.error(`Error preparing masterSlave primary ${appname}: ${error.message}`);
     // leave it stopped if the permissions-fix workflow failed
-  } finally {
-    permissionsFixInFlight.delete(appId);
   }
 }
 
@@ -3574,21 +3383,10 @@ async function reinstallOldApplications() {
               await appDockerRestart(appSpecifications.name);
             } catch (error) {
               log.error(error);
-              if (error.busyCollision) {
-                // a transient collision with another operation's flag, not a
-                // failed install: the components stay soft-uninstalled with
-                // the row and their data volumes intact. The row already
-                // carries the new spec (re-inserted before the component
-                // loop), so the reconciler recreates the missing components
-                // over the preserved volumes. Removing here would destroy
-                // preserved data over a timing collision.
-                log.warn(`Redeployment of ${appSpecifications.name} deferred (${error.message}); keeping the app for the reconciler`);
-              } else {
-                log.warn(`REMOVAL REASON: Redeployment error - ${appSpecifications.name} failed during redeployment: ${error.message}`);
-                // eslint-disable-next-line no-await-in-loop
-                await appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
-                log.info(`Cleanup completed for ${appSpecifications.name} after redeployment failure`);
-              }
+              log.warn(`REMOVAL REASON: Redeployment error - ${appSpecifications.name} failed during redeployment: ${error.message}`);
+              // eslint-disable-next-line no-await-in-loop
+              await appUninstaller.removeAppLocally(appSpecifications.name, null, true, true, true); // remove entire app
+              log.info(`Cleanup completed for ${appSpecifications.name} after redeployment failure`);
             }
           }
         }
@@ -3731,22 +3529,9 @@ async function forceAppRemovals() {
  * @returns {Promise<void>}
  */
 async function masterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https) {
-  // Declared outside the try so the finally can check ownership of the global
-  // flag against the pass that is current by the time it runs.
-  const thisPass = { abandoned: false, lastProgressAt: monotonicMs() };
   try {
     // eslint-disable-next-line no-param-reassign
     globalStateParam.masterSlaveAppsRunning = true;
-    currentMasterSlavePass = thisPass;
-    // A wedged pass keeps running after the scheduler gives up on it; anything it
-    // does from then on is based on a stale FDM/docker view and can fight the pass
-    // that replaced it (flipping a live primary's syncthing folder to receiveonly,
-    // or issuing a start/stop that has since been reversed).
-    const superseded = () => {
-      if (!thisPass.abandoned) return false;
-      log.warn('masterSlaveApps: pass was abandoned by the scheduler watchdog, dropping pending action');
-      return true;
-    };
     // do not run if installationInProgress or removalInProgress or softRedeployInProgress or hardRedeployInProgress
     if (globalStateParam.installationInProgress || globalStateParam.removalInProgress || globalStateParam.softRedeployInProgress || globalStateParam.hardRedeployInProgress) {
       return;
@@ -3800,13 +3585,9 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
       rejectUnauthorized: false,
     });
     const axiosOptions = {
-      timeout: config.fluxapps.masterSlaveFdmTimeoutMs ?? 10000,
+      timeout: 10000,
       httpsAgent: agent,
     };
-    // A standby waits index * this before it may claim an unclaimed primary, so
-    // lower-index nodes get first refusal instead of every holder racing to start.
-    const staggerMs = config.fluxapps.masterSlaveStaggerMs ?? 3 * 60 * 1000;
-    const probeTimeoutMs = config.fluxapps.masterSlaveProbeTimeoutMs ?? 10 * 1000;
 
     // Cleanup stale entries from maps to prevent memory leaks
     const validIdentifiers = new Set();
@@ -3856,14 +3637,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
 
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled.data) {
-      // Progress heartbeat for the scheduler's watchdog. The network calls in
-      // this loop are individually bounded (10s FDM regions, 10s peer probes),
-      // so a pass that is merely SLOW - many g: apps, degraded FDM - keeps
-      // beating and keeps its actuations, while a pass wedged on one dead await
-      // (including the unbounded DB read below) goes silent and is abandoned.
-      // Same principle as the pull stall detector: silence is the failure, not
-      // elapsed time.
-      thisPass.lastProgressAt = monotonicMs();
       let fdmOk = true;
       let identifier;
       let needsToBeChecked = false;
@@ -3998,19 +3771,47 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 });
                 const index = runningAppList.findIndex((x) => ipsMatch(x.ip, localSocketAddr));
 
-                // Helper function to check if any lower-index nodes are running the app
-                const checkLowerIndexNodesRunning = async () => {
-                  if (index <= 0) return false; // Index 0 or not found, no lower nodes to check
+                // The remembered primary is this node, but the component is not
+                // running here - so the memory is stale: we were stopped, or the
+                // FluxOS process outlived the container. Keeping it disqualifies
+                // this node twice over: the no-history start below requires no
+                // remembered primary, and the previous-primary branch requires the
+                // remembered primary to be a DIFFERENT node. The last primary is
+                // therefore permanently unelectable, and when every instance is in
+                // that state the app can never come back at all without a restart
+                // to clear this map. Drop it and let the normal paths decide.
+                if (mastersRunningGSyncthingApps.has(identifier)
+                  && ipsMatch(mastersRunningGSyncthingApps.get(identifier), localSocketAddr)
+                  && !runningAppsNames.includes(identifier)) {
+                  mastersRunningGSyncthingApps.delete(identifier);
+                  log.info(`masterSlaveApps: cleared this node's own stale primary record for ${identifier} - it is not running here`);
+                }
+
+                // Probe peers to see whether the g: component is already running
+                // somewhere else. `scope` selects which peers:
+                //   'lower' - only nodes ahead of us in the election order, the
+                //             pre-existing check used by the staggered starts.
+                //   'all'   - every other node. An index-0 start needs this: it has
+                //             no lower-index nodes, so a lower-only check always
+                //             answers "nobody" and the start proceeds blind. FDM
+                //             registration lags a node actually starting (measured
+                //             at ~110s in production), and throughout that window
+                //             FDM reports no primary while an instance is live - so
+                //             without this an index-0 node starts a second writer
+                //             on a shared volume.
+                // Best-effort by design, matching the existing probe: an unreachable
+                // peer is treated as not-running so a network fault cannot strand an
+                // app forever. It narrows the window rather than closing it; real
+                // mutual exclusion needs a lease, which is out of scope here.
+                const checkPeersRunning = async (scope) => {
+                  const limit = scope === 'all' ? runningAppList.length : index;
+                  if (limit <= 0) return false; // not found, or no lower nodes to check
 
                   const { CancelToken } = axios;
-                  const timeout = probeTimeoutMs;
+                  const timeout = 10 * 1000;
 
-                  // Check all nodes with lower index
-                  for (let i = 0; i < index; i += 1) {
-                    // each probe is bounded at probeTimeoutMs; beat per probe so a
-                    // high-index node's long (but advancing) walk is not mistaken
-                    // for a wedged pass
-                    thisPass.lastProgressAt = monotonicMs();
+                  for (let i = 0; i < limit; i += 1) {
+                    if (i === index) continue; // never probe ourselves
                     const nodeToCheck = runningAppList[i];
                     if (!nodeToCheck) continue;
 
@@ -4034,29 +3835,38 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                       // (e.g. a DB cluster component) run on every node and must not be mistaken
                       // for the master/slave component being active there.
                       if (appsRunning.find((app) => app.Names[0].includes(identifier))) {
-                        log.info(`masterSlaveApps: component:${identifier} is running on lower-index node (index ${i}) at ${ipToCheck}, will not start`);
+                        log.info(`masterSlaveApps: component:${identifier} is running on peer node (index ${i}) at ${ipToCheck}, will not start`);
                         return true;
                       }
                     } catch (error) {
                       isResolved = true;
-                      log.info(`masterSlaveApps: Failed to check lower-index node ${i} at ${ipToCheck} for app:${installedApp.name}, error: ${error.message}`);
+                      log.info(`masterSlaveApps: Failed to check peer node ${i} at ${ipToCheck} for app:${installedApp.name}, error: ${error.message}`);
                       // Continue checking other nodes
                     }
                   }
                   return false;
                 };
+                const checkLowerIndexNodesRunning = () => checkPeersRunning('lower');
 
                 if (index === 0 && !mastersRunningGSyncthingApps.has(identifier)) {
-                  // Index 0: Start immediately if no history
-                  if (superseded()) return;
-                  requestMasterStartWithPermissionsFix(identifier, appId, superseded);
-                  log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
+                  // Index 0 with no history starts - but only once no peer is
+                  // already running it. Without this probe the start is issued
+                  // blind, and FDM's registration lag makes "FDM says no primary"
+                  // an unreliable proxy for "nobody is running it".
+                  // eslint-disable-next-line no-await-in-loop
+                  const peerRunning = await checkPeersRunning('all');
+                  if (peerRunning) {
+                    log.info(`masterSlaveApps: not starting app:${installedApp.name} index: ${index} - a peer is already running it`);
+                  } else {
+                    requestMasterStartWithPermissionsFix(identifier, appId);
+                    log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
+                  }
                 } else if (!timeTostartNewMasterApp.has(identifier) && mastersRunningGSyncthingApps.has(identifier) && !ipsMatch(mastersRunningGSyncthingApps.get(identifier), localSocketAddr)) {
                   // There was a previous master (not me), and it's no longer on FDM
                   const { CancelToken } = axios;
                   const source = CancelToken.source();
                   let isResolved = false;
-                  const timeout = probeTimeoutMs;
+                  const timeout = 10 * 1000; // 10 seconds
                   setTimeout(() => {
                     if (!isResolved) {
                       source.cancel('Operation canceled by the user.');
@@ -4089,8 +3899,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                   // Previous master is not running, determine next primary
                   if (index === 0) {
-                    if (superseded()) return;
-                  requestMasterStartWithPermissionsFix(identifier, appId, superseded);
+                    requestMasterStartWithPermissionsFix(identifier, appId);
                     log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
                   } else {
                     const previousMasterIndex = runningAppList.findIndex((x) => ipsMatch(x.ip, mastersRunningGSyncthingApps.get(identifier)));
@@ -4098,20 +3907,19 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     if (previousMasterIndex >= 0) {
                       log.info(`masterSlaveApps: app:${installedApp.name} had primary running at index: ${previousMasterIndex}`);
                       if (index > previousMasterIndex) {
-                        timetoStartApp += (index - 1) * staggerMs;
+                        timetoStartApp += (index - 1) * 3 * 60 * 1000;
                       } else {
-                        timetoStartApp += index * staggerMs;
+                        timetoStartApp += index * 3 * 60 * 1000;
                       }
                     } else {
-                      timetoStartApp += index * staggerMs;
+                      timetoStartApp += index * 3 * 60 * 1000;
                     }
                     if (timetoStartApp <= Date.now()) {
                       // Time to start, but check if lower-index nodes are running
                       // eslint-disable-next-line no-await-in-loop
                       const lowerNodeRunning = await checkLowerIndexNodesRunning();
                       if (!lowerNodeRunning) {
-                        if (superseded()) return;
-                  requestMasterStartWithPermissionsFix(identifier, appId, superseded);
+                        requestMasterStartWithPermissionsFix(identifier, appId);
                         log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index}`);
                       }
                     } else {
@@ -4120,21 +3928,11 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     }
                   }
                 } else if (timeTostartNewMasterApp.has(identifier) && timeTostartNewMasterApp.get(identifier) <= Date.now()) {
-                  // A chain for this component is still running: keep the matured
-                  // slot so the next tick retries the moment it clears - and skip
-                  // the probe walk below, which a kept slot would otherwise re-pay
-                  // (index x 10s) on every pass for the life of the chain.
-                  if (permissionsFixInFlight.has(appId)) {
-                    log.info(`masterSlaveApps: promotion chain for ${identifier} still running, keeping its scheduled slot`);
-                    // eslint-disable-next-line no-continue
-                    continue;
-                  }
                   // Scheduled start time has arrived, check if lower-index nodes are running
                   // eslint-disable-next-line no-await-in-loop
                   const lowerNodeRunning = await checkLowerIndexNodesRunning();
                   if (!lowerNodeRunning) {
-                    if (superseded()) return;
-                    requestMasterStartWithPermissionsFix(identifier, appId, superseded);
+                    requestMasterStartWithPermissionsFix(identifier, appId);
                     log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index} that was scheduled to start at ${timeTostartNewMasterApp.get(identifier).toString()}`);
                     timeTostartNewMasterApp.delete(identifier);
                   } else {
@@ -4143,7 +3941,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                 } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
                   // Non-primary node with no history - schedule start based on index
-                  const timetoStartApp = Date.now() + (index * staggerMs);
+                  const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);
                   log.info(`masterSlaveApps: scheduling app:${installedApp.name} index: ${index} to start at ${timetoStartApp.toString()}`);
                   timeTostartNewMasterApp.set(identifier, timetoStartApp);
                 } else {
@@ -4160,7 +3958,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
               if (!ipsMatch(localSocketAddr, ip) && runningAppsNames.includes(identifier)) {
                 // Stop only the g: component on this standby node. Non-g siblings (e.g. a DB
                 // cluster component that needs all instances running) must keep running.
-                if (superseded()) return;
                 appReconciler.setControllerDesired(identifier, 'stopped', 'masterSlave standby');
                 log.info(`masterSlaveApps: requesting stop of component:${identifier} - primary runs on ip:${ip}, localSocketAddr is: ${localSocketAddr}`);
               } else if (ipsMatch(localSocketAddr, ip) && !runningAppsNames.includes(identifier)) {
@@ -4192,8 +3989,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 }
 
                 if (isReady) {
-                  if (superseded()) return;
-                  requestMasterStartWithPermissionsFix(identifier, appId, superseded);
+                  requestMasterStartWithPermissionsFix(identifier, appId);
                   log.info(`masterSlaveApps: starting docker component:${identifier}`);
                 } else {
                   log.info(`masterSlaveApps: app:${installedApp.name} is registered as primary on FDM but not ready yet (syncthing not synced), skipping start for this cycle`);
@@ -4207,122 +4003,11 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
   } catch (error) {
     log.error(`masterSlaveApps: ${error}`);
   } finally {
-    // Only the CURRENT pass owns the flag. An abandoned pass reaches this
-    // finally when it eventually unwedges - by then the watchdog has released
-    // the flag and a replacement pass may have set it true for itself; an
-    // unconditional clear here would clobber the live pass's lock.
-    if (currentMasterSlavePass === thisPass) {
-      // eslint-disable-next-line no-param-reassign
-      globalStateParam.masterSlaveAppsRunning = false;
-    }
+    // eslint-disable-next-line no-param-reassign
+    globalStateParam.masterSlaveAppsRunning = false;
+    await serviceHelper.delay(config.fluxapps.masterSlaveIntervalMs ?? 30 * 1000);
+    masterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https);
   }
-}
-
-/**
- * Interval-based scheduler for masterSlaveApps, replacing the previous recursive
- * self-reschedule (a `masterSlaveApps(...)` call inside the function's own
- * `finally`). That pattern was fragile in two ways, and either could permanently
- * stop g: primary election with no recovery - leaving g: syncthing apps stuck in
- * the `created` state (never elected) until a manual restart:
- *   - a throw from the reschedule tail / an unhandled rejection in the recursion
- *     chain broke the chain, and
- *   - a pass that never settles (e.g. a docker or FDM call wedged while a
- *     container was being torn down mid-failover) meant the `finally` - and thus
- *     the only reschedule - never ran.
- * A setInterval (level-triggered, self-healing) fires independently of any pass,
- * mirroring syncthingApps(); the per-pass timeout below additionally guarantees a
- * wedged pass can never hold the single-flight guard forever.
- *
- * @param {object} globalStateParam
- * @param {Function} installedApps
- * @param {Function} listRunningApps
- * @param {Map} receiveOnlySyncthingAppsCache
- * @param {Array} backupInProgressParam
- * @param {Array} restoreInProgressParam
- * @param {object} https
- * @returns {{ stop: Function, isActive: Function }}
- */
-function startMasterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https) {
-  let intervalId = null;
-  let isRunning = false;
-
-  const intervalMs = config.fluxapps.masterSlaveIntervalMs ?? 30 * 1000;
-  // The watchdog judges a pass by SILENCE, not total elapsed time (the pull
-  // stall detector's principle): a pass with many g: apps or degraded FDM
-  // legitimately runs past any fixed budget while still advancing, and
-  // abandoning it drops the very elections it exists to make. The pass beats
-  // a heartbeat between its bounded awaits; only a heartbeat older than this
-  // means it is wedged on a single dead call.
-  const maxPassMs = config.fluxapps.masterSlaveMaxPassMs ?? Math.max(intervalMs * 4, 2 * 60 * 1000);
-
-  const runPass = async () => {
-    // Single-flight: skip if the previous pass is still in flight so passes never
-    // overlap (a slow pass just yields the tick, same as the old sequential gap).
-    if (isRunning) {
-      log.info('masterSlaveApps: previous pass still running, skipping this iteration');
-      return;
-    }
-    isRunning = true;
-    try {
-      let timer;
-      const pass = masterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https);
-      // Deadline-extension timer: fires when the pass's heartbeat has been
-      // silent for maxPassMs, re-arming for the remainder whenever the pass
-      // has beaten in the meantime. A wedged pass is still abandoned exactly
-      // maxPassMs after its last sign of life.
-      const watchdog = new Promise((_, reject) => {
-        const arm = (delayMs) => {
-          timer = setTimeout(() => {
-            const idleMs = monotonicMs() - (currentMasterSlavePass ? currentMasterSlavePass.lastProgressAt : 0);
-            if (idleMs >= maxPassMs) {
-              reject(new Error(`pass made no progress for ${Math.round(idleMs / 1000)}s`));
-            } else {
-              // clamped: the sources are monotonic, but a nonsense delta must
-              // degrade to a prompt re-check, never a 32-bit setTimeout overflow
-              arm(Math.min(maxPassMs, Math.max(1, maxPassMs - idleMs)));
-            }
-          }, delayMs);
-        };
-        arm(maxPassMs);
-      });
-      try {
-        await Promise.race([pass, watchdog]);
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (error) {
-      // masterSlaveApps swallows its own errors; this catches the watchdog
-      // timeout (and any unexpected throw) so a stuck pass can never tear down
-      // or permanently block the interval.
-      // Invalidate the abandoned pass so it cannot mutate if it later unwedges,
-      // and release the global lock it may never reach its own `finally` to clear
-      // (appInstaller gates performDockerCleanup on it; a pass wedged on a
-      // BOUNDED call does unwedge and reach its finally, where the ownership
-      // check keeps it from clobbering a replacement's lock). Single-flight
-      // means the pass registered as current is exactly the one this raced.
-      if (currentMasterSlavePass) currentMasterSlavePass.abandoned = true;
-      // eslint-disable-next-line no-param-reassign
-      globalStateParam.masterSlaveAppsRunning = false;
-      log.error(`startMasterSlaveApps: ${error.message} - releasing guard so the next tick runs a fresh pass`);
-    } finally {
-      isRunning = false;
-    }
-  };
-
-  // Run immediately, then keep running on a fixed interval.
-  runPass();
-  intervalId = setInterval(runPass, intervalMs);
-
-  return {
-    stop: () => {
-      if (intervalId) {
-        clearInterval(intervalId);
-        intervalId = null;
-        log.info('masterSlaveApps: scheduler stopped');
-      }
-    },
-    isActive: () => intervalId !== null,
-  };
 }
 
 module.exports = {
@@ -4358,6 +4043,5 @@ module.exports = {
   checkAndRemoveEnterpriseAppsOnNonArcane,
   forceAppRemovals,
   masterSlaveApps,
-  startMasterSlaveApps,
   appDockerStart,
 };

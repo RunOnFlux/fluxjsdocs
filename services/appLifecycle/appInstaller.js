@@ -243,8 +243,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
  * @param {object} fullAppSpecs - Full app specifications
  * @returns {Promise<void>}
  */
-async function verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs, options = {}) {
-  const allowLocalImageFallback = options.allowLocalImageFallback || false;
+async function verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs) {
   // check image and its architecture
   const architecture = await systemArchitecture();
   if (!supportedArchitectures.includes(architecture)) {
@@ -287,59 +286,18 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
     pullConfig.authToken = authToken;
   }
 
-  // Pull-first keeps a recreate fresh (a same-tag pull is a cheap manifest check).
-  // The local image only substitutes when the registry cannot be REACHED and the
-  // bits are already here, so the stale-run window is exactly the outage's duration
-  // and never a policy. A registry that answers that the image is bad is a statement
-  // about the image, not about this node, and still fails. Opt-in, so a fresh
-  // install never silently proceeds on layers someone else left behind.
-  const canRunFromLocalImage = async (error) => {
-    const transient = error.registryErrorClass === 'transient';
-    const localBytes = transient && allowLocalImageFallback
-      ? await dockerService.appDockerImageSize(appSpecifications.repotag)
-      : 0;
-    const usable = allowLocalImageFallback && transient && localBytes > 0;
-    if (!usable) {
-      // Say which condition ruled it out: a recreate that fails here goes on to be
-      // kept-but-down, and "why did it not use the copy it already had" is the first
-      // question anyone asks of that.
-      log.warn(`verifyAndPullImage - not falling back to the local image for ${appSpecifications.repotag}: `
-        + `fallbackAllowed=${allowLocalImageFallback} transient=${transient} localBytes=${localBytes} (${error.message})`);
-    }
-    return usable;
-  };
-
-  let registryReachable = true;
-
   await imgVerifier.verifyImage();
-  try {
-    // throwIfError stamps registryErrorClass on the throw - the verifier's own
-    // transient/permanent verdict, so a definitive answer about the image (bad
-    // arch, over size, not whitelisted) can never read as "registry unreachable".
-    imgVerifier.throwIfError();
-  } catch (error) {
-    if (!await canRunFromLocalImage(error)) throw error;
-    registryReachable = false;
-    log.warn(`verifyAndPullImage - registry unreachable for ${appSpecifications.repotag}; continuing from the local image`);
+  imgVerifier.throwIfError();
+
+  if (!imgVerifier.supported) {
+    throw new Error(`Architecture ${architecture} not supported by ${appSpecifications.repotag}`);
   }
 
-  // A registry we could not reach cannot have told us the architecture is wrong, and
-  // there is nothing to pull - the image we are about to run is the one already here.
-  if (registryReachable) {
-    if (!imgVerifier.supported) {
-      throw new Error(`Architecture ${architecture} not supported by ${appSpecifications.repotag}`);
-    }
+  // if dockerhub, this is now registry-1.docker.io instead of hub.docker.com
+  pullConfig.provider = imgVerifier.provider;
 
-    // if dockerhub, this is now registry-1.docker.io instead of hub.docker.com
-    pullConfig.provider = imgVerifier.provider;
-
-    try {
-      await dockerPullStreamPromise(pullConfig, res);
-    } catch (error) {
-      if (!await canRunFromLocalImage(error)) throw error;
-      log.warn(`verifyAndPullImage - registry unreachable for ${appSpecifications.repotag}; continuing from the local image`);
-    }
-  }
+  // eslint-disable-next-line no-unused-vars
+  await dockerPullStreamPromise(pullConfig, res);
 
   const pullStatus = {
     status: isComponent ? `Pulling component ${appSpecifications.name} of Flux App ${appName}` : `Pulling global Flux App ${appName} was successful`,
@@ -417,16 +375,6 @@ async function ensureAppDockerNetwork(appName, res) {
       if (octet === null) {
         throw new Error(`Flux App network of ${appName} failed to initiate. No free 172.23.x.0/24 subnet available on this node.`);
       }
-      // The create is awaited UNBOUNDED on purpose: a rejection here always means
-      // the daemon ANSWERED (subnet taken, name conflict), which is what makes
-      // advancing to the next octet safe. A client-side timeout would break that
-      // contract - the create could still land with this app's name, and a second
-      // create for the same name duplicates it (dockerd accepts duplicate names),
-      // leaving the name ambiguous and the app unstartable with no self-heal. On
-      // the reconciler's recreate paths a wedge here is bounded by the provision
-      // ceiling; on the install paths it is not bounded at all - a pre-existing
-      // gap (installationInProgress has no watchdog) owned by the
-      // operation-registry redesign.
       // eslint-disable-next-line no-await-in-loop
       fluxNet = await dockerService.createFluxAppDockerNetwork(appName, octet).catch((error) => log.error(error));
       if (!fluxNet) tried.add(octet);
@@ -875,7 +823,7 @@ async function checkOrbitAppHealth(appSpecifications, appName, isComponent, res)
  * @param {boolean} test - Whether this is a test installation
  * @returns {Promise<void>} Installation result
  */
-async function installApplicationHard(appSpecifications, appName, isComponent, res, fullAppSpecs, test = false, options = {}) {
+async function installApplicationHard(appSpecifications, appName, isComponent, res, fullAppSpecs, test = false) {
   // Verify the apps this app must be networked with (networkWith token) are
   // installed locally and owned by the same owner. Enforced here too — not just
   // in registerAppLocally — so direct callers that bypass it (container health
@@ -887,7 +835,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
   await setupApplicationPorts(appSpecifications, appName, isComponent, res, test);
 
   // Verify and pull Docker image
-  await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs, options);
+  await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs);
 
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -977,7 +925,7 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {object} fullAppSpecs Full app specifications.
  * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs, options = {}) {
+async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs) {
   // Verify the apps this app must be networked with (networkWith token) are
   // installed locally and owned by the same owner. Enforced here too — not just
   // in softRegisterAppLocally — so direct callers that bypass it (container
@@ -989,7 +937,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
   await setupApplicationPorts(appSpecifications, appName, isComponent, res);
 
   // Verify and pull Docker image
-  await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs, options);
+  await verifyAndPullImage(appSpecifications, appName, isComponent, res, fullAppSpecs);
 
   const createApp = {
     status: isComponent ? `Creating component ${appSpecifications.name} of local Flux App ${appName}` : `Creating local Flux App ${appName}`,
