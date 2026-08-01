@@ -12,12 +12,14 @@ const { normalizeSocketAddress, extractIp, extractPort, socketAddressesMatch } =
 
 // Import modular services
 const appQueryService = require('../appQuery/appQueryService');
+const messageStore = require('../appMessaging/messageStore');
 const registryManager = require('../appDatabase/registryManager');
 const imageManager = require('../appSecurity/imageManager');
 const hwRequirements = require('../appRequirements/hwRequirements');
 const portManager = require('../appNetwork/portManager');
 const appUtilities = require('../utils/appUtilities');
 const mountParser = require('../utils/mountParser');
+const ipLocationStore = require('../appPlacement/ipLocationStore');
 const placementFeasibility = require('../appPlacement/placementFeasibility');
 const systemIntegration = require('../appSystem/systemIntegration');
 const globalState = require('../utils/globalState');
@@ -295,10 +297,26 @@ async function trySpawningGlobalApplication() {
         }
         return app.nodes.length === 0 || app.nodes.find((ip) => socketAddressesMatch(ip, localSocketAddr)) || app.version >= 8;
       });
-      // filter apps that dont have geolocation or that are forbidden to spawn on my node geolocation
-      globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('a!c')).length === 0 || !app.geolocation.find((loc) => loc.startsWith('a!c') && `a!c${myNodeLocation}`.startsWith(loc.replace('_NONE', '')))));
-      // filter apps that dont have geolocation or have and match my node geolocation
-      globalAppNamesLocation = globalAppNamesLocation.filter((app) => (app.geolocation.length === 0 || app.geolocation.filter((loc) => loc.startsWith('ac')).length === 0 || app.geolocation.find((loc) => loc.startsWith('ac') && `ac${myNodeLocation}`.startsWith(loc))));
+      // Selection uses the SAME eligibility implementation as candidate
+      // counting and the install gate - one truth table everywhere. The node's
+      // own location: self-reported continent and country, region from its own
+      // published table. Selection may only over-include (the installer
+      // re-checks with the same rules); the old string-prefix filters here
+      // hid every table-vocabulary region pin from spawning and stripped
+      // _NONE, which turned a no-op deny into a whole-country selection ban.
+      const [myContinentCode, myCountryCode] = (myNodeLocation ?? '').split('_');
+      let myTableRegion = null;
+      try {
+        const localHit = await ipLocationStore.lookup(extractIp(localSocketAddr));
+        myTableRegion = localHit?.region ?? null;
+      } catch (error) {
+        // store unreadable = region unknown; selection over-includes and the
+        // installer arbitrates
+      }
+      const myLocation = { continentCode: myContinentCode ?? null, countryCode: myCountryCode ?? null, region: myTableRegion };
+      globalAppNamesLocation = globalAppNamesLocation.filter(
+        (app) => placementFeasibility.nodeLocationMatchesGeolocation(myLocation, app.geolocation),
+      );
       globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
 
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
@@ -479,18 +497,21 @@ async function trySpawningGlobalApplication() {
     // exists: this domain is refused once it holds its share of the instances,
     // computed over the app's eligible candidate set - never refused outright.
     let placementShare = null;
+    let placementDomainOf = null;
     let myDomain = null;
     if (syncthingApp && !pinnedHere) {
-      placementShare = await placementFeasibility.placementFeasibility(appSpecifications, minInstances);
-      myDomain = placementFeasibility.faultDomain(localIp);
+      const computation = await placementFeasibility.placementComputation(appSpecifications, minInstances);
+      placementShare = computation.feasibility;
+      placementDomainOf = computation.domainOf;
+      myDomain = placementDomainOf(localIp);
       // No `placeable` gate here, deliberately. This node reached the placement
       // check having passed its own geolocation filter, so it is itself an
       // eligible candidate - a table that resolves zero candidates network-wide
       // is contradicting the node's own location rather than proving the app
       // unplaceable, and refusing on that would strand the app everywhere.
       // Install-time geolocation checks remain authoritative.
-      const heldInMine = placementFeasibility.countHeldInDomain(runningAppList, myDomain)
-        + placementFeasibility.countHeldInDomain(installingAppList, myDomain);
+      const heldInMine = await placementFeasibility.countHeldInDomain(runningAppList, myDomain, placementDomainOf)
+        + await placementFeasibility.countHeldInDomain(installingAppList, myDomain, placementDomainOf);
       if (heldInMine >= placementShare.maxPerDomain) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} uses syncthing and fault domain ${myDomain} already holds ${heldInMine} of its ${placementShare.maxPerDomain}-instance share (${placementShare.domainCount} eligible domains)`);
         return shortDelayTime;
@@ -686,6 +707,37 @@ async function trySpawningGlobalApplication() {
       return shortDelayTime;
     }
 
+    // Retract this node's installing claim, network-wide. A silent back-out
+    // leaves the fluxappinstalling broadcast alive for its full TTL, and that
+    // ghost keeps counting against instance totals and domain shares - and can
+    // even win the cold-start seed election - for up to 15 minutes. On a small
+    // eligible pool (a pinned org or region) one collision round of ghosts
+    // stalls the whole domain for that window, so every withdrawal must say
+    // so. The existing fluxappinstallingerror message IS the retraction the
+    // network already understands: storing it clears the sender's installing
+    // entry on every node (and the error-count gate is advisory, so it never
+    // bars this node's own retry).
+    const withdrawInstallingClaim = async (reason) => {
+      try {
+        const withdrawal = {
+          type: 'fluxappinstallingerror',
+          version: 1,
+          name: appSpecifications.name,
+          hash: appHash,
+          ip: localSocketAddr,
+          error: reason,
+          broadcastedAt: Date.now(),
+        };
+        await messageStore.storeAppInstallingErrorMessage(withdrawal);
+        // eslint-disable-next-line global-require
+        const fluxCommMessagesSenderLib = require('../fluxCommunicationMessagesSender');
+        await fluxCommMessagesSenderLib.broadcastMessageToAll(withdrawal);
+      } catch (error) {
+        // best effort - the installing TTL remains the backstop
+        log.warn(`trySpawningGlobalApplication - could not retract installing claim for ${appToRun}: ${error.message}`);
+      }
+    };
+
     // an application was selected and checked that it can run on this node. try to install and run it locally
     // lets broadcast to the network the app is going to be installed on this node, so we don't get lot's of intances installed when it's not needed
     let broadcastedAt = Date.now();
@@ -723,28 +775,33 @@ async function trySpawningGlobalApplication() {
       const index = installingAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
       if (runningAppList.length + index + 1 > minInstances) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances, my instance is number ${runningAppList.length + index + 1}`);
+        await withdrawInstallingClaim('claim withdrawn: instance count filled by earlier claimants');
         return shortDelayTime;
       }
     }
 
     if (syncthingApp && !pinnedHere && placementShare) {
-      // Re-check the domain share against the propagated lists. Running
-      // instances consume the share outright; among simultaneous installing
-      // claimants the earliest broadcasts win the remainder - the
+      // Re-check the domain share against the propagated lists, keyed by the
+      // same computation that produced the share - a fresher view of the
+      // network would move nodes between domains the share was never computed
+      // for. Running instances consume the share outright; among simultaneous
+      // installing claimants the earliest broadcasts win the remainder - the
       // generalisation of the old oldest-wins resolver to shares above one.
-      const runningInMine = placementFeasibility.countHeldInDomain(runningAppList, myDomain);
+      const runningInMine = await placementFeasibility.countHeldInDomain(runningAppList, myDomain, placementDomainOf);
       const remainingShare = placementShare.maxPerDomain - runningInMine;
       if (remainingShare <= 0) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} uses syncthing and fault domain ${myDomain} already runs ${runningInMine} of its ${placementShare.maxPerDomain}-instance share`);
+        await withdrawInstallingClaim('claim withdrawn: domain share held by running instances');
         return shortDelayTime;
       }
       const claimantsInMine = installingAppList
-        .filter((location) => placementFeasibility.faultDomain(location.ip) === myDomain)
+        .filter((location) => placementDomainOf(location.ip) === myDomain)
         .sort((a, b) => (a.broadcastedAt ?? Number.MAX_SAFE_INTEGER) - (b.broadcastedAt ?? Number.MAX_SAFE_INTEGER));
       const myIndex = claimantsInMine.findIndex((location) => socketAddressesMatch(location.ip, localSocketAddr));
       const claimantsAhead = myIndex === -1 ? claimantsInMine.length : myIndex;
       if (claimantsAhead >= remainingShare) {
         log.info(`trySpawningGlobalApplication - Application ${appToRun} uses syncthing and ${claimantsAhead} earlier claimants in fault domain ${myDomain} fill its remaining share of ${remainingShare}`);
+        await withdrawInstallingClaim('claim withdrawn: domain share filled by earlier claimants');
         return shortDelayTime;
       }
       if (claimantsInMine.length > 1) {
