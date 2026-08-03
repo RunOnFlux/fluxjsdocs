@@ -41,7 +41,6 @@ const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 const fluxService = require('./fluxService');
 const geolocationService = require('./geolocationService');
-const ipLocationSync = require('./appPlacement/ipLocationSync');
 const upnpService = require('./upnpService');
 const syncthingService = require('./syncthingService');
 const pgpService = require('./pgpService');
@@ -434,7 +433,8 @@ async function startFluxFunctions() {
     }, bootDelay(30 * 1000));
     setTimeout(() => {
       appController.stopAllNonFluxRunningApps();
-      monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
+      // Best effort during boot — the reconciler starts monitoring per app as it settles.
+      monitoringOrchestrator.startMonitoringOfApps(null).catch((error) => log.error(error));
       portManager.restoreAppsPortsSupport();
     }, bootDelay(1 * 60 * 1000));
     // Resolve this node's enterprise identity once, up front. Self-reschedules
@@ -448,10 +448,6 @@ async function startFluxFunctions() {
     const startDbDependentServices = async () => {
       await globalState.waitForDbReady();
       log.info('DB ready - starting db-dependent services');
-      // Interim until policyStore supersedes it at the userconfig rebase (see the
-      // module header): restore the iplocation table from its GridFS cache and keep
-      // it fresh. Detached - placement degrades to /16 arithmetic without a table.
-      ipLocationSync.startSync().catch((err) => log.error(`ipLocationSync start error: ${err.message}`));
       advancedWorkflows.checkAndRemoveEnterpriseAppsOnNonArcane();
       await identityReady;
       try {

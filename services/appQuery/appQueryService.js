@@ -219,99 +219,6 @@ async function listRunningApps(req, res) {
 }
 
 /**
- * Component identifiers this node holds: running here, or committed to running
- * and not started yet.
- *
- * The question a primary election actually asks a peer. Running containers alone
- * answer it wrongly during the masterSlave primary path, which fixes ownership on
- * the persistent data before it starts anything - for that whole window the node
- * has decided but has no container, so a peer reading running containers is told
- * the component is free and starts a second writer on the shared volume.
- *
- * Uncached, unlike listrunningapps: a 15-second-stale answer reopens the same
- * window it exists to close.
- *
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message carrying an array of container-name identifiers.
- */
-async function heldComponents(req, res) {
-  try {
-    const containers = await dockerService.dockerListContainers(false);
-    const running = containers
-      .map((container) => (container.Names?.[0] || '').replace(/^\//, ''))
-      .filter((name) => name.slice(0, 3) === 'zel' || name.slice(0, 4) === 'flux');
-
-    // eslint-disable-next-line global-require
-    const appReconciler = require('../appMonitoring/appReconciler');
-    const committed = appReconciler.committedIdentifiers()
-      .map((identifier) => dockerService.getAppIdentifier(identifier));
-
-    const held = [...new Set([...running, ...committed])];
-    const response = messageHelper.createDataMessage(held);
-    return res ? res.json(response) : response;
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    return res ? res.json(errorResponse) : errorResponse;
-  }
-}
-
-/**
- * Syncthing folder ids this node has promoted to sendreceive - the folders it
- * holds the writable copy of.
- *
- * Asked by a peer before it promotes a folder of its own. Promotion is decided
- * from each node's own view of the holder list, and those views fill in at
- * different moments, so two nodes can each conclude they are the one - the first
- * while it is briefly the only holder it knows of, the second once it can see
- * more and wins the tiebreak among them. Neither revisits the decision, because a
- * promoted folder never re-enters the election. Nothing else carries this: folder
- * type is local syncthing config, and at genesis the promoted node has no data
- * yet, so the has-data signal is silent exactly when it is needed.
- *
- * Served from the set the syncthing monitor refreshes each pass, not by reading
- * syncthing per request: the route is unauthenticated and reachable by any peer,
- * so an on-demand read would be an amplifier into syncthing, and the API has no
- * rate limiting of its own. It is also then O(1), so it needs no response cache
- * and carries no staleness beyond one monitor pass.
- *
- * `ready` is what stops a booting node being read as a free one. Before the
- * monitor's first pass this node cannot distinguish "I hold nothing" from "I have
- * not looked", and answering the first would invite a peer to promote alongside a
- * folder this node is already holding. The asker treats an unready peer as a
- * reason to wait rather than a clearance.
- *
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message carrying { ready, folders }.
- */
-async function promotedFolders(req, res) {
-  try {
-    // eslint-disable-next-line global-require
-    const globalState = require('../utils/globalState');
-    const ids = globalState.promotedFolderIds;
-    const response = messageHelper.createDataMessage({
-      ready: ids !== null,
-      folders: ids === null ? [] : [...ids],
-    });
-    return res ? res.json(response) : response;
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    return res ? res.json(errorResponse) : errorResponse;
-  }
-}
-
-/**
  * List all apps (both running and installed)
  * @param {object} req Request.
  * @param {object} res Response.
@@ -454,8 +361,6 @@ module.exports = {
   installedApps,
   decryptEnterpriseApps,
   listRunningApps,
-  heldComponents,
-  promotedFolders,
   listAllApps,
   getlatestApplicationSpecificationAPI,
   getApplicationOriginalOwner,
