@@ -1022,8 +1022,7 @@ async function clockDrift(req, res) {
  * @param {object} res Response.
  */
 function isCommunicationEstablished(req, res) {
-  const outboundCount = peerManager.outboundCount;
-  const inboundCount = peerManager.inboundCount;
+  const { outboundCount, inboundCount } = peerManager;
   let message;
   if (outboundCount < config.fluxapps.minOutgoing) { // easier to establish
     message = messageHelper.createErrorMessage(`Not enough outgoing connections established to Flux network. Minimum required ${config.fluxapps.minOutgoing} found ${outboundCount}`);
@@ -1567,7 +1566,7 @@ async function setDOSStateApi(req, res) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
   }
-  let body = req.body;
+  let { body } = req;
   if (typeof body !== 'object') {
     try { body = JSON.parse(body); } catch { body = {}; }
   }
@@ -2129,9 +2128,15 @@ async function removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces) {
 // Re-exported here for backward compatibility.
 
 /**
- * Allow Node to bind to privileged without sudo
+ * Allow Node to bind to privileged ports without sudo. Legacy only: Arcane
+ * grants CAP_NET_BIND_SERVICE to the fluxos unit itself, so the interpreter
+ * carries no file capability there. A capability on the shared interpreter
+ * would extend privileged binding to every local user's node process, and
+ * puts the dynamic loader into secure-execution mode for all of them.
  */
 async function allowNodeToBindPrivilegedPorts() {
+  if (isArcane) return;
+
   try {
     const cmdAsync = util.promisify(nodecmd.run);
     const exec = "sudo setcap 'cap_net_bind_service=+ep' `which node`";
