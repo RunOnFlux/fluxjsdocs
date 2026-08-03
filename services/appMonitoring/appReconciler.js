@@ -4,6 +4,7 @@ const fluxEventBus = require('../utils/fluxEventBus');
 const dbHelper = require('../dbHelper');
 const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
+const dockerOperations = require('../appManagement/dockerOperations');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const globalState = require('../utils/globalState');
@@ -42,6 +43,13 @@ const controllerDesired = new Map();
 // guards). The reconciler actuates the wipe inside its per-key single-flight, so
 // a start can never race it.
 const dataDesired = new Map();
+
+// Components a decider has committed to running but has not started yet, because
+// its pre-start data-safety work is still in flight. Read by the peer probe: a
+// node that answers only with running containers withholds an intent it already
+// holds, and the asking node starts a second writer. In-memory for the same
+// reason as controllerDesired - a claim must not survive the process that made it.
+const startingClaims = new Set();
 
 // brief settle between the stop and the rm -rf so the container has fully released
 // its appdata mount before the wipe (mirrors the sync layer's prior 500ms delay).
@@ -366,7 +374,7 @@ async function recreateMissing(identifier) {
   await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
   try {
     await containerHealthMonitor.recreateMissingContainers(identifier);
-    appInspector.startAppMonitoring(identifier);
+    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.info(`appReconciler - recreated missing container ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated' });
     notifyContainerStarted(identifier);
@@ -413,7 +421,7 @@ async function recreateForNetworkHeal(identifier) {
     // fallocates + mke2fs). We removed a live container whose data was intact, so a
     // recreate that cannot verify the volume must fail and be retried - never wipe it.
     await containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true });
-    appInspector.startAppMonitoring(identifier);
+    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.info(`appReconciler - recreated ${identifier} to clear a detached network endpoint`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated', reason: 'networkDetached' });
     notifyContainerStarted(identifier);
@@ -617,7 +625,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
   // Stop the per-minute stats monitor before removing the container (mirrors the
   // uninstaller). Otherwise its interval runs against a gone container, leaking and
   // error-spamming. The recreate re-establishes it via startAppMonitoring.
-  appInspector.stopAppMonitoring(identifier, true);
+  appInspector.stopAppMonitoring(identifier, true, globalState.appsMonitored);
   try {
     // v=false: Flux data lives on bind mounts; the recreate reuses them via a soft
     // install (enforced: recreateForNetworkHeal passes softOnly).
@@ -627,7 +635,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
     // container we did NOT manage to remove is not left unmonitored. The heal flag
     // stays set on purpose - the remove may have partially succeeded, and a stale
     // flag only keeps us on the recreate path (never the uninstall one).
-    appInspector.startAppMonitoring(identifier);
+    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.error(`appReconciler - failed to remove detached ${identifier}: ${err.message}; will retry`);
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
@@ -761,7 +769,7 @@ async function reconcile(rawIdentifier) {
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
-      await volumeService.clearAppVolumeData(identifier);
+      await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
     } catch (err) {
       // A failed stop/wipe is the only actuation path here that would otherwise drop
       // to the hourly sweep (~1h down). Leave dataDesired 'clear' - so the retried
@@ -892,7 +900,7 @@ async function reconcile(rawIdentifier) {
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
-  appInspector.startAppMonitoring(identifier);
+  appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
   notifyContainerStarted(identifier);
@@ -1038,6 +1046,40 @@ function clearControllerDesired(rawIdentifier) {
   dataDesired.delete(identifier);
 }
 
+/**
+ * A decider has committed to running this component but cannot start it yet -
+ * the masterSlave primary path fixes ownership on the persistent data first,
+ * which takes long enough that a peer asking "is anyone running this?" gets a
+ * truthful no and starts a second writer. Held from the decision, released when
+ * the attempt ends: a start that succeeds is covered by controllerDesired from
+ * then on, and one that fails is correctly no longer a claim.
+ *
+ * Deliberately not time-bounded. The claimant knows when it has finished, so
+ * there is nothing to guess at, and the state is process-local - a crash or a
+ * FluxOS restart drops it with no way for a stale claim to outlive its owner.
+ */
+function claimStarting(rawIdentifier) {
+  startingClaims.add(canonical(rawIdentifier));
+}
+
+function releaseStarting(rawIdentifier) {
+  startingClaims.delete(canonical(rawIdentifier));
+}
+
+/**
+ * Component identifiers this node runs or is committed to running, from its own
+ * state alone. The running containers are the caller's to add - this is the part
+ * Docker cannot answer.
+ * @returns {string[]}
+ */
+function committedIdentifiers() {
+  const ids = new Set(startingClaims);
+  controllerDesired.forEach((state, identifier) => {
+    if (state === 'running') ids.add(identifier);
+  });
+  return [...ids];
+}
+
 // --- lifecycle -----------------------------------------------------------
 
 let started = false;
@@ -1081,6 +1123,9 @@ module.exports = {
   enqueueAll,
   setControllerDesired,
   clearControllerDesired,
+  claimStarting,
+  releaseStarting,
+  committedIdentifiers,
   requestStopAndClearData,
   setOnContainerStarted,
   waitForBootDrainSettled: () => bootDrainGate.wait(),

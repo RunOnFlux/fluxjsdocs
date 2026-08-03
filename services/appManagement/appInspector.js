@@ -4,7 +4,6 @@ const verificationHelper = require('../verificationHelper');
 const messageHelper = require('../messageHelper');
 const dockerService = require('../dockerService');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
-const globalState = require('../utils/globalState');
 const cpuBurstHelper = require('../utils/cpuBurstHelper');
 const log = require('../../lib/log');
 // eslint-disable-next-line no-unused-vars
@@ -299,62 +298,49 @@ async function appStats(req, res) {
 }
 
 /**
- * Get the collected monitoring statistics for an application
- * @param {string} appname - Application name, optionally component-qualified
- * @param {number|string} [range] - Window in milliseconds to report on, or null for everything
- * @returns {Array<object>} Collected statistics
- */
-function appMonitor(appname, range = null) {
-  if (!appname) {
-    throw new Error('No Flux App specified');
-  }
-
-  let window = range;
-  if (window !== null) {
-    window = parseInt(window, 10);
-    if (!Number.isInteger(window) || window <= 0) {
-      throw new Error('Invalid range value. It must be a positive integer or null.');
-    }
-  }
-
-  const monitored = globalState.appsMonitored[appname];
-  if (!monitored) {
-    throw new Error('No data available');
-  }
-
-  let appStatsMonitoring = monitored.statsStore;
-  if (window) {
-    const cutoffTimestamp = Date.now() - window;
-    const hoursInMs = 24 * 60 * 60 * 1000;
-    appStatsMonitoring = appStatsMonitoring.filter((stats) => stats.timestamp >= cutoffTimestamp);
-    if (window > hoursInMs) {
-      appStatsMonitoring = appStatsMonitoring.filter((_, index, array) => index % 20 === 0 || index === array.length - 1);
-    }
-  }
-  return appStatsMonitoring;
-}
-
-/**
  * Get application monitoring data
  * @param {object} req - Request object
  * @param {object} res - Response object
+ * @param {object} appsMonitored - Apps monitoring data
  * @returns {Promise<void>}
  */
-async function appMonitorAPI(req, res) {
+async function appMonitor(req, res, appsMonitored) {
   try {
-    const appname = req.params.appname || req.query.appname;
-    const range = req.params.range || req.query.range || null;
+    let { appname, range } = req.params;
+    appname = appname || req.query.appname;
+    range = range || req.query.range || null;
 
     if (!appname) {
       throw new Error('No Flux App specified');
+    }
+
+    if (range !== null) {
+      range = parseInt(range, 10);
+      if (!Number.isInteger(range) || range <= 0) {
+        throw new Error('Invalid range value. It must be a positive integer or null.');
+      }
     }
 
     const mainAppName = appname.split('_')[1] || appname;
 
     const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
-      const appResponse = messageHelper.createDataMessage(appMonitor(appname, range));
-      res.json(appResponse);
+      if (appsMonitored[appname]) {
+        let appStatsMonitoring = appsMonitored[appname].statsStore;
+        if (range) {
+          const now = Date.now();
+          const cutoffTimestamp = now - range;
+          const hoursInMs = 24 * 60 * 60 * 1000;
+          appStatsMonitoring = appStatsMonitoring.filter((stats) => stats.timestamp >= cutoffTimestamp);
+          if (range > hoursInMs) {
+            appStatsMonitoring = appStatsMonitoring.filter((_, index, array) => index % 20 === 0 || index === array.length - 1);
+          }
+        }
+        const appResponse = messageHelper.createDataMessage(appStatsMonitoring);
+        res.json(appResponse);
+      } else {
+        throw new Error('No data available');
+      }
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -428,55 +414,85 @@ async function getAppFolderSize(appName) {
 /**
  * Start monitoring an application
  * @param {string} appName - Application name
+ * @param {object} [appsMonitored] - Apps monitoring data reference (optional, will get from appsService if not provided)
  * @returns {void}
  */
-function startAppMonitoring(appName) {
+function startAppMonitoring(appName, appsMonitored) {
   if (!appName) {
     throw new Error('No App specified');
   }
 
-  const { appsMonitored } = globalState;
+  // eslint-disable-next-line global-require
+  // Get appsMonitored from globalState if not provided (to avoid circular dependency)
+  if (!appsMonitored) {
+    // eslint-disable-next-line global-require
+    const globalState = require('../utils/globalState');
+    // eslint-disable-next-line prefer-destructuring, no-param-reassign
+    appsMonitored = globalState.appsMonitored;
+  }
 
+  // Safety check: if appsMonitored is still undefined, throw a more descriptive error
+  if (!appsMonitored) {
+    // eslint-disable-next-line no-param-reassign
+    throw new Error('Failed to initialize app monitoring: appsMonitored object is undefined');
+  // eslint-disable-next-line no-param-reassign
+  }
+
+  // eslint-disable-next-line no-param-reassign
   log.info('Initialize Monitoring...');
   // Clear previous interval for this app to prevent multiple intervals
   if (appsMonitored[appName] && appsMonitored[appName].oneMinuteInterval) {
     clearInterval(appsMonitored[appName].oneMinuteInterval);
   }
-  appsMonitored[appName] = {
-    statsStore: [],
-    lastHourstatsStore: [],
-    run: 0,
-  };
+  // eslint-disable-next-line no-param-reassign
+  appsMonitored[appName] = {}; // Initialize the app's monitoring object
+  if (!appsMonitored[appName].statsStore) {
+    // eslint-disable-next-line no-param-reassign
+    appsMonitored[appName].statsStore = [];
+  }
+  if (!appsMonitored[appName].lastHourstatsStore) {
+    // eslint-disable-next-line no-param-reassign
+    appsMonitored[appName].lastHourstatsStore = [];
+  }
+  // eslint-disable-next-line no-param-reassign
+  appsMonitored[appName].run = 0;
+  // eslint-disable-next-line no-param-reassign
   appsMonitored[appName].oneMinuteInterval = setInterval(async () => {
     try {
       if (!appsMonitored[appName]) {
         log.error(`Monitoring of ${appName} already stopped`);
         return;
+      // eslint-disable-next-line no-param-reassign
       }
       const dockerContainer = await dockerService.getDockerContainerOnly(appName);
       if (!dockerContainer) {
         log.error(`Monitoring of ${appName} not possible. App does not exist. Forcing stopping of monitoring`);
         // eslint-disable-next-line no-use-before-define
-        stopAppMonitoring(appName, true);
+        stopAppMonitoring(appName, true, appsMonitored);
         return;
       }
+      // eslint-disable-next-line no-param-reassign
       appsMonitored[appName].run += 1;
       const statsNow = await dockerService.dockerContainerStats(appName);
       const containerStorageInfo = await getContainerStorage(appName);
+      // eslint-disable-next-line no-param-reassign
       statsNow.disk_stats = containerStorageInfo;
       const now = Date.now();
       if (appsMonitored[appName].run % 3 === 0) {
         const inspect = await dockerService.dockerContainerInspect(appName);
+        // eslint-disable-next-line no-param-reassign
         statsNow.nanoCpus = inspect.HostConfig.NanoCpus;
         appsMonitored[appName].statsStore.push({ timestamp: now, data: statsNow });
         const statsStoreSizeInBytes = new TextEncoder().encode(JSON.stringify(appsMonitored[appName].statsStore)).length;
         const estimatedSizeInMB = statsStoreSizeInBytes / (1024 * 1024);
         log.info(`Size of stats for ${appName}: ${estimatedSizeInMB.toFixed(2)} MB`);
+        // eslint-disable-next-line no-param-reassign
         appsMonitored[appName].statsStore = appsMonitored[appName].statsStore.filter(
           (stat) => now - stat.timestamp <= 7 * 24 * 60 * 60 * 1000,
         );
       }
       appsMonitored[appName].lastHourstatsStore.push({ timestamp: now, data: statsNow });
+      // eslint-disable-next-line no-param-reassign
       appsMonitored[appName].lastHourstatsStore = appsMonitored[appName].lastHourstatsStore.filter(
         (stat) => now - stat.timestamp <= 60 * 60 * 1000,
       );
@@ -485,19 +501,34 @@ function startAppMonitoring(appName) {
     }
   }, 1 * 60 * 1000);
 }
+// eslint-disable-next-line global-require
 
 /**
  * Stop monitoring an application
  * @param {string} appName - Application name
  * @param {boolean} deleteData - Whether to delete monitoring data
+ * @param {object} [appsMonitored] - Apps monitoring data reference (optional, will get from appsService if not provided)
  * @returns {void}
  */
-function stopAppMonitoring(appName, deleteData) {
-  const { appsMonitored } = globalState;
+function stopAppMonitoring(appName, deleteData, appsMonitored) {
+  // Get appsMonitored from globalState if not provided (to avoid circular dependency)
+  if (!appsMonitored) {
+    // eslint-disable-next-line global-require
+    const globalState = require('../utils/globalState');
+    // eslint-disable-next-line prefer-destructuring, no-param-reassign
+    appsMonitored = globalState.appsMonitored;
+  }
+
+  // Safety check: if appsMonitored is still undefined, log warning and return early
+  if (!appsMonitored) {
+    log.warn(`Cannot stop monitoring for ${appName}: appsMonitored object is undefined`);
+    return;
+  }
 
   if (appsMonitored[appName]) {
     clearInterval(appsMonitored[appName].oneMinuteInterval);
     if (deleteData) {
+      // eslint-disable-next-line no-param-reassign
       delete appsMonitored[appName];
     }
   }
@@ -983,7 +1014,6 @@ module.exports = {
   appInspect,
   appStats,
   appMonitor,
-  appMonitorAPI,
   appMonitorStream,
   appExec,
   appChanges,
