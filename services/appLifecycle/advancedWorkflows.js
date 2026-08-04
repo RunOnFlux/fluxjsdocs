@@ -17,7 +17,6 @@ const {
   DEFAULT_API_PORT, extractIp, extractPort, socketAddressesMatch, ipsMatch,
 } = require('../utils/socketAddressUtils');
 const generalService = require('../generalService');
-const placementFeasibility = require('../appPlacement/placementFeasibility');
 // eslint-disable-next-line no-unused-vars
 const upnpService = require('../upnpService');
 const {
@@ -30,7 +29,6 @@ const {
   legacyAppVolumesPath,
 } = require('../utils/appConstants');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
-const { compareInstanceSeniority } = require('../utils/instanceOrdering');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
@@ -2091,12 +2089,6 @@ async function appDockerRestart(appname) {
  * @returns {Promise<void>}
  */
 async function requestMasterStartWithPermissionsFix(appname, appId) {
-  // Claimed before the ownership fix, not after it: the fix takes long enough
-  // that a peer probing "is anyone running this?" would otherwise get a truthful
-  // no from a node that has already committed, and start alongside it. Released
-  // in the finally - from a successful start the controllerDesired below carries
-  // the claim, and a failed one must stop claiming.
-  appReconciler.claimStarting(appname);
   try {
     log.info(`Preparing masterSlave primary ${appname}: fixing permissions before start`);
 
@@ -2125,8 +2117,6 @@ async function requestMasterStartWithPermissionsFix(appname, appId) {
   } catch (error) {
     log.error(`Error preparing masterSlave primary ${appname}: ${error.message}`);
     // leave it stopped if the permissions-fix workflow failed
-  } finally {
-    appReconciler.releaseStarting(appname);
   }
 }
 
@@ -2811,14 +2801,6 @@ async function updateAppGlobaly(params) {
   // Validate structural compatibility
   await validateApplicationUpdateCompatibility(appSpecFormatted, appInfo);
 
-  // placement feasibility applies to updates too: a narrowed geolocation,
-  // raised instance count or grown sizing must not buy a spec the network
-  // provably cannot satisfy - the redeploy would strip the out-of-geo
-  // instances and leave the app below its count, or at zero. Placed after the
-  // previous spec is resolved so an update that changes nothing
-  // placement-relevant - a renewal, a cancellation - is never refused.
-  await placementFeasibility.checkPlacementFeasibility(appSpecFormatted, 'updateAppGlobaly', previousAppSpec);
-
   if (isEnterprise) {
     appSpecFormatted.contacts = [];
     appSpecFormatted.compose = [];
@@ -2945,9 +2927,27 @@ async function checkAndRemoveApplicationInstance() {
         const appDetails = await registryManager.getApplicationGlobalSpecifications(installedApp.name);
         if (appDetails) {
           log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking if should be unninstalled from the FluxNode..`);
-          // junior end first: the newest instance stands aside, ties broken
-          // by the shared ordering so every node names the same surplus
-          runningAppList.sort((a, b) => compareInstanceSeniority(b, a));
+          runningAppList.sort((a, b) => {
+            if (!a.runningSince && b.runningSince) {
+              return 1;
+            }
+            if (a.runningSince && !b.runningSince) {
+              return -1;
+            }
+            if (a.runningSince < b.runningSince) {
+              return 1;
+            }
+            if (a.runningSince > b.runningSince) {
+              return -1;
+            }
+            if (a.ip < b.ip) {
+              return 1;
+            }
+            if (a.ip > b.ip) {
+              return -1;
+            }
+            return 0;
+          });
           // eslint-disable-next-line no-await-in-loop
           const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
           if (localSocketAddr) {
@@ -3760,7 +3760,27 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 const registryManager = require('../appDatabase/registryManager');
                 // eslint-disable-next-line no-await-in-loop
                 const runningAppList = await registryManager.appLocation(installedApp.name);
-                runningAppList.sort(compareInstanceSeniority);
+                runningAppList.sort((a, b) => {
+                  if (!a.runningSince && b.runningSince) {
+                    return -1;
+                  }
+                  if (a.runningSince && !b.runningSince) {
+                    return 1;
+                  }
+                  if (a.runningSince < b.runningSince) {
+                    return -1;
+                  }
+                  if (a.runningSince > b.runningSince) {
+                    return 1;
+                  }
+                  if (a.ip < b.ip) {
+                    return -1;
+                  }
+                  if (a.ip > b.ip) {
+                    return 1;
+                  }
+                  return 0;
+                });
                 const index = runningAppList.findIndex((x) => ipsMatch(x.ip, localSocketAddr));
 
                 // The remembered primary is this node, but the component is not
@@ -3840,21 +3860,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     const cancelTimer = setTimeout(() => source.cancel('Operation canceled by timeout.'), timeout);
 
                     try {
-                      // heldcomponents, not listrunningapps: a peer part-way through
-                      // its own pre-start ownership fix has committed but has no
-                      // container, and answering from containers alone reports the
-                      // component free. A peer too old to serve it falls back below.
-                      const heldResponse = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/heldcomponents`, { timeout, cancelToken: source.token })
-                        .catch(() => null);
-                      const held = heldResponse?.data?.data;
-                      if (Array.isArray(held)) {
-                        if (held.includes(appId)) {
-                          log.info(`masterSlaveApps: component:${identifier} is held on peer node (index ${i}) at ${ipToCheck}, will not start`);
-                          return true;
-                        }
-                        return false;
-                      }
-
                       const response = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/listrunningapps`, { timeout, cancelToken: source.token });
                       const appsRunning = response.data.data;
                       // Match on the g: component identifier, not the app name: non-g siblings
@@ -3973,41 +3978,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     log.info(`masterSlaveApps: not starting app:${installedApp.name} index: ${index} - lower-index node is already running`);
                     timeTostartNewMasterApp.delete(identifier);
                   }
-                } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier)
-                  && receiveOnlySyncthingAppsCache.get(appId)?.designatedLeader) {
-                  // The state machine's confirmed designated leader is the only
-                  // instance that can seed a newborn app: at genesis every other
-                  // instance is receiveonly with nothing to sync from, so serving
-                  // the index stagger would wait on nodes that provably cannot
-                  // become ready.
-                  //
-                  // Every peer is probed, not just the lower-index ones. A
-                  // lower-only check belongs to the staggered starts, where index
-                  // order is what serialises the candidates; this branch exists
-                  // precisely to leave that order, so it starts as blind as an
-                  // index-0 start does and needs the same 'all' scope.
-                  // eslint-disable-next-line no-await-in-loop
-                  const peerRunning = await checkPeersRunning('all');
-                  if (peerRunning) {
-                    log.info(`masterSlaveApps: not starting app:${installedApp.name} index: ${index} - a peer is already running it`);
-                  } else {
-                    requestMasterStartWithPermissionsFix(identifier, appId);
-                    log.info(`masterSlaveApps: starting docker component:${identifier} index: ${index} - designated leader seeds without the index stagger`);
-                  }
-                  // Any stagger already scheduled for this node is moot: the seed has
-                  // just been handled here, and leaving the entry lets the scheduled
-                  // branch start it a second time when that time arrives. Whether the
-                  // schedule was set before the election confirmed the leader - which
-                  // is a race this branch has to win, not defer to - or after, the
-                  // answer is the same.
-                  timeTostartNewMasterApp.delete(identifier);
-                  // The claim covers genesis only, and nothing else retracts it:
-                  // once the folder is sendreceive the state machine returns on its
-                  // already-syncing branch and never reaches the election again.
-                  // Spent here, so it cannot take this node out of the stagger on
-                  // later primary losses.
-                  const seedCache = receiveOnlySyncthingAppsCache.get(appId);
-                  if (seedCache) seedCache.designatedLeader = false;
                 } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
                   // Non-primary node with no history - schedule start based on index
                   const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);

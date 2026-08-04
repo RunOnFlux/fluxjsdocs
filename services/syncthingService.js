@@ -2802,19 +2802,6 @@ async function collectSyncthingMetrics() {
                   errors,
                 };
                 metrics.overall.issues.push(`Folder ${folder.label || folderId} has ${errors + pullErrors} error(s)`);
-                // The counts alone cannot be diagnosed from a log dump -
-                // surface the file-level causes, bounded so a sick folder
-                // cannot flood the log.
-                // eslint-disable-next-line no-await-in-loop
-                const folderErrorsResponse = await getFolderIdErrors(folderId);
-                const fileErrors = folderErrorsResponse.status === 'success' ? (folderErrorsResponse.data?.errors ?? []) : [];
-                const shown = fileErrors.slice(0, 5);
-                shown.forEach((fileError) => {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileError.path}: ${fileError.error}`);
-                });
-                if (fileErrors.length > shown.length) {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileErrors.length - shown.length} further file error(s) not shown`);
-                }
               }
             }
           } catch (error) {
@@ -2844,22 +2831,14 @@ async function collectSyncthingMetrics() {
       metrics.overall.issues.push(`Failed to collect folder metrics: ${error.message}`);
     }
 
-    // Drain syncthing's system error buffer. The buffer is cumulative for
-    // the daemon's lifetime and the daemon outlives FluxOS restarts, so each
-    // entry is an occurrence, not a state: log its content, clear the
-    // buffer, and report unhealthy only for the pass the errors arrived in.
+    // Collect system errors
     try {
       const errorsResponse = await performRequest('get', '/rest/system/error');
-      if (errorsResponse.status === 'success' && errorsResponse.data?.errors?.length) {
+      if (errorsResponse.status === 'success' && errorsResponse.data?.errors) {
         metrics.errors.system = errorsResponse.data.errors;
-        metrics.overall.healthy = false;
-        metrics.overall.issues.push(`${metrics.errors.system.length} syncthing system error(s) this pass`);
-        metrics.errors.system.forEach((systemError) => {
-          log.error(`Syncthing system error at ${systemError.when}: ${systemError.message}`);
-        });
-        const clearResponse = await performRequest('post', '/rest/system/error/clear');
-        if (clearResponse.status !== 'success') {
-          log.warn(`Failed to clear syncthing system errors, they will re-log next pass: ${clearResponse.data?.message}`);
+        if (metrics.errors.system.length > 0) {
+          metrics.overall.healthy = false;
+          metrics.overall.issues.push(`${metrics.errors.system.length}`);
         }
       }
     } catch (error) {

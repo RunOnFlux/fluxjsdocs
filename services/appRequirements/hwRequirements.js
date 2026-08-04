@@ -2,7 +2,6 @@ const os = require('os');
 const config = require('config');
 const generalService = require('../generalService');
 const geolocationService = require('../geolocationService');
-const ipLocationStore = require('../appPlacement/ipLocationStore');
 const benchmarkService = require('../benchmarkService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
 const { socketAddressesMatch } = require('../utils/socketAddressUtils');
@@ -176,35 +175,6 @@ async function checkAppGeolocationRequirements(appSpecs) {
     const myNodeLocationContinentALL = 'ALL';
     const myNodeLocationContCountryALL = `${nodeGeo.continentCode}_ALL`;
     const myNodeLocationFullALL = `${nodeGeo.continentCode}_${nodeGeo.countryCode}_ALL`;
-    // The table's vocabulary for this node's own location: full ISO 3166-2,
-    // resolved through the same published table the candidate filter counts
-    // with, so the two cannot disagree about this node. Region entries in
-    // that vocabulary match on proof only, in both directions: an allow is
-    // satisfied - and a deny applies - exactly when this node's table region
-    // is known and equal. An unknown region (no table, no covering row, no
-    // region there, store unreadable) satisfies no region pin and is caught
-    // by no region deny. The installer's truth table is the candidate
-    // filter's.
-    let myTableRegion = null;
-    let myTableContCountry = myNodeLocationContCountry;
-    try {
-      const hit = nodeGeo.ip ? await ipLocationStore.lookup(nodeGeo.ip) : null;
-      if (hit?.countryCode && hit.continentCode) {
-        myTableContCountry = `${hit.continentCode}_${hit.countryCode}`;
-        myTableRegion = hit.region ?? null;
-      }
-    } catch (error) {
-      log.warn(`checkAppGeolocationRequirements - node location unavailable from the table: ${error.message}`);
-    }
-    const isTableRegionEntry = (value) => {
-      const parts = value.split('_');
-      return parts.length >= 3 && /^[A-Z]{2}-[A-Z0-9]{1,3}$/.test(parts[2]) && parts[2].slice(0, 2) === parts[1];
-    };
-    const matchesTableRegionEntry = (value) => {
-      if (!isTableRegionEntry(value) || !myTableRegion) return false;
-      const parts = value.split('_');
-      return `${parts[0]}_${parts[1]}` === myTableContCountry && parts[2] === myTableRegion;
-    };
     if (appContinent && !geoC.length && !geoCForbidden.length) { // backwards old style compatible. Can be removed after a month
       if (appContinent.slice(1) !== nodeGeo.continentCode) {
         throw new Error('App specs with continents geolocation set not matching node geolocation. Aborting.');
@@ -216,16 +186,13 @@ async function checkAppGeolocationRequirements(appSpecs) {
       }
     }
     geoCForbidden.forEach((locationNotAllowed) => {
-      const v = locationNotAllowed.slice(3);
-      if (v === myNodeLocationContinent || v === myNodeLocationContCountry || v === myNodeLocationFull
-        || matchesTableRegionEntry(v)) {
+      if (locationNotAllowed.slice(3) === myNodeLocationContinent || locationNotAllowed.slice(3) === myNodeLocationContCountry || locationNotAllowed.slice(3) === myNodeLocationFull) {
         throw new Error('App specs of geolocation set is forbidden to run on node geolocation. Aborting.');
       }
     });
     if (geoC.length) {
       const nodeLocationOK = geoC.find((locationAllowed) => locationAllowed.slice(2) === myNodeLocationContinent || locationAllowed.slice(2) === myNodeLocationContCountry || locationAllowed.slice(2) === myNodeLocationFull
-        || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL
-        || matchesTableRegionEntry(locationAllowed.slice(2)));
+        || locationAllowed.slice(2) === myNodeLocationContinentALL || locationAllowed.slice(2) === myNodeLocationContCountryALL || locationAllowed.slice(2) === myNodeLocationFullALL);
       if (!nodeLocationOK) {
         throw new Error('App specs of geolocation set is not matching to run on node geolocation. Aborting.');
       }
