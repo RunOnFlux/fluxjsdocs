@@ -47,6 +47,12 @@ const DISCOVERY = {
   connectionDelayMs: config.fluxapps.discoveryConnectionDelayMs ?? 500,
 };
 
+// How many events of a sync response are carried through verification and
+// storage together. A response holds up to 2500, and each event fans out into a
+// database operation per app it reports, so the whole response is never held at
+// once.
+const SYNC_EVENTS_PER_SLICE = 250;
+
 /**
  * To handle temporary app messages.
  * @param {object} message Message.
@@ -109,8 +115,9 @@ async function batchVerifyBroadcasts(broadcasts, label) {
 
   if (items.length === 0) return [];
 
-  const workerItems = items.map((it) => ({ messageToVerify: it.messageToVerify, pubKey: it.pubKey, signature: it.signature }));
-  const cryptoResults = await verifyPool.verify(workerItems);
+  // The worker reads only the three fields it needs, so items go across as they
+  // are rather than being copied into a narrower shape first
+  const cryptoResults = await verifyPool.verify(items);
 
   const verified = [];
   for (let i = 0; i < items.length; i++) {
@@ -153,66 +160,107 @@ async function handleAppRunningSyncResponse(message, peerKey) {
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppRunningSyncResponse - Received ${messages.length} events from ${peerKey} (done: ${!!done})`);
 
-    const appRunningBroadcasts = [];
-    const otherBroadcasts = [];
-    const evictedEvents = [];
-    for (const event of messages) {
-      if (event.envelope && event.type === 'apprunning') {
-        appRunningBroadcasts.push({ ...event.envelope, data: event.data });
-      } else if (event.type === 'evicted') {
-        // Evicted events lack per-event signatures because they are generated
-        // locally by nodeStatusMonitor, which makes non-deterministic HTTP
-        // probe decisions about whether a remote node is alive. The
-        // isSyncRequested check above ensures only solicited responses are
-        // processed, but a compromised confirmed peer we sync from could still
-        // include fake evictions. Impact is limited: only affects this node's
-        // view and self-heals on the next apprunning broadcast (≤60 min).
-        //
-        // The root cause is nodeStatusMonitor itself — it will be replaced by
-        // a peer quorum approach where eviction is determined by consensus of
-        // signed "peer unreachable" events (3 missed pongs on the WebSocket
-        // layer). Once that lands, evicted events will carry verifiable
-        // signatures and this path will verify them like all other event types.
-        evictedEvents.push(event);
-      } else if (event.envelope) {
-        otherBroadcasts.push(event);
+    // A sync response is processed a slice at a time. Verifying and storing the
+    // whole response at once holds the events, their verification copies and the
+    // database encoding of every location update in memory together, which is
+    // what made a single response cost hundreds of megabytes that were never
+    // returned to the OS.
+    // Evictions are applied ahead of the other state events, as they were
+    // before this response was processed in slices.
+    const evictions = [];
+    const stateEvents = [];
+    // Which apps a node still runs is only known from its newest broadcast in
+    // the whole response, so pruning cannot be decided from inside a slice. Only
+    // verified broadcasts count - pruning deletes rows, and an unsigned event
+    // must never be able to do that.
+    const newestByIp = new Map();
+    let locationWriteFailed = false;
+
+    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
+      const appRunningBroadcasts = [];
+      const otherBroadcasts = [];
+      const evictedEvents = [];
+      for (const event of slice) {
+        if (event.envelope && event.type === 'apprunning') {
+          appRunningBroadcasts.push({ ...event.envelope, data: event.data });
+        } else if (event.type === 'evicted') {
+          // Evicted events lack per-event signatures because they are generated
+          // locally by nodeStatusMonitor, which makes non-deterministic HTTP
+          // probe decisions about whether a remote node is alive. The
+          // isSyncRequested check above ensures only solicited responses are
+          // processed, but a compromised confirmed peer we sync from could still
+          // include fake evictions. Impact is limited: only affects this node's
+          // view and self-heals on the next apprunning broadcast (≤60 min).
+          //
+          // The root cause is nodeStatusMonitor itself — it will be replaced by
+          // a peer quorum approach where eviction is determined by consensus of
+          // signed "peer unreachable" events (3 missed pongs on the WebSocket
+          // layer). Once that lands, evicted events will carry verifiable
+          // signatures and this path will verify them like all other event types.
+          evictedEvents.push(event);
+        } else if (event.envelope) {
+          otherBroadcasts.push(event);
+        }
       }
-    }
 
-    const verifiedAppRunning = await batchVerifyBroadcasts(appRunningBroadcasts, 'handleAppRunningSyncResponse');
+      const verifiedAppRunning = await batchVerifyBroadcasts(appRunningBroadcasts, 'handleAppRunningSyncResponse');
 
-    const otherToVerify = otherBroadcasts.map((e) => ({ ...e.envelope, data: e.data }));
-    const verifiedOther = await batchVerifyBroadcasts(otherToVerify, 'handleAppRunningSyncResponse');
-    const verifiedOtherSet = new Set(verifiedOther);
-    const otherEvents = [...evictedEvents];
-    for (let i = 0; i < otherBroadcasts.length; i++) {
-      if (verifiedOtherSet.has(otherToVerify[i])) {
-        otherEvents.push(otherBroadcasts[i]);
+      const otherToVerify = otherBroadcasts.map((e) => ({ ...e.envelope, data: e.data }));
+      const verifiedOther = await batchVerifyBroadcasts(otherToVerify, 'handleAppRunningSyncResponse');
+      const verifiedOtherSet = new Set(verifiedOther);
+      evictions.push(...evictedEvents);
+      for (let i = 0; i < otherBroadcasts.length; i++) {
+        if (verifiedOtherSet.has(otherToVerify[i])) {
+          stateEvents.push(otherBroadcasts[i]);
+        }
       }
+
+      for (const broadcast of verifiedAppRunning) {
+        const { data } = broadcast;
+        if (!data || data.version !== 2 || !Array.isArray(data.apps) || !data.apps.length) continue;
+        const seen = newestByIp.get(data.ip);
+        if (!seen || data.broadcastedAt > seen.broadcastedAt) {
+          newestByIp.set(data.ip, { names: data.apps.map((a) => a.name), broadcastedAt: data.broadcastedAt });
+        }
+      }
+
+      if (verifiedAppRunning.length > 0) {
+        const { stored, writeFailed } = await messageStore.storeBatchAppRunningMessages(verifiedAppRunning, { prune: false });
+        if (writeFailed) locationWriteFailed = true;
+        log.info(`handleAppRunningSyncResponse - Stored ${stored} of ${verifiedAppRunning.length} verified apprunning events`);
+        fluxEventBus.publish('sync:chunkVerified', { syncType: 'apprunning', peer: peerKey, verified: verifiedAppRunning.length, stored });
+      }
+    });
+
+    if (locationWriteFailed) {
+      log.warn('handleAppRunningSyncResponse - skipping location pruning, a location write failed');
+    } else {
+      await messageStore.pruneAppRunningLocations(newestByIp);
     }
 
-    if (verifiedAppRunning.length > 0) {
-      const { stored } = await messageStore.storeBatchAppRunningMessages(verifiedAppRunning);
-      log.info(`handleAppRunningSyncResponse - Stored ${stored} of ${verifiedAppRunning.length} verified apprunning events`);
-      fluxEventBus.publish('sync:chunkVerified', { syncType: 'apprunning', peer: peerKey, verified: verifiedAppRunning.length, stored });
-    }
+    // Applied after every slice, never inside one. An eviction clears a node's
+    // locations outright, so a slice storing that node's apprunning events
+    // afterwards would put them straight back - and evictions carry no
+    // broadcastedAt, so the sender's timestamp sort puts them in the earliest
+    // slice every time.
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.appsglobal.database);
-    for (const event of otherEvents) {
-      if (event.type === 'sigterm') {
-        await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
-        const newExpireAt = new Date(event.data.broadcastedAt + SIGTERM_EXPIRY_MS);
-        await dbHelper.updateInDatabase(database, globalAppsLocations, { ip: event.data.ip }, { $set: { expireAt: newExpireAt } });
-      } else if (event.type === 'appremoved') {
-        await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
-        await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, { ip: event.data.ip, name: event.data.appName }, {});
-      } else if (event.type === 'evicted') {
-        await messageStore.storeAppStateEvent(event.type, { ip: event.ip });
-        await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, { ip: event.ip });
+    for (const event of [...evictions, ...stateEvents]) {
+        if (event.type === 'sigterm') {
+          await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
+          const newExpireAt = new Date(event.data.broadcastedAt + SIGTERM_EXPIRY_MS);
+          await dbHelper.updateInDatabase(database, globalAppsLocations, { ip: event.data.ip }, { $set: { expireAt: newExpireAt } });
+        } else if (event.type === 'appremoved') {
+          await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
+          await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, { ip: event.data.ip, name: event.data.appName }, {});
+        } else if (event.type === 'evicted') {
+          await messageStore.storeAppStateEvent(event.type, { ip: event.ip });
+          await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, { ip: event.ip });
       } else if (event.type === 'ipchanged') {
         await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
       }
     }
+
     if (done) {
       appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apprunning');
       log.info('handleAppRunningSyncResponse - Sync complete');
@@ -229,12 +277,13 @@ async function handleAppInstallingSyncResponse(message, peerKey) {
     const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppInstallingSyncResponse - Received ${messages.length} broadcasts from ${peerKey} (done: ${!!done})`);
-    const verified = await batchVerifyBroadcasts(messages, 'handleAppInstallingSyncResponse');
-    if (verified.length > 0) {
+    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
+      const verified = await batchVerifyBroadcasts(slice, 'handleAppInstallingSyncResponse');
+      if (verified.length === 0) return;
       const { stored } = await messageStore.storeBatchAppInstallingMessages(verified);
       log.info(`handleAppInstallingSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
       fluxEventBus.publish('sync:chunkVerified', { syncType: 'appinstalling', peer: peerKey, verified: verified.length, stored });
-    }
+    });
     if (done) {
       appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'appinstalling');
       log.info('handleAppInstallingSyncResponse - Sync complete');
@@ -251,12 +300,13 @@ async function handleAppInstallingErrorsSyncResponse(message, peerKey) {
     const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppInstallingErrorsSyncResponse - Received ${messages.length} broadcasts from ${peerKey} (done: ${!!done})`);
-    const verified = await batchVerifyBroadcasts(messages, 'handleAppInstallingErrorsSyncResponse');
-    if (verified.length > 0) {
+    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
+      const verified = await batchVerifyBroadcasts(slice, 'handleAppInstallingErrorsSyncResponse');
+      if (verified.length === 0) return;
       const { stored } = await messageStore.storeBatchAppInstallingErrorMessages(verified);
       log.info(`handleAppInstallingErrorsSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
       fluxEventBus.publish('sync:chunkVerified', { syncType: 'apperrors', peer: peerKey, verified: verified.length, stored });
-    }
+    });
     if (done) {
       appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apperrors');
       log.info('handleAppInstallingErrorsSyncResponse - Sync complete');
@@ -509,7 +559,6 @@ async function handleNodeSigtermMessage(message, fromIP, port) {
  * @param {import('./utils/FluxPeerSocket').FluxPeerSocket} peerSocket FluxPeerSocket instance.
  */
 async function dispatchFluxMessage(msgObj, peerSocket) {
-  const isOutbound = peerSocket.direction === DIRECTION.OUTBOUND;
   const codes = peerSocket.closeCodes;
   const {
     pubKey, timestamp, signature, version, data,
@@ -796,6 +845,35 @@ function connectedPeersInfo(req, res) {
 }
 
 /**
+ * How many peers answered our most recent ping, out of how many we hold.
+ *
+ * The freshest liveness signal this node has about the network, and the one that
+ * tells it whether IT is the thing that has gone quiet. Peer COUNT alone cannot: a
+ * socket survives wsMaxMissedPongs rounds before it is dropped, so a node that has
+ * just been cut off keeps a full peer list for ~45s and reads as perfectly healthy
+ * throughout - after the point a decision gated on two 30s monitor passes could
+ * already have been made. missedPongs moves on the first missed round instead
+ * (~15s), which lands before that.
+ *
+ * Reported as a ratio rather than a bare count because the useful question is
+ * proportional: one silent peer among many is that peer's problem, while all of
+ * them going quiet at once is this node's. An absolute floor would also be a fleet
+ * size in disguise - a node configured with two peers can never reach a threshold
+ * written for a node with twelve.
+ *
+ * @returns {{responding: number, total: number}} Peers with no missed pong, and all peers
+ */
+function peerResponsiveness() {
+  let responding = 0;
+  let total = 0;
+  for (const peer of peerManager.allValues()) {
+    total += 1;
+    if (peer.missedPongs === 0) responding += 1;
+  }
+  return { responding, total };
+}
+
+/**
  * To keep connections alive by pinging all outgoing and incoming peers.
  */
 function keepConnectionsAlive() {
@@ -961,7 +1039,11 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
         zlibDeflateOptions: {
         // See zlib defaults.
           chunkSize: 1024,
-          memLevel: 9,
+          // No-context-takeover resets the stream after every message, so the
+          // window only ever matches within one. Gossip messages are a few KB
+          // and compress to the same bytes on an 8KB window as on a 32KB one,
+          // for a third of the memory - and a context is held per peer socket.
+          memLevel: 8,
           level: 9,
         },
         zlibInflateOptions: {
@@ -970,8 +1052,10 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
         // Other options settable:
         clientNoContextTakeover: true, // Defaults to negotiated value.
         serverNoContextTakeover: true, // Defaults to negotiated value.
-        serverMaxWindowBits: 15, // Defaults to negotiated value.
-        clientMaxWindowBits: 15, // Defaults to negotiated value.
+        // This socket only ever talks to another node, so both directions size
+        // down; a peer on an older build negotiates back up to 15.
+        serverMaxWindowBits: 13,
+        clientMaxWindowBits: 13,
         // Below options specified as default values.
         concurrencyLimit: 2, // Limits zlib concurrency for perf.
         threshold: 128, // Size (in bytes) below which messages
@@ -1204,7 +1288,11 @@ async function addOutgoingPeer(req, res) {
 function startDiscovery() {
   if (discoveryRunning) return;
   discoveryRunning = true;
-  fluxDiscovery();
+  // Driven by the node list arriving rather than by a retry that happens to
+  // land after it. A peer holds one socket in either direction, so peers that
+  // dial us while we are waiting take the very sockets we would have dialled
+  // them on, and a late first pass then has nothing left to connect to.
+  networkStateService.onReady(fluxDiscovery);
 }
 
 async function startDiscoveryApi(req, res) {
@@ -1239,6 +1327,13 @@ async function fluxDiscovery() {
 
     if (!localSocketAddr) {
       throw new Error('Flux IP not detected. Flux discovery is awaiting.');
+    }
+
+    // An unknown node list and an empty one are the same value below, and acting
+    // on the second when it is really the first sizes both deterministic loops
+    // to zero - the node then connects to nobody and reports no error.
+    if (!networkStateService.isReady()) {
+      throw new Error('Network state not yet known. Flux discovery is awaiting.');
     }
 
     const sortedNodeList = await fluxCommunicationUtils.deterministicFluxList({
@@ -1590,6 +1685,7 @@ module.exports = {
   removePeer,
   removeIncomingPeer,
   connectedPeersInfo,
+  peerResponsiveness,
   keepConnectionsAlive,
   fluxDiscovery,
   startDiscovery,
