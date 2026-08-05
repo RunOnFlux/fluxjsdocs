@@ -57,21 +57,62 @@ const dockerPullStreamPromise = util.promisify(dockerService.dockerPullStream);
 const supportedArchitectures = ['amd64', 'arm64'];
 
 /**
- * Reclaim disk before an install by removing unreferenced docker images.
- *
- * Only images. Containers, networks and volumes were pruned here too, keyed on
- * docker's notion of "unused" - nothing attached right now - which is equally
- * true of a healthy app whose container is momentarily down, of a container
- * FluxOS is running for its own purposes, and of anything the node operator
- * left stopped. The guard in front of this only ever knew about installed app
- * components, so those other three were never covered. An image, by contrast,
- * is unreferenced or it is not, and re-pulling one is a download rather than a
- * loss.
- *
+ * Perform Docker cleanup (prune containers, networks, volumes, images)
  * @param {object} res - Response object for streaming
  * @returns {Promise<void>}
  */
 async function performDockerCleanup(res) {
+  const dockerContainers = {
+    status: 'Clearing up unused docker containers...',
+  };
+  log.info(dockerContainers);
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerContainers));
+    if (res.flush) res.flush();
+  }
+  await dockerService.pruneContainers();
+  const dockerContainers2 = {
+    status: 'Docker containers cleaned.',
+  };
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerContainers2));
+    if (res.flush) res.flush();
+  }
+
+  const dockerNetworks = {
+    status: 'Clearing up unused docker networks...',
+  };
+  log.info(dockerNetworks);
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerNetworks));
+    if (res.flush) res.flush();
+  }
+  await dockerService.pruneNetworks();
+  const dockerNetworks2 = {
+    status: 'Docker networks cleaned.',
+  };
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerNetworks2));
+    if (res.flush) res.flush();
+  }
+
+  const dockerVolumes = {
+    status: 'Clearing up unused docker volumes...',
+  };
+  log.info(dockerVolumes);
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerVolumes));
+    if (res.flush) res.flush();
+  }
+  await dockerService.pruneVolumes();
+  const dockerVolumes2 = {
+    status: 'Docker volumes cleaned.',
+  };
+  if (res) {
+    res.write(serviceHelper.ensureString(dockerVolumes2));
+    if (res.flush) res.flush();
+  }
+
   const dockerImages = {
     status: 'Clearing up unused docker images...',
   };
@@ -477,7 +518,10 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       throw new Error('Unable to check running Apps');
     }
     const appsInstalled = installedAppsRes.data;
-    const decryptedAppsInstalled = await appQueryService.decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
+    const { apps: decryptedAppsInstalled, unreadable } = await appQueryService.decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
+    if (unreadable.length) {
+      log.warn(`Component names unavailable for undecryptable apps: ${unreadable.map((app) => app.name).join(', ')}`);
+    }
     const runningApps = runningAppsRes.data;
     const installedAppComponentNames = [];
     decryptedAppsInstalled.forEach((app) => {

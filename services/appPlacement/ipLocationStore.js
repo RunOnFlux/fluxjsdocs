@@ -42,6 +42,11 @@ const { bareIp } = require('../utils/socketAddressUtils');
 
 const gunzip = util.promisify(zlib.gunzip);
 
+// Hand the thread back so queued I/O and timers run. setImmediate, not a
+// resolved promise: a promise only drains microtasks, which is the same thread
+// with extra steps.
+const yieldToEventLoop = () => new Promise((resolve) => { setImmediate(resolve); });
+
 const MAGIC = 'FLXGEO';
 const SUPPORTED_VERSION = 2;
 // magic(6) + version(1) + u32 header length
@@ -54,6 +59,10 @@ const IPV4_MAX = 0xffffffff;
 const MIN_ROW_COUNT = 1500000;
 const INSERT_BATCH_SIZE = 10000;
 const MAX_BATCHES_IN_FLIGHT = 4;
+// Rows decoded between handing the thread back. Small enough that no single
+// stretch is noticeable (a few milliseconds), large enough that two million rows
+// cost a couple of hundred yields rather than one per row.
+const ROWS_PER_YIELD = 10000;
 // Bounds what one artifact string can cost in a document. Not a vocabulary
 // check - the vocabularies are the publisher's, and rejecting a token this
 // build has not seen would take the whole fleet's table down with it.
@@ -75,7 +84,18 @@ const policyDocumentsCollection = config.database.local.collections.policyDocume
 let status = { ready: false, generated: null, rowCount: 0 };
 // country -> continent, from the header of whatever baseline this node holds
 let continentByCountry = new Map();
+// '<CC>|<region name>' -> ISO 3166-2, from the same header. The rows carry
+// codes, while an app's geolocation may name a region the way ip-api does, and
+// this is what connects the two.
+let regionCodeByName = new Map();
 let minimumRowCount = MIN_ROW_COUNT;
+// The per-node view, resident. It is a decoration on the node list - one small
+// fact per listed address - and the node list lives in this process, so keeping
+// the view beside it removes both the per-computation read and the need to keep
+// a collection in step with a list. Mongo still holds it, for restarts.
+// Replaced whole on refresh, never mutated: see nodeLocationSnapshot.
+let nodeView = new Map();
+let nodeViewLoaded = false;
 
 /**
  * An artifact this build refuses. The caller keeps whatever it already holds.
@@ -197,10 +217,25 @@ function parseHeader(buf) {
       throw malformed(`header continents.${country} is not a token`);
     }
   });
+  // The region-name vocabulary, keyed '<CC>|<name>'. Optional: a baseline built
+  // before it existed carries none, and without it a spec that names a region
+  // the way ip-api does is answered at country granularity - the same place a
+  // name this vocabulary cannot resolve lands, and the safe direction.
+  const regionNameEntries = Object.entries(header.regionNames ?? {});
+  if (typeof (header.regionNames ?? {}) !== 'object' || Array.isArray(header.regionNames)) {
+    throw malformed('header section regionNames is not an object');
+  }
+  regionNameEntries.forEach(([key, code]) => {
+    if (typeof code !== 'string' || !code || code.length > MAX_TOKEN_LENGTH
+      || key.length > MAX_TOKEN_LENGTH * 2) {
+      throw malformed(`header regionNames.${key} is not a token`);
+    }
+  });
   return {
     header,
-    // a Map, so a country named after an Object.prototype member reads as itself
+    // Maps, so a country named after an Object.prototype member reads as itself
     continents: new Map(continentEntries),
+    regionNames: new Map(regionNameEntries),
     rowCount: buf.readUInt32LE(rowCountOffset),
     rowsOffset: rowCountOffset + 4,
   };
@@ -211,6 +246,13 @@ function parseHeader(buf) {
  * batches of documents. With no callback nothing is materialised - that is the
  * validation pass, which must complete before the first write so a malformed
  * artifact never touches the database.
+ *
+ * The walk gives the thread back every ROWS_PER_YIELD rows. Two million rows of
+ * pure decoding is a fifth of a second on a developer machine and longer on a
+ * node, and for that whole time the process serves no request, reads no socket
+ * and fires no timer. The batch sink is not a substitute: it awaits real I/O
+ * only once MAX_BATCHES_IN_FLIGHT writes are outstanding, and awaiting an
+ * already-settled promise drains microtasks without letting the event loop run.
  * @param {Buffer} buf Decompressed artifact
  * @param {object} parsed parseHeader() result
  * @param {(docs: Array<object>) => Promise<void>} [onBatch] Batch sink
@@ -252,6 +294,10 @@ async function walkRows(buf, parsed, onBatch) {
         await onBatch(batch);
         batch = [];
       }
+    }
+    if ((i + 1) % ROWS_PER_YIELD === 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await yieldToEventLoop();
     }
   }
   if (cursor.offset !== buf.length) throw malformed('row count disagrees with the byte stream');
@@ -340,9 +386,11 @@ async function writeIngestMarker(database, parsed) {
       $set: {
         generated: parsed.header.generated,
         rowCount: parsed.rowCount,
-        // the header's country -> continent map, so a boot that adopts the
-        // stored table can answer continentForCountry without the artifact
+        // the header's vocabularies, so a boot that adopts the stored table can
+        // answer continentForCountry and resolve a region name without holding
+        // the artifact
         continents: Object.fromEntries(parsed.continents),
+        regionNames: Object.fromEntries(parsed.regionNames),
         ingestedAt: Date.now(),
       },
     },
@@ -380,6 +428,7 @@ async function setArtifact(bytes) {
 
   status = { ready: true, generated: parsed.header.generated, rowCount: parsed.rowCount };
   continentByCountry = parsed.continents;
+  regionCodeByName = parsed.regionNames;
   await writeIngestMarker(database, parsed);
   log.info(`ipLocationStore - baseline installed: ${parsed.rowCount} ranges, generated ${parsed.header.generated}`);
   return { generated: status.generated, rowCount: status.rowCount };
@@ -406,6 +455,7 @@ async function adoptPersistedStatus() {
   if (!marker || typeof marker.generated !== 'string' || !marker.generated) return false;
   status = { ready: true, generated: marker.generated, rowCount: marker.rowCount ?? 0 };
   continentByCountry = new Map(Object.entries(marker.continents ?? {}));
+  regionCodeByName = new Map(Object.entries(marker.regionNames ?? {}));
   log.info(`ipLocationStore - adopted the stored baseline: ${status.rowCount} ranges, generated ${status.generated}`);
   return true;
 }
@@ -422,18 +472,92 @@ function continentForCountry(countryCode) {
 }
 
 /**
- * The whole per-node location view in one query - the read placement makes for
- * every computation, in place of a lookup per node.
- * @returns {Promise<Array<object>>}
+ * The ISO 3166-2 code for a region an app named the way ip-api does.
+ *
+ * A geolocation entry may carry either vocabulary - 'acEU_DE_DE-BY' or
+ * 'acEU_DE_Bavaria' - while the rows carry codes alone. Null when this node
+ * holds no vocabulary, or the name is not in it: the caller then answers that
+ * entry at country granularity, which counts more nodes rather than fewer.
+ * @param {string} countryCode ISO 3166-1 alpha-2 code
+ * @param {string} regionName The entry's region part
+ * @returns {string | null}
  */
-async function getNodeLocations() {
+function regionCodeForName(countryCode, regionName) {
+  if (!status.ready || !countryCode || !regionName) return null;
+  return regionCodeByName.get(`${countryCode}|${regionName}`) ?? null;
+}
+
+/**
+ * The fault-domain key a stored location gives its address: the organisation
+ * holding the range, else the registry allocation block. Null when the table
+ * resolved neither, which leaves the address on the /16 rung its caller
+ * computes. Derived once, when the entry is built.
+ * @param {{o: string|null, bs: number|null, be: number|null}} doc A stored location
+ * @returns {string | null}
+ */
+function domainKeyFor(doc) {
+  if (doc.o) return `org:${doc.o}`;
+  if (doc.bs !== null && doc.bs !== undefined) return `blk:${doc.bs}-${doc.be}`;
+  return null;
+}
+
+/**
+ * One entry of the per-node view, in the shape its readers use: the fault
+ * domain already keyed, and the three location fields eligibility reads.
+ * @param {object} doc A stored nodelocations document
+ * @returns {{d: string|null, c: string|null, n: string|null, r: string|null, g: string|null}}
+ */
+function viewEntry(doc) {
+  return {
+    d: domainKeyFor(doc),
+    c: doc.c ?? null,
+    n: doc.n ?? null,
+    r: doc.r ?? null,
+    g: doc.g ?? null,
+  };
+}
+
+/**
+ * Load the stored view into the process. One read, at boot: the rows survive a
+ * restart in mongo, and re-deriving them would cost a lookup per node against
+ * the range table.
+ * @returns {Promise<void>}
+ */
+async function loadNodeLocationView() {
   const database = db();
   if (!database) throw unavailable('no database connection');
+  let docs;
   try {
-    return await dbHelper.findInDatabase(database, nodeLocationsCollection, {});
+    docs = await dbHelper.findInDatabase(database, nodeLocationsCollection, {});
   } catch (error) {
     throw unavailable(error.message);
   }
+  const loaded = new Map();
+  (docs ?? []).forEach((doc) => loaded.set(doc._id, viewEntry(doc)));
+  nodeView = loaded;
+  nodeViewLoaded = true;
+}
+
+/**
+ * The per-node location view this process holds.
+ *
+ * The map is replaced whole on every refresh and never mutated in place, so a
+ * caller that takes it once answers every question from one consistent picture
+ * of the network - a spawn decision and the share it is measured against can
+ * never come from two different views.
+ *
+ * `ready` is what a caller must gate a location answer on: it means this
+ * process holds both a baseline and the view derived from it. Without it the
+ * map is empty, every address falls to /16 arithmetic, and that is exactly the
+ * posture a node with no table at all is in.
+ * @returns {{byIp: Map<string, object>, ready: boolean, generated: string|null}}
+ */
+function nodeLocationSnapshot() {
+  return {
+    byIp: nodeView,
+    ready: status.ready && nodeViewLoaded,
+    generated: status.generated ?? null,
+  };
 }
 
 /**
@@ -479,42 +603,58 @@ async function lookup(ip) {
 }
 
 /**
- * Bring the per-node view in line with the node list: documents derived from an
- * older baseline are dropped whole, and every listed address without one is
- * looked up and written. A lookup that fails leaves that node without a
- * document, which reads downstream as an unresolved location - the /16 rung -
- * so one failure never fails the pass.
+ * Bring the per-node view in line with the node list.
+ *
+ * The list is what the view is FOR, so it is also what the view is bounded by:
+ * an address the list no longer carries is dropped, and an entry derived from
+ * an older baseline is re-derived. That leaves the view holding exactly the
+ * listed addresses, which is what lets a reader take absence at face value.
+ *
+ * A lookup that fails leaves that address out, which reads downstream as an
+ * unresolved location - the /16 rung - so one failure never fails the pass. The
+ * resident view is swapped in at the end, whole: a reader holding the previous
+ * one keeps a consistent picture rather than watching this pass rewrite it.
  * @param {Array<{ip: string}>} nodeList The deterministic node list
  * @returns {Promise<{refreshed: number, dropped: number}>}
  */
 async function refreshNodeLocations(nodeList) {
   // without a baseline there is nothing to derive a location from, and the
-  // documents already held stay as they are
+  // entries already held stay as they are
   if (!status.ready) return { refreshed: 0, dropped: 0 };
   const database = db();
   if (!database) throw unavailable('no database connection');
+  if (!nodeViewLoaded) await loadNodeLocationView();
 
-  let dropped = 0;
-  let held;
-  try {
-    const removal = await dbHelper.removeDocumentsFromCollection(
-      database,
-      nodeLocationsCollection,
-      { g: { $ne: status.generated } },
-    );
-    dropped = removal?.deletedCount ?? 0;
-    held = await dbHelper.findInDatabase(database, nodeLocationsCollection, {}, { projection: { _id: 1 } });
-  } catch (error) {
-    throw unavailable(error.message);
-  }
-
-  const known = new Set((held ?? []).map((doc) => doc._id));
+  const listed = new Set();
   const missing = [];
   (nodeList ?? []).forEach((node) => {
     const ip = bareIp(node?.ip);
-    if (!ip || known.has(ip)) return;
-    known.add(ip);
-    missing.push(ip);
+    if (!ip || listed.has(ip)) return;
+    listed.add(ip);
+    const held = nodeView.get(ip);
+    // an entry from an older baseline says where the address used to resolve
+    if (!held || held.g !== status.generated) missing.push(ip);
+  });
+
+  const departed = [...nodeView.keys()].filter((ip) => !listed.has(ip));
+
+  let dropped = 0;
+  if (departed.length) {
+    try {
+      const removal = await dbHelper.removeDocumentsFromCollection(
+        database,
+        nodeLocationsCollection,
+        { _id: { $in: departed } },
+      );
+      dropped = removal?.deletedCount ?? 0;
+    } catch (error) {
+      throw unavailable(error.message);
+    }
+  }
+
+  const next = new Map();
+  nodeView.forEach((entry, ip) => {
+    if (listed.has(ip) && entry.g === status.generated) next.set(ip, entry);
   });
 
   let refreshed = 0;
@@ -524,28 +664,28 @@ async function refreshNodeLocations(nodeList) {
     while (cursor < missing.length) {
       const ip = missing[cursor];
       cursor += 1;
+      const doc = {
+        o: null, bs: null, be: null, c: null, n: null, r: null, g: status.generated,
+      };
       try {
         // eslint-disable-next-line no-await-in-loop
         const hit = await lookup(ip);
+        doc.o = hit?.org ?? null;
+        // no allocation means no block rung: the /16 rung applies instead
+        doc.bs = hit?.block?.start ?? null;
+        doc.be = hit?.block?.end ?? null;
+        doc.c = hit?.countryCode ?? null;
+        doc.n = hit?.continentCode ?? null;
+        doc.r = hit?.region ?? null;
         // eslint-disable-next-line no-await-in-loop
         await dbHelper.updateOneInDatabase(
           database,
           nodeLocationsCollection,
           { _id: ip },
-          {
-            $set: {
-              o: hit?.org ?? null,
-              // no allocation means no block rung: the /16 rung applies instead
-              bs: hit?.block?.start ?? null,
-              be: hit?.block?.end ?? null,
-              c: hit?.countryCode ?? null,
-              n: hit?.continentCode ?? null,
-              r: hit?.region ?? null,
-              g: status.generated,
-            },
-          },
+          { $set: doc },
           { upsert: true },
         );
+        next.set(ip, viewEntry(doc));
         refreshed += 1;
       } catch (error) {
         failure = failure ?? error;
@@ -556,6 +696,9 @@ async function refreshNodeLocations(nodeList) {
     { length: Math.min(NODE_LOOKUP_CONCURRENCY, missing.length) },
     () => fill(),
   ));
+
+  nodeView = next;
+  nodeViewLoaded = true;
   if (failure) log.warn(`ipLocationStore - some node locations could not be refreshed: ${failure.message}`);
   return { refreshed, dropped };
 }
@@ -575,7 +718,10 @@ function currentStatus() {
 function clear() {
   status = { ready: false, generated: null, rowCount: 0 };
   continentByCountry = new Map();
+  regionCodeByName = new Map();
   minimumRowCount = MIN_ROW_COUNT;
+  nodeView = new Map();
+  nodeViewLoaded = false;
 }
 
 /**
@@ -592,7 +738,9 @@ module.exports = {
   setArtifact,
   adoptPersistedStatus,
   continentForCountry,
-  getNodeLocations,
+  regionCodeForName,
+  loadNodeLocationView,
+  nodeLocationSnapshot,
   refreshNodeLocations,
   lookup,
   status: currentStatus,

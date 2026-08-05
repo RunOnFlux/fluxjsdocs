@@ -21,6 +21,8 @@ const {
   EARLY_EVAL_MIN_GAP_MS,
 } = require('./syncthingMonitorConstants');
 const { createMonitorAccelerator } = require('./syncthingMonitorAccelerator');
+const { createPeerFolderLiveness } = require('./peerFolderLiveness');
+const { socketAddressesMatch } = require('../utils/socketAddressUtils');
 const {
   sortAndFilterLocations,
   buildDeviceConfiguration,
@@ -126,6 +128,30 @@ async function checkAppFolderMounts(appsInstalled) {
 }
 
 /**
+ * The apps holding at least one syncing folder still awaiting a promotion
+ * decision. Only those folders ask a peer anything, so only their holders are
+ * worth asking about: a node whose synced apps are all running probes nothing,
+ * and must keep probing nothing.
+ * @param {Array} appsInstalled - List of installed apps (decrypted)
+ * @param {Set<string>} suspendedAppNames - Apps under backup or restore
+ * @param {Map} receiveOnlySyncthingAppsCache - Per-folder transition state
+ * @returns {Set<string>} App names
+ */
+function appsAwaitingPromotion(appsInstalled, suspendedAppNames, receiveOnlySyncthingAppsCache) {
+  const names = new Set();
+  appsInstalled.forEach((installedApp) => {
+    if (suspendedAppNames.has(installedApp.name)) return;
+    appComponents(installedApp).forEach(({ appId, containerData }) => {
+      const primaryContainer = (containerData ?? '').split('|')[0];
+      if (!requiresSyncing(getContainerDataFlags(primaryContainer))) return;
+      const cache = receiveOnlySyncthingAppsCache.get(appId);
+      if (cache && !cache.restarted) names.add(installedApp.name);
+    });
+  });
+  return names;
+}
+
+/**
  * Installed apps having at least one component whose docker app identifier is
  * in the given folder-id list (syncthing folder ids ARE the app identifiers).
  * @param {Array} appsInstalled - List of installed apps
@@ -201,6 +227,7 @@ async function processContainerData(params) {
     folderIds,
     foldersConfiguration,
     newFoldersConfiguration,
+    liveness,
   } = params;
 
   const containersData = containerData.split('|');
@@ -262,6 +289,7 @@ async function processContainerData(params) {
       syncthingFolder,
       installedAppName,
       mountVerifyNeeded: state.syncthingAppsFirstRun || erroredFolderIds.has(appId),
+      liveness,
     });
 
     // Update cache if provided
@@ -382,11 +410,26 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
     }
 
     // Decrypt enterprise apps (version 8 with encrypted content). This pass acts
-    // on the specification - an undecrypted enterprise app carries an empty
-    // compose, which would read as "this app owns no folders" and sweep every
-    // folder it has. A decrypt failure aborts the pass through the outer catch;
-    // the next pass retries once the enterprise key is available.
-    appsInstalled.data = await decryptEnterpriseApps(appsInstalled.data, { throwOnError: true });
+    // on the specification, and an app whose spec cannot be read tells us
+    // nothing about which folders it owns - so its folders are protected from
+    // the sweep and its safety flags are left standing, while every app that
+    // DID decrypt is managed normally. Aborting the whole pass instead would
+    // stop folder registration, mount safety, promotion and error draining for
+    // every app on the node, and stop publishing the writable-folder answer its
+    // peers block on - for as long as one app stays unreadable.
+    const decrypted = await decryptEnterpriseApps(appsInstalled.data);
+    appsInstalled.data = decrypted.apps;
+    const unreadableAppNames = new Set(decrypted.unreadable.map((app) => app.name));
+    if (unreadableAppNames.size) {
+      log.warn(`syncthingAppsCore - folders of undecryptable apps are protected this pass: ${[...unreadableAppNames].join(', ')}`);
+    }
+    // A folder id is the component identifier, which ends in _<appName> - and an
+    // app name cannot contain an underscore - so a folder always names the app
+    // that owns it, even when that app's components are unreadable.
+    const ownedByUnreadableApp = (folderId) => {
+      const appName = folderId.slice(folderId.lastIndexOf('_') + 1);
+      return unreadableAppNames.has(appName);
+    };
 
     // The folders installed apps own. Computed here, before any decision the
     // pass makes: the skip-gate below tells "syncthing has no such folder
@@ -415,13 +458,15 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
       : appsMatchingFolderIds(appsInstalled.data, pendingFolderIds);
     // A flagged folder no installed app carries can never be acted on -
     // resolve it rather than re-match it forever (the uninstall already
-    // removed whatever the flag was protecting).
+    // removed whatever the flag was protecting). An app whose spec could not be
+    // read carries nothing either, but for a reason that says nothing about the
+    // folder: its flag stays standing until its components can be enumerated.
     if (!state.syncthingAppsFirstRun && pendingFolderIds.length > 0) {
       const matchable = new Set();
       appsToVerify.forEach((installedApp) => {
         appComponents(installedApp).forEach(({ appId }) => matchable.add(appId));
       });
-      pendingFolderIds.filter((id) => !matchable.has(id))
+      pendingFolderIds.filter((id) => !matchable.has(id) && !ownedByUnreadableApp(id))
         .forEach((id) => syncthingEventsConsumer.resolveMountVerify(id));
     }
     const { unmountedApps, verifiedSafeIds } = appsToVerify.length > 0
@@ -582,9 +627,32 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
     const foldersConfiguration = [];
     const newFoldersConfiguration = [];
 
+    // Peer liveness, answered once for the whole pass. Both promotion decisions
+    // ask the same peers the same question, and the folder loop is sequential -
+    // asked inside it, one unreachable holder costs its full timeout again for
+    // every folder that elects it, and past three the pass outruns the interval
+    // and the next cycle is dropped for every folder on the node. Asking the
+    // whole set at once costs one timeout no matter how many folders wait on it.
+    // Nothing is probed unless a folder is actually awaiting promotion.
+    const liveness = createPeerFolderLiveness();
+    const awaitingPromotion = appsAwaitingPromotion(
+      appsInstalled.data,
+      new Set([...state.backupInProgress, ...state.restoreInProgress]),
+      state.receiveOnlySyncthingAppsCache,
+    );
+    if (awaitingPromotion.size) {
+      const peerLists = await Promise.all([...awaitingPromotion].map((name) => appLocation(name)));
+      await liveness.prewarm(
+        peerLists.flat()
+          .map((entry) => entry?.ip)
+          .filter((ip) => ip && !socketAddressesMatch(ip, localSocketAddr)),
+      );
+    }
+
     // Shared parameters for processing
     const sharedParams = {
       localSocketAddr,
+      liveness,
       localDeviceId,
       state,
       // the folders flagged when the pass began: the state machine re-verifies
@@ -648,8 +716,13 @@ async function syncthingAppsCore(state, installedAppsFn, getGlobalStateFn) {
     // state machine still owns its folder, and deleting it would take
     // syncthing's index, peer devices and any standing safety demotion with it.
     const nonUsedFolders = allFoldersResp.data.filter(
-      (syncthingFolder) => !ownerIds.has(syncthingFolder.id),
+      (syncthingFolder) => !ownerIds.has(syncthingFolder.id)
+        && !ownedByUnreadableApp(syncthingFolder.id),
     );
+    allFoldersResp.data
+      .filter((syncthingFolder) => !ownerIds.has(syncthingFolder.id)
+        && ownedByUnreadableApp(syncthingFolder.id))
+      .forEach((syncthingFolder) => log.warn(`syncthingAppsCore - keeping folder ${syncthingFolder.id}: its app could not be decrypted, so ownership is unknown`));
     // An owned folder the pass never registered means its component went
     // unprocessed: the folder survives, but the skip is never silent - no
     // configuration is being applied to it until the component is reached again.

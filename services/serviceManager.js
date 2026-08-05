@@ -30,7 +30,6 @@ const appSpawner = require('./appLifecycle/appSpawner');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
-const fileOperationRecovery = require('./appSystem/fileOperationRecovery');
 const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
@@ -353,7 +352,7 @@ async function startFluxFunctions() {
     appReconciler.setOnContainerStarted(() => peerNotification.checkAndNotifyPeersOfRunningApps());
     // a removed component's in-memory controller verdict dies with it - a
     // reinstalled g:/r: app must await a fresh election, not inherit a stale one
-    appUninstaller.setOnComponentRemoved((id) => appReconciler.clearControllerDesired(id));
+    appUninstaller.setOnComponentRemoved((id) => appReconciler.forgetDesiredState(id));
     log.info('App Spawner initialized');
 
     fluxNetworkHelper.adjustFirewall();
@@ -392,16 +391,6 @@ async function startFluxFunctions() {
     log.info('Container mount recovery check...');
     await containerMountRecovery.performContainerMountRecovery().catch((error) => {
       log.error(`Container mount recovery service error: ${error.message}`);
-    });
-    // A file operation's container is detached from the process that started
-    // it, so a FluxOS restart leaves one running with nobody waiting for its
-    // result, and its staging directory on the volume. Reclaim both - and
-    // restore any destination whose publish was interrupted between its two
-    // renames. Runs after the volumes above are mounted, since the sweep reads
-    // them.
-    log.info('Reclaiming interrupted file operations...');
-    await fileOperationRecovery.recoverInterruptedFileOperations().catch((error) => {
-      log.error(`File operation recovery error: ${error.message}`);
     });
     syncthingService.startSyncthingSentinel();
     log.info('Syncthing service started');
