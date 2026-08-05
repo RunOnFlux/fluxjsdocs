@@ -30,6 +30,7 @@ const appSpawner = require('./appLifecycle/appSpawner');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
+const fileOperationRecovery = require('./appSystem/fileOperationRecovery');
 const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
@@ -392,8 +393,22 @@ async function startFluxFunctions() {
     await containerMountRecovery.performContainerMountRecovery().catch((error) => {
       log.error(`Container mount recovery service error: ${error.message}`);
     });
+    // A file operation's container is detached from the process that started
+    // it, so a FluxOS restart leaves one running with nobody waiting for its
+    // result, and its staging directory on the volume. Reclaim both - and
+    // restore any destination whose publish was interrupted between its two
+    // renames. Runs after the volumes above are mounted, since the sweep reads
+    // them.
+    log.info('Reclaiming interrupted file operations...');
+    await fileOperationRecovery.recoverInterruptedFileOperations().catch((error) => {
+      log.error(`File operation recovery error: ${error.message}`);
+    });
     syncthingService.startSyncthingSentinel();
     log.info('Syncthing service started');
+    // Awaited: generating an identity rewrites config/userconfig.js, and that
+    // write is not atomic - a reload landing inside it leaves the process with
+    // no userconfig.initial at all. A node that already has an identity returns
+    // from here immediately, so this costs the fleet nothing.
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
     // Ensure watchdog is installed and running on legacy OS (non-ArcaneOS) nodes
