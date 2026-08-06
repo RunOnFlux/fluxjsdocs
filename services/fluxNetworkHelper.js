@@ -1022,7 +1022,8 @@ async function clockDrift(req, res) {
  * @param {object} res Response.
  */
 function isCommunicationEstablished(req, res) {
-  const { outboundCount, inboundCount } = peerManager;
+  const outboundCount = peerManager.outboundCount;
+  const inboundCount = peerManager.inboundCount;
   let message;
   if (outboundCount < config.fluxapps.minOutgoing) { // easier to establish
     message = messageHelper.createErrorMessage(`Not enough outgoing connections established to Flux network. Minimum required ${config.fluxapps.minOutgoing} found ${outboundCount}`);
@@ -1566,7 +1567,7 @@ async function setDOSStateApi(req, res) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
   }
-  let { body } = req;
+  let body = req.body;
   if (typeof body !== 'object') {
     try { body = JSON.parse(body); } catch { body = {}; }
   }

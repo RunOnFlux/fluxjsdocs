@@ -24,6 +24,8 @@ async function deterministicFluxList(options = {}) {
   const sort = options.sort || false;
   const addressOnly = options.addressOnly || false;
 
+  await networkStateService.waitStarted();
+
   if (!filter) {
     const state = networkStateService.networkState({ sort });
 
@@ -46,6 +48,8 @@ async function deterministicFluxList(options = {}) {
 }
 
 async function getNodeCount() {
+  await networkStateService.waitStarted();
+
   const count = networkStateService.nodeCount();
 
   return count;
@@ -57,6 +61,8 @@ async function getNodeCount() {
  * @returns {Proimse<Fluxnode | null}
  */
 async function getFluxnodeFromFluxList(socketAddress) {
+  await networkStateService.waitStarted();
+
   const node = await networkStateService.getFluxnodeBySocketAddress(socketAddress);
 
   return node;
@@ -68,6 +74,8 @@ async function getFluxnodeFromFluxList(socketAddress) {
  * @returns {Proimse<boolean>}
  */
 async function socketAddressInFluxList(socketAddress) {
+  await networkStateService.waitStarted();
+
   const found = await networkStateService.socketAddressInNetworkState(socketAddress);
 
   return found;
