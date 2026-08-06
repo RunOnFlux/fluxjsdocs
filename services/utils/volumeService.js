@@ -1,14 +1,64 @@
 const fs = require('fs').promises;
 const path = require('node:path');
-const util = require('node:util');
-const df = require('node-df');
 const dockerService = require('../dockerService');
+const deviceHelper = require('../deviceHelper');
 const serviceHelper = require('../serviceHelper');
 const mountParser = require('./mountParser');
 const log = require('../../lib/log');
-const { appsFolder, appVolumesPath, legacyAppVolumesPath } = require('./appConstants');
+const {
+  appsFolder, appVolumesPath, legacyAppVolumesPath, APP_VOLUME_MOUNT_OPTIONS,
+} = require('./appConstants');
 
-const dfAsync = util.promisify(df);
+/**
+ * The host filesystems eligible to hold an app's FLUXFSVOL image.
+ *
+ * Block-backed, and neither the root nor a boot filesystem. Loop devices are
+ * excluded because a loop mount IS an app volume - treating one as a candidate
+ * host would place an app's image inside another app's volume.
+ *
+ * Throws when the mount table cannot be read; callers narrow their search to
+ * the appvolumes directories rather than treating that as "no disks".
+ *
+ * @returns {Promise<Array<object>>} mount rows from deviceHelper
+ */
+async function eligibleHostMounts() {
+  const filesystems = await deviceHelper.listMountedFilesystems();
+  return filesystems.filter((entry) => entry.source.includes('/dev/')
+    && !entry.source.includes('loop')
+    && !entry.target.includes('boot')
+    && entry.target !== '/');
+}
+
+/**
+ * The host volumes that count towards this node's advertised capacity, sized in
+ * whole GB.
+ *
+ * A wider set than eligibleHostMounts: a loop-mounted ROOT is included, because
+ * on some images that is the host disk rather than an app volume. Callers that
+ * place a FLUXFSVOL want the narrower set; callers that total up node capacity
+ * want this one.
+ *
+ * GB here means DECIMAL GB. That is the unit the rest of the capacity
+ * arithmetic uses - app hdd requirements and the config reserves are both
+ * decimal - so reporting GiB would shrink every node's apparent capacity by
+ * about 7% and start rejecting apps that fit.
+ *
+ * @returns {Promise<Array<{filesystem: string, mount: string, size: number,
+ *   used: number, available: number}>>}
+ */
+async function capacityVolumesInGb() {
+  const mounts = await deviceHelper.listMountedFilesystems();
+  return mounts
+    .filter((volume) => (volume.source.includes('/dev/') && !volume.source.includes('loop') && !volume.target.includes('boot'))
+      || (volume.source.includes('loop') && volume.target === '/'))
+    .map((volume) => ({
+      filesystem: volume.source,
+      mount: volume.target,
+      size: Math.round(volume.sizeBytes / 1e9),
+      used: Math.round(volume.usedBytes / 1e9),
+      available: Math.round(volume.availableBytes / 1e9),
+    }));
+}
 
 /**
  * Whether a path currently has a filesystem mounted on it. Reads
@@ -49,16 +99,12 @@ async function getVolumeFilePath(appId) {
   const candidates = [];
 
   try {
-    const dfres = await dfAsync({});
-    dfres.forEach((volume) => {
-      const eligible = volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop')
-        && !volume.mount.includes('boot') && volume.mount !== '/';
-      if (eligible) {
-        candidates.push(path.join(volume.mount, volumeFileName));
-      }
+    const mounts = await eligibleHostMounts();
+    mounts.forEach((mount) => {
+      candidates.push(path.join(mount.target, volumeFileName));
     });
   } catch (error) {
-    log.warn(`getVolumeFilePath - df failed (${error.message}), falling back to appvolumes locations only`);
+    log.warn(`getVolumeFilePath - findmnt failed (${error.message}), falling back to appvolumes locations only`);
   }
 
   candidates.push(path.join(appVolumesPath, volumeFileName));
@@ -89,16 +135,10 @@ async function getComponentAppIdsFromVolumeFiles(appName) {
   const searchDirs = new Set([appVolumesPath, legacyAppVolumesPath]);
 
   try {
-    const dfres = await dfAsync({});
-    dfres.forEach((volume) => {
-      const eligible = volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop')
-        && !volume.mount.includes('boot') && volume.mount !== '/';
-      if (eligible) {
-        searchDirs.add(volume.mount);
-      }
-    });
+    const mounts = await eligibleHostMounts();
+    mounts.forEach((mount) => searchDirs.add(mount.target));
   } catch (error) {
-    log.warn(`getComponentAppIdsFromVolumeFiles - df failed (${error.message}), searching appvolumes locations only`);
+    log.warn(`getComponentAppIdsFromVolumeFiles - findmnt failed (${error.message}), searching appvolumes locations only`);
   }
 
   const escapedName = appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -169,7 +209,7 @@ async function ensureAppVolumeMounted(identifier) {
   }
 
   const mountRes = await serviceHelper.runCommand('mount', {
-    runAsRoot: true, params: ['-o', 'loop', volumeFile, mountPoint], logError: false,
+    runAsRoot: true, params: ['-o', APP_VOLUME_MOUNT_OPTIONS, volumeFile, mountPoint], logError: false,
   });
   if (mountRes.error) {
     // another actor (e.g. a legacy @reboot job on its last boot) may have
@@ -341,11 +381,33 @@ async function ensureMountPathsExist(appSpecifications, appName, isComponent, fu
   }
 }
 
+/**
+ * Delete everything an app holds in its volume, leaving the volume itself mounted
+ * @param {string} identifier - Component identifier
+ * @returns {Promise<void>}
+ */
+async function clearAppVolumeData(identifier) {
+  const appId = dockerService.getAppIdentifier(identifier);
+  const appDataPath = path.join(appsFolder, appId, 'appdata');
+  try {
+    const entries = await fs.readdir(appDataPath);
+    await Promise.all(entries.map((entry) => serviceHelper.runCommand('rm', {
+      runAsRoot: true,
+      params: ['-rf', path.join(appDataPath, entry)],
+    })));
+    log.info(`Deleted data for app ${appId}`);
+  } catch (error) {
+    log.error(`Error deleting data for app ${appId}: ${error.message}`);
+  }
+}
+
 module.exports = {
   verifyAppVolumeMount,
   ensureMountPathsExist,
+  capacityVolumesInGb,
   isPathMounted,
   getVolumeFilePath,
   getComponentAppIdsFromVolumeFiles,
   ensureAppVolumeMounted,
+  clearAppVolumeData,
 };
