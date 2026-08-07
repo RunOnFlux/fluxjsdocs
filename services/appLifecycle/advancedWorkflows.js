@@ -35,6 +35,9 @@ const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const appReconciler = require('../appMonitoring/appReconciler');
+const syncthingFolderStateMachine = require('../appMonitoring/syncthingFolderStateMachine');
+const syncthingServiceModule = require('../syncthingService');
+const { getContainerDataFlags, requiresSyncing } = require('../appMonitoring/syncthingMonitorHelpers');
 const appsRuntimeState = require('../appManagement/appsRuntimeState');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
@@ -53,6 +56,13 @@ const timeTostartNewMasterApp = new Map();
 // in the logs from a loop that has died, which is exactly how it has been
 // misread. Cleared when the lock lifts so a later stop announces again.
 const operatorStoppedNoted = new Set();
+
+// The directories a restore may read an archive from, and so the only values
+// its `type` may take. It names a directory inside the app's volume and reaches
+// a shell through tar, so an unrecognised one is refused rather than
+// interpolated. Matches the three prefixes backupRestoreService's path
+// validation accepts.
+const RESTORE_TYPES = ['local', 'remote', 'upload'];
 
 // Promisified functions
 const cmdAsync = util.promisify(nodecmd.run);
@@ -1781,13 +1791,9 @@ async function redeployAPI(req, res) {
  * @returns {Promise<void>}
  */
 async function sendChunk(res, chunk) {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      res.write(`${chunk}\n`);
-      if (res.flush) res.flush();
-      resolve();
-    }, 3000); // Adjust the delay as needed
-  });
+  await serviceHelper.delay(3000);
+  res.write(`${chunk}\n`);
+  if (res.flush) res.flush();
 }
 
 /**
@@ -1820,14 +1826,6 @@ async function stopSyncthingApp(appComponentName, res) {
         // remove folder from syncthing
         // eslint-disable-next-line no-await-in-loop
         await syncthingService.adjustConfigFolders('delete', undefined, folderId);
-        // check if restart is needed
-        // eslint-disable-next-line no-await-in-loop
-        const restartRequired = await syncthingService.getConfigRestartRequired();
-        if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-          log.info('Syncthing restart required, restarting...');
-          // eslint-disable-next-line no-await-in-loop
-          await syncthingService.systemRestart();
-        }
         const adjustSyncthingB = {
           status: 'Syncthing adjusted',
         };
@@ -1901,6 +1899,111 @@ async function changeSyncthingFolderType(folderId, folderType) {
 }
 
 /**
+ * The syncthing folder id backing a component's volume. Folder ids ARE the
+ * docker app identifiers, so a composed app has one folder PER COMPONENT and
+ * the app name alone never names a folder. Legacy (version <= 3) apps pass the
+ * literal 'null' component, mirroring IOUtils.getVolumeInfo.
+ * @param {string} appname - Application name
+ * @param {string} componentName - Component name, or 'null' for a legacy app
+ * @returns {string} Syncthing folder id
+ */
+function syncthingFolderIdForComponent(appname, componentName) {
+  return componentName === 'null'
+    ? dockerService.getAppIdentifier(appname)
+    : dockerService.getAppIdentifier(`${componentName}_${appname}`);
+}
+
+/**
+ * Pause or resume one syncthing folder. Pausing stops that folder's runner -
+ * and therefore all writes to its directory - while leaving the folder config
+ * and its index in place, so it is the right way to hold data still for the
+ * duration of an operation. Deleting the folder instead loses the config, and
+ * only the syncthing monitor's per-app pass ever recreates it.
+ *
+ * Scoped to a single folder: the daemon and every other folder keep running.
+ * A paused/resumed folder never sets syncthing's restart-required flag, so no
+ * process restart is involved (verified against syncthing v2 - the folder
+ * runner is stopped and, when unpausing, started again in place).
+ * @param {string} folderId - Syncthing folder ID
+ * @param {boolean} paused - Desired paused state
+ * @returns {Promise<boolean>} - true if applied, false otherwise
+ */
+async function setSyncthingFolderPaused(folderId, paused) {
+  try {
+    const response = await syncthingServiceModule.adjustConfigFolders('patch', { paused }, folderId);
+    if (response.status === 'success') {
+      log.info(`setSyncthingFolderPaused - ${folderId} paused=${paused}`);
+      return 'held';
+    }
+    // 4xx: syncthing has no such folder. Nothing is replicating it, so there is
+    // nothing to hold still and the caller may proceed - which is NOT true of
+    // any other failure, where the folder may be live and unheld.
+    if (response.data?.code === 'ERR_BAD_REQUEST') {
+      log.info(`setSyncthingFolderPaused - ${folderId} is unknown to syncthing; nothing to hold still`);
+      return 'absent';
+    }
+    log.error(`setSyncthingFolderPaused - ${folderId} paused=${paused} failed: ${JSON.stringify(response)}`);
+    return 'failed';
+  } catch (error) {
+    log.error(`setSyncthingFolderPaused - ${folderId} paused=${paused} failed: ${error.message}`);
+    return 'failed';
+  }
+}
+
+/**
+ * An app's components in one shape whatever its version. A version <= 3 app has
+ * no compose array and one implicit component, addressed as the literal 'null' -
+ * the identifier IOUtils.getVolumeInfo and the syncthing folder ids both use for
+ * it.
+ * @param {object} appDetails - Global app specification
+ * @returns {Array<{name: string, containerData: string}>} Components
+ */
+function componentsOfApp(appDetails) {
+  return appDetails.version <= 3
+    ? [{ name: 'null', containerData: appDetails.containerData }]
+    : (appDetails.compose || []);
+}
+
+/**
+ * How a component's data is replicated, which is what decides whether an
+ * operation on it has to reach beyond this node:
+ *
+ * - `none`    the data is this instance's own and reaches nobody.
+ * - `elected` (g:) one instance runs at a time, so every other copy is
+ *             quiescent and syncthing carries a change to them.
+ * - `shared`  (r:/s:) every instance runs and writes, so their containers are
+ *             holding data a change here has just replaced underneath them.
+ *
+ * Read from the PRIMARY mount's flags, which is what syncthing itself is
+ * configured from - a flag on a later mount configures nothing, so a substring
+ * search over the whole containerData reports sync on apps that have none.
+ * @param {string} containerData - Component containerData
+ * @returns {string} 'none' | 'elected' | 'shared'
+ */
+function syncModeOfComponent(containerData) {
+  const flags = getContainerDataFlags((containerData || '').split('|')[0]);
+  if (!requiresSyncing(flags)) return 'none';
+  return flags.includes('g') ? 'elected' : 'shared';
+}
+
+/**
+ * The components of an app whose data is synced, paired with their syncthing
+ * folder ids. Uses the same predicate that decides a folder is created at all,
+ * so this can never disagree with what syncthing is actually configured with.
+ * @param {object} appDetails - Global app specification
+ * @param {string} appname - Application name
+ * @returns {Array<{componentName: string, folderId: string}>} Synced components
+ */
+function syncedComponentsOfApp(appDetails, appname) {
+  return componentsOfApp(appDetails)
+    .filter((comp) => syncModeOfComponent(comp.containerData) !== 'none')
+    .map((comp) => ({
+      componentName: comp.name,
+      folderId: syncthingFolderIdForComponent(appname, comp.name),
+    }));
+}
+
+/**
  * Helper function to apply permissions fix on persistent container data
  * Fixes permissions on appdata and all additional mount points
  * @param {string} appId - Application ID
@@ -1966,40 +2069,75 @@ async function appDockerStart(appname) {
 }
 
 /**
- * Helper function to stop app docker containers
- * @param {string} appname - App name
- * @returns {Promise<void>}
+ * Stop every container the given app name covers, and answer whether they are
+ * all actually down.
+ *
+ * Every component is attempted even when one fails. The catch used to sit
+ * outside the loop, so the first component that would not stop skipped every
+ * component after it, and the caller - which then went on to replace the app's
+ * data - saw nothing at all.
+ *
+ * The verdict is read back from docker rather than taken from the stop call. A
+ * stop that returned is not the same as a container that is down, and appdata
+ * lives on a volume a running container is still writing to: clearing it under
+ * one leaves the app writing into a half-emptied tree and able to save its own
+ * state back over whatever the restore puts there.
+ *
+ * @param {string} appname - App name, or a single component identifier
+ * @returns {Promise<{stopped: boolean, running: string[], errors: string[]}>}
+ *  `running` names the components docker still reports as up - what a caller
+ *  that is about to destroy data must refuse on.
  */
 async function appDockerStop(appname) {
-  try {
-    // eslint-disable-next-line global-require
-    const registryManager = require('../appDatabase/registryManager');
+  // eslint-disable-next-line global-require
+  const registryManager = require('../appDatabase/registryManager');
 
+  let identifiers = [];
+  try {
     const mainAppName = appname.split('_')[1] || appname;
-    const isComponent = appname.includes('_');
-    if (isComponent) {
-      await dockerService.appDockerStop(appname);
-      stopAppMonitoring(appname, false);
+    if (appname.includes('_')) {
+      identifiers = [appname];
     } else {
       const appSpecs = await registryManager.getApplicationSpecifications(mainAppName);
-      if (!appSpecs) {
-        throw new Error('Application not found');
-      }
-      if (appSpecs.version <= 3) {
-        await dockerService.appDockerStop(appname);
-        stopAppMonitoring(appname, false);
-      } else {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appComponent of appSpecs.compose) {
-          // eslint-disable-next-line no-await-in-loop
-          await dockerService.appDockerStop(`${appComponent.name}_${appSpecs.name}`);
-          stopAppMonitoring(`${appComponent.name}_${appSpecs.name}`, false);
-        }
-      }
+      if (!appSpecs) throw new Error('Application not found');
+      identifiers = appSpecs.version <= 3
+        ? [appname]
+        : appSpecs.compose.map((component) => `${component.name}_${appSpecs.name}`);
     }
   } catch (error) {
     log.error(error);
+    // The component list itself is unknown, so nothing can be asserted about
+    // what is running - which is a refusal, not an empty success.
+    return { stopped: false, running: [], errors: [error.message] };
   }
+
+  const running = [];
+  const errors = [];
+  // eslint-disable-next-line no-restricted-syntax
+  for (const identifier of identifiers) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await dockerService.appDockerStop(identifier);
+      stopAppMonitoring(identifier, false);
+    } catch (error) {
+      log.error(`appDockerStop - ${identifier}: ${error.message}`);
+      errors.push(`${identifier}: ${error.message}`);
+    }
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const info = await dockerService.dockerContainerInspect(identifier);
+      if (info?.State?.Running) running.push(identifier);
+    } catch (error) {
+      // A container that cannot be inspected cannot be shown to be down. A
+      // missing one is legitimately not running, and answers 404.
+      if (error.statusCode === 404 || /no such container/i.test(error.message || '')) continue;
+      log.error(`appDockerStop - could not verify ${identifier}: ${error.message}`);
+      running.push(identifier);
+      errors.push(`${identifier}: unverifiable (${error.message})`);
+    }
+  }
+
+  return { stopped: running.length === 0, running, errors };
 }
 
 /**
@@ -2122,6 +2260,9 @@ async function requestMasterStartWithPermissionsFix(appname, appId) {
 async function appendBackupTask(req, res) {
   let appname;
   let backup;
+  let force;
+  // folders this task paused, so a failure anywhere below can resume them
+  const pausedFolderIds = [];
   try {
     const processedBody = serviceHelper.ensureObject(req.body);
     log.info(processedBody);
@@ -2129,6 +2270,7 @@ async function appendBackupTask(req, res) {
     appname = processedBody.appname;
     // eslint-disable-next-line prefer-destructuring
     backup = processedBody.backup;
+    force = processedBody.force === true || processedBody.force === 'true';
     if (!appname || !backup) {
       throw new Error('appname and backup parameters are mandatory');
     }
@@ -2149,22 +2291,72 @@ async function appendBackupTask(req, res) {
   try {
     const authorized = res ? await verificationHelper.verifyPrivilege('appownerabove', req, appname) : true;
     if (authorized === true) {
-      globalState.backupInProgress.push(appname);
-      // Check if app using syncthing, stop syncthing for all component that using it
       // eslint-disable-next-line global-require
       const registryManager = require('../appDatabase/registryManager');
       const appDetails = await registryManager.getApplicationGlobalSpecifications(appname);
+      const requested = new Set(backup.filter((item) => item.backup).map((item) => item.component));
+      const allSyncedComponents = syncedComponentsOfApp(appDetails, appname);
+      const syncedComponents = allSyncedComponents.filter((comp) => requested.has(comp.componentName));
+
+      // An archive is only worth keeping if this instance holds a complete copy.
+      // A synced app's data lives on every instance, and a backup is deliberately
+      // taken from a standby - the quiescent one - so the question is never "is
+      // this the primary" but "is this copy whole". An index that is behind, or
+      // absent entirely (a folder syncthing was never configured with), yields an
+      // archive of whatever happens to be on disk, which can be nothing at all.
+      // Checked BEFORE anything is stopped: a refusal must not cost a healthy app
+      // an outage.
+      const incomplete = [];
       // eslint-disable-next-line no-restricted-syntax
-      const syncthing = appDetails.compose.find((comp) => comp.containerData.includes('g:') || comp.containerData.includes('r:') || comp.containerData.includes('s:'));
-      if (syncthing) {
+      for (const { componentName, folderId } of syncedComponents) {
         // eslint-disable-next-line no-await-in-loop
-        await sendChunk(res, `Stopping syncthing for ${appname}\n`);
-        // eslint-disable-next-line no-await-in-loop
-        await stopSyncthingApp(appname, res);
+        const syncStatus = await syncthingFolderStateMachine.getFolderSyncCompletion(folderId);
+        if (!syncStatus) {
+          incomplete.push(`${componentName}: no syncthing folder - this instance has never synced`);
+        } else if (!syncStatus.isSynced) {
+          incomplete.push(`${componentName}: ${syncStatus.syncPercentage.toFixed(2)}% synced (${syncStatus.inSyncBytes}/${syncStatus.globalBytes} bytes)`);
+        }
+      }
+      if (incomplete.length > 0) {
+        const summary = incomplete.join('; ');
+        if (!force) {
+          throw new Error(`Refusing to back up an incomplete copy - ${summary}. Back up from a fully synced instance, or repeat with force to archive what is on disk anyway.`);
+        }
+        log.warn(`appendBackupTask - ${appname} forced over an incomplete copy - ${summary}`);
+        await sendChunk(res, `WARNING: backing up an incomplete copy - ${summary}\n`);
       }
 
+      globalState.backupInProgress.push(appname);
+
+      // Hold the data still by pausing the folders being archived - the folder
+      // runner stops, so nothing writes underneath the archive. Deleting them
+      // instead (as this once did) loses the folder config, and only the
+      // syncthing monitor's per-app pass ever puts it back; on a node where that
+      // pass cannot complete, the app silently stops being redundant forever.
+      // eslint-disable-next-line no-restricted-syntax
+      for (const { folderId } of syncedComponents) {
+        // eslint-disable-next-line no-await-in-loop
+        await sendChunk(res, `Pausing syncthing folder ${folderId}\n`);
+        // eslint-disable-next-line no-await-in-loop
+        const held = await setSyncthingFolderPaused(folderId, true);
+        if (held === 'held') pausedFolderIds.push(folderId);
+        // An unheld folder is still pulling, so the archive would be taken over
+        // data that moves underneath it. A torn archive is the thing this whole
+        // path exists to stop being created.
+        if (held === 'failed') {
+          throw new Error(`Refused: ${folderId} could not be held still, so an archive taken now could be inconsistent`);
+        }
+      }
+      const syncthing = allSyncedComponents.length > 0;
+
       await sendChunk(res, 'Stopping application...\n');
-      await appDockerStop(appname);
+      const stopVerdict = await appDockerStop(appname);
+      // Same reason the folders are held: an archive taken while a container is
+      // still writing is torn, and a torn archive is what this path exists to
+      // stop being created.
+      if (!stopVerdict.stopped) {
+        throw new Error(`Refused: ${stopVerdict.running.join(', ') || appname} could not be stopped, so an archive taken now could be inconsistent`);
+      }
       await serviceHelper.delay(5 * 1000);
       // eslint-disable-next-line global-require
       const IOUtils = require('../IOUtils');
@@ -2195,15 +2387,27 @@ async function appendBackupTask(req, res) {
         }
       }
       await serviceHelper.delay(5 * 1000);
+      // the archive is written - let the folders sync again before the app is
+      // brought back, so redundancy is restored at the earliest safe moment
+      // eslint-disable-next-line no-restricted-syntax
+      for (const folderId of pausedFolderIds) {
+        // eslint-disable-next-line no-await-in-loop
+        await setSyncthingFolderPaused(folderId, false);
+      }
+      pausedFolderIds.length = 0;
       await sendChunk(res, 'Starting application...\n');
       if (!syncthing) {
         await appDockerStart(appname);
       } else {
-        const componentsWithoutGSyncthing = appDetails.compose.filter((comp) => !comp.containerData.includes('g:'));
+        // A g: component's run state belongs to the election, not to this task:
+        // starting it here would put a second writer on the shared volume.
+        // Every other component is this task's to bring back.
+        const componentsToStart = componentsOfApp(appDetails)
+          .filter((comp) => syncModeOfComponent(comp.containerData) !== 'elected');
         // eslint-disable-next-line no-restricted-syntax
-        for (const component of componentsWithoutGSyncthing) {
+        for (const component of componentsToStart) {
           // eslint-disable-next-line no-await-in-loop
-          await appDockerStart(`${component.name}_${appname}`);
+          await appDockerStart(component.name === 'null' ? appname : `${component.name}_${appname}`);
         }
       }
       await sendChunk(res, 'Finalizing...\n');
@@ -2219,6 +2423,11 @@ async function appendBackupTask(req, res) {
     }
   } catch (error) {
     log.error(error);
+    // eslint-disable-next-line no-restricted-syntax
+    for (const folderId of pausedFolderIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await setSyncthingFolderPaused(folderId, false);
+    }
     const indexToRemove = globalState.backupInProgress.indexOf(appname);
     if (indexToRemove >= 0) {
       globalState.backupInProgress.splice(indexToRemove, 1);
@@ -2231,6 +2440,17 @@ async function appendBackupTask(req, res) {
 
 /**
  * Append a restore task based on the provided parameters.
+ *
+ * Nothing is deleted until a complete, readable replacement is known to exist:
+ * the archive is fetched and read end to end first, and only then does appdata
+ * make way for it. The order is the whole point - this ran the other way round,
+ * and a restore of an archive that turned out to hold one config file was what
+ * destroyed the app it was meant to protect.
+ *
+ * The other instances are never told to redeploy. They hold the only other
+ * copies, a forced redeploy deletes their volumes, and syncthing already
+ * carries a restored folder to them. Where their containers are running they
+ * are restarted, which recreates nothing.
  * @async
  * @param {object} req - Request object.
  * @param {object} res - Response object.
@@ -2241,6 +2461,14 @@ async function appendRestoreTask(req, res) {
   let appname;
   let restore;
   let type;
+  let force;
+  // folders this task paused, so a failure anywhere below can resume them
+  const pausedFolderIds = [];
+  // the component whose appdata is mid-replacement, if any. Set before its data
+  // makes way and cleared once the archive is fully unpacked, so it names a
+  // directory that is neither the old copy nor the new one - and nothing else.
+  // A component that finished is whole, however the components after it fare.
+  let swapInFlight = null;
   try {
     const processedBody = serviceHelper.ensureObject(req.body);
     log.info(processedBody);
@@ -2250,8 +2478,15 @@ async function appendRestoreTask(req, res) {
     restore = processedBody.restore;
     // eslint-disable-next-line prefer-destructuring
     type = processedBody.type;
+    force = processedBody.force === true || processedBody.force === 'true';
     if (!appname || !restore || !type) {
       throw new Error('appname, restore and type parameters are mandatory');
+    }
+    if (!Array.isArray(restore)) {
+      throw new Error('restore must be a list of components');
+    }
+    if (!RESTORE_TYPES.includes(type)) {
+      throw new Error(`Refused: type must be one of ${RESTORE_TYPES.join(', ')}`);
     }
     const indexRestore = globalState.restoreInProgress.indexOf(appname);
     if (indexRestore !== -1) {
@@ -2269,117 +2504,294 @@ async function appendRestoreTask(req, res) {
   }
   try {
     const authorized = res ? await verificationHelper.verifyPrivilege('appownerabove', req, appname) : true;
-    if (authorized === true) {
-      const componentItem = restore.map((restoreItem) => restoreItem);
-      globalState.restoreInProgress.push(appname);
-      // eslint-disable-next-line global-require
-      const registryManager = require('../appDatabase/registryManager');
-      const appDetails = await registryManager.getApplicationGlobalSpecifications(appname);
-      // eslint-disable-next-line no-restricted-syntax
-      const syncthing = appDetails.compose.find((comp) => comp.containerData.includes('g:') || comp.containerData.includes('r:') || comp.containerData.includes('s:'));
-      if (syncthing) {
-        // eslint-disable-next-line no-await-in-loop
-        await sendChunk(res, `Stopping syncthing for ${appname}\n`);
-        // eslint-disable-next-line no-await-in-loop
-        await stopSyncthingApp(appname, res);
-      }
-      await sendChunk(res, 'Stopping application...\n');
-      await appDockerStop(appname);
-      await serviceHelper.delay(5 * 1000);
-      // eslint-disable-next-line global-require
-      const IOUtils = require('../IOUtils');
-      // eslint-disable-next-line no-restricted-syntax
-      for (const component of restore) {
-        if (component.restore) {
-          // eslint-disable-next-line no-await-in-loop
-          const componentVolumeInfo = await IOUtils.getVolumeInfo(appname, component.component, 'B', 0, 'mount');
-          const appDataPath = `${componentVolumeInfo[0].mount}/appdata`;
-          // eslint-disable-next-line no-await-in-loop
-          await sendChunk(res, `Removing ${component.component} component data...\n`);
-          // eslint-disable-next-line no-await-in-loop
-          await serviceHelper.delay(2 * 1000);
-          // eslint-disable-next-line no-await-in-loop
-          await IOUtils.removeDirectory(appDataPath, true);
-        }
-      }
-
-      if (type === 'remote') {
-        // eslint-disable-next-line no-restricted-syntax
-        for (const restoreItem of componentItem) {
-          if (restoreItem?.url !== '') {
-            // eslint-disable-next-line no-await-in-loop
-            const componentPath = await IOUtils.getVolumeInfo(appname, restoreItem.component, 'B', 0, 'mount');
-            // eslint-disable-next-line no-await-in-loop
-            await IOUtils.removeDirectory(`${componentPath[0].mount}/backup/remote`, true);
-            // eslint-disable-next-line no-await-in-loop
-            await sendChunk(res, `Downloading ${restoreItem.url}...\n`);
-            // eslint-disable-next-line no-await-in-loop
-            const downloadStatus = await IOUtils.downloadFileFromUrl(restoreItem.url, `${componentPath[0].mount}/backup/remote`, restoreItem.component, true);
-            if (downloadStatus !== true) {
-              throw new Error(`Error: Failed to download ${restoreItem.url}...`);
-            }
-          }
-        }
-      }
-
-      // eslint-disable-next-line no-restricted-syntax
-      for (const component of restore) {
-        if (component.restore) {
-          // eslint-disable-next-line no-await-in-loop
-          const componentPath = await IOUtils.getVolumeInfo(appname, component.component, 'B', 0, 'mount');
-          const targetPath = `${componentPath[0].mount}/appdata`;
-          const tarGzPath = `${componentPath[0].mount}/backup/${type}/backup_${component.component.toLowerCase()}.tar.gz`;
-          // eslint-disable-next-line no-await-in-loop
-          await sendChunk(res, `Unpacking backup archive for ${component.component.toLowerCase()}...\n`);
-          // eslint-disable-next-line no-await-in-loop
-          const tarStatus = await IOUtils.untarFile(targetPath, tarGzPath);
-          if (tarStatus.status === false) {
-            throw new Error(`Error: Failed to unpack archive file for ${component.component.toLowerCase()}, ${tarStatus.error}`);
-          } else {
-            // eslint-disable-next-line no-await-in-loop
-            await sendChunk(res, `Removing backup file for ${component.component.toLowerCase()}...\n`);
-            // eslint-disable-next-line no-await-in-loop
-            await IOUtils.removeFile(tarGzPath);
-          }
-          const syncthingAux = appDetails.compose.find((comp) => comp.name === component.component && (comp.containerData.includes('g:') || comp.containerData.includes('r:')));
-          if (syncthingAux) {
-            // eslint-disable-next-line global-require
-            const identifier = `${component.component}_${appname}`;
-            const appId = dockerService.getAppIdentifier(identifier);
-            // eslint-disable-next-line global-require
-            const { receiveOnlySyncthingAppsCache } = require('../utils/appCaches');
-            const cache = {
-              restarted: true,
-              numberOfExecutionsRequired: 4,
-              numberOfExecutions: 10,
-            };
-            receiveOnlySyncthingAppsCache.set(appId, cache);
-          }
-        }
-      }
-      await serviceHelper.delay(1 * 5 * 1000);
-      await sendChunk(res, 'Starting application...\n');
-      await appDockerStart(appname);
-      if (syncthing) {
-        await sendChunk(res, 'Redeploying other instances...\n');
-        // eslint-disable-next-line global-require
-        const appController = require('../appManagement/appController');
-        appController.executeAppGlobalCommand(appname, 'redeploy', req.headers.zelidauth, true);
-        await serviceHelper.delay(1 * 60 * 1000);
-      }
-      await sendChunk(res, 'Finalizing...\n');
-      await serviceHelper.delay(5 * 1000);
-      const indexToRemove = globalState.restoreInProgress.indexOf(appname);
-      globalState.restoreInProgress.splice(indexToRemove, 1);
-      res.end();
-      return true;
-      // eslint-disable-next-line no-else-return
-    } else {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res.json(errMessage);
     }
+    // eslint-disable-next-line global-require
+    const registryManager = require('../appDatabase/registryManager');
+    const appDetails = await registryManager.getApplicationGlobalSpecifications(appname);
+    if (!appDetails) {
+      throw new Error(`Refused: no specifications found for ${appname}`);
+    }
+
+    // Only the components the caller asked for. The UI sends every component of
+    // the app on every request, the unselected ones flagged false and, in remote
+    // mode, carrying an empty url - reading the list rather than the flags would
+    // turn every restore into a whole-app restore.
+    const components = componentsOfApp(appDetails);
+    // Named once each: a component listed twice would be paused, downloaded and
+    // unpacked twice over, the second pass clearing what the first had just put
+    // in place.
+    const requested = [...new Map(
+      restore.filter((item) => item.restore).map((item) => [item.component, item]),
+    ).values()];
+    const targets = requested.map((item) => {
+      const component = components.find((comp) => comp.name === item.component);
+      if (!component) {
+        throw new Error(`Refused: ${item.component} is not a component of ${appname}`);
+      }
+      return {
+        name: component.name,
+        // the folder id IS the docker app identifier, so it addresses the
+        // syncthing folder, the receiveonly cache and the reconciler alike
+        folderId: syncthingFolderIdForComponent(appname, component.name),
+        syncMode: syncModeOfComponent(component.containerData),
+        url: item.url,
+      };
+    });
+
+    // A g: component has exactly one writer and it is the instance FDM points
+    // at. Restoring onto any other copy puts the data where the primary is
+    // still overwriting it: it reports success and is quietly undone. Only a
+    // positive answer disqualifies this node - an unreachable FDM must not
+    // block a restore, the same way it does not block an election.
+    if (!force && targets.some((target) => target.syncMode === 'elected')) {
+      const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+      const { ip: primaryIp, fdmOk } = await getMasterIpFromFdm(appname, { timeout: 10000 });
+      if (fdmOk && primaryIp && !ipsMatch(primaryIp, localSocketAddr)) {
+        throw new Error(`Refused: restore on ${primaryIp}, it holds the live copy`);
+      }
+    }
+
+    // Claimed here rather than at the top: the check up there happens before
+    // authorisation, the spec lookup and a possible FDM round trip, and a second
+    // request arriving inside that window would pass it too. Re-reading it
+    // immediately before the push leaves no await between the two, so nothing
+    // can interleave.
+    if (globalState.restoreInProgress.includes(appname)) {
+      throw new Error(`Restore for app ${appname} is running...`);
+    }
+    globalState.restoreInProgress.push(appname);
+
+    // Hold the data still by pausing the folders being replaced. Deleting them
+    // instead (as this once did, by an app-level identifier that matched no
+    // composed app's folder and so did nothing at all) loses the folder config,
+    // and only the syncthing monitor's per-app pass ever puts it back.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const target of targets.filter((item) => item.syncMode !== 'none')) {
+      // eslint-disable-next-line no-await-in-loop
+      await sendChunk(res, `Pausing syncthing folder ${target.folderId}\n`);
+      // eslint-disable-next-line no-await-in-loop
+      const held = await setSyncthingFolderPaused(target.folderId, true);
+      if (held === 'held') pausedFolderIds.push(target.folderId);
+      // Clearing appdata happens INSIDE the replicated folder - the folder path
+      // is the mount root, not appdata - so an unheld sendreceive folder turns
+      // the clear into deletions this node broadcasts to every healthy peer.
+      // Refuse while the data is still there rather than find out afterwards.
+      if (held === 'failed') {
+        throw new Error(`Refused: ${target.folderId} could not be held still, so clearing its data would propagate the deletions to the other instances`);
+      }
+    }
+
+    await sendChunk(res, 'Stopping application...\n');
+    const stopVerdict = await appDockerStop(appname);
+    // A container still up is still writing to the volume whose appdata is
+    // about to be emptied - it would write into a half-cleared tree and can
+    // save its own state back over what the archive puts there.
+    if (!stopVerdict.stopped) {
+      throw new Error(`Refused: ${stopVerdict.running.join(', ') || appname} could not be stopped, so its data cannot be replaced safely`);
+    }
+    await serviceHelper.delay(5 * 1000);
+
+    // eslint-disable-next-line global-require
+    const IOUtils = require('../IOUtils');
+    // eslint-disable-next-line no-restricted-syntax
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      const volume = await IOUtils.getVolumeInfo(appname, target.name, 'B', 0, 'mount');
+      if (!volume) {
+        throw new Error(`Refused: ${target.name} volume is not mounted`);
+      }
+      target.mount = volume[0].mount;
+      target.appDataPath = `${volume[0].mount}/appdata`;
+      target.archivePath = `${volume[0].mount}/backup/${type}/backup_${target.name.toLowerCase()}.tar.gz`;
+    }
+
+    if (type === 'remote') {
+      // eslint-disable-next-line no-restricted-syntax
+      for (const target of targets) {
+        if (!target.url) {
+          throw new Error(`Refused: no url given for ${target.name}`);
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await IOUtils.removeDirectory(`${target.mount}/backup/remote`, true);
+        // eslint-disable-next-line no-await-in-loop
+        await sendChunk(res, `Downloading ${target.url}...\n`);
+        // eslint-disable-next-line no-await-in-loop
+        const downloadStatus = await IOUtils.downloadFileFromUrl(target.url, `${target.mount}/backup/remote`, target.name, true);
+        if (downloadStatus !== true) {
+          throw new Error(`Error: Failed to download ${target.url}...`);
+        }
+        // This copy is ours, so this task is the one that removes it
+        target.downloaded = true;
+        // A connection that dropped, or an error page served as 200, lands here
+        // as a short file. The archive read below would catch it too, but only
+        // after inflating what did arrive, and it cannot say what was expected.
+        // eslint-disable-next-line no-await-in-loop
+        const expectedBytes = await IOUtils.getRemoteFileSize(target.url, 'B', 0, true);
+        // eslint-disable-next-line no-await-in-loop
+        const receivedBytes = await IOUtils.getFileSize(target.archivePath);
+        if (Number.isFinite(expectedBytes) && expectedBytes > 0 && receivedBytes !== expectedBytes) {
+          throw new Error(`Error: download incomplete, got ${receivedBytes} of ${expectedBytes} bytes`);
+        }
+      }
+    }
+
+    // Read every archive before any of them is acted on: one decompression
+    // pass that writes nothing, proving the archive is whole and readable while
+    // the data it would replace is still there. Its true size is what the space
+    // check below needs, and the compressed size cannot supply it.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      await sendChunk(res, `Checking archive for ${target.name.toLowerCase()}...\n`);
+      // eslint-disable-next-line no-await-in-loop
+      const archive = await IOUtils.inspectTarGz(target.archivePath);
+      if (!archive.status) {
+        throw new Error(`Error: archive for ${target.name.toLowerCase()} is unreadable, ${archive.error}`);
+      }
+      if (archive.entries === 0) {
+        throw new Error(`Error: archive for ${target.name.toLowerCase()} is empty`);
+      }
+      target.archive = archive;
+
+      // Deleting appdata is what frees the room the archive needs, so that is
+      // what the archive is measured against. A volume that cannot be measured
+      // is judged on its free space alone - under-stating the room refuses a
+      // restore that would have fit, which is recoverable; over-stating it runs
+      // out of space halfway through, which is not.
+      // Free space is read HERE, not when the mount was resolved: a remote
+      // restore has just written the archive into this same volume, so a figure
+      // taken before the download over-states the room by the size of the
+      // archive itself - and every FluxDrive restore is a remote one.
+      // eslint-disable-next-line no-await-in-loop
+      const volume = await IOUtils.getVolumeInfo(appname, target.name, 'B', 0, 'available');
+      if (!volume) {
+        throw new Error(`Refused: ${target.name} volume is not mounted`);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const appDataBytes = await IOUtils.getDirectorySizeBytes(target.appDataPath);
+      const room = volume[0].available + (appDataBytes ?? 0);
+      if (archive.bytes > room) {
+        const needed = IOUtils.convertFileSize(archive.bytes, 'GB', 2);
+        const have = IOUtils.convertFileSize(room, 'GB', 2);
+        throw new Error(`Refused: ${target.name} needs ${needed}, has ${have}`);
+      }
+    }
+
+    // eslint-disable-next-line no-restricted-syntax
+    for (const target of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      await sendChunk(res, `Restoring ${target.name.toLowerCase()}...\n`);
+      // from here the directory is neither copy. A clearing that reports
+      // failure may still have removed most of it, so the mark goes on first.
+      swapInFlight = target;
+      // eslint-disable-next-line no-await-in-loop
+      const cleared = await IOUtils.removeDirectory(target.appDataPath, true);
+      if (cleared !== true) {
+        throw new Error(`Error: could not clear ${target.name.toLowerCase()} appdata before unpacking`);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const tarStatus = await IOUtils.untarFile(target.appDataPath, target.archivePath);
+      if (tarStatus.status === false) {
+        throw new Error(`Error: Failed to unpack archive file for ${target.name.toLowerCase()}, ${tarStatus.error}`);
+      }
+      swapInFlight = null;
+      log.info(`appendRestoreTask - ${appname} ${target.name} restored ${target.archive.entries} entries, ${target.archive.bytes} bytes`);
+
+      // Mark the folder settled so the receiveonly machinery leaves this copy
+      // alone: it is the one the other instances are meant to take.
+      if (target.syncMode !== 'none') {
+        globalState.receiveOnlySyncthingAppsCache.set(target.folderId, {
+          restarted: true,
+          numberOfExecutionsRequired: 4,
+          numberOfExecutions: 10,
+        });
+      }
+    }
+
+    // The folders carry the restored data out to the other instances the moment
+    // they resume, so this is the propagation - there is nothing to ask the
+    // peers to do about their data.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const folderId of pausedFolderIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await setSyncthingFolderPaused(folderId, false);
+    }
+    pausedFolderIds.length = 0;
+
+    await serviceHelper.delay(1 * 5 * 1000);
+    await sendChunk(res, 'Starting application...\n');
+    await appDockerStart(appname);
+
+    // Only the copy this task downloaded is ours to remove. An uploaded or
+    // local archive is the owner's restore point, and restoring from it must
+    // not consume it. Held until here so that a failure at any point above can
+    // be retried from the archive rather than re-fetched.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const target of targets.filter((item) => item.downloaded)) {
+      // eslint-disable-next-line no-await-in-loop
+      await IOUtils.removeFile(target.archivePath);
+    }
+
+    // An r:/s: component runs on every instance at once, so the peers' running
+    // containers are holding the data this restore has just replaced; a restart
+    // is what makes them read it again, and it recreates no volume. A g:
+    // component has no peer container to disturb - the other instances are
+    // stopped and adopt the restored data when the role next moves - and an
+    // unsynced component's data never left this node.
+    if (targets.some((target) => target.syncMode === 'shared')) {
+      await sendChunk(res, 'Restarting other instances...\n');
+      // eslint-disable-next-line global-require
+      const appController = require('../appManagement/appController');
+      appController.executeAppGlobalCommand(appname, 'apprestart', req.headers.zelidauth, undefined, true); // do not wait
+    }
+
+    await sendChunk(res, 'Finalizing...\n');
+    await serviceHelper.delay(5 * 1000);
+    const indexToRemove = globalState.restoreInProgress.indexOf(appname);
+    if (indexToRemove >= 0) {
+      globalState.restoreInProgress.splice(indexToRemove, 1);
+    }
+    res.end();
+    return true;
   } catch (error) {
     log.error(error);
+    // A component whose appdata was replaced and then failed holds a partial
+    // directory, and that is not a copy the other instances should be given.
+    // Demoting the folder stops it being sent and disqualifies this node from
+    // election until syncthing has healed it from a peer; the cache entry has
+    // to say NOT settled, or the folder state machine skips the healing path
+    // and starts the container on the partial data. Leaving the folder paused
+    // instead is not an option - the monitor reads a paused folder as drift and
+    // resumes it.
+    if (swapInFlight) {
+      // The demotion only means anything where there is a folder: it stops this
+      // copy being sent, and disqualifies the node from election until syncthing
+      // has healed it from a peer. The cache entry has to say NOT settled, or
+      // the folder state machine skips the healing path and starts the container
+      // on the partial data.
+      if (swapInFlight.syncMode !== 'none') {
+        await changeSyncthingFolderType(swapInFlight.folderId, 'receiveonly');
+        globalState.receiveOnlySyncthingAppsCache.set(swapInFlight.folderId, {
+          restarted: false,
+          numberOfExecutions: 0,
+        });
+      }
+      // The hold means something for every component, and used to be applied
+      // only to the synced ones. A component that syncs has peers to be put
+      // right by, so holding it costs it minutes; a component that does not has
+      // no repair path at all - it is the one where running on a half-replaced
+      // directory is least recoverable, because the app writes fresh state over
+      // the wreckage and the next restore lands on top of that.
+      appReconciler.setControllerDesired(swapInFlight.folderId, 'stopped', 'restore did not complete');
+    }
+    // eslint-disable-next-line no-restricted-syntax
+    for (const folderId of pausedFolderIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await setSyncthingFolderPaused(folderId, false);
+    }
     const indexToRemove = globalState.restoreInProgress.indexOf(appname);
     if (indexToRemove >= 0) {
       globalState.restoreInProgress.splice(indexToRemove, 1);
