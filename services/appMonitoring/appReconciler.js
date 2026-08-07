@@ -1153,6 +1153,11 @@ module.exports = {
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
+  // The one answer to "what is this container actually doing" - it probes the
+  // daemon rather than pattern-matching an inspect error, so it can tell docker
+  // being unreachable from the container being gone. Anything that acts on a
+  // container's run state needs that distinction, not just the reconciler.
+  dockerActual,
   // exposed for tests
   reconcile,
   policyAllowsRun,
