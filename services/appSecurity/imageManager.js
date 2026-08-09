@@ -2,6 +2,8 @@ const config = require('config');
 const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
+// eslint-disable-next-line no-unused-vars
+const pgpService = require('../pgpService');
 const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
@@ -290,7 +292,7 @@ async function getUserBlockedRepositores() {
       return userBlockedRepos;
     }
     const usableUserBlockedRepos = [];
-    const marketPlaceUrl = `${config.stats.baseUrl}/marketplace/listapps`;
+    const marketPlaceUrl = 'https://stats.runonflux.io/marketplace/listapps';
     const response = await axios.get(marketPlaceUrl);
     console.log(response);
     if (response && response.data && response.data.status === 'success') {

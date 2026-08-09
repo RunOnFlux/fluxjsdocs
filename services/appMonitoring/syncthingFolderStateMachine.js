@@ -8,6 +8,7 @@ const appUninstaller = require('../appLifecycle/appUninstaller');
 const messageHelper = require('../messageHelper');
 const syncthingService = require('../syncthingService');
 const serviceHelper = require('../serviceHelper');
+const volumeService = require('../utils/volumeService');
 const { appsFolder } = require('../utils/appConstants');
 const appTamperingDetectionService = require('../appTamperingDetectionService');
 const { socketAddressesMatch, extractIp } = require('../utils/socketAddressUtils');
@@ -22,7 +23,7 @@ const {
   ACTIVE_FOLDER_STATES,
 } = require('./syncthingMonitorConstants');
 
-const { isPathMounted } = require('../utils/volumeService');
+const { isPathMounted } = volumeService;
 
 const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n);
 
@@ -394,6 +395,11 @@ function isDesignatedLeader(allPeersList, localSocketAddr, deferToRunningPeers =
  * deferring - the holder is very likely still serving on the other side of the
  * split.
  *
+ * "Gone" means silent, and only silent. A holder that answers - even to say it
+ * cannot answer this question - is alive, and dropping a live holder out of the
+ * election is the one thing this must never do: every survivor would then pick the
+ * next IP and promote alongside a holder that is still writing.
+ *
  * @param {string} holderIp
  * @returns {Promise<boolean>}
  */
@@ -454,6 +460,18 @@ async function holderListExcludingDead(allPeersList, localSocketAddr, liveness) 
  *   writer this exists to prevent, and a stalled app is visible where diverged
  *   data is not.
  *
+ *   UNANSWERABLE does NOT block, and must not. A peer that predates this endpoint
+ *   is alive and cannot be asked, ever - it will not finish a pass and start
+ *   answering, so the unbounded wait UNREADY earns by resolving itself is not
+ *   earned here. Blocking on it would hold promotion open until somebody upgrades
+ *   that node: on a cold start every other holder defers to the same lowest IP, so
+ *   one un-upgraded peer would stop the app starting anywhere. This check simply
+ *   cannot cover a peer that cannot answer, and the honest reading of that is that
+ *   the folder gets the behaviour it had before this check existed - decided by the
+ *   election alone - rather than a guess dressed as a guarantee. Peers that CAN
+ *   answer are still checked, so the cover grows as the fleet upgrades and is
+ *   complete once it has.
+ *
  * It narrows the window rather than closing it: two nodes that both ask before
  * either promotes still both promote. Closing that needs the consensus-grounded
  * election the residual-limitation note above describes.
@@ -474,8 +492,16 @@ async function findPeerBlockingPromotion(appId, peers, localSocketAddr, liveness
 
   const holder = answers.find((answer) => answer.reachable && answer.ready && answer.folders.includes(appId));
   if (holder) return { ip: holder.ip, reason: 'already holds the writable copy' };
-  const unready = answers.find((answer) => answer.reachable && !answer.ready);
+  const unready = answers.find((answer) => answer.reachable && answer.answerable && !answer.ready);
   if (unready) return { ip: unready.ip, reason: 'has not determined its folder state yet' };
+
+  // Recorded, not blocked - see UNANSWERABLE above. Worth a line of its own so a
+  // promotion made without full cover is visible as that, and so the remedy reads
+  // as "upgrade that node" rather than "debug its monitor".
+  const unanswerable = answers.find((answer) => answer.reachable && !answer.answerable);
+  if (unanswerable) {
+    log.info(`findPeerBlockingPromotion - ${appId}: ${extractIp(unanswerable.ip)} is alive but cannot be asked which folders it holds; promoting on the election alone, as this node would have before this check existed`);
+  }
 
   const unreachable = answers.find((answer) => !answer.reachable);
   if (unreachable) {
@@ -1028,6 +1054,7 @@ async function manageFolderSyncState(params) {
     localSocketAddr,
     syncthingFolder,
     installedAppName,
+    mountVerifyNeeded = true,
     liveness,
   } = params;
 
@@ -1036,10 +1063,52 @@ async function manageFolderSyncState(params) {
 
   // If already syncing in sendreceive mode, ensure container is running
   if (folderAlreadySyncing) {
-    // The mount is sound by the time this runs: the pass verifies every folder
-    // it is going to act on before it acts, and holds out the ones that fail.
-    // Re-deriving that verdict here would cost a syncthing round trip and a
-    // directory walk per folder to answer a question already answered.
+    // Mount safety of a live sendreceive folder is verified at decision points
+    // (startup, FolderErrors from syncthing) - not per pass: the .stfolder
+    // marker inside the volume turns storage loss into FolderErrors, and the
+    // caller flags exactly those folders here
+    if (mountVerifyNeeded) {
+      const folderPath = syncFolder.path || `${appsFolder}${appId}/appdata`;
+      let mountSafety = await verifySendReceiveFolderSafety(appId, folderPath);
+
+      if (!mountSafety.isSafe && !mountSafety.isMounted) {
+        // The detection is actionable: the backing image normally still exists,
+        // and FluxOS owns the mount - repair instead of just blocking. The
+        // re-verify still holds the folder back (receiveonly) if the freshly
+        // mounted volume disagrees with the index (phantom-index case).
+        const mountAttempt = await volumeService.ensureAppVolumeMounted(appId);
+        if (mountAttempt.mounted) {
+          log.info(`manageFolderSyncState - ${appId} volume was not mounted; mounted it, re-verifying folder safety`);
+          mountSafety = await verifySendReceiveFolderSafety(appId, folderPath);
+        }
+      }
+
+      if (!mountSafety.isSafe) {
+        // DANGER: Mount not ready! Switch to receiveonly to prevent data propagation
+        log.error(`manageFolderSyncState - SAFETY BLOCK: ${appId} mount not safe (${mountSafety.reason}). Switching to receiveonly mode to prevent data loss.`);
+        log.error(`manageFolderSyncState - Mount status: mounted=${mountSafety.isMounted}, hasContent=${mountSafety.hasContent}, files=${mountSafety.fileCount}`);
+
+        // Update folder to receiveonly mode to prevent this node from sending "empty" state to peers
+        syncthingFolder.type = 'receiveonly';
+        const cache = {
+          numberOfExecutions: 0,
+          mountSafetyBlocked: true,
+          blockedReason: mountSafety.reason,
+          blockedAt: Date.now(),
+        };
+        receiveOnlySyncthingAppsCache.set(appId, cache);
+
+        // Hold the container too: its binds point at the same unsafe dir. The
+        // reconciler is the actuator; the receiveonly machinery flips the
+        // verdict back to running once the folder is verifiably synced.
+        appReconciler.setControllerDesired(appId, 'stopped', `mount safety block: ${mountSafety.reason}`);
+
+        // Return with skipUpdate=false so the folder config gets updated to receiveonly
+        return { syncthingFolder, cache, skipUpdate: false };
+      }
+    }
+
+    // Mount is safe (verified) or not in question (steady state)
     await ensureContainerRunning(appId, containerDataFlags);
     // Ensure cache entry exists so health monitor can track this folder
     const existingCache = receiveOnlySyncthingAppsCache.get(appId);
