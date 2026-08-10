@@ -425,7 +425,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     if (res.flush) res.flush();
   }
 
-  const okVolumes = await volumeService.capacityVolumesInGb();
+  const okVolumes = await volumeService.capacityVolumesInGib();
 
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -2443,7 +2443,7 @@ async function testAppMount() {
     log.info('Mount Test: started');
     log.info('Mount Test: Searching available space...');
 
-    const okVolumes = await volumeService.capacityVolumesInGb();
+    const okVolumes = await volumeService.capacityVolumesInGib();
 
     // check if space is not sharded in some bad way. Always count the fluxSystemReserve
     let useThisVolume = null;
