@@ -14,7 +14,6 @@ const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const syncthingService = require('./syncthingService');
 const fifoQueue = require('./utils/fifoQueue');
-const fluxEventBus = require('./utils/fluxEventBus');
 const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -25,24 +24,10 @@ const isArcane = Boolean(process.env.FLUXOS_PATH);
 let syncthingTimer = null;
 
 /**
- * A FIFO queue used to store and run apt commands.
- *
- * Built complete. A queue that arrives without its worker has to be finished off
- * later by whoever happens to get there first, and until they do it silently
- * accepts work it cannot run - so its behaviour depends on call order, and a test
- * that touches it inherits whatever the last one left behind.
+ * A FIFO queue used to store and run apt commands
  * @type {fifoQueue.FifoQueue}
  */
-// eslint-disable-next-line no-use-before-define
-const aptQueue = new fifoQueue.FifoQueue({ worker: aptRunner });
-// eslint-disable-next-line no-use-before-define
-aptQueue.on('failed', monitorAptCache);
-// The queue has stopped handing this one back. Worth saying out loud: the caller
-// took its error long ago, so without this the work is simply never done again and
-// nothing ever mentions it.
-aptQueue.on('abandoned', ({ options, error, cycles }) => {
-  log.error(`Giving up on apt-get ${options.command} after ${cycles} attempts: ${error.message}`);
-});
+const aptQueue = new fifoQueue.FifoQueue();
 
 /**
  * For testing
@@ -76,7 +61,6 @@ async function aptRunner(options = {}) {
   // any apt after 1.9.11 has the DPkg::Lock::Timeout option.
   const params = [
     '-y', // Auto-answer yes to prompts
-    '--no-install-recommends', // Only what the package needs, not what it suggests
     '-o', `DPkg::Lock::Timeout=${timeout}`, // How long to wait for a lock
     '-o', 'Dpkg::Options::=--force-confdef', // Use default for new config files
     '-o', 'Dpkg::Options::=--force-confold', // Keep old config files on conflict
@@ -146,15 +130,7 @@ async function queueAptGetCommand(command, options = {}) {
 
   const wait = options.wait || false;
   const commandOptions = { command, params, timeout: options.timeout };
-  // Every worker option the caller set, not just retries. updateAptCache asks for
-  // retainErrors: false so a failed update is dropped rather than left at the head
-  // of the queue; dropping that request here left the queue holding a task it was
-  // told to bin, ready to run again the moment anything resumed it.
-  const workerOptions = {
-    retries: options.retries,
-    retryDelay: options.retryDelay,
-    retainErrors: options.retainErrors,
-  };
+  const workerOptions = { retries: options.retries };
   return aptQueue.push({ commandOptions, workerOptions }, wait);
 }
 
@@ -345,12 +321,12 @@ async function addSyncthingRepository() {
   const packageName = 'syncthing';
   // syncthing does this weird
   const dist = 'syncthing';
-  const sourceUrl = config.syncthing.aptSourceUrl;
+  const sourceUrl = 'https://apt.syncthing.net/';
   const components = ['stable-v2'];
   const sourceOptions = ['signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg'];
 
   // keyring vars
-  const keyUrl = config.syncthing.releaseKeyUrl;
+  const keyUrl = 'https://syncthing.net/release-key.gpg';
   const keyringName = 'syncthing-archive-keyring.gpg';
 
   // this will log errors
@@ -531,11 +507,13 @@ async function monitorSyncthingPackage() {
   try {
     if (syncthingTimer) return;
 
+    await addSyncthingRepository();
+
     const versionChecker = async () => {
       const {
         data: { data },
       } = await axios
-        .get(`${config.stats.baseUrl}/getmodulesminimumversions`, {
+        .get('https://stats.runonflux.io/getmodulesminimumversions', {
           timeout: 10000,
         })
         .catch((error) => {
@@ -554,7 +532,7 @@ async function monitorSyncthingPackage() {
           minSyncthingVersion,
         );
 
-        if (upToDate) return false;
+        if (upToDate) return;
 
         // The sources changed at version 2.0.0 from stable, to stable-v2
         const hasNewSources = serviceHelper.minVersionSatisfy(
@@ -566,16 +544,10 @@ async function monitorSyncthingPackage() {
           const updated = await updateSyncthingRepository();
           if (!updated) {
             log.warn('Failed to update syncthing repository sources, skipping syncthing upgrade');
-            return false;
+            return;
           }
         }
       }
-
-      // Here, rather than before the version check: a node whose syncthing is
-      // already current has nothing to install, and writing it a keyring and an
-      // apt source it will never read is work it did not ask for. Only a node
-      // that is about to install needs somewhere to install from.
-      await addSyncthingRepository();
 
       const upgraded = await ensurePackageVersion(
         'syncthing',
@@ -588,18 +560,13 @@ async function monitorSyncthingPackage() {
         log.info('Syncthing upgraded, restarting to load new binary...');
         await syncthingService.systemRestart(null, null).catch(() => { });
       }
-
-      return upgraded;
     };
 
-    const upgraded = await versionChecker();
+    await versionChecker();
 
     syncthingTimer = setInterval(versionChecker, 1000 * 60 * 60 * 24); // 24 hours
-
-    return upgraded;
   } catch (error) {
     log.error(error);
-    return false;
   }
 }
 
@@ -706,40 +673,21 @@ async function monitorSystem() {
   if (isArcane) return;
 
   try {
-    // ensureChronyd answers whether chrony ended up configured, which is true
-    // both when it installed it and when it was already there. What it installed
-    // is a different question, and only the package can answer it.
-    const chronyWasPresent = Boolean(await getPackageVersion('chrony'));
+    aptQueue.addWorker(aptRunner);
+    aptQueue.on('failed', monitorAptCache);
 
-    // Started together and reported on together. The queue still serialises the
-    // apt work behind them, so running them concurrently costs nothing; the
-    // caller does not await monitorSystem, so the boot does not wait either.
-    const checks = {
-      // ubuntu 18.04 -> 24.04 all share this package
-      'ca-certificates': ensurePackageVersion('ca-certificates', '20230311'),
-      // 18.04 == 1.187
-      // 20.04 == 1.206
-      // 22.04 == 1.218
-      // Debian 12 = 1.219
-      'netcat-openbsd': ensurePackageVersion('netcat-openbsd', '1.187'),
-      syncthing: monitorSyncthingPackage(),
-      // eslint-disable-next-line no-use-before-define
-      chrony: ensureChronyd().then(
-        async () => !chronyWasPresent && Boolean(await getPackageVersion('chrony')),
-      ),
-    };
+    // don't await these, let the queue deal with it
 
-    const outcomes = await Promise.all(Object.values(checks));
-    const names = Object.keys(checks);
-
-    // Published whether or not anything was installed, because "checked and had
-    // nothing to do" is a different fact from "has not run yet" and the logs
-    // below only speak in the first case. A node that is already provisioned -
-    // which is every node after its first boot - is otherwise indistinguishable
-    // from one whose checks have not started.
-    fluxEventBus.publish('system:packages-checked', {
-      installed: names.filter((_, i) => outcomes[i]),
-    });
+    // ubuntu 18.04 -> 24.04 all share this package
+    setImmediate(() => ensurePackageVersion('ca-certificates', '20230311'));
+    // 18.04 == 1.187
+    // 20.04 == 1.206
+    // 22.04 == 1.218
+    // Debian 12 = 1.219
+    setImmediate(() => ensurePackageVersion('netcat-openbsd', '1.187'));
+    setImmediate(() => monitorSyncthingPackage());
+    // eslint-disable-next-line no-use-before-define
+    setImmediate(() => ensureChronyd());
   } catch (error) {
     log.error(error);
   }
@@ -818,10 +766,10 @@ async function mongodGpgKeyVeryfity() {
     const versionMatch = stdout.match(/MongoDB (\d+\.\d+) Release Signing Key/);
     if (expiredMatch) {
       if (versionMatch) {
-        const keyUrl = `${config.mongodb.signingKeyBaseUrl}/server-${versionMatch[1]}.asc`;
+        const keyUrl = `https://pgp.mongodb.com/server-${versionMatch[1]}.asc`;
         const filePath = '/usr/share/keyrings/mongodb-archive-keyring.gpg';
         log.info(`MongoDB version: ${versionMatch[1]}`);
-        log.info(`GPG URL: ${keyUrl}`);
+        log.info(`GPG URL: https://pgp.mongodb.com/server-${versionMatch[1]}.asc`);
         log.info(`The key has expired on ${expiredMatch[1]}`);
         const command = `curl -fsSL ${keyUrl} | sudo gpg --batch --yes -o ${filePath} --dearmor`;
         // eslint-disable-next-line no-shadow
