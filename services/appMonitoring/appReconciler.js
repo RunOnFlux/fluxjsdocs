@@ -4,7 +4,6 @@ const fluxEventBus = require('../utils/fluxEventBus');
 const dbHelper = require('../dbHelper');
 const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
-const dockerOperations = require('../appManagement/dockerOperations');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const globalState = require('../utils/globalState');
@@ -375,7 +374,7 @@ async function recreateMissing(identifier) {
   await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
   try {
     await containerHealthMonitor.recreateMissingContainers(identifier);
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.info(`appReconciler - recreated missing container ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated' });
     notifyContainerStarted(identifier);
@@ -422,7 +421,7 @@ async function recreateForNetworkHeal(identifier) {
     // fallocates + mke2fs). We removed a live container whose data was intact, so a
     // recreate that cannot verify the volume must fail and be retried - never wipe it.
     await containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true });
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.info(`appReconciler - recreated ${identifier} to clear a detached network endpoint`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated', reason: 'networkDetached' });
     notifyContainerStarted(identifier);
@@ -626,7 +625,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
   // Stop the per-minute stats monitor before removing the container (mirrors the
   // uninstaller). Otherwise its interval runs against a gone container, leaking and
   // error-spamming. The recreate re-establishes it via startAppMonitoring.
-  appInspector.stopAppMonitoring(identifier, true, globalState.appsMonitored);
+  appInspector.stopAppMonitoring(identifier, true);
   try {
     // v=false: Flux data lives on bind mounts; the recreate reuses them via a soft
     // install (enforced: recreateForNetworkHeal passes softOnly).
@@ -636,7 +635,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
     // container we did NOT manage to remove is not left unmonitored. The heal flag
     // stays set on purpose - the remove may have partially succeeded, and a stale
     // flag only keeps us on the recreate path (never the uninstall one).
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.error(`appReconciler - failed to remove detached ${identifier}: ${err.message}; will retry`);
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
@@ -770,7 +769,7 @@ async function reconcile(rawIdentifier) {
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
-      await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
+      await volumeService.clearAppVolumeData(identifier);
     } catch (err) {
       // A failed stop/wipe is the only actuation path here that would otherwise drop
       // to the hourly sweep (~1h down). Leave dataDesired 'clear' - so the retried
@@ -901,7 +900,7 @@ async function reconcile(rawIdentifier) {
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
-  appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+  appInspector.startAppMonitoring(identifier);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
   notifyContainerStarted(identifier);
@@ -1154,6 +1153,11 @@ module.exports = {
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
+  // The one answer to "what is this container actually doing" - it probes the
+  // daemon rather than pattern-matching an inspect error, so it can tell docker
+  // being unreachable from the container being gone. Anything that acts on a
+  // container's run state needs that distinction, not just the reconciler.
+  dockerActual,
   // exposed for tests
   reconcile,
   policyAllowsRun,
