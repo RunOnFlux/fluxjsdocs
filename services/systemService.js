@@ -14,7 +14,6 @@ const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const syncthingService = require('./syncthingService');
 const fifoQueue = require('./utils/fifoQueue');
-const fluxEventBus = require('./utils/fluxEventBus');
 const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -25,38 +24,16 @@ const isArcane = Boolean(process.env.FLUXOS_PATH);
 let syncthingTimer = null;
 
 /**
- * A FIFO queue used to store and run apt commands.
- * @type {fifoQueue.FifoQueue|null}
+ * A FIFO queue used to store and run apt commands
+ * @type {fifoQueue.FifoQueue}
  */
-let aptQueue = null;
+const aptQueue = new fifoQueue.FifoQueue();
 
 /**
- * The apt queue, built on first use.
- *
- * Built COMPLETE, and built LATE. Complete because a queue that arrives without
- * its worker has to be finished off later by whoever happens to get there first,
- * and until they do it silently accepts work it cannot run - so its behaviour
- * depends on call order, and a test that touches it inherits whatever the last
- * one left behind. Late because a module that is merely imported should not have
- * started anything: an Arcane node never queues apt work at all, and a script or
- * a test reaching in here for one unrelated function should not acquire a worker
- * it did not ask for. Constructing the whole thing on first use is what satisfies
- * both - there is no window in which the queue exists without its worker.
- *
+ * For testing
  * @returns {fifoQueue.FifoQueue}
  */
 function getQueue() {
-  if (aptQueue) return aptQueue;
-
-  aptQueue = new fifoQueue.FifoQueue({ worker: aptRunner });
-  aptQueue.on('failed', monitorAptCache);
-  // The queue has stopped handing this one back. Worth saying out loud: the caller
-  // took its error long ago, so without this the work is simply never done again and
-  // nothing ever mentions it.
-  aptQueue.on('abandoned', ({ options, error, cycles }) => {
-    log.error(`Giving up on apt-get ${options.command} after ${cycles} attempts: ${error.message}`);
-  });
-
   return aptQueue;
 }
 
@@ -84,7 +61,6 @@ async function aptRunner(options = {}) {
   // any apt after 1.9.11 has the DPkg::Lock::Timeout option.
   const params = [
     '-y', // Auto-answer yes to prompts
-    '--no-install-recommends', // Only what the package needs, not what it suggests
     '-o', `DPkg::Lock::Timeout=${timeout}`, // How long to wait for a lock
     '-o', 'Dpkg::Options::=--force-confdef', // Use default for new config files
     '-o', 'Dpkg::Options::=--force-confold', // Keep old config files on conflict
@@ -135,16 +111,11 @@ async function cacheUpdateTime() {
 
 /**
  * @param {string} command The command to run
- * @param {{params?: Array, timeout?: number, retries?: number, retryDelay?: number,
- *   retainErrors?: boolean, wait?: Boolean}} options
+ * @param {{params?: Array, timeout?: number, retries?: number, wait?: Boolean}} options
  *
  * params: params to pass to command
- * timeout: how many seconds to wait (180 default)
- * retries: how many times to retry (queue default, 5)
- * retryDelay: how long to wait between attempts in ms (queue default, 60000)
- * retainErrors: keep a failed task and try it again later rather than dropping
- *   it (queue default, true). Every one of these is forwarded, so an option left
- *   unset takes the queue's default rather than this function's.
+ * timeout: how many seconds to wait (60 default)
+ * retries: how many times to retry (3 default)
  * wait: should the queue item be awaited
  *
  * @returns {Promise<Object | void>}
@@ -159,16 +130,8 @@ async function queueAptGetCommand(command, options = {}) {
 
   const wait = options.wait || false;
   const commandOptions = { command, params, timeout: options.timeout };
-  // Every worker option the caller set, not just retries. updateAptCache asks for
-  // retainErrors: false so a failed update is dropped rather than left at the head
-  // of the queue; dropping that request here left the queue holding a task it was
-  // told to bin, ready to run again the moment anything resumed it.
-  const workerOptions = {
-    retries: options.retries,
-    retryDelay: options.retryDelay,
-    retainErrors: options.retainErrors,
-  };
-  return getQueue().push({ commandOptions, workerOptions }, wait);
+  const workerOptions = { retries: options.retries };
+  return aptQueue.push({ commandOptions, workerOptions }, wait);
 }
 
 /**
@@ -358,12 +321,12 @@ async function addSyncthingRepository() {
   const packageName = 'syncthing';
   // syncthing does this weird
   const dist = 'syncthing';
-  const sourceUrl = config.syncthing.aptSourceUrl;
+  const sourceUrl = 'https://apt.syncthing.net/';
   const components = ['stable-v2'];
   const sourceOptions = ['signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg'];
 
   // keyring vars
-  const keyUrl = config.syncthing.releaseKeyUrl;
+  const keyUrl = 'https://syncthing.net/release-key.gpg';
   const keyringName = 'syncthing-archive-keyring.gpg';
 
   // this will log errors
@@ -544,11 +507,13 @@ async function monitorSyncthingPackage() {
   try {
     if (syncthingTimer) return;
 
+    await addSyncthingRepository();
+
     const versionChecker = async () => {
       const {
         data: { data },
       } = await axios
-        .get(`${config.stats.baseUrl}/getmodulesminimumversions`, {
+        .get('https://stats.runonflux.io/getmodulesminimumversions', {
           timeout: 10000,
         })
         .catch((error) => {
@@ -567,7 +532,7 @@ async function monitorSyncthingPackage() {
           minSyncthingVersion,
         );
 
-        if (upToDate) return false;
+        if (upToDate) return;
 
         // The sources changed at version 2.0.0 from stable, to stable-v2
         const hasNewSources = serviceHelper.minVersionSatisfy(
@@ -579,16 +544,10 @@ async function monitorSyncthingPackage() {
           const updated = await updateSyncthingRepository();
           if (!updated) {
             log.warn('Failed to update syncthing repository sources, skipping syncthing upgrade');
-            return false;
+            return;
           }
         }
       }
-
-      // Here, rather than before the version check: a node whose syncthing is
-      // already current has nothing to install, and writing it a keyring and an
-      // apt source it will never read is work it did not ask for. Only a node
-      // that is about to install needs somewhere to install from.
-      await addSyncthingRepository();
 
       const upgraded = await ensurePackageVersion(
         'syncthing',
@@ -601,18 +560,13 @@ async function monitorSyncthingPackage() {
         log.info('Syncthing upgraded, restarting to load new binary...');
         await syncthingService.systemRestart(null, null).catch(() => { });
       }
-
-      return upgraded;
     };
 
-    const upgraded = await versionChecker();
+    await versionChecker();
 
     syncthingTimer = setInterval(versionChecker, 1000 * 60 * 60 * 24); // 24 hours
-
-    return upgraded;
   } catch (error) {
     log.error(error);
-    return false;
   }
 }
 
@@ -635,7 +589,7 @@ async function monitorAptCache(event) {
   // than apt-get install)
   if (options.command === 'update') {
     // we don't need to log here, as the error gets logged automatically by runCommand
-    getQueue().resume();
+    aptQueue.resume();
     return;
   }
 
@@ -672,7 +626,7 @@ async function monitorAptCache(event) {
     // eslint-disable-next-line no-await-in-loop
     const { error: lockCheckError } = await serviceHelper.runCommand('apt-get', { runAsRoot: true, params: ['check'] });
     if (!lockCheckError) {
-      getQueue().resume();
+      aptQueue.resume();
       return;
     }
 
@@ -704,12 +658,12 @@ async function monitorAptCache(event) {
 
   const { error: checkError } = await serviceHelper.runCommand('apt-get', { runAsRoot: true, params: ['check'] });
   if (!checkError) {
-    getQueue().resume();
+    aptQueue.resume();
     return;
   }
 
   log.error('Unable to run apt-get command(s), clearing the queue and resetting state.');
-  getQueue().clear();
+  aptQueue.clear();
 }
 
 /**
@@ -718,49 +672,24 @@ async function monitorAptCache(event) {
 async function monitorSystem() {
   if (isArcane) return;
 
-  let installed = [];
   try {
-    // ensureChronyd answers whether chrony ended up configured, which is true
-    // both when it installed it and when it was already there. What it installed
-    // is a different question, and only the package can answer it.
-    const chronyWasPresent = Boolean(await getPackageVersion('chrony'));
+    aptQueue.addWorker(aptRunner);
+    aptQueue.on('failed', monitorAptCache);
 
-    // Started together and reported on together. The queue still serialises the
-    // apt work behind them, so running them concurrently costs nothing; the
-    // caller does not await monitorSystem, so the boot does not wait either.
-    const checks = {
-      // ubuntu 18.04 -> 24.04 all share this package
-      'ca-certificates': ensurePackageVersion('ca-certificates', '20230311'),
-      // 18.04 == 1.187
-      // 20.04 == 1.206
-      // 22.04 == 1.218
-      // Debian 12 = 1.219
-      'netcat-openbsd': ensurePackageVersion('netcat-openbsd', '1.187'),
-      syncthing: monitorSyncthingPackage(),
-      // eslint-disable-next-line no-use-before-define
-      chrony: ensureChronyd().then(
-        async () => !chronyWasPresent && Boolean(await getPackageVersion('chrony')),
-      ),
-    };
+    // don't await these, let the queue deal with it
 
-    const names = Object.keys(checks);
-    const settled = await Promise.allSettled(Object.values(checks));
-    // Named individually rather than as one failure, so a log says which check
-    // could not answer instead of only that something could not.
-    settled.forEach((outcome, i) => {
-      if (outcome.status === 'rejected') log.error(`monitorSystem - the ${names[i]} check failed: ${outcome.reason?.message ?? outcome.reason}`);
-    });
-    installed = names.filter((_, i) => settled[i].status === 'fulfilled' && settled[i].value);
+    // ubuntu 18.04 -> 24.04 all share this package
+    setImmediate(() => ensurePackageVersion('ca-certificates', '20230311'));
+    // 18.04 == 1.187
+    // 20.04 == 1.206
+    // 22.04 == 1.218
+    // Debian 12 = 1.219
+    setImmediate(() => ensurePackageVersion('netcat-openbsd', '1.187'));
+    setImmediate(() => monitorSyncthingPackage());
+    // eslint-disable-next-line no-use-before-define
+    setImmediate(() => ensureChronyd());
   } catch (error) {
     log.error(error);
-  } finally {
-    // Published on every path out of here, including the ones that failed.
-    // "Checked and had nothing to do" is a different fact from "has not run
-    // yet", and a check that threw is a third - tried and could not. All three
-    // are silence to a waiter, which then waits out its whole timeout for an
-    // answer that is never coming, and a node already provisioned looks the
-    // same as one whose checks never started.
-    fluxEventBus.publish('system:packages-checked', { installed });
   }
 }
 
@@ -837,10 +766,10 @@ async function mongodGpgKeyVeryfity() {
     const versionMatch = stdout.match(/MongoDB (\d+\.\d+) Release Signing Key/);
     if (expiredMatch) {
       if (versionMatch) {
-        const keyUrl = `${config.mongodb.signingKeyBaseUrl}/server-${versionMatch[1]}.asc`;
+        const keyUrl = `https://pgp.mongodb.com/server-${versionMatch[1]}.asc`;
         const filePath = '/usr/share/keyrings/mongodb-archive-keyring.gpg';
         log.info(`MongoDB version: ${versionMatch[1]}`);
-        log.info(`GPG URL: ${keyUrl}`);
+        log.info(`GPG URL: https://pgp.mongodb.com/server-${versionMatch[1]}.asc`);
         log.info(`The key has expired on ${expiredMatch[1]}`);
         const command = `curl -fsSL ${keyUrl} | sudo gpg --batch --yes -o ${filePath} --dearmor`;
         // eslint-disable-next-line no-shadow
