@@ -8,9 +8,12 @@ const appUninstaller = require('../appLifecycle/appUninstaller');
 const messageHelper = require('../messageHelper');
 const syncthingService = require('../syncthingService');
 const serviceHelper = require('../serviceHelper');
+const volumeService = require('../utils/volumeService');
 const { appsFolder } = require('../utils/appConstants');
 const appTamperingDetectionService = require('../appTamperingDetectionService');
 const { socketAddressesMatch, extractIp } = require('../utils/socketAddressUtils');
+const fluxEventBus = require('../utils/fluxEventBus');
+const { silenceVerdict, SilenceVerdict } = require('./peerFolderLiveness');
 const {
   LEADER_CONFIRM_COUNT,
   SYNC_COMPLETE_PERCENTAGE,
@@ -22,7 +25,7 @@ const {
   ACTIVE_FOLDER_STATES,
 } = require('./syncthingMonitorConstants');
 
-const { isPathMounted } = require('../utils/volumeService');
+const { isPathMounted } = volumeService;
 
 const monotonicMs = () => Number(process.hrtime.bigint() / 1000000n);
 
@@ -399,14 +402,32 @@ function isDesignatedLeader(allPeersList, localSocketAddr, deferToRunningPeers =
  * election is the one thing this must never do: every survivor would then pick the
  * next IP and promote alongside a holder that is still writing.
  *
+ * And silence alone is still not enough: gone requires evidence. The verdict
+ * needs this node's own syncthing to have been asked about the holder's device
+ * and answered that it is not connected. A device this node cannot ask about
+ * proves nothing, and a proof of nothing keeps the holder.
+ *
+ * @param {string} appId
  * @param {string} holderIp
  * @returns {Promise<boolean>}
  */
-async function holderIsGone(holderIp, liveness) {
+async function holderIsGone(appId, holderIp, liveness) {
   const answer = await liveness.read(holderIp);
   if (answer.reachable) return false;
-  const { connected, responding, total } = liveness.localConnectivity();
-  if (!connected) {
+
+  const verdict = await silenceVerdict(appId, holderIp, liveness);
+  if (verdict === SilenceVerdict.CONNECTION_ALIVE) {
+    log.info(`holderIsGone - ${extractIp(holderIp)}'s API is silent, but this node's syncthing still holds a live connection to it for ${appId}; it is restarting, not gone`);
+    fluxEventBus.publish('syncthing:holderRetained', { folder: appId, holder: holderIp, reason: 'connectionAlive' });
+    return false;
+  }
+  if (verdict === SilenceVerdict.NO_EVIDENCE) {
+    log.info(`holderIsGone - ${extractIp(holderIp)} is unreachable, but this node cannot ask its own syncthing about it for ${appId}; gone requires evidence, keeping it`);
+    fluxEventBus.publish('syncthing:holderRetained', { folder: appId, holder: holderIp, reason: 'noEvidence' });
+    return false;
+  }
+  if (verdict === SilenceVerdict.LOCALLY_ISOLATED) {
+    const { responding, total } = liveness.localConnectivity();
     log.info(`holderIsGone - ${extractIp(holderIp)} is unreachable, but only ${responding} of this node's ${total} peers are answering; treating this node as the isolated one`);
     return false;
   }
@@ -421,16 +442,18 @@ async function holderIsGone(holderIp, liveness) {
  * left, so they agree without coordinating, and the promotion check still catches
  * any second node that acts on it.
  *
+ * @param {string} appId
  * @param {Array<Object>} allPeersList
  * @param {string} localSocketAddr
  * @param {Object} liveness This pass's peer view
  * @returns {Promise<Array<Object>>}
  */
-async function holderListExcludingDead(allPeersList, localSocketAddr, liveness) {
+async function holderListExcludingDead(appId, allPeersList, localSocketAddr, liveness) {
   const leader = lowestIpHolder(allPeersList);
   if (!leader || socketAddressesMatch(leader, localSocketAddr)) return allPeersList;
-  if (!await holderIsGone(leader, liveness)) return allPeersList;
+  if (!await holderIsGone(appId, leader, liveness)) return allPeersList;
   log.warn(`holderListExcludingDead - elected holder ${leader} is gone and this node's own connectivity is healthy; re-electing without it`);
+  fluxEventBus.publish('syncthing:holderExcluded', { folder: appId, holder: leader });
   return allPeersList.filter((peer) => !socketAddressesMatch(peer.ip, leader));
 }
 
@@ -777,15 +800,26 @@ async function handleReceiveOnlyTransition(params) {
   // keeps winning and every survivor defers to it until its location broadcast
   // expires - 125 minutes with the app down. Dropped from the list here, before the
   // pick, when this node can show the holder is gone rather than merely silent to it.
-  const electionList = await holderListExcludingDead(runningAppList, localSocketAddr, liveness);
+  const electionList = await holderListExcludingDead(appId, runningAppList, localSocketAddr, liveness);
   const electedLeader = isDesignatedLeader(electionList, localSocketAddr, aPeerHasData || !folderIsEmpty);
-  cache.leaderStreak = electedLeader ? (cache.leaderStreak || 0) + 1 : 0;
+  // The floor holderIsGone asks of a silent holder, asked of this node before
+  // its own win can count: a node whose peers have gone quiet is the one that
+  // fell over, and a win it confirms in that state seeds the app on a
+  // partition's minority side while the majority defers to its IP. Isolation
+  // resets the streak rather than pausing it, so a heal is followed by
+  // LEADER_CONFIRM_COUNT clean passes like any other blip.
+  const { connected } = liveness.localConnectivity();
+  cache.leaderStreak = electedLeader && connected ? (cache.leaderStreak || 0) + 1 : 0;
   const isLeader = electedLeader && cache.leaderStreak >= LEADER_CONFIRM_COUNT;
-  // The confirmed designation is readable by masterSlaveApps through this
-  // shared cache: the genesis seed skips the primary-selection index stagger
-  // (nothing below it can become ready before it starts). Updated every
-  // unpromoted pass, so a lost election withdraws the claim.
-  cache.designatedLeader = isLeader;
+  // Withdrawn on every unpromoted pass, so a lost election drops the claim
+  // and the intent behind it. It is raised again only where the promotion is
+  // APPLIED - the state machine records intent at the last gate, and the
+  // monitor flips it once the folder batch lands in syncthing.
+  // masterSlaveApps reads designatedLeader to skip the primary-selection
+  // index stagger, so it has to mean "the folder is writable", not "won the
+  // vote" and not "promotion decided".
+  cache.designatedLeader = false;
+  cache.designationPending = false;
 
   // RESIDUAL LIMITATION (architectural - this election is a heuristic, not consensus):
   // a confirmed leader is the cold-start seed and flips to sendreceive WITHOUT a sync
@@ -847,6 +881,15 @@ async function handleReceiveOnlyTransition(params) {
       syncthingFolder.type = 'receiveonly';
       return { syncthingFolder, cache };
     }
+
+    // Every gate passed - but deciding the promotion is not applying it. The
+    // designation masterSlaveApps reads has to mean "the folder IS writable",
+    // and the type below reaches syncthing only when the monitor applies this
+    // pass's folder batch - so the claim is recorded as intent here, and the
+    // monitor raises designatedLeader once the apply lands. Raising it now
+    // would let the container start against a folder still receiveonly for as
+    // long as the apply takes.
+    cache.designationPending = true;
 
     // Fix permissions before changing to sendreceive - ensures correct ownership for synced data
     await fixAppdataPermissions(appId);
@@ -1053,6 +1096,7 @@ async function manageFolderSyncState(params) {
     localSocketAddr,
     syncthingFolder,
     installedAppName,
+    mountVerifyNeeded = true,
     liveness,
   } = params;
 
@@ -1061,10 +1105,52 @@ async function manageFolderSyncState(params) {
 
   // If already syncing in sendreceive mode, ensure container is running
   if (folderAlreadySyncing) {
-    // The mount is sound by the time this runs: the pass verifies every folder
-    // it is going to act on before it acts, and holds out the ones that fail.
-    // Re-deriving that verdict here would cost a syncthing round trip and a
-    // directory walk per folder to answer a question already answered.
+    // Mount safety of a live sendreceive folder is verified at decision points
+    // (startup, FolderErrors from syncthing) - not per pass: the .stfolder
+    // marker inside the volume turns storage loss into FolderErrors, and the
+    // caller flags exactly those folders here
+    if (mountVerifyNeeded) {
+      const folderPath = syncFolder.path || `${appsFolder}${appId}/appdata`;
+      let mountSafety = await verifySendReceiveFolderSafety(appId, folderPath);
+
+      if (!mountSafety.isSafe && !mountSafety.isMounted) {
+        // The detection is actionable: the backing image normally still exists,
+        // and FluxOS owns the mount - repair instead of just blocking. The
+        // re-verify still holds the folder back (receiveonly) if the freshly
+        // mounted volume disagrees with the index (phantom-index case).
+        const mountAttempt = await volumeService.ensureAppVolumeMounted(appId);
+        if (mountAttempt.mounted) {
+          log.info(`manageFolderSyncState - ${appId} volume was not mounted; mounted it, re-verifying folder safety`);
+          mountSafety = await verifySendReceiveFolderSafety(appId, folderPath);
+        }
+      }
+
+      if (!mountSafety.isSafe) {
+        // DANGER: Mount not ready! Switch to receiveonly to prevent data propagation
+        log.error(`manageFolderSyncState - SAFETY BLOCK: ${appId} mount not safe (${mountSafety.reason}). Switching to receiveonly mode to prevent data loss.`);
+        log.error(`manageFolderSyncState - Mount status: mounted=${mountSafety.isMounted}, hasContent=${mountSafety.hasContent}, files=${mountSafety.fileCount}`);
+
+        // Update folder to receiveonly mode to prevent this node from sending "empty" state to peers
+        syncthingFolder.type = 'receiveonly';
+        const cache = {
+          numberOfExecutions: 0,
+          mountSafetyBlocked: true,
+          blockedReason: mountSafety.reason,
+          blockedAt: Date.now(),
+        };
+        receiveOnlySyncthingAppsCache.set(appId, cache);
+
+        // Hold the container too: its binds point at the same unsafe dir. The
+        // reconciler is the actuator; the receiveonly machinery flips the
+        // verdict back to running once the folder is verifiably synced.
+        appReconciler.setControllerDesired(appId, 'stopped', `mount safety block: ${mountSafety.reason}`);
+
+        // Return with skipUpdate=false so the folder config gets updated to receiveonly
+        return { syncthingFolder, cache, skipUpdate: false };
+      }
+    }
+
+    // Mount is safe (verified) or not in question (steady state)
     await ensureContainerRunning(appId, containerDataFlags);
     // Ensure cache entry exists so health monitor can track this folder
     const existingCache = receiveOnlySyncthingAppsCache.get(appId);
