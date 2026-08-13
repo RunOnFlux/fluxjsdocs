@@ -4,7 +4,6 @@ const fluxEventBus = require('../utils/fluxEventBus');
 const dbHelper = require('../dbHelper');
 const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
-const dockerOperations = require('../appManagement/dockerOperations');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const globalState = require('../utils/globalState');
@@ -306,6 +305,9 @@ async function dockerActual(identifier) {
       exists: true,
       running: !!(info.State && info.State.Running),
       exitCode: everRan ? (info.State.ExitCode ?? null) : null,
+      // the kernel's verdict, not the entrypoint's: an image that swallows its
+      // payload's status still cannot hide this one
+      oomKilled: !!(info.State && info.State.OOMKilled),
       finishedAt,
       // classified from THIS inspect so the running-branch network check needs no
       // second docker call (and no TOCTOU between two inspects).
@@ -375,7 +377,7 @@ async function recreateMissing(identifier) {
   await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
   try {
     await containerHealthMonitor.recreateMissingContainers(identifier);
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.info(`appReconciler - recreated missing container ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated' });
     notifyContainerStarted(identifier);
@@ -422,7 +424,7 @@ async function recreateForNetworkHeal(identifier) {
     // fallocates + mke2fs). We removed a live container whose data was intact, so a
     // recreate that cannot verify the volume must fail and be retried - never wipe it.
     await containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true });
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.info(`appReconciler - recreated ${identifier} to clear a detached network endpoint`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated', reason: 'networkDetached' });
     notifyContainerStarted(identifier);
@@ -626,7 +628,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
   // Stop the per-minute stats monitor before removing the container (mirrors the
   // uninstaller). Otherwise its interval runs against a gone container, leaking and
   // error-spamming. The recreate re-establishes it via startAppMonitoring.
-  appInspector.stopAppMonitoring(identifier, true, globalState.appsMonitored);
+  appInspector.stopAppMonitoring(identifier, true);
   try {
     // v=false: Flux data lives on bind mounts; the recreate reuses them via a soft
     // install (enforced: recreateForNetworkHeal passes softOnly).
@@ -636,7 +638,7 @@ async function healDetachedNetwork(identifier, mainAppName, spec) {
     // container we did NOT manage to remove is not left unmonitored. The heal flag
     // stays set on purpose - the remove may have partially succeeded, and a stale
     // flag only keeps us on the recreate path (never the uninstall one).
-    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+    appInspector.startAppMonitoring(identifier);
     log.error(`appReconciler - failed to remove detached ${identifier}: ${err.message}; will retry`);
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
@@ -770,7 +772,7 @@ async function reconcile(rawIdentifier) {
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
-      await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
+      await volumeService.clearAppVolumeData(identifier);
     } catch (err) {
       // A failed stop/wipe is the only actuation path here that would otherwise drop
       // to the hourly sweep (~1h down). Leave dataDesired 'clear' - so the retried
@@ -862,12 +864,25 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  // exists but stopped, should run -> backoff-paced restart (no sleeping; the
-  // worker re-enqueues when the backoff window elapses)
-  const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt);
+  // exists but stopped, should run -> restart, paced by the ladder only when the
+  // stop carries evidence of a fault (no sleeping; the worker re-enqueues when
+  // the backoff window elapses). A clean exit goes back immediately: it is an
+  // operator restarting their own app far more often than it is a crash, and
+  // pacing that turns a deliberate restart into what looks like an outage.
+  // exitCode null is a container that has never run - an initial start, not a death.
+  const crashed = !!actual.oomKilled || (actual.exitCode !== null && actual.exitCode !== 0);
+  const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt, crashed);
   if (wait > 0) {
-    log.warn(`appReconciler - ${identifier} stopped, backing off ${Math.round(wait / 1000)}s before restart`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'backoff', waitMs: wait });
+    // name which of the two put it here: a reported fault, or restarts arriving
+    // fast enough to be one whatever the exit code said. Support cannot tell
+    // these apart from the outside, and the difference decides what they do next.
+    const cause = crashed
+      ? `exit ${actual.exitCode}${actual.oomKilled ? ' (OOM-killed)' : ''}`
+      : 'restarting too fast to be healthy';
+    log.warn(`appReconciler - ${identifier} stopped, ${cause}; backing off ${Math.round(wait / 1000)}s before restart`);
+    fluxEventBus.publish('reconciler:actuated', {
+      identifier, action: 'backoff', waitMs: wait, crashed,
+    });
     scheduleRetry(identifier, wait);
     return;
   }
@@ -888,20 +903,24 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  await appsRuntimeState.recordRestart(identifier);
+  await appsRuntimeState.recordRestart(identifier, crashed);
   try {
     await dockerService.appDockerStart(identifier);
   } catch (err) {
     // No die event fires for a failed start (the container never ran), so a
     // dropped throw here leaves the component down until the hourly sweep.
-    // Schedule our own retry; pacing is free - the attempt was recorded above,
-    // so a persistent failure walks the backoff ladder instead of hammering.
+    // Schedule our own retry. A start that never ran carries no exit code, so it
+    // is not a fault and does not walk the ladder directly - it reaches the
+    // ladder by filling the burst window, which these retries do comfortably
+    // (restartBurstCount x MANAGED_RETRY_MS against restartBurstWindowMs). That
+    // relationship is what bounds a permanently failing start, and the config
+    // comment on the window is where it is stated.
     log.error(`appReconciler - failed to start ${identifier}: ${err.message}; retrying`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'startFailed', reason: err.message });
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
-  appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
+  appInspector.startAppMonitoring(identifier);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
   notifyContainerStarted(identifier);
@@ -1154,6 +1173,11 @@ module.exports = {
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
+  // The one answer to "what is this container actually doing" - it probes the
+  // daemon rather than pattern-matching an inspect error, so it can tell docker
+  // being unreachable from the container being gone. Anything that acts on a
+  // container's run state needs that distinction, not just the reconciler.
+  dockerActual,
   // exposed for tests
   reconcile,
   policyAllowsRun,
