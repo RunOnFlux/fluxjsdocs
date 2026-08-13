@@ -30,6 +30,9 @@ const appSpawner = require('./appLifecycle/appSpawner');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
+const fileOperationRecovery = require('./appSystem/fileOperationRecovery');
+const networkRecovery = require('./appSystem/networkRecovery');
+const volumeExecutor = require('./appSystem/volumeExecutor');
 const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
@@ -53,7 +56,6 @@ const volumeValidationService = require('./volumeValidationService');
 const watchdogService = require('./watchdogService');
 const cloudUIUpdateService = require('./cloudUIUpdateService');
 const appTamperingBlocklistService = require('./appTamperingBlocklistService');
-const residentialNodeDosService = require('./residentialNodeDosService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const appsRuntimeState = require('./appManagement/appsRuntimeState');
@@ -375,12 +377,6 @@ async function startFluxFunctions() {
     appTamperingBlocklistService.start().catch((err) => {
       log.error(`appTamperingBlocklist start error: ${err.message}`);
     });
-    // Not awaited, and started ahead of setNodeGeolocation below on purpose: the
-    // first tick reads geolocation from the db when there is one, and otherwise
-    // decides nothing and retries until the lookup this boot has landed.
-    residentialNodeDosService.start().catch((err) => {
-      log.error(`residentialNodeDos start error: ${err.message}`);
-    });
     log.info('Flux checks operational');
     fluxCommunication.initializeDiscovery();
     await nodeConfirmationService.start();
@@ -399,6 +395,32 @@ async function startFluxFunctions() {
     await containerMountRecovery.performContainerMountRecovery().catch((error) => {
       log.error(`Container mount recovery service error: ${error.message}`);
     });
+    // A file operation's container is detached from the process that started
+    // it, so a FluxOS restart leaves one running with nobody waiting for its
+    // result, and its staging directory on the volume. Reclaim both - and
+    // restore any destination whose publish was interrupted between its two
+    // renames. Runs after the volumes above are mounted, since the sweep reads
+    // them.
+    log.info('Reclaiming interrupted file operations...');
+    await fileOperationRecovery.recoverInterruptedFileOperations().catch((error) => {
+      log.error(`File operation recovery error: ${error.message}`);
+    });
+    // Not awaited, and not now: the node takes the file operation image at its
+    // own place in a window, so the fleet ends up holding it without every node
+    // fetching at the same moment. A node that cannot reach the registry takes
+    // it from one that did, which only works if they have it.
+    volumeExecutor.startImagePrefetch();
+
+    // At boot, before anything installs: an app network is created per app and
+    // removed only by the uninstaller, so an uninstall interrupted between the
+    // container going and the network going leaves one behind for ever. Each
+    // holds an octet that getFreeFluxAppNetworkOctet cannot hand out again, and
+    // when the last of 255 is gone nothing can be installed on the node.
+    //
+    // Here rather than on a schedule because a sweep must not meet an install
+    // in progress: at boot the expected names are simply what the database
+    // holds, with no window in which an app has a network and no record yet.
+    await networkRecovery.reclaimOrphanedAppNetworks();
     syncthingService.startSyncthingSentinel();
     log.info('Syncthing service started');
     // Awaited: generating an identity rewrites config/userconfig.js, and that
