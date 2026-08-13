@@ -2,7 +2,7 @@ const log = require('../lib/log');
 const path = require('path');
 const messageHelper = require('./messageHelper');
 const verificationHelper = require('./verificationHelper');
-const { sendFile } = require('./utils/fileTransfer');
+const serviceHelper = require('./serviceHelper');
 const IOUtils = require('./IOUtils');
 const fs = require('fs').promises;
 const { sanitizePath, verifyRealPath } = require('./utils/pathSecurity');
@@ -85,11 +85,7 @@ async function getVolumeDataOfComponent(req, res) {
     const authorized = res ? await verificationHelper.verifyPrivilege('appownerabove', req, appname) : true;
     if (authorized === true) {
       const dfInfoData = await IOUtils.getVolumeInfo(appname, component, multiplier, decimal, fields);
-      // Anything empty means the component's volume is not reachable, whatever
-      // shape it arrives in. This asked for null specifically and getVolumeInfo
-      // answered false, so it never fired and a missing mount was reported as a
-      // success carrying no data - which the UI then reads a mount path off.
-      if (!dfInfoData || !dfInfoData.length) {
+      if (dfInfoData === null) {
         throw new Error('No matching mount found');
       }
       const response = messageHelper.createDataMessage(dfInfoData[0]);
@@ -275,7 +271,11 @@ async function downloadLocalFile(req, res) {
       await verifyRealPath(filepath, appsFolder);
       const fileNameArray = filepath.split('/');
       const fileName = fileNameArray[fileNameArray.length - 1];
-      return await sendFile(res, filepath, fileName);
+      const chmodResult = await serviceHelper.runCommand('chmod', { runAsRoot: true, params: ['777', filepath] });
+      if (chmodResult.error) {
+        throw chmodResult.error;
+      }
+      return res.download(filepath, fileName);
       // eslint-disable-next-line no-else-return
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
