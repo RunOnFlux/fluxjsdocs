@@ -528,7 +528,18 @@ async function copyAppsObject(req, res) {
     // cp copying INTO the staging directory instead of becoming it.
     return startOperation(res, volume, {
       kind: 'fileoperation.copy', status: 'Copying...', owner: volume.owner, trackBytes: true, bytesTotal,
-    }, (progress) => executor.run(volume, ['cp', '-a', '-T', source, staging], { ...progress, publish: { staging, destination } }));
+    }, (progress) => executor.run(volume, ['cp', '-a', '-T', source, staging], {
+      ...progress,
+      publish: { staging, destination },
+      // The measurement above is what refuses this early and with a sentence.
+      // It is not what makes it safe: it is taken by the FluxOS process, which
+      // is root on ArcaneOS but an ordinary user elsewhere, and a directory the
+      // app made private is one it cannot open. measureTree skips what it
+      // cannot read, so the figure can be low - silently, and in the direction
+      // that admits a copy which does not fit. The ceiling is applied to what
+      // actually lands, by the container, which can read all of it.
+      maxBytes: volume.availableBytes / SPACE_HEADROOM,
+    }));
   } catch (error) {
     respondError(res, error);
   }
@@ -575,18 +586,33 @@ async function compressAppsObject(req, res) {
     const operand = sourceIsDirectory ? '.' : path.basename(source.relative);
 
     const staging = volume.staging();
+    // `--` before the operand, because a name is not an option. A file may
+    // legitimately begin with a dash - the component rule rejects only the
+    // separators and the control characters - and both archivers would read one
+    // as a flag and refuse the request. Ending option parsing is what makes the
+    // operand a filename whatever it starts with, and unlike a `./` prefix it
+    // leaves the name stored in the archive alone.
     const argv = format === 'zip'
       // -r recurses, -q keeps the per-file listing out of the container's
       // output, -y stores a symlink as a symlink instead of the file it points
       // at, which is what tar and cp -a already do.
-      ? ['zip', '-r', '-q', '-y', staging, operand]
-      : ['tar', '-czf', staging, operand];
+      ? ['zip', '-r', '-q', '-y', staging, '--', operand]
+      : ['tar', '-czf', staging, '--', operand];
 
     // Bytes written to the archive, with no total: how far a source of a known
     // size compresses is not knowable until it has.
     return startOperation(res, volume, {
       kind: 'fileoperation.compress', status: 'Compressing...', owner: volume.owner, trackBytes: true,
-    }, (progress) => executor.run(volume, argv, { ...progress, workingDir, publish: { staging, destination } }));
+    }, (progress) => executor.run(volume, argv, {
+      ...progress,
+      workingDir,
+      publish: { staging, destination },
+      // As for copy: the measurement above refuses this early, the ceiling is
+      // what makes it safe. A source measured by a process that cannot open
+      // every directory in it reads low, and an archive is written by one that
+      // can read all of them.
+      maxBytes: volume.availableBytes / SPACE_HEADROOM,
+    }));
   } catch (error) {
     respondError(res, error);
   }

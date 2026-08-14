@@ -5,7 +5,7 @@ const deviceHelper = require('../deviceHelper');
 const serviceHelper = require('../serviceHelper');
 const verificationHelper = require('../verificationHelper');
 const {
-  sanitizePath, verifyRealPath, verifyRealPathOfExistingPath, openNoFollow,
+  sanitizePath, verifyRealPath, verifyRealPathOfExistingPath,
 } = require('../utils/pathSecurity');
 const { appsFolder, APP_NAME_REGEX, APP_NAME_REGEX_LEGACY } = require('../utils/appConstants');
 const { STAGING_PREFIX, isReservedName } = require('./volumeReservedNames');
@@ -357,45 +357,6 @@ class VolumeSession {
   }
 
   /**
-   * Read a small file the application owns, as bytes rather than as a path to
-   * follow.
-   *
-   * Reading is the one thing an operand could do without the container, and it
-   * is the one place a link still leads somewhere: resolve() lets a link
-   * through deliberately, because moving or removing one acts on the link
-   * itself. A read acts THROUGH it, so it is refused here instead - opened
-   * O_NOFOLLOW, and sized from the open handle so the size cannot change
-   * between asking and reading.
-   *
-   * The bound is the caller's because only the caller knows what the file is
-   * for. A path fits in a few kilobytes; a file the application chose the size
-   * of does not have to.
-   *
-   * @param {VolumePath} volumePath
-   * @param {number} maxBytes - refuse anything larger
-   * @returns {Promise<string>} The file's contents.
-   */
-  // eslint-disable-next-line class-methods-use-this
-  async readSmallFile(volumePath, maxBytes) {
-    if (!(volumePath instanceof VolumePath)) {
-      throw new Error('readSmallFile requires a VolumePath');
-    }
-    if (!Number.isInteger(maxBytes) || maxBytes < 1) {
-      throw new Error('readSmallFile requires a positive byte ceiling');
-    }
-    const { handle, stats } = await openNoFollow(volumePath.hostPath);
-    try {
-      const { size } = stats;
-      if (size > maxBytes) {
-        throw new Error(`${volumePath.relative} is ${size} bytes, over the ${maxBytes} byte ceiling`);
-      }
-      return await handle.readFile('utf8');
-    } finally {
-      await handle.close();
-    }
-  }
-
-  /**
    * The directory containing this path.
    *
    * Built rather than resolved: the path it derives from has already passed
@@ -451,11 +412,17 @@ class VolumeSession {
       ? await measureTree(volumePath.hostPath, fs, { occupied: true })
       : stats.blocks * BLOCK_UNIT;
 
-    // Fails closed by throwing rather than by reporting a figure: a source that
-    // cannot be read is a refusal, because an operation that runs out of space
-    // partway leaves a partial tree the user has to identify and clean up. That
-    // is measureTree's behaviour and the lstat's above, so there is no
-    // unmeasurable answer left to check for here.
+    // An ESTIMATE, and low rather than high when it is wrong. The lstat above
+    // throws on a source that cannot be reached at all, but measureTree skips
+    // an entry it cannot stat and walks nothing under a directory it cannot
+    // open - and this runs in the FluxOS process, root on ArcaneOS and an
+    // ordinary user elsewhere, so a directory the app made private to its own
+    // uid is exactly that case.
+    //
+    // Which is what it is for: refusing an operation early and in a sentence,
+    // before anything starts. What makes the operation SAFE is the byte ceiling
+    // its executor run carries - applied to what actually lands, by a container
+    // that can read every part of the volume.
     return size;
   }
 
