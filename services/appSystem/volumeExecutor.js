@@ -7,10 +7,12 @@ const dockerService = require('../dockerService');
 const deviceHelper = require('../deviceHelper');
 const serviceHelper = require('../serviceHelper');
 const networkStateService = require('../networkStateService');
+const fluxNetworkHelper = require('../fluxNetworkHelper');
 const jobRegistry = require('../utils/jobRegistry');
 const fluxEventBus = require('../utils/fluxEventBus');
 const log = require('../../lib/log');
-const { Writable } = require('node:stream');
+const { Writable, pipeline } = require('node:stream');
+const { createWriteStream, createReadStream } = require('node:fs');
 const { AsyncLock } = require('../utils/asyncLock');
 const { measureTree } = require('../utils/treeSize');
 const { appsFolder } = require('../utils/appConstants');
@@ -374,6 +376,7 @@ const ACQUIRE_BACKOFF_MS = 30000;
 const ACQUIRE_BACKOFF_CEILING_MS = 60 * 60 * 1000;
 
 let acquiring = null;
+let acquiringUsedRegistry = false;
 let failedAt = 0;
 let backoffMs = 0;
 let backoffUntil = 0;
@@ -426,8 +429,35 @@ const BUSY_RETRY_AFTER_CEILING_MS = 5 * 60 * 1000;
 /** How many draws that costs at most, since the same peer can come up twice. */
 const PEER_IMAGE_DRAWS = 20;
 
-/** How long a peer has to hand over the whole archive. */
+/** How long a peer has to answer at all. */
 const PEER_IMAGE_TIMEOUT_MS = 120000;
+
+/**
+ * How long the transfer may go with no bytes arriving.
+ *
+ * PEER_IMAGE_TIMEOUT_MS does NOT cover this and cannot be made to: axios settles
+ * a stream request when the response HEADERS arrive, and its timer is spent by
+ * then. A peer that answers and then goes quiet - a hostile one, or an ordinary
+ * NAT dropping the connection mid-archive - therefore left `docker load` waiting
+ * on a body that never ended, so the shared acquisition promise never settled,
+ * no retry was ever scheduled, the registry was never reached, and every file
+ * operation on the node was refused until FluxOS restarted.
+ *
+ * Measured against arrival rather than total time, so a genuinely slow link
+ * still finishes: the same reasoning as the upload rate floor, in the other
+ * direction.
+ */
+const PEER_IMAGE_STALL_MS = 30000;
+
+/**
+ * The most this node will take from a peer before it has verified anything.
+ *
+ * The archive is around fourteen megabytes. Nothing is known about the bytes
+ * until they have all arrived, so the ceiling is what stops a peer writing an
+ * unbounded amount into this node's docker store and filling the disk the
+ * tenants' applications are on - a check that ran afterwards ran too late.
+ */
+const PEER_IMAGE_MAX_BYTES = 128 * 1024 * 1024;
 
 /**
  * How many peers this node hands the image to at once.
@@ -436,9 +466,128 @@ const PEER_IMAGE_TIMEOUT_MS = 120000;
  * network state recognises, so without a ceiling a node can be asked to spend
  * its bandwidth by whoever asks most often.
  */
-const PEER_IMAGE_SERVE_LIMIT = 2;
+const PEER_IMAGE_SERVE_LIMIT = 4;
+
+/**
+ * How long a serve may go with the caller taking nothing.
+ *
+ * A slot came back only when the caller DISCONNECTED, and a caller that neither
+ * disconnects nor reads does neither: the export simply blocks on backpressure
+ * and the slot is held for as long as the socket is open. Two such connections
+ * took every slot on a node until FluxOS restarted, and nothing said so - the
+ * node's own operations kept working, so it looked healthy while quietly
+ * serving no peer at all. Cheap to do to every node in the fleet at once, which
+ * pushes all of them onto the registry: the load peer serving exists to avoid.
+ *
+ * Reachable by more than node operators, because an application's container
+ * egresses under its host node's address.
+ *
+ * Measured against bytes taken rather than total time, so a slow but honest
+ * caller still completes. The ingress side already reasons this way; this is the
+ * same rule pointed the other direction, and there was no two-hour backstop
+ * here as there is there.
+ */
+const PEER_IMAGE_SERVE_STALL_MS = 30000;
 
 let peerImageServes = 0;
+
+/**
+ * How long the set of fleet addresses is reused for.
+ *
+ * Deciding whether a caller is a node meant copying the whole network state -
+ * around 13,000 entries - and splitting a string per entry, BEFORE the caller
+ * had been shown to be anyone. Measured at ~2.4ms of the event loop per
+ * request, so roughly 400 requests a second saturate the one core FluxOS has
+ * and stall everything else on it: app installs, operation polling, peer
+ * messaging. The route is unauthenticated and the image id it needs is public
+ * config, so that was reachable by anyone.
+ *
+ * A set is built once per window instead, however many callers arrive, which is
+ * the same answer at a constant cost. Held only while the endpoint is being
+ * used: nothing builds it on a node no peer ever asks.
+ *
+ * The convention this follows is already in the tree - the one other
+ * unauthenticated route that walks the fleet list is wrapped in
+ * `cache('30 seconds')`. A window is fine here for the same reason it is there:
+ * a node that joined seconds ago can wait, and one that left is refused a
+ * little late.
+ */
+const FLEET_ADDRESS_WINDOW_MS = 30000;
+
+let fleetAddresses = null;
+let fleetAddressesAt = 0;
+
+/**
+ * Whether an address belongs to a node in the fleet.
+ *
+ * By address rather than by socketAddress: a node's API port cannot be read off
+ * an inbound connection, whose source port is ephemeral, and the fleet does not
+ * all run on the default one.
+ *
+ * @param {string} remote
+ * @returns {boolean}
+ */
+function fleetHolds(remote) {
+  if (!fleetAddresses || monotonicMs() - fleetAddressesAt >= FLEET_ADDRESS_WINDOW_MS) {
+    fleetAddresses = new Set(networkStateService.networkState().map((node) => node.ip.split(':')[0]));
+    fleetAddressesAt = monotonicMs();
+  }
+  return fleetAddresses.has(remote);
+}
+
+/**
+ * Take a peer's archive onto the disk, bounded, before anything reads it.
+ *
+ * To a file and not to memory: the ceiling has to be generous enough that an
+ * honest archive is never refused, and holding that much heap on a node whose
+ * memory is the constraint would trade one denial of service for another.
+ *
+ * Three things end the transfer: the ceiling, the stall window, and the caller
+ * giving up. Each destroys the response, so a peer cannot hold the socket after
+ * this returns, and the partial file is removed by the caller's finally.
+ *
+ * @param {NodeJS.ReadableStream} body - the peer's response
+ * @param {string} destination - where to put it
+ * @returns {Promise<number>} bytes taken
+ */
+async function receivePeerArchive(body, destination) {
+  let taken = 0;
+  let stalled = null;
+  let failure = null;
+
+  const sink = createWriteStream(destination);
+
+  const stopWith = (error) => {
+    failure = failure || error;
+    body.destroy(error);
+  };
+
+  const watchdog = setInterval(function noticeSilence() {
+    if (stalled === taken) {
+      stopWith(new Error(`sent nothing for ${PEER_IMAGE_STALL_MS}ms`));
+      return;
+    }
+    stalled = taken;
+  }, PEER_IMAGE_STALL_MS);
+  if (watchdog.unref) watchdog.unref();
+
+  body.on('data', function count(chunk) {
+    taken += chunk.length;
+    if (taken > PEER_IMAGE_MAX_BYTES) {
+      stopWith(new Error(`sent more than ${PEER_IMAGE_MAX_BYTES} bytes`));
+    }
+  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      pipeline(body, sink, (error) => (error || failure ? reject(failure || error) : resolve()));
+    });
+  } finally {
+    clearInterval(watchdog);
+  }
+
+  return taken;
+}
 
 /**
  * Remove everything an archive brought that was not the image being fetched.
@@ -502,6 +651,7 @@ async function discardUnwantedImages(loaded, accepted, socketAddress) {
  */
 async function fetchImageFromPeer(expected) {
   const asked = new Set();
+  const localAddress = await fluxNetworkHelper.getLocalSocketAddress().catch(() => null);
 
   // Bounded by peers CONTACTED, not by draws. The draw is random, so counting
   // draws lets a repeat stand in for a peer: on a small fleet that is the
@@ -509,7 +659,16 @@ async function fetchImageFromPeer(expected) {
   // it. The draw ceiling is what stops a fleet of one from looping.
   for (let draw = 0; asked.size < PEER_IMAGE_ATTEMPTS && draw < PEER_IMAGE_DRAWS; draw += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const socketAddress = await networkStateService.getRandomSocketAddress(null);
+    // This node's own address, so a draw cannot come back as itself. Every other
+    // caller of this passes one; passing null never matched, so a node could
+    // spend one of only four attempts asking itself for an image it has already
+    // established it does not hold. Negligible across the fleet, one draw in
+    // three on a three-node one.
+    //
+    // Not fatal if it cannot be determined - a draw that might waste an attempt
+    // is better than no peer search at all.
+    // eslint-disable-next-line no-await-in-loop
+    const socketAddress = await networkStateService.getRandomSocketAddress(localAddress);
     if (!socketAddress || asked.has(socketAddress)) {
       // eslint-disable-next-line no-continue
       continue;
@@ -517,14 +676,36 @@ async function fetchImageFromPeer(expected) {
     asked.add(socketAddress);
 
     const [ip, port = '16127'] = socketAddress.split(':');
+    let archivePath = null;
     try {
       // eslint-disable-next-line no-await-in-loop
       const response = await serviceHelper.axiosGet(
         `http://${ip}:${port}/apps/fileoperationimage/${expected}`,
         { responseType: 'stream', timeout: PEER_IMAGE_TIMEOUT_MS },
       );
+      // Onto the disk first, bounded and with a stall window, so an archive
+      // this node knows nothing about cannot be unbounded in size or in time.
       // eslint-disable-next-line no-await-in-loop
-      const loaded = await dockerService.loadImage(response.data);
+      archivePath = path.join(os.tmpdir(), `flux-op-image-${crypto.randomUUID()}.tar`);
+      // eslint-disable-next-line no-await-in-loop
+      await receivePeerArchive(response.data, archivePath);
+
+      // And looked at before the daemon is allowed near it. `docker load`
+      // APPLIES the names an archive declares, which moves them off whatever
+      // this node had under them - so a peer could rename this node's own app
+      // images by packing their names in, and the cleanup afterwards removes
+      // the stolen name rather than giving it back. This node's own serve path
+      // exports by id and so declares no names at all; an archive that declares
+      // any is doing something we never do, and is refused rather than
+      // repaired.
+      // eslint-disable-next-line no-await-in-loop
+      const declared = await dockerService.archiveNames(archivePath);
+      if (declared.length) {
+        throw new Error(`archive names ${declared.join(', ')}, which this node does not accept from a peer`);
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const loaded = await dockerService.loadImage(createReadStream(archivePath));
       // Whatever else came in the archive goes, whether or not the wanted image
       // was in it. Returning on success first - which is what this did - left a
       // peer able to put images of its choosing on this node permanently, since
@@ -563,10 +744,18 @@ async function fetchImageFromPeer(expected) {
       log.warn(`volumeExecutor - ${socketAddress} sent ${loaded.ids.length} image(s), none of them ${expected}`);
     } catch (error) {
       log.warn(`volumeExecutor - ${socketAddress} could not provide the file operation image: ${error.message}`);
+    } finally {
+      // Whatever ended the transfer, the partial file goes: a peer that dies
+      // mid-archive must not leave this node accumulating debris nothing will
+      // ever look at again.
+      if (archivePath) {
+        // eslint-disable-next-line no-await-in-loop
+        await fs.unlink(archivePath).catch(() => {});
+      }
     }
   }
 
-  throw new Error(`asked ${asked.size} peer(s), none provided it`);
+  return { peer: null, asked: asked.size };
 }
 
 /**
@@ -611,17 +800,36 @@ async function serveImageToPeer(req, res) {
       return;
     }
 
-    // By address rather than by socketAddress: a node's API port cannot be read
-    // off an inbound connection, whose source port is ephemeral, and the fleet
-    // does not all run on the default one.
-    if (!networkStateService.networkState().some((node) => node.ip.split(':')[0] === remote)) {
-      res.status(403).end();
+    // HEAD reaches this handler too - express answers it from the GET route when
+    // no HEAD route exists - and node discards the body of a HEAD response
+    // without ever applying backpressure. So a HEAD cost this node a full
+    // export, read off the disk and packed by docker, while costing the caller
+    // one packet and no bandwidth at all. Nothing here has a body worth
+    // describing, so there is nothing to answer.
+    if (req.method === 'HEAD') {
+      res.status(405).end();
       return;
     }
 
+    // The ceiling before the fleet lookup, because it is a comparison and the
+    // lookup is a set membership that may have to rebuild the set: a node with
+    // no capacity should not pay to find out who is asking.
+    //
+    // Taken in the SAME TICK it is tested, before any await. Testing it, then
+    // awaiting, then taking it - which is what this did - lets every request
+    // that arrives together read the same count and all pass, so the ceiling
+    // bounded nothing at exactly the moment it was needed.
     if (peerImageServes >= PEER_IMAGE_SERVE_LIMIT) {
+      log.info(`volumeExecutor - refused ${remote} the file operation image: already serving ${peerImageServes}`);
       res.set('Retry-After', '30');
       res.status(503).end();
+      return;
+    }
+    serving = true;
+    peerImageServes += 1;
+
+    if (!fleetHolds(remote)) {
+      res.status(403).end();
       return;
     }
 
@@ -633,9 +841,6 @@ async function serveImageToPeer(req, res) {
       res.status(404).end();
       return;
     }
-
-    serving = true;
-    peerImageServes += 1;
 
     // Subscribed BEFORE the export, because the caller can hang up while docker
     // is still packing the archive. `close` fires once, so a listener attached
@@ -665,8 +870,33 @@ async function serveImageToPeer(req, res) {
 
     res.set('Content-Type', 'application/x-tar');
     archive.on('error', function exportFailed() { res.destroy(); });
-    archive.pipe(res);
-    await disconnected;
+
+    // Bytes LEAVING the export, which is what a caller taking nothing stops:
+    // pipe holds the archive against backpressure, so no data event fires while
+    // the socket is not being drained. Counting them is therefore counting the
+    // caller's progress, without needing anything from the socket.
+    let sent = 0;
+    let sentAtLastLook = null;
+    archive.on('data', function count(chunk) { sent += chunk.length; });
+
+    const watchdog = setInterval(function noticeIdleCaller() {
+      if (sentAtLastLook === sent) {
+        log.warn(`volumeExecutor - stopped serving the file operation image to ${remote}: took nothing for ${PEER_IMAGE_SERVE_STALL_MS}ms`);
+        archive.destroy();
+        res.destroy();
+        noteCallerGone();
+        return;
+      }
+      sentAtLastLook = sent;
+    }, PEER_IMAGE_SERVE_STALL_MS);
+    if (watchdog.unref) watchdog.unref();
+
+    try {
+      archive.pipe(res);
+      await disconnected;
+    } finally {
+      clearInterval(watchdog);
+    }
   } catch (error) {
     log.error(`volumeExecutor - could not hand over the file operation image: ${error.message}`);
     if (!res.headersSent) res.status(500).end();
@@ -691,9 +921,12 @@ async function serveImageToPeer(req, res) {
  */
 async function acquisitionCycle(expected, sources) {
   const fromPeer = await fetchImageFromPeer(expected).catch((error) => {
-    log.info(`volumeExecutor - no peer provided the file operation image: ${error.message}`);
-    return null;
+    log.error(`volumeExecutor - the peer search failed: ${error.message}`);
+    return { peer: null, asked: 0 };
   });
+  if (!fromPeer.peer) {
+    log.info(`volumeExecutor - no peer provided the file operation image: asked ${fromPeer.asked}`);
+  }
 
   if (await heldImageId()) {
     // Where it came from, not just that it is here. The store is asked either
@@ -702,9 +935,9 @@ async function acquisitionCycle(expected, sources) {
     // leaves the image on the disk, and the node goes on asking other peers for
     // something it already has. `unrecognised` is that case, and is the only
     // way it is visible from outside.
-    fluxEventBus.publish('fileoperation:imageAcquired', fromPeer
+    fluxEventBus.publish('fileoperation:imageAcquired', fromPeer.peer
       ? { source: 'peer', peer: fromPeer.peer, asked: fromPeer.asked }
-      : { source: 'unrecognised' });
+      : { source: 'unrecognised', asked: fromPeer.asked });
     return true;
   }
 
@@ -719,7 +952,14 @@ async function acquisitionCycle(expected, sources) {
       // the store is asked rather than the pull taken at its word.
       // eslint-disable-next-line no-await-in-loop
       if (await heldImageId()) {
-        fluxEventBus.publish('fileoperation:imageAcquired', { source: 'registry', asked: attempt + 1 });
+        // `asked` is peers asked, on every branch. It used to be re-used here for
+        // registry attempts, so one key on one event meant two different things
+        // and anything adding them up was adding different denominators - and
+        // the peers this node asked first were invisible whenever the registry
+        // won, which is most of the time.
+        fluxEventBus.publish('fileoperation:imageAcquired', {
+          source: 'registry', asked: fromPeer.asked, attempts: attempt + 1,
+        });
         return true;
       }
       log.warn(`volumeExecutor - ${image} resolved to an image this node is not pinned to`);
@@ -763,7 +1003,20 @@ function scheduleAcquisition(expected) {
  * @returns {Promise<boolean>}
  */
 function acquireImage(expected, options) {
-  if (acquiring) return acquiring;
+  // Sharing a round is right when it is looking where this caller needs it to.
+  // It is not when the round in flight is the prefetch's peers-only one and the
+  // caller was allowed the registry: joining it inherited a refusal from
+  // sources that were never tried, and since the round was also `thenRetry:
+  // false`, nothing was scheduled afterwards either. The caller was simply told
+  // no while the source that would have answered went unasked - and the window
+  // is not short, since four peers that blackhole take minutes.
+  if (acquiring && (acquiringUsedRegistry || !options.registry)) return acquiring;
+
+  if (acquiring) {
+    return acquiring.then((held) => (held ? true : acquireImage(expected, options)));
+  }
+
+  acquiringUsedRegistry = options.registry;
 
   // Only a round that was allowed every source can say the search failed. The
   // prefetch's first round asks peers alone, so it has learned nothing about
@@ -887,8 +1140,16 @@ async function ensureImage(onProgress = null) {
   const held = await heldImageId();
   if (held) return held;
 
+  // How long this node will ACTUALLY refuse for, which is the longer of the two
+  // things that make it refuse: the silence window it is inside, and whatever
+  // the backoff has climbed to. Reporting only the backoff told a caller to come
+  // back in the five-second floor while the node went on refusing for a minute,
+  // so a client that honours the header retried about twelve times for nothing.
+  const silenceLeft = () => (failedAt ? IMAGE_FAILURE_SILENCE_MS - (monotonicMs() - failedAt) : 0);
+  const comeBackIn = () => Math.max(silenceLeft(), backoffUntil - monotonicMs());
+
   if (failedAt && monotonicMs() - failedAt < IMAGE_FAILURE_SILENCE_MS) {
-    throw imageComing(backoffUntil - monotonicMs());
+    throw imageComing(comeBackIn());
   }
 
   if (onProgress) onProgress('Fetching the file operation image...');
@@ -898,7 +1159,7 @@ async function ensureImage(onProgress = null) {
 
   const arrived = await heldImageId();
   if (arrived) return arrived;
-  throw imageComing(backoffUntil - monotonicMs());
+  throw imageComing(comeBackIn());
 }
 
 /**
