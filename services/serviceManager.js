@@ -30,6 +30,9 @@ const appSpawner = require('./appLifecycle/appSpawner');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
+const fileOperationRecovery = require('./appSystem/fileOperationRecovery');
+const networkRecovery = require('./appSystem/networkRecovery');
+const volumeExecutor = require('./appSystem/volumeExecutor');
 const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
@@ -392,6 +395,42 @@ async function startFluxFunctions() {
     await containerMountRecovery.performContainerMountRecovery().catch((error) => {
       log.error(`Container mount recovery service error: ${error.message}`);
     });
+    // A file operation's container is detached from the process that started
+    // it, so a FluxOS restart leaves one running with nobody waiting for its
+    // result, and its staging directory on the volume. Reclaim both - and
+    // restore any destination whose publish was interrupted between its two
+    // renames. Runs after the volumes above are mounted, since the sweep reads
+    // them.
+    // Started BEFORE the recovery below, because the recovery needs it. A
+    // publish interrupted between its two renames is put back by running a
+    // container, so a node that boots without the image cannot do it - and the
+    // failure is per-entry and logged, with nothing that looks again until the
+    // next restart. That leaves the owner's data parked under a reserved name
+    // their file browser hides and their delete refuses, for as long as the
+    // node stays up. Starting the fetch first costs nothing and closes most of
+    // that window.
+    //
+    // Not awaited: the node takes the image at its own place in a window, so
+    // the fleet ends up holding it without every node fetching at the same
+    // moment. A node that cannot reach the registry takes it from one that did,
+    // which only works if they have it.
+    volumeExecutor.startImagePrefetch();
+
+    log.info('Reclaiming interrupted file operations...');
+    await fileOperationRecovery.recoverInterruptedFileOperations().catch((error) => {
+      log.error(`File operation recovery error: ${error.message}`);
+    });
+
+    // At boot, before anything installs: an app network is created per app and
+    // removed only by the uninstaller, so an uninstall interrupted between the
+    // container going and the network going leaves one behind for ever. Each
+    // holds an octet that getFreeFluxAppNetworkOctet cannot hand out again, and
+    // when the last of 255 is gone nothing can be installed on the node.
+    //
+    // Here rather than on a schedule because a sweep must not meet an install
+    // in progress: at boot the expected names are simply what the database
+    // holds, with no window in which an app has a network and no record yet.
+    await networkRecovery.reclaimOrphanedAppNetworks();
     syncthingService.startSyncthingSentinel();
     log.info('Syncthing service started');
     // Awaited: generating an identity rewrites config/userconfig.js, and that
