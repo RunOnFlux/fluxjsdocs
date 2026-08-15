@@ -305,6 +305,9 @@ async function dockerActual(identifier) {
       exists: true,
       running: !!(info.State && info.State.Running),
       exitCode: everRan ? (info.State.ExitCode ?? null) : null,
+      // the kernel's verdict, not the entrypoint's: an image that swallows its
+      // payload's status still cannot hide this one
+      oomKilled: !!(info.State && info.State.OOMKilled),
       finishedAt,
       // classified from THIS inspect so the running-branch network check needs no
       // second docker call (and no TOCTOU between two inspects).
@@ -861,12 +864,25 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  // exists but stopped, should run -> backoff-paced restart (no sleeping; the
-  // worker re-enqueues when the backoff window elapses)
-  const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt);
+  // exists but stopped, should run -> restart, paced by the ladder only when the
+  // stop carries evidence of a fault (no sleeping; the worker re-enqueues when
+  // the backoff window elapses). A clean exit goes back immediately: it is an
+  // operator restarting their own app far more often than it is a crash, and
+  // pacing that turns a deliberate restart into what looks like an outage.
+  // exitCode null is a container that has never run - an initial start, not a death.
+  const crashed = !!actual.oomKilled || (actual.exitCode !== null && actual.exitCode !== 0);
+  const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt, crashed);
   if (wait > 0) {
-    log.warn(`appReconciler - ${identifier} stopped, backing off ${Math.round(wait / 1000)}s before restart`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'backoff', waitMs: wait });
+    // name which of the two put it here: a reported fault, or restarts arriving
+    // fast enough to be one whatever the exit code said. Support cannot tell
+    // these apart from the outside, and the difference decides what they do next.
+    const cause = crashed
+      ? `exit ${actual.exitCode}${actual.oomKilled ? ' (OOM-killed)' : ''}`
+      : 'restarting too fast to be healthy';
+    log.warn(`appReconciler - ${identifier} stopped, ${cause}; backing off ${Math.round(wait / 1000)}s before restart`);
+    fluxEventBus.publish('reconciler:actuated', {
+      identifier, action: 'backoff', waitMs: wait, crashed,
+    });
     scheduleRetry(identifier, wait);
     return;
   }
@@ -887,14 +903,18 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  await appsRuntimeState.recordRestart(identifier);
+  await appsRuntimeState.recordRestart(identifier, crashed);
   try {
     await dockerService.appDockerStart(identifier);
   } catch (err) {
     // No die event fires for a failed start (the container never ran), so a
     // dropped throw here leaves the component down until the hourly sweep.
-    // Schedule our own retry; pacing is free - the attempt was recorded above,
-    // so a persistent failure walks the backoff ladder instead of hammering.
+    // Schedule our own retry. A start that never ran carries no exit code, so it
+    // is not a fault and does not walk the ladder directly - it reaches the
+    // ladder by filling the burst window, which these retries do comfortably
+    // (restartBurstCount x MANAGED_RETRY_MS against restartBurstWindowMs). That
+    // relationship is what bounds a permanently failing start, and the config
+    // comment on the window is where it is stated.
     log.error(`appReconciler - failed to start ${identifier}: ${err.message}; retrying`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'startFailed', reason: err.message });
     scheduleRetry(identifier, MANAGED_RETRY_MS);
@@ -1153,6 +1173,11 @@ module.exports = {
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
+  // The one answer to "what is this container actually doing" - it probes the
+  // daemon rather than pattern-matching an inspect error, so it can tell docker
+  // being unreachable from the container being gone. Anything that acts on a
+  // container's run state needs that distinction, not just the reconciler.
+  dockerActual,
   // exposed for tests
   reconcile,
   policyAllowsRun,
