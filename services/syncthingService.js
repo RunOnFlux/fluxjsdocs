@@ -2355,10 +2355,6 @@ async function adjustSyncthing() {
         }
       }
     }
-    const restartRequired = await getConfigRestartRequired();
-    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-      await systemRestart();
-    }
   } catch (error) {
     log.error(error);
   }
