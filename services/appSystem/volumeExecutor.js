@@ -45,6 +45,16 @@ const EXECUTOR_LABELS = { 'runonflux.role': 'fileop' };
 const nodeLock = new AsyncLock(Number.MAX_SAFE_INTEGER);
 const appLocks = new Map();
 
+// Container ids and staging paths of the operations THIS process has in flight.
+// Boot recovery removes file-operation containers and staging directories left by
+// a PREVIOUS process; consulting these keeps it from reaping one that belongs to an
+// operation running right now. Populated by run() for the life of each operation and
+// cleared in its finally, so "orphaned" means exactly "owned by no live operation"
+// rather than "carries our label" - the API answers requests before recovery runs,
+// so an operation can be in flight when it does.
+const liveContainerIds = new Set();
+const liveStagingPaths = new Set();
+
 function lockForApp(identifier) {
   if (!appLocks.has(identifier)) appLocks.set(identifier, new AsyncLock(Number.MAX_SAFE_INTEGER));
   return appLocks.get(identifier);
@@ -1136,6 +1146,11 @@ const OUTPUT_TAIL_BYTES = 2000;
  */
 const REFUSAL_BY_STATUS = new Map([
   [5, { code: 'EEXIST', message: 'Destination already exists' }],
+  // flux-op refused because the only way to carry the request out was to delete
+  // data it never named - a file put where a directory is, an entry moved onto
+  // itself under another name. A distinct code so a caller answers it specifically
+  // rather than as a generic failure.
+  [6, { code: 'EDESTRUCTIVE', message: 'The destination could only be replaced by deleting data that was not part of this request' }],
 ]);
 
 /**
@@ -1256,7 +1271,7 @@ async function volumeUsedBytes(mount, fsPromises) {
  * stays dropped, including MKNOD, so an archive cannot create device nodes.
  */
 function containerOptions(session, argv, image, workingDir = WORK_ROOT, withInput = false) {
-  const { memoryBytes, pidsLimit } = settings();
+  const { memoryBytes, pidsLimit, cpuCores } = settings();
 
   return {
     Image: image,
@@ -1278,7 +1293,18 @@ function containerOptions(session, argv, image, workingDir = WORK_ROOT, withInpu
       CapAdd: ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'],
       SecurityOpt: ['no-new-privileges'],
       Memory: memoryBytes,
+      // Equal to Memory: this field is memory plus swap in one figure, so equal
+      // means no swap. Left unset, docker grants the same amount again in swap,
+      // and memoryBytes was chosen as the bound on a runaway archive, not half
+      // of one.
+      MemorySwap: memoryBytes,
       PidsLimit: pidsLimit,
+      NanoCPUs: Math.round(cpuCores * 1e9),
+      // A quarter of the default weight: under contention the applications win,
+      // because they are what the node is for and their own CPU quotas were
+      // priced. On an idle core this costs a file operation nothing - shares
+      // only decide who yields when someone has to.
+      CpuShares: 256,
       // Docker's default seccomp and apparmor profiles apply because nothing
       // here disables them. Never pass seccomp=unconfined - it is the change
       // that gets made to "fix" a mystery permissions error and it removes the
@@ -1471,6 +1497,12 @@ async function feedContainer(stdin, input, transferred, exited, stopContainer, r
  *   with EEXIST rather than replacing what is there. The refusal is the rename's
  *   own, so it answers for the instant nothing was written rather than for a
  *   look taken beforehand - the app is writing to this volume throughout.
+ * @param {boolean} [options.merge] - overlay a directory result onto an existing
+ *   directory at the destination rather than replacing it wholesale. Only acts
+ *   when both are directories: a file over a file is still replaced, and a file
+ *   over a directory (or the reverse) is refused either way. Without it a
+ *   directory is never replaced wholesale, since that deletes every entry the
+ *   caller did not name but that sat beside one they did.
  * @param {VolumePath} [options.workingDir] - the directory the command runs in,
  *   defaulting to the volume root. An archiver decides its stored layout from
  *   where it is run and what it is handed, and zip has no equivalent of tar's
@@ -1492,7 +1524,7 @@ async function run(session, argv, options = {}) {
   const {
     onProgress = null, isCanceled = null, status = 'Working...',
     publish = null, mkdirStaging = false, maxBytes = 0, dataOnly = false,
-    noReplace = false, onBytes = null, workingDir = null, input = null,
+    noReplace = false, merge = false, onBytes = null, workingDir = null, input = null,
     slotHeld = false,
   } = options;
 
@@ -1549,6 +1581,7 @@ async function run(session, argv, options = {}) {
       ...(maxBytes > 0 ? ['--max-bytes', String(Math.floor(maxBytes))] : []),
       ...(dataOnly ? ['--data-only'] : []),
       ...(noReplace ? ['--no-replace'] : []),
+      ...(merge ? ['--merge'] : []),
       ...(input ? ['--from-stdin'] : []),
       toParam(target),
       toParam(publish.destination),
@@ -1566,8 +1599,20 @@ async function run(session, argv, options = {}) {
   // whole block for minutes and reads as a container doing nothing.
   const received = { bytes: 0 };
 
+  // Marked live so a restart mid-operation does not reap this container or sweep
+  // this staging directory out from under it. A move or a rename publishes the
+  // caller's own source rather than a staging directory, so there is nothing to
+  // guard for those - only the operations that write into staging. What is
+  // registered - and later reclaimed - is the minted ROOT: for an entry nested
+  // in a staging directory that is the directory, so the scratch a tool wrote
+  // beside its output goes with it.
+  const registeredStaging = publish && publish.staging
+    ? stagingRootOf(publish.staging.hostPath, session.mount)
+    : null;
   const release = slotHeld ? () => {} : acquireSlot(session.identifier);
   let container = null;
+  let registeredContainerId = null;
+  if (registeredStaging) liveStagingPaths.add(registeredStaging);
   let ticker = null;
   // Hoisted so the `finally` can reach them: everything this function opens is
   // closed there, and a handle declared inside the `try` is out of scope.
@@ -1578,8 +1623,8 @@ async function run(session, argv, options = {}) {
   let settled = false;
   // stop, not kill: this sends SIGTERM first and only escalates to SIGKILL
   // after the grace period. flux-op traps the TERM, stops the command and
-  // reclaims its staging directory - a SIGKILL reaches neither, and the space
-  // stays spent until the next boot sweep.
+  // reclaims its staging directory - a SIGKILL reaches neither, which is what
+  // reclaimStaging in the finally is for.
   const stopContainer = () => {
     if (!container) return;
     container.stop({ t: settings().cancelGraceSeconds }).catch(() => {});
@@ -1621,6 +1666,15 @@ async function run(session, argv, options = {}) {
     const image = await ensureImage(onProgress);
     await assertMountIsLive(session);
 
+    // A nested staging entry's directory has to exist before the command does:
+    // zip cannot create its output's parent. Host-side for the same reasons
+    // the sweep is, and after the mount check for the same reason everything
+    // else here is.
+    if (registeredStaging && registeredStaging !== publish.staging.hostPath) {
+      const made = await serviceHelper.runCommand('mkdir', { runAsRoot: true, params: ['-p', registeredStaging] });
+      if (made.error) throw made.error;
+    }
+
     container = await dockerService.createContainer(
       containerOptions(
         session,
@@ -1630,6 +1684,8 @@ async function run(session, argv, options = {}) {
         Boolean(input),
       ),
     );
+    registeredContainerId = container.id;
+    liveContainerIds.add(registeredContainerId);
 
     // Opened BEFORE start, and on next-exit rather than the default. The
     // default condition is "not-running", which a created container already
@@ -1809,7 +1865,91 @@ async function run(session, argv, options = {}) {
     // while the slot released below lets another operation start on the same
     // app. A container that has already exited reaps itself.
     if (container && !settled) stopContainer();
+    if (registeredContainerId) liveContainerIds.delete(registeredContainerId);
+    // Deregistered by the reclaim once it has run, not here: a sweep running
+    // while the reclaim waits out the container must still skip this path.
+    if (registeredStaging) reclaimStaging(registeredStaging, exited);
     release();
+  }
+}
+
+/**
+ * Remove one staging entry, on the host.
+ *
+ * Host-side rather than in a container, for the same reasons the sweep is: the
+ * path is the mount plus one minted component with nothing to traverse, `rm
+ * -rf` removes a symlink rather than following it, and a node that cannot
+ * fetch the executor image still reclaims its debris. Root, because the
+ * container wrote into it as root and the FluxOS process is not root
+ * everywhere.
+ *
+ * @param {string} hostPath absolute path of the staging entry
+ */
+async function removeStagingPath(hostPath) {
+  const result = await serviceHelper.runCommand('rm', { runAsRoot: true, params: ['-rf', hostPath] });
+  if (result.error) throw result.error;
+}
+
+/**
+ * The minted root an operation's staging entry lives under.
+ *
+ * What the live registry holds and the reclaim removes: for a plain staging
+ * entry that is the entry itself, and for one nested in a staging DIRECTORY
+ * (a compress archive, with the tool's scratch beside it) it is the
+ * directory, so the scratch goes with the entry. The root must carry the
+ * minted shape, because deriving a DIFFERENT path than the caller handed over
+ * and then rm -rf'ing it deserves proof it is ours.
+ *
+ * @param {string} hostPath the staging entry's host path
+ * @param {string} mount the volume root
+ * @returns {string} the root-level path to register and reclaim
+ */
+function stagingRootOf(hostPath, mount) {
+  const [top, ...rest] = path.relative(mount, hostPath).split(path.sep);
+  if (!rest.length) return hostPath;
+  if (!isStagingName(top)) {
+    throw new Error('A nested staging entry must live under a minted staging directory');
+  }
+  return path.join(mount, top);
+}
+
+/**
+ * Reclaim an operation's staging path once its container is gone.
+ *
+ * flux-op removes its own staging on every exit it is allowed to see - but
+ * SIGKILL is not one of those: the memory cgroup OOM-killing PID 1, a cancel
+ * whose grace expired mid-removal, a dockerd restart. The path then holds
+ * whatever was staged - up to the volume's whole free space - under a name the
+ * owner can neither see (filtered from the listing) nor delete (refused), and
+ * it used to stay that way until the next FluxOS restart. FluxOS minted the
+ * name, so FluxOS ends it: once the container's exit has been observed
+ * (bounded by the cancel grace plus a margin, for a wait whose connection died
+ * with dockerd), whatever is left at the path is removed. Ordinarily nothing
+ * is - the publish renamed it away or flux-op removed it - and the rm is a
+ * no-op.
+ *
+ * Deliberately not awaited by run(): the slot is released the moment the
+ * operation ends, and this finishes on its own clock. The path stays in
+ * liveStagingPaths until it is done, so a sweep running meanwhile still skips
+ * it.
+ *
+ * @param {string} hostPath the operation's registered staging path
+ * @param {Promise<object>|null} exited the container's exit subscription, if one was opened
+ */
+async function reclaimStaging(hostPath, exited) {
+  try {
+    if (exited) {
+      const graceMs = (settings().cancelGraceSeconds * 1000) + 10000;
+      let deadline;
+      const deadlinePassed = new Promise((resolve) => { deadline = setTimeout(resolve, graceMs); });
+      await Promise.race([exited.catch(() => {}), deadlinePassed]);
+      clearTimeout(deadline);
+    }
+    await removeStagingPath(hostPath);
+  } catch (error) {
+    log.warn(`volumeExecutor - could not reclaim ${hostPath}: ${error.message}`);
+  } finally {
+    liveStagingPaths.delete(hostPath);
   }
 }
 
@@ -1821,9 +1961,11 @@ async function run(session, argv, options = {}) {
  * reclaimed separately by sweepStagingDirectories; nothing it wrote is visible
  * at a destination path, because publishing is the last thing flux-op does.
  *
- * Selection is by LABEL. This is the ownership-scoped removal that replaced the
- * blanket container prune: it removes what FluxOS knows it started, rather than
- * everything docker currently considers unused.
+ * Selection is by LABEL, less what a live operation owns. This is the
+ * ownership-scoped removal that replaced the blanket container prune: it removes
+ * what FluxOS knows it started and is NOT still running, rather than everything
+ * docker currently considers unused. The API answers before this runs, so a
+ * container this process created moments ago is skipped by its id.
  *
  * @returns {Promise<number>} how many were removed
  */
@@ -1837,7 +1979,9 @@ async function reapOrphanedContainers() {
   }
 
   const orphans = (containers || []).filter(
-    (container) => container.Labels && container.Labels['runonflux.role'] === 'fileop',
+    (container) => container.Labels
+      && container.Labels['runonflux.role'] === 'fileop'
+      && !liveContainerIds.has(container.Id),
   );
 
   let removed = 0;
@@ -1875,9 +2019,11 @@ async function reapOrphanedContainers() {
  * number and a timestamp, neither of which is unique, and the cost of being
  * wrong was deleting that copy.
  *
- * Matched against a real identifier shape rather than by prefix, because this
- * DELETES what it matches in a directory the app owner also writes to, and
- * `.flux-op-backups` is a name somebody may legitimately have chosen.
+ * Matched against a real identifier shape rather than by prefix, and skipping any
+ * a live operation is still writing into, because this DELETES what it matches in a
+ * directory the app owner also writes to: `.flux-op-backups` is a name somebody may
+ * legitimately have chosen, and a `.flux-op-<uuid>` an operation of this process
+ * minted is one it still needs.
  *
  * On the host rather than in a container: the name came from readdir, so it is
  * one component with nothing to traverse, and `rm -rf` unlinks a symlink rather
@@ -1897,20 +2043,15 @@ async function sweepStagingDirectories(session) {
 
   const removed = [];
 
-  // On the host, and safe there: `name` came from readdir, so it is one
-  // component with nothing to traverse, and `rm -rf` removes a symlink rather
-  // than following it. It needs no container, so a node that cannot fetch the
-  // executor image still reclaims its debris.
   const remove = async (name) => {
-    const result = await serviceHelper.runCommand('rm', { runAsRoot: true, params: ['-rf', path.join(mount, name)] });
-    if (result.error) throw result.error;
+    await removeStagingPath(path.join(mount, name));
     removed.push(name);
   };
 
   // eslint-disable-next-line no-restricted-syntax
   for (const entry of entries) {
     try {
-      if (isStagingName(entry)) {
+      if (isStagingName(entry) && !liveStagingPaths.has(path.join(mount, entry))) {
         // eslint-disable-next-line no-await-in-loop
         await remove(entry);
       }
