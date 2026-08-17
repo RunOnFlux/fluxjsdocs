@@ -5,7 +5,6 @@ const path = require('node:path');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
 const volumeService = require('../utils/volumeService');
-const { SYNCTHING_IGNORE_FILE, SYNCTHING_IGNORE_LINES } = require('../appSystem/volumeReservedNames');
 const {
   DEVICE_ID_REQUEST_TIMEOUT_MS,
   SYNCTHING_RESCAN_INTERVAL_SECONDS,
@@ -296,52 +295,6 @@ function folderNeedsUpdate(existingFolder, newFolder) {
   );
 }
 
-/**
- * Ensure the folder's .stignore carries every FluxOS policy line.
- *
- * Volume creation writes the file once, so a folder created before a policy
- * line existed never hears about it - every existing g:/r:/s: app carries the
- * creation-era content until something converges it, and the monitor pass is
- * the one place every replicated folder is already visited with its mount
- * verified. Missing lines are appended; anything else in the file is kept,
- * because asserting our lines does not require destroying lines we did not
- * write. Almost every pass reads, compares, and does nothing.
- *
- * Call only after the mount check has passed: on the bare directory this
- * would write to the host filesystem, exactly the leak ensureStfolderExists
- * refuses.
- *
- * @param {string} folder - Folder path
- */
-async function ensureStignoreCovers(folder) {
-  const ignorePath = path.join(folder, SYNCTHING_IGNORE_FILE);
-  const tmpPath = path.join(folder, `${SYNCTHING_IGNORE_FILE}.tmp.${process.pid}`);
-  try {
-    const current = await fs.readFile(ignorePath, 'utf8').catch((error) => {
-      if (error.code !== 'ENOENT') throw error;
-      return '';
-    });
-    const lines = current.split('\n');
-    const missing = SYNCTHING_IGNORE_LINES.filter((line) => !lines.includes(line));
-    if (!missing.length) return;
-    const kept = current === '' || current.endsWith('\n') ? current : `${current}\n`;
-    // Written to a temp beside the target and moved over it as root. The move
-    // is an atomic replace on the same filesystem, so a crash never leaves a
-    // half-written .stignore; and as root it lands even when the existing file
-    // is root-owned from an older FluxOS-as-root build, where an in-place write
-    // would fail EACCES and the staging-ignore protection would silently never
-    // arrive. ensureStfolderExists does its own work as root for the same
-    // reason.
-    await fs.writeFile(tmpPath, `${kept}${missing.join('\n')}\n`);
-    const moved = await serviceHelper.runCommand('mv', { runAsRoot: true, params: [tmpPath, ignorePath] });
-    if (moved.error) throw moved.error;
-    log.info(`ensureStignoreCovers - added ${missing.join(', ')} to ${ignorePath}`);
-  } catch (error) {
-    await fs.unlink(tmpPath).catch(() => {});
-    log.error(`ensureStignoreCovers - could not converge ${ignorePath}: ${error.message}`);
-  }
-}
-
 module.exports = {
   getDeviceID,
   getDeviceIDCached,
@@ -350,7 +303,6 @@ module.exports = {
   buildDeviceConfiguration,
   createSyncthingFolderConfig,
   ensureStfolderExists,
-  ensureStignoreCovers,
   getContainerFolderPath,
   getContainerDataFlags,
   requiresSyncing,
