@@ -5,6 +5,8 @@ const path = require('node:path');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
 const volumeService = require('../utils/volumeService');
+const { SYNCTHING_IGNORE_LINES } = require('../appSystem/volumeReservedNames');
+const syncthingService = require('../syncthingService');
 const {
   DEVICE_ID_REQUEST_TIMEOUT_MS,
   SYNCTHING_RESCAN_INTERVAL_SECONDS,
@@ -295,6 +297,46 @@ function folderNeedsUpdate(existingFolder, newFolder) {
   );
 }
 
+/**
+ * Ensure a folder's syncthing ignores carry every FluxOS policy line.
+ *
+ * .stignore is syncthing's own control file - it writes it atomically, runs as
+ * root so it lands on any legacy root-owned file, and never replicates it or
+ * its temp. So FluxOS sets the patterns through syncthing's API rather than
+ * writing the file: there is no temp, no ownership dance, and nothing on the
+ * volume to orphan on a powercut. Volume creation still seeds the file directly
+ * for a brand-new folder syncthing does not yet know; this converges every
+ * EXISTING folder whose ignores predate a policy line.
+ *
+ * Additive: syncthing's POST replaces the whole set, so the current patterns
+ * are read and the missing lines appended before posting - anything an app
+ * added in-container is kept. Nothing is posted when every line is already
+ * present, so a converged folder is neither rewritten nor rescanned. Every
+ * syncthing call returns its outcome in-band and never throws, so status is
+ * checked rather than caught.
+ *
+ * Call only for a folder syncthing already knows (the caller checks); on an
+ * unknown folder the API would answer with an error and nothing would converge.
+ *
+ * @param {string} folderId - the syncthing folder id (the app identifier)
+ */
+async function ensureStignoreCovers(folderId) {
+  const read = await syncthingService.getFolderIgnores(folderId);
+  if (read.status !== 'success') {
+    log.error(`ensureStignoreCovers - could not read ignores for ${folderId}: ${read.data?.message ?? 'unknown error'}`);
+    return;
+  }
+  const current = Array.isArray(read.data?.ignore) ? read.data.ignore : [];
+  const missing = SYNCTHING_IGNORE_LINES.filter((line) => !current.includes(line));
+  if (!missing.length) return;
+  const written = await syncthingService.setFolderIgnores(folderId, [...current, ...missing]);
+  if (written.status !== 'success') {
+    log.error(`ensureStignoreCovers - could not set ignores for ${folderId}: ${written.data?.message ?? 'unknown error'}`);
+    return;
+  }
+  log.info(`ensureStignoreCovers - added ${missing.join(', ')} to ${folderId} ignores`);
+}
+
 module.exports = {
   getDeviceID,
   getDeviceIDCached,
@@ -303,6 +345,7 @@ module.exports = {
   buildDeviceConfiguration,
   createSyncthingFolderConfig,
   ensureStfolderExists,
+  ensureStignoreCovers,
   getContainerFolderPath,
   getContainerDataFlags,
   requiresSyncing,
