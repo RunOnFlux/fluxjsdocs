@@ -1,10 +1,8 @@
 const config = require('config');
 const util = require('util');
+const df = require('node-df');
 const fs = require('node:fs');
 const path = require('node:path');
-const {
-  SYNCTHING_FOLDER_MARKER, SYNCTHING_IGNORE_FILE, SYNCTHING_IGNORE_LINES,
-} = require('../appSystem/volumeReservedNames');
 const nodecmd = require('node-cmd');
 const axios = require('axios');
 const dbHelper = require('../dbHelper');
@@ -30,7 +28,6 @@ const {
   appsFolder,
   appVolumesPath,
   legacyAppVolumesPath,
-  APP_VOLUME_MOUNT_OPTIONS,
 } = require('../utils/appConstants');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { compareInstanceSeniority } = require('../utils/instanceOrdering');
@@ -44,6 +41,7 @@ const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
 const appNetworkLinker = require('./appNetworkLinker');
+const fluxEventBus = require('../utils/fluxEventBus');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -417,6 +415,7 @@ let dosMountMessage = '';
  * @returns {Promise<void>}
  */
 async function createAppVolume(appSpecifications, appName, isComponent, res) {
+  const dfAsync = util.promisify(df);
   const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
   const appId = dockerService.getAppIdentifier(identifier);
 
@@ -429,7 +428,22 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     if (res.flush) res.flush();
   }
 
-  const okVolumes = await volumeService.capacityVolumesInGib();
+  // we want whole numbers in GB
+  const options = {
+    prefixMultiplier: 'GB',
+    isDisplayPrefixMultiplier: false,
+    precision: 0,
+  };
+
+  const dfres = await dfAsync(options);
+  const okVolumes = [];
+  dfres.forEach((volume) => {
+    if (volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop') && !volume.mount.includes('boot')) {
+      okVolumes.push(volume);
+    } else if (volume.filesystem.includes('loop') && volume.mount === '/') {
+      okVolumes.push(volume);
+    }
+  });
 
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -588,7 +602,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       res.write(serviceHelper.ensureString(mountingStatus));
       if (res.flush) res.flush();
     }
-    await execAsRoot('mount', ['-o', APP_VOLUME_MOUNT_OPTIONS, volumeFile, appDir]);
+    await execAsRoot('mount', ['-o', 'loop', volumeFile, appDir]);
     const mountingStatus2 = {
       status: 'Volume mounted',
     };
@@ -760,7 +774,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       // mountpoint - it is syncthing's own guard against syncing an unmounted
       // dir, and the immutable bare mountpoint guarantees it can never be
       // recreated there.
-      await execAsRoot('mkdir', ['-p', path.join(appDir, SYNCTHING_FOLDER_MARKER)]);
+      await execAsRoot('mkdir', ['-p', path.join(appDir, '.stfolder')]);
       const stFolderCreation2 = {
         status: '.stfolder created',
       };
@@ -770,10 +784,9 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
         if (res.flush) res.flush();
       }
 
-      // Create .stignore with the FluxOS policy lines - what keeps backup and
-      // an operation's staging off the network (in parent directory; the app
-      // dir is 777 by now so no elevation is needed)
-      await fs.promises.writeFile(path.join(appDir, SYNCTHING_IGNORE_FILE), `${SYNCTHING_IGNORE_LINES.join('\n')}\n`);
+      // Create .stignore file to exclude backup directory (in parent
+      // directory; the app dir is 777 by now so no elevation is needed)
+      await fs.promises.writeFile(path.join(appDir, '.stignore'), '/backup\n');
       const stiFileCreation = {
         status: '.stignore created',
       };
@@ -2443,12 +2456,28 @@ async function testAppMount() {
     await removeTestAppMount();
     const appSize = 1;
     const overHeadRequired = 2;
+    const dfAsync = util.promisify(df);
     const appId = 'flux_fluxTestVol';
 
     log.info('Mount Test: started');
     log.info('Mount Test: Searching available space...');
 
-    const okVolumes = await volumeService.capacityVolumesInGib();
+    // we want whole numbers in GB
+    const options = {
+      prefixMultiplier: 'GB',
+      isDisplayPrefixMultiplier: false,
+      precision: 0,
+    };
+
+    const dfres = await dfAsync(options);
+    const okVolumes = [];
+    dfres.forEach((volume) => {
+      if (volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop') && !volume.mount.includes('boot')) {
+        okVolumes.push(volume);
+      } else if (volume.filesystem.includes('loop') && volume.mount === '/') {
+        okVolumes.push(volume);
+      }
+    });
 
     // check if space is not sharded in some bad way. Always count the fluxSystemReserve
     let useThisVolume = null;
@@ -2491,7 +2520,7 @@ async function testAppMount() {
     log.info('Mount Test: Directory made');
     log.info('Mount Test: Mounting volume...');
 
-    await execAsRoot('mount', ['-o', APP_VOLUME_MOUNT_OPTIONS, volumePath, path.join(appsFolder, appId)]);
+    await execAsRoot('mount', ['-o', 'loop', volumePath, path.join(appsFolder, appId)]);
     log.info('Mount Test: Volume mounted. Test completed.');
     dosMountMessage = '';
     // run removal
@@ -2884,7 +2913,82 @@ async function updateAppGlobalyApi(req, res) {
 }
 
 /**
- * To find and remove apps that are spawned more than maximum number of instances allowed locally.
+ * Whether this node is the primary currently elected to run an app's `g:`
+ * component.
+ *
+ * A `g:` component runs on one node at a time, and that node is the one writing
+ * to the volume. Handing the app back from under it drops whatever it has
+ * written since the peer last reported the folder complete, so the primary
+ * stands down and lets masterSlaveApps elect a successor before it may leave.
+ *
+ * The election keys one identifier per app - the app name below v4, and
+ * `<component>_<app>` above it - so both forms are matched.
+ * @param {string} appName Global app name.
+ * @param {string} localSocketAddr This node's socket address.
+ * @returns {boolean}
+ */
+function isElectedPrimaryHere(appName, localSocketAddr) {
+  // eslint-disable-next-line no-restricted-syntax
+  for (const [identifier, masterIp] of mastersRunningGSyncthingApps) {
+    const namesThisApp = identifier === appName || identifier.endsWith(`_${appName}`);
+    if (namesThisApp && ipsMatch(masterIp, localSocketAddr)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether this node should give up an app, and why.
+ *
+ * Two reasons, one answer. SURPLUS: the app runs on more nodes than it needs and
+ * this node holds the junior instance. EVACUATION: the node is shedding what it
+ * holds because it is no longer fit to serve, and this app's turn has come.
+ *
+ * Only the reason is decided here. Whether it is SAFE to act on it is
+ * appEvacuationSafety's question, and both must agree - a count has never been
+ * able to tell a redundant copy from the last one that holds the data.
+ * @param {object} installedApp Locally installed app record.
+ * @param {object[]} runningAppList Instance locations for the app.
+ * @param {string} localSocketAddr This node's socket address.
+ * @returns {{giveUp: boolean, reason: string, detail: string}}
+ */
+function reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr) {
+  // lazy load to avoid circular dependency
+  // eslint-disable-next-line global-require
+  const residentialNodeDosService = require('../residentialNodeDosService');
+  const minInstances = installedApp.instances || config.fluxapps.minimumInstances;
+
+  if (runningAppList.length > minInstances) {
+    // junior end first: the newest instance stands aside, ties broken
+    // by the shared ordering so every node names the same surplus
+    const ordered = [...runningAppList].sort((a, b) => compareInstanceSeniority(b, a));
+    const index = ordered.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
+    if (index === 0) {
+      return {
+        giveUp: true,
+        reason: 'SURPLUS',
+        detail: `running on ${runningAppList.length} instances (max: ${minInstances}) and this node is the newest`,
+      };
+    }
+  }
+
+  if (residentialNodeDosService.isEvacuating()) {
+    const verdict = residentialNodeDosService.mayEvacuateApp(installedApp.name, runningAppList, localSocketAddr);
+    if (verdict.ok) {
+      return {
+        giveUp: true,
+        reason: 'EVACUATION',
+        detail: 'node is not fit to serve and is handing its apps back',
+      };
+    }
+    return { giveUp: false, reason: 'EVACUATION', detail: verdict.reason };
+  }
+
+  return { giveUp: false, reason: 'NONE', detail: '' };
+}
+
+/**
+ * The single pass that decides whether this node should stop holding an app.
+ * At most one app goes per pass, spaced by config.fluxapps.removal.delay.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function checkAndRemoveApplicationInstance() {
@@ -2908,36 +3012,75 @@ async function checkAndRemoveApplicationInstance() {
     const appUninstaller = require('./appUninstaller');
     // eslint-disable-next-line global-require
     const registryManager = require('../appDatabase/registryManager');
+    // eslint-disable-next-line global-require
+    const evacuationSafety = require('./appEvacuationSafety');
+    // eslint-disable-next-line global-require
+    const residentialNodeDosService = require('../residentialNodeDosService');
+    // eslint-disable-next-line global-require
+    const { findSyncedPeer } = require('../appMonitoring/syncthingFolderStateMachine');
+
+    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+    if (!localSocketAddr) {
+      log.info('Give-up-an-app pass skipped: local socket address unknown');
+      return;
+    }
+
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled) {
       // eslint-disable-next-line no-await-in-loop
       const runningAppList = await registryManager.appLocation(installedApp.name);
-      const minInstances = installedApp.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
-      if (runningAppList.length > minInstances) {
-        // eslint-disable-next-line no-await-in-loop
-        const appDetails = await registryManager.getApplicationGlobalSpecifications(installedApp.name);
-        if (appDetails) {
-          log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking if should be unninstalled from the FluxNode..`);
-          // junior end first: the newest instance stands aside, ties broken
-          // by the shared ordering so every node names the same surplus
-          runningAppList.sort((a, b) => compareInstanceSeniority(b, a));
-          // eslint-disable-next-line no-await-in-loop
-          const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-          if (localSocketAddr) {
-            const index = runningAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
-            if (index === 0) {
-              log.info(`Application ${installedApp.name} going to be removed from node as it was the latest one running it to install it..`);
-              log.warn(`REMOVAL REASON: Too many instances - ${installedApp.name} running on ${runningAppList.length} instances (max: ${minInstances}) - This node is the newest instance`);
-              log.warn(`Removing application ${installedApp.name} locally`);
-              // eslint-disable-next-line no-await-in-loop
-              await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
-              log.warn(`Application ${installedApp.name} locally removed`);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
-            }
-          }
+      const decision = reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr);
+      // Every pass reports what it decided about every app it holds. Without
+      // this the pass is invisible: it logs nothing at all when it has nothing
+      // to give up, so "never ran" and "ran and declined" read identically, and
+      // a suite can only tell them apart by scraping logs.
+      fluxEventBus.publish('giveUp:considered', {
+        appName: installedApp.name,
+        giveUp: decision.giveUp,
+        reason: decision.reason,
+        detail: decision.detail,
+      });
+      if (!decision.giveUp) {
+        if (decision.reason === 'EVACUATION') {
+          log.info(`${installedApp.name} not handed back yet: ${decision.detail}`);
         }
+        // eslint-disable-next-line no-continue
+        continue;
       }
+
+      // eslint-disable-next-line no-await-in-loop
+      const safety = await evacuationSafety.canSafelyRemoveApp(installedApp.name, {
+        appLocation: registryManager.appLocation,
+        getApplicationGlobalSpecifications: registryManager.getApplicationGlobalSpecifications,
+        findSyncedPeer,
+        isElectedPrimary: (name) => isElectedPrimaryHere(name, localSocketAddr),
+      });
+      fluxEventBus.publish('giveUp:safety', {
+        appName: installedApp.name,
+        reason: decision.reason,
+        safe: safety.safe,
+        detail: safety.reason,
+      });
+      if (!safety.safe) {
+        // The observation window restarts, so the queue wait is served against an
+        // uninterrupted period of the app being whole rather than accumulated
+        // across a gap.
+        residentialNodeDosService.forgetAppObservation(installedApp.name);
+        log.info(`${installedApp.name} would be given up (${decision.reason}) but it is not safe: ${safety.reason}`);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      log.warn(`REMOVAL REASON: ${decision.reason} - ${installedApp.name} ${decision.detail}. Safe: ${safety.reason}`);
+      // eslint-disable-next-line no-await-in-loop
+      await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
+      log.warn(`Application ${installedApp.name} locally removed`);
+      if (decision.reason === 'EVACUATION') {
+        residentialNodeDosService.noteEvacuated(installedApp.name);
+      }
+      // One per pass. Removing a second here would take two instances off the
+      // network before the spawner has replaced either.
+      return;
     }
   } catch (error) {
     log.error(error);
@@ -4149,6 +4292,8 @@ module.exports = {
   installationInProgressReset,
   setInstallationInProgressTrue,
   checkAndRemoveApplicationInstance,
+  reasonToGiveUpApp,
+  isElectedPrimaryHere,
   reinstallOldApplications,
   checkAndRemoveEnterpriseAppsOnNonArcane,
   forceAppRemovals,

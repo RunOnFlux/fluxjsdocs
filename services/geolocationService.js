@@ -1,9 +1,11 @@
 const config = require('config');
+const dns = require('node:dns').promises;
 const log = require('../lib/log');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const { extractIp } = require('./utils/socketAddressUtils');
 const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
+const networkClassifier = require('./utils/networkClassifier');
 
 const { geolocation: geolocationCollection } = config.database.local.collections;
 
@@ -13,7 +15,30 @@ let staticIp = false;
 let dataCenter = false;
 let lastIpChangeDate = null;
 let execution = 1;
-const staticIpOrgs = ['hetzner', 'ovh', 'netcup', 'hostnodes', 'contabo', 'hostslim', 'zayo', 'cogent', 'lumen'];
+// What this node observed about its own address - never the verdict drawn from
+// it. Gathering costs an ip-api call and a PTR lookup, so it happens on the slow
+// pass; the verdict also needs the published table, which is cheap to consult
+// and arrives later, so it is reached on demand.
+//
+// Null means nothing has been gathered yet, which readers must distinguish from
+// a verdict of UNKNOWN: "not observed" against "observed, and the evidence does
+// not decide".
+let networkEvidence = null;
+
+/**
+ * Whether this address stays put. Three-state, because "we have not observed it
+ * long enough" is a different answer from "it moves", and only one of them
+ * should keep a node away from apps that need a stable address.
+ */
+const STATIC_IP_STATE = Object.freeze({
+  STATIC: 'STATIC',
+  DYNAMIC: 'DYNAMIC',
+  UNKNOWN: 'UNKNOWN',
+});
+let staticIpState = STATIC_IP_STATE.UNKNOWN;
+// The stability window is measured from here, not from lastIpChangeDate, which
+// stays null until a change is actually seen.
+let ipFirstSeenAt = null;
 const staticIpStabilityDays = 10;
 
 /**
@@ -23,7 +48,7 @@ const staticIpStabilityDays = 10;
  * @param {boolean} isDataCenter - Whether the node is in a data center
  * @param {number|null} ipChangeDate - Timestamp of when the IP last changed
  */
-async function storeGeolocationToDb(geolocation, isStaticIp, isDataCenter, ipChangeDate) {
+async function storeGeolocationToDb(geolocation, isStaticIp, isDataCenter, ipChangeDate, observations = {}) {
   try {
     const dbClient = dbHelper.databaseConnection();
     if (!dbClient) {
@@ -38,6 +63,11 @@ async function storeGeolocationToDb(geolocation, isStaticIp, isDataCenter, ipCha
         staticIp: isStaticIp,
         dataCenter: isDataCenter,
         lastIpChangeDate: ipChangeDate,
+        // The window is an observation, so it outlives the process: a restart
+        // that reset it would hold every node at UNKNOWN for another ten days.
+        ipFirstSeenAt: observations.ipFirstSeenAt ?? null,
+        staticIpState: observations.staticIpState ?? null,
+        networkEvidence: observations.networkEvidence ?? null,
         updatedAt: Date.now(),
       },
     };
@@ -68,12 +98,123 @@ async function getGeolocationFromDb() {
         staticIp: result.staticIp || false,
         dataCenter: result.dataCenter || false,
         lastIpChangeDate: result.lastIpChangeDate || null,
+        ipFirstSeenAt: result.ipFirstSeenAt || null,
+        // `?? null`: a document written before these fields existed carries no
+        // observation, and saying so lets the next pass start the window.
+        staticIpState: result.staticIpState ?? null,
+        networkEvidence: result.networkEvidence ?? null,
       };
     }
-    return { geolocation: null, staticIp: false, dataCenter: false, lastIpChangeDate: null };
+    return {
+      geolocation: null,
+      staticIp: false,
+      dataCenter: false,
+      lastIpChangeDate: null,
+      ipFirstSeenAt: null,
+      staticIpState: null,
+      networkEvidence: null,
+    };
   } catch (error) {
     log.error(`Failed to retrieve geolocation from database: ${error.message}`);
-    return { geolocation: null, staticIp: false, dataCenter: false, lastIpChangeDate: null };
+    return {
+      geolocation: null,
+      staticIp: false,
+      dataCenter: false,
+      lastIpChangeDate: null,
+      ipFirstSeenAt: null,
+      staticIpState: null,
+      networkEvidence: null,
+    };
+  }
+}
+
+/**
+ * Reverse DNS for this node's own address - the strongest signal about the
+ * network that does not come from a vendor.
+ * @param {string} ip The node's public address.
+ * @returns {Promise<string|null>} The first PTR name, or null when there is none.
+ */
+async function resolvePtr(ip) {
+  try {
+    const names = await dns.reverse(ip);
+    return (names && names.length) ? names[0] : null;
+  } catch (error) {
+    // No PTR is ordinary - roughly a quarter of fleet hosts have none. It costs
+    // one signal, and the classifier decides on what remains.
+    return null;
+  }
+}
+
+/**
+ * What the published location table says about an address.
+ *
+ * The table is the authority. It is built in the policy repo from evidence a
+ * node cannot gather for itself - chiefly the registries' own record of what a
+ * block was assigned for, which six thousand nodes cannot each go and fetch -
+ * and it is reviewed there with its reasons rather than derived here.
+ *
+ * TWO OUTCOMES, AND THEY MUST NOT BE CONFUSED:
+ *
+ *   consulted: false  the table could not be asked - none has been ingested
+ *                     yet, or the store could not be read. Nothing is known,
+ *                     and a node must reach no verdict at all.
+ *   consulted: true   the table answered. `classification` is its verdict, or
+ *                     null where it holds none for this address: no covering
+ *                     row, or an organisation the policy repo deliberately
+ *                     left unclassified. THAT null is an answer, and it is what
+ *                     hands the decision to the node's own evidence.
+ *
+ * Collapsing the two is the very mistake this whole classifier exists to
+ * avoid, one level up: "I have not asked" is not "there is no verdict". A node
+ * boots, fetches a 4.6 MB artifact, and ingests two million rows, while a
+ * single ip-api call answers in milliseconds - so the table is reliably absent
+ * at the moment a booting node would otherwise decide, and treating that as an
+ * abstention lets the node act on its own guess against a verdict the table
+ * was about to give it.
+ * @param {string} ip The node's public address.
+ * @returns {Promise<{consulted: boolean, classification: string|null}>}
+ */
+async function publishedClassification(ip) {
+  // Lazily required, like the benchmark service below: the location store
+  // pulls in the database layer, and geolocation is read on paths that must
+  // not depend on it being up.
+  // eslint-disable-next-line global-require
+  const ipLocationStore = require('./appPlacement/ipLocationStore');
+  if (!ipLocationStore.status().ready) {
+    return { consulted: false, classification: null };
+  }
+  try {
+    const hit = await ipLocationStore.lookup(ip);
+    return { consulted: true, classification: hit?.networkClass ?? null };
+  } catch (error) {
+    // A table that cannot be read is a table that was not asked. Same as above:
+    // not evidence about the address, and not an abstention either.
+    log.info(`Location table could not answer for ${ip}: ${error.message}`);
+    return { consulted: false, classification: null };
+  }
+}
+
+/**
+ * Bench upload/download, for the link-asymmetry signal. Required lazily to keep
+ * geolocation off the benchmark service's load path.
+ * @returns {Promise<{uploadSpeed: number, downloadSpeed: number}>} Zeroes when
+ * bench cannot be read, which the classifier reads as no signal rather than as a
+ * symmetric link.
+ */
+async function benchLinkSpeeds() {
+  try {
+    // eslint-disable-next-line global-require
+    const benchmarkService = require('./benchmarkService');
+    const response = await benchmarkService.getBenchmarks();
+    if (!response || response.status !== 'success' || !response.data) {
+      return { uploadSpeed: 0, downloadSpeed: 0 };
+    }
+    return {
+      uploadSpeed: response.data.upload_speed || 0,
+      downloadSpeed: response.data.download_speed || 0,
+    };
+  } catch (error) {
+    return { uploadSpeed: 0, downloadSpeed: 0 };
   }
 }
 
@@ -100,7 +241,11 @@ async function setNodeGeolocation() {
       log.info(`Checking geolocation of ${localIp}`);
       storedIp = localSocketAddr;
       // consider another service failover or stats db
-      const ipApiUrl = `${config.geolocation.ipApiBaseUrl}/json/${localIp}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org,isp,proxy,hosting`;
+      // `as` names the operator's own autonomous system, which does not vary
+      // with who registered a /29: across the fleet 227 ASNs separate hosting
+      // from access networks with only 8 carrying both, against 87 distinct
+      // `org` strings for the 329 nodes this decides about.
+      const ipApiUrl = `${config.geolocation.ipApiBaseUrl}/json/${localIp}?fields=status,continent,continentCode,country,countryCode,region,regionName,lat,lon,query,org,isp,as,proxy,hosting,mobile`;
       const ipRes = await serviceHelper.axiosGet(ipApiUrl);
       if (ipRes.data.status === 'success' && ipRes.data.query !== '') {
         storedGeolocation = {
@@ -114,6 +259,11 @@ async function setNodeGeolocation() {
           lat: ipRes.data.lat,
           lon: ipRes.data.lon,
           org: ipRes.data.org || ipRes.data.isp,
+          isp: ipRes.data.isp,
+          asn: ipRes.data.as,
+          mobile: ipRes.data.mobile,
+          proxy: ipRes.data.proxy,
+          hosting: ipRes.data.hosting,
           static: ipRes.data.proxy || ipRes.data.hosting,
           dataCenter: ipRes.data.hosting,
         };
@@ -142,88 +292,87 @@ async function setNodeGeolocation() {
     }
     log.info(`Geolocation of ${localIp} is ${JSON.stringify(storedGeolocation)}`);
 
-    // Check if IP has changed
+    // Static IP is observed, never inferred from the operator: the address must
+    // be bound to a local interface and have been held for the stability window.
     const currentIp = storedGeolocation.ip;
     const ipChanged = previousIp && previousIp !== currentIp;
+    const now = Date.now();
+    const stabilityThreshold = staticIpStabilityDays * 24 * 60 * 60 * 1000;
 
     if (ipChanged) {
-      // IP changed - set static to false and record the change date
-      staticIp = false;
-      lastIpChangeDate = Date.now();
-      log.info(`IP changed from ${previousIp} to ${currentIp}. Setting staticIp to false.`);
-    } else {
-      // IP has not changed - check static IP conditions
-      const hasPublicIp = await fluxNetworkHelper.hasPublicIpOnInterface();
-      const now = Date.now();
-      const stabilityThreshold = staticIpStabilityDays * 24 * 60 * 60 * 1000;
-
-      // If lastIpChangeDate is null (never recorded), consider IP as stable for more than 10 days
-      const effectiveLastIpChangeDate = lastIpChangeDate || (now - stabilityThreshold - 1);
-      const daysSinceChange = (now - effectiveLastIpChangeDate) / (24 * 60 * 60 * 1000);
-
-      // Determine static IP status based on multiple signals
-      if (hasPublicIp) {
-        // Has public IP on interface - strong indicator of static IP
-        if (now - effectiveLastIpChangeDate >= stabilityThreshold) {
-          // IP stable for 10+ days with public IP on interface - definitely static
-          staticIp = true;
-          if (lastIpChangeDate) {
-            log.info(`Node has public IP on interface and IP stable for ${daysSinceChange.toFixed(1)} days. Setting staticIp to true.`);
-          } else {
-            log.info('Node has public IP on interface and no IP change recorded. Assuming stable IP. Setting staticIp to true.');
-          }
-        } else {
-          // Has public IP but hasn't been stable long enough yet
-          // Check other signals (API and org-based)
-          staticIp = false;
-          if (storedGeolocation.static) {
-            staticIp = true;
-          } else if (storedGeolocation.org) {
-            for (let i = 0; i < staticIpOrgs.length; i += 1) {
-              const org = staticIpOrgs[i];
-              if (storedGeolocation.org.toLowerCase().includes(org)) {
-                staticIp = true;
-                break;
-              }
-            }
-          }
-          log.info(`Node has public IP on interface, IP stable for ${daysSinceChange.toFixed(1)} days (need ${staticIpStabilityDays}). staticIp=${staticIp}`);
-        }
-      } else {
-        // No public IP on interface - use API and org-based detection only
-        staticIp = false;
-        if (storedGeolocation.static) {
-          staticIp = true;
-        } else if (storedGeolocation.org) {
-          for (let i = 0; i < staticIpOrgs.length; i += 1) {
-            const org = staticIpOrgs[i];
-            if (storedGeolocation.org.toLowerCase().includes(org)) {
-              staticIp = true;
-              break;
-            }
-          }
-        }
-      }
+      lastIpChangeDate = now;
+      ipFirstSeenAt = now;
+      log.info(`IP changed from ${previousIp} to ${currentIp}. Static IP observation restarts.`);
+    } else if (!ipFirstSeenAt) {
+      // An address just met has been held for no time at all. It becomes STATIC
+      // by being held, never by assumption.
+      ipFirstSeenAt = now;
+      log.info(`First observation of ${currentIp}. Static IP unknown until it has been held for ${staticIpStabilityDays} days.`);
     }
 
-    // Data center detection (unchanged logic)
-    if (storedGeolocation.dataCenter) {
-      dataCenter = true;
+    const hasPublicIp = await fluxNetworkHelper.hasPublicIpOnInterface();
+    const heldForMs = now - ipFirstSeenAt;
+    const heldDays = heldForMs / (24 * 60 * 60 * 1000);
+
+    if (!hasPublicIp) {
+      // The public address is not on any local interface, so the node is behind
+      // NAT. Nothing about the operator changes that.
+      staticIpState = STATIC_IP_STATE.DYNAMIC;
+    } else if (heldForMs >= stabilityThreshold) {
+      staticIpState = STATIC_IP_STATE.STATIC;
     } else {
-      dataCenter = false;
-      if (storedGeolocation.org) {
-        for (let i = 0; i < staticIpOrgs.length; i += 1) {
-          const org = staticIpOrgs[i];
-          if (storedGeolocation.org.toLowerCase().includes(org)) {
-            dataCenter = true;
-            break;
-          }
-        }
-      }
+      // Public IP on the interface, but not yet held long enough to know.
+      staticIpState = STATIC_IP_STATE.UNKNOWN;
     }
+    staticIp = staticIpState === STATIC_IP_STATE.STATIC;
+    log.info(`Static IP: ${staticIpState} (public IP on interface: ${hasPublicIp}, address held ${heldDays.toFixed(1)} of ${staticIpStabilityDays} days)`);
+
+    // Whether the address is held (above) and what network it sits on (here) are
+    // separate questions, answered from separate evidence.
+    //
+    // This pass gathers the EVIDENCE and stops there. Reaching a verdict also
+    // needs the published table, and the table is not this pass's to wait for:
+    // it arrives in a 4.6 MB artifact the node is still ingesting while this
+    // runs, and a pass that recorded its own conclusion here would be recording
+    // "the table said nothing" and standing by it until the next pass, three
+    // days later. getNetworkClassification() reaches the verdict when asked,
+    // which is what every other consumer of that table already does.
+    const [ptr, linkSpeeds] = await Promise.all([
+      resolvePtr(currentIp),
+      benchLinkSpeeds(),
+    ]);
+    const classified = networkClassifier.classifyNetwork({
+      ptr,
+      hosting: storedGeolocation.hosting,
+      proxy: storedGeolocation.proxy,
+      mobile: storedGeolocation.mobile,
+      isp: storedGeolocation.isp,
+      asn: storedGeolocation.asn,
+      uploadSpeed: linkSpeeds.uploadSpeed,
+      downloadSpeed: linkSpeeds.downloadSpeed,
+    });
+
+    // One whole object, assigned once every input has settled: a reader must
+    // never combine evidence from a half-finished pass.
+    networkEvidence = Object.freeze({
+      ip: currentIp,
+      classification: classified.classification,
+      evidenceFor: Object.freeze([...classified.evidenceFor]),
+      evidenceAgainst: Object.freeze([...classified.evidenceAgainst]),
+      ptr: ptr || null,
+      gatheredAt: now,
+    });
+    dataCenter = classified.classification === networkClassifier.CLASSIFICATION.DATACENTER;
+    log.info(`Network evidence for ${currentIp}: the node's own reading is ${classified.classification}`
+      + ` (for: ${classified.evidenceFor.join(', ') || 'none'};`
+      + ` against: ${classified.evidenceAgainst.join(', ') || 'none'})`);
 
     // Store geolocation to database for persistence across restarts
-    await storeGeolocationToDb(storedGeolocation, staticIp, dataCenter, lastIpChangeDate);
+    await storeGeolocationToDb(storedGeolocation, staticIp, dataCenter, lastIpChangeDate, {
+      ipFirstSeenAt,
+      staticIpState,
+      networkEvidence,
+    });
     execution += 1;
     setTimeout(() => { // executes again in 3 days
       setNodeGeolocation();
@@ -249,27 +398,102 @@ async function getNodeGeolocation() {
   // Try to get from database if not in memory
   const dbData = await getGeolocationFromDb();
   if (dbData.geolocation) {
-    storedGeolocation = dbData.geolocation;
-    staticIp = dbData.staticIp;
-    dataCenter = dbData.dataCenter;
-    lastIpChangeDate = dbData.lastIpChangeDate;
+    ({
+      geolocation: storedGeolocation,
+      staticIp,
+      dataCenter,
+      lastIpChangeDate,
+      ipFirstSeenAt,
+      networkEvidence,
+    } = dbData);
+    staticIpState = dbData.staticIpState ?? STATIC_IP_STATE.UNKNOWN;
     log.info('Geolocation restored from database');
   }
   return storedGeolocation;
 }
 
 /**
- * Method responsible for returning if node ip is static based on IP org.
+ * Whether this node's address is known to stay put. True only when the address
+ * is bound to a local interface and has been held for the stability window; an
+ * address not yet observed that long is not static, so apps that require one are
+ * never placed on evidence the node does not have.
+ * @returns {boolean}
  */
 function isStaticIP() {
   return staticIp;
 }
 
 /**
- * Method responsible for returning if node is in a data center based on IP org.
+ * The three-state form of isStaticIP, for callers that need to tell "we have not
+ * watched it long enough" apart from "it moves".
+ * @returns {('STATIC'|'DYNAMIC'|'UNKNOWN')}
+ */
+function getStaticIpState() {
+  return staticIpState;
+}
+
+/**
+ * Whether this node sits in a data centre. True only on a positive verdict from
+ * networkClassifier - CONFLICTED and UNKNOWN are both false, because neither is
+ * evidence of a data centre.
+ * @returns {boolean}
  */
 function isDataCenter() {
   return dataCenter;
+}
+
+/**
+ * The node's access-network verdict, reached now from the evidence it gathered
+ * and the table it currently holds.
+ *
+ * Reached here rather than stored because its two halves arrive at different
+ * times and on different clocks. The evidence is expensive and refreshed every
+ * three days; the published table is a local read that a booting node does not
+ * have yet and will have shortly. Deciding once, at the moment only one half
+ * exists, is how a node ends up acting for three days on a verdict the table
+ * would have overruled.
+ *
+ * NO TABLE MEANS NO VERDICT. Not a fallback to the node's own reading - the
+ * fallback belongs to a table that WAS consulted and holds nothing for this
+ * address. Until one has been ingested, this node knows nothing about which
+ * kind of network it is on, and null is the only honest answer. Nothing
+ * enforces on null.
+ * @returns {Promise<{classification: string, source: string,
+ *   evidenceFor: string[], evidenceAgainst: string[], ptr: string|null,
+ *   gatheredAt: number}|null>} Null when nothing has been gathered yet, or when
+ *   no location table has been consulted. `source` names the authority:
+ *   'published-table', 'node' where the table holds no verdict for this
+ *   address, or 'node-veto' where the node declined a published RESIDENTIAL on
+ *   evidence about its own address.
+ */
+async function getNetworkClassification() {
+  if (!networkEvidence) return null;
+
+  const published = await publishedClassification(networkEvidence.ip);
+  if (!published.consulted) return null;
+
+  // The table decides, but a node that can see hosting evidence about its OWN
+  // address exempts itself. An organisation is published on a strong majority
+  // of its hosts rather than on all of them, so a minority of its addresses may
+  // be the other kind - and this is how one of them declines a verdict meant
+  // for its neighbours. The veto only ever removes a node from enforcement;
+  // local evidence can never impose one the table did not give.
+  const vetoed = published.classification === networkClassifier.CLASSIFICATION.RESIDENTIAL
+    && networkEvidence.evidenceAgainst.length > 0;
+
+  return Object.freeze({
+    classification: vetoed
+      ? networkClassifier.CLASSIFICATION.CONFLICTED
+      : (published.classification ?? networkEvidence.classification),
+    // Which authority decided, so a verdict can be traced to the table that
+    // carried it, to the node that worked it out, or to the node declining one.
+    // eslint-disable-next-line no-nested-ternary
+    source: vetoed ? 'node-veto' : (published.classification ? 'published-table' : 'node'),
+    evidenceFor: networkEvidence.evidenceFor,
+    evidenceAgainst: networkEvidence.evidenceAgainst,
+    ptr: networkEvidence.ptr,
+    gatheredAt: networkEvidence.gatheredAt,
+  });
 }
 
 /**
@@ -292,7 +516,10 @@ module.exports = {
   setNodeGeolocation,
   getNodeGeolocation,
   isStaticIP,
+  getStaticIpState,
   isDataCenter,
+  getNetworkClassification,
   getLastIpChangeDate,
   hasPublicIp,
+  STATIC_IP_STATE,
 };
