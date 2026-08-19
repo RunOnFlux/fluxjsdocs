@@ -56,7 +56,6 @@ const volumeValidationService = require('./volumeValidationService');
 const watchdogService = require('./watchdogService');
 const cloudUIUpdateService = require('./cloudUIUpdateService');
 const appTamperingBlocklistService = require('./appTamperingBlocklistService');
-const residentialNodeDosService = require('./residentialNodeDosService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const appsRuntimeState = require('./appManagement/appsRuntimeState');
@@ -462,20 +461,6 @@ async function startFluxFunctions() {
     appTamperingBlocklistService.start().catch((err) => {
       log.error(`appTamperingBlocklist start error: ${err.message}`);
     });
-    // Not awaited, and started ahead of setNodeGeolocation below on purpose: the
-    // first tick reads geolocation from the db when there is one, and otherwise
-    // decides nothing and retries until the lookup this boot has landed.
-    //
-    // Injected the same way nodeStatusMonitor is, and for the same reason: the
-    // app list is read from a query service deep enough in the lifecycle graph
-    // that requiring it here would put geolocation and the network helper on
-    // that load path. Removing the app is not this service's job - the single
-    // give-up-an-app pass in advancedWorkflows does that.
-    residentialNodeDosService.start({
-      installedAppsFn: appQueryService.installedApps,
-    }).catch((err) => {
-      log.error(`residentialNodeDos start error: ${err.message}`);
-    });
     log.info('Flux checks operational');
     fluxCommunication.initializeDiscovery();
     await nodeConfirmationService.start();
@@ -571,7 +556,8 @@ async function startFluxFunctions() {
     }, bootDelay(30 * 1000));
     setTimeout(() => {
       appController.stopAllNonFluxRunningApps();
-      monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
+      // Best effort during boot — the reconciler starts monitoring per app as it settles.
+      monitoringOrchestrator.startMonitoringOfApps(null).catch((error) => log.error(error));
       portManager.restoreAppsPortsSupport();
     }, bootDelay(1 * 60 * 1000));
     // Resolve this node's enterprise identity once, up front. Self-reschedules

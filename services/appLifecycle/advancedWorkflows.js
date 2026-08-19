@@ -44,7 +44,6 @@ const { stopAppMonitoring } = require('../appManagement/appInspector');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const globalState = require('../utils/globalState');
 const appNetworkLinker = require('./appNetworkLinker');
-const fluxEventBus = require('../utils/fluxEventBus');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -2885,82 +2884,7 @@ async function updateAppGlobalyApi(req, res) {
 }
 
 /**
- * Whether this node is the primary currently elected to run an app's `g:`
- * component.
- *
- * A `g:` component runs on one node at a time, and that node is the one writing
- * to the volume. Handing the app back from under it drops whatever it has
- * written since the peer last reported the folder complete, so the primary
- * stands down and lets masterSlaveApps elect a successor before it may leave.
- *
- * The election keys one identifier per app - the app name below v4, and
- * `<component>_<app>` above it - so both forms are matched.
- * @param {string} appName Global app name.
- * @param {string} localSocketAddr This node's socket address.
- * @returns {boolean}
- */
-function isElectedPrimaryHere(appName, localSocketAddr) {
-  // eslint-disable-next-line no-restricted-syntax
-  for (const [identifier, masterIp] of mastersRunningGSyncthingApps) {
-    const namesThisApp = identifier === appName || identifier.endsWith(`_${appName}`);
-    if (namesThisApp && ipsMatch(masterIp, localSocketAddr)) return true;
-  }
-  return false;
-}
-
-/**
- * Whether this node should give up an app, and why.
- *
- * Two reasons, one answer. SURPLUS: the app runs on more nodes than it needs and
- * this node holds the junior instance. EVACUATION: the node is shedding what it
- * holds because it is no longer fit to serve, and this app's turn has come.
- *
- * Only the reason is decided here. Whether it is SAFE to act on it is
- * appEvacuationSafety's question, and both must agree - a count has never been
- * able to tell a redundant copy from the last one that holds the data.
- * @param {object} installedApp Locally installed app record.
- * @param {object[]} runningAppList Instance locations for the app.
- * @param {string} localSocketAddr This node's socket address.
- * @returns {{giveUp: boolean, reason: string, detail: string}}
- */
-function reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr) {
-  // lazy load to avoid circular dependency
-  // eslint-disable-next-line global-require
-  const residentialNodeDosService = require('../residentialNodeDosService');
-  const minInstances = installedApp.instances || config.fluxapps.minimumInstances;
-
-  if (runningAppList.length > minInstances) {
-    // junior end first: the newest instance stands aside, ties broken
-    // by the shared ordering so every node names the same surplus
-    const ordered = [...runningAppList].sort((a, b) => compareInstanceSeniority(b, a));
-    const index = ordered.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
-    if (index === 0) {
-      return {
-        giveUp: true,
-        reason: 'SURPLUS',
-        detail: `running on ${runningAppList.length} instances (max: ${minInstances}) and this node is the newest`,
-      };
-    }
-  }
-
-  if (residentialNodeDosService.isEvacuating()) {
-    const verdict = residentialNodeDosService.mayEvacuateApp(installedApp.name, runningAppList, localSocketAddr);
-    if (verdict.ok) {
-      return {
-        giveUp: true,
-        reason: 'EVACUATION',
-        detail: 'node is not fit to serve and is handing its apps back',
-      };
-    }
-    return { giveUp: false, reason: 'EVACUATION', detail: verdict.reason };
-  }
-
-  return { giveUp: false, reason: 'NONE', detail: '' };
-}
-
-/**
- * The single pass that decides whether this node should stop holding an app.
- * At most one app goes per pass, spaced by config.fluxapps.removal.delay.
+ * To find and remove apps that are spawned more than maximum number of instances allowed locally.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function checkAndRemoveApplicationInstance() {
@@ -2984,75 +2908,36 @@ async function checkAndRemoveApplicationInstance() {
     const appUninstaller = require('./appUninstaller');
     // eslint-disable-next-line global-require
     const registryManager = require('../appDatabase/registryManager');
-    // eslint-disable-next-line global-require
-    const evacuationSafety = require('./appEvacuationSafety');
-    // eslint-disable-next-line global-require
-    const residentialNodeDosService = require('../residentialNodeDosService');
-    // eslint-disable-next-line global-require
-    const { findSyncedPeer } = require('../appMonitoring/syncthingFolderStateMachine');
-
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    if (!localSocketAddr) {
-      log.info('Give-up-an-app pass skipped: local socket address unknown');
-      return;
-    }
-
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled) {
       // eslint-disable-next-line no-await-in-loop
       const runningAppList = await registryManager.appLocation(installedApp.name);
-      const decision = reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr);
-      // Every pass reports what it decided about every app it holds. Without
-      // this the pass is invisible: it logs nothing at all when it has nothing
-      // to give up, so "never ran" and "ran and declined" read identically, and
-      // a suite can only tell them apart by scraping logs.
-      fluxEventBus.publish('giveUp:considered', {
-        appName: installedApp.name,
-        giveUp: decision.giveUp,
-        reason: decision.reason,
-        detail: decision.detail,
-      });
-      if (!decision.giveUp) {
-        if (decision.reason === 'EVACUATION') {
-          log.info(`${installedApp.name} not handed back yet: ${decision.detail}`);
+      const minInstances = installedApp.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
+      if (runningAppList.length > minInstances) {
+        // eslint-disable-next-line no-await-in-loop
+        const appDetails = await registryManager.getApplicationGlobalSpecifications(installedApp.name);
+        if (appDetails) {
+          log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking if should be unninstalled from the FluxNode..`);
+          // junior end first: the newest instance stands aside, ties broken
+          // by the shared ordering so every node names the same surplus
+          runningAppList.sort((a, b) => compareInstanceSeniority(b, a));
+          // eslint-disable-next-line no-await-in-loop
+          const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+          if (localSocketAddr) {
+            const index = runningAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
+            if (index === 0) {
+              log.info(`Application ${installedApp.name} going to be removed from node as it was the latest one running it to install it..`);
+              log.warn(`REMOVAL REASON: Too many instances - ${installedApp.name} running on ${runningAppList.length} instances (max: ${minInstances}) - This node is the newest instance`);
+              log.warn(`Removing application ${installedApp.name} locally`);
+              // eslint-disable-next-line no-await-in-loop
+              await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
+              log.warn(`Application ${installedApp.name} locally removed`);
+              // eslint-disable-next-line no-await-in-loop
+              await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
+            }
+          }
         }
-        // eslint-disable-next-line no-continue
-        continue;
       }
-
-      // eslint-disable-next-line no-await-in-loop
-      const safety = await evacuationSafety.canSafelyRemoveApp(installedApp.name, {
-        appLocation: registryManager.appLocation,
-        getApplicationGlobalSpecifications: registryManager.getApplicationGlobalSpecifications,
-        findSyncedPeer,
-        isElectedPrimary: (name) => isElectedPrimaryHere(name, localSocketAddr),
-      });
-      fluxEventBus.publish('giveUp:safety', {
-        appName: installedApp.name,
-        reason: decision.reason,
-        safe: safety.safe,
-        detail: safety.reason,
-      });
-      if (!safety.safe) {
-        // The observation window restarts, so the queue wait is served against an
-        // uninterrupted period of the app being whole rather than accumulated
-        // across a gap.
-        residentialNodeDosService.forgetAppObservation(installedApp.name);
-        log.info(`${installedApp.name} would be given up (${decision.reason}) but it is not safe: ${safety.reason}`);
-        // eslint-disable-next-line no-continue
-        continue;
-      }
-
-      log.warn(`REMOVAL REASON: ${decision.reason} - ${installedApp.name} ${decision.detail}. Safe: ${safety.reason}`);
-      // eslint-disable-next-line no-await-in-loop
-      await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
-      log.warn(`Application ${installedApp.name} locally removed`);
-      if (decision.reason === 'EVACUATION') {
-        residentialNodeDosService.noteEvacuated(installedApp.name);
-      }
-      // One per pass. Removing a second here would take two instances off the
-      // network before the spawner has replaced either.
-      return;
     }
   } catch (error) {
     log.error(error);
@@ -3633,6 +3518,29 @@ const PeerComponent = Object.freeze({
 // budget buys nothing and costs availability.
 const PEER_PROBE_TIMEOUT_MS = 10 * 1000;
 
+/**
+ * How long an instance waits per place in the queue before it may take a primary
+ * FDM is reporting as empty.
+ *
+ * The stagger serialises the candidates so they do not all start against the same
+ * volume at once, and its length is set by how long FDM takes to register a node
+ * that HAS started - measured at ~110s in production. A place is worth more than
+ * that or the wait does not cover what it exists to cover.
+ *
+ * Read from config on every call, and per place rather than as a total, because
+ * the only consumer that overrides it is a test: at three minutes a place, every
+ * staggered-start path costs minutes of wall clock to reach, which is why none of
+ * them has rig coverage. A suite exercising one compresses it in its own
+ * configOverrides - not in the shared harness config, which would re-time every
+ * existing g: election suite for the benefit of the one that needs it.
+ *
+ * @param {number} places how far down the election order, 0 for no wait
+ * @returns {number} milliseconds
+ */
+function staggerMs(places) {
+  return places * (config.fluxapps.masterSlaveStaggerMs ?? 3 * 60 * 1000);
+}
+
 // Why a silent peer was left alone, in the words an operator reading the log
 // needs: each one is a different thing to go and look at.
 const SILENCE_REASONS = Object.freeze({
@@ -3978,6 +3886,21 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                       return PeerComponent.NOT_RUNNING;
                     }
 
+                    // The peer HAS the endpoint and it failed. FluxOS answers
+                    // errors in band, so this arrives as a 200 carrying an error
+                    // object rather than a list - indistinguishable from a peer
+                    // too old for the route by shape alone, which is why it is
+                    // separated here.
+                    // Falling through would answer from the container list a
+                    // question the peer has just said it cannot answer, and that
+                    // list cannot see the durable stop lock at all: a primary its
+                    // owner stopped to work on reads as free, and this node
+                    // elects itself over them. Alive and unreadable is UNKNOWN.
+                    if (heldResponse?.data?.status === 'error') {
+                      log.info(`masterSlaveApps: peer node (${label}) at ${ipToCheck} could not answer what it holds for app:${installedApp.name} - alive, and cannot be ruled out, will not start`);
+                      return PeerComponent.UNKNOWN;
+                    }
+
                     const response = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/listrunningapps`, { timeout: PEER_PROBE_TIMEOUT_MS, cancelToken: source.token });
                     const appsRunning = response.data?.data;
                     // A reply this node cannot read is not a clearance. The peer
@@ -4012,8 +3935,28 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 };
 
                 const checkPeersRunning = async (scope) => {
-                  const limit = scope === 'all' ? runningAppList.length : index;
-                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // not found, or no lower nodes to check
+                  // A lower-only scope with nobody in it is not an answer. At index 0
+                  // there is no node ahead to ask, and index -1 - this node absent
+                  // from the location list - has none either, so the walk below asks
+                  // NOBODY and the caller reads that as clear.
+                  //
+                  // That is the same blind start the index-0 branch takes scope 'all'
+                  // to avoid, reached from the staggered paths instead. It is not
+                  // unreachable there: the stagger is booked at index >= 2, index is
+                  // re-derived from the location list every pass, and the instances
+                  // ahead can age out of that list before the booked turn arrives -
+                  // leaving a node at index 0 holding a schedule. FDM's registration
+                  // lags a node actually starting (~110s in production), so through
+                  // that whole window it reports no primary while an instance is live,
+                  // and starting on "nobody is ahead of me" puts a second writer on
+                  // the shared volume.
+                  //
+                  // Escalate rather than answer: a start is never issued without some
+                  // peer having been asked. An empty 'all' is a real answer - there is
+                  // genuinely no one to ask - and falls through below.
+                  const effectiveScope = scope === 'lower' && index <= 0 ? 'all' : scope;
+                  const limit = effectiveScope === 'all' ? runningAppList.length : index;
+                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // nobody to ask at all
 
                   const peers = [];
                   for (let i = 0; i < limit; i += 1) {
@@ -4080,12 +4023,12 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     if (previousMasterIndex >= 0) {
                       log.info(`masterSlaveApps: app:${installedApp.name} had primary running at index: ${previousMasterIndex}`);
                       if (index > previousMasterIndex) {
-                        timetoStartApp += (index - 1) * 3 * 60 * 1000;
+                        timetoStartApp += staggerMs(index - 1);
                       } else {
-                        timetoStartApp += index * 3 * 60 * 1000;
+                        timetoStartApp += staggerMs(index);
                       }
                     } else {
-                      timetoStartApp += index * 3 * 60 * 1000;
+                      timetoStartApp += staggerMs(index);
                     }
                     if (timetoStartApp <= Date.now()) {
                       // Time to start, but check if lower-index nodes are running
@@ -4166,7 +4109,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                 } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
                   // Non-primary node with no history - schedule start based on index
-                  const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);
+                  const timetoStartApp = Date.now() + staggerMs(index);
                   log.info(`masterSlaveApps: scheduling app:${installedApp.name} index: ${index} to start at ${timetoStartApp.toString()}`);
                   timeTostartNewMasterApp.set(identifier, timetoStartApp);
                 } else {
@@ -4264,8 +4207,6 @@ module.exports = {
   installationInProgressReset,
   setInstallationInProgressTrue,
   checkAndRemoveApplicationInstance,
-  reasonToGiveUpApp,
-  isElectedPrimaryHere,
   reinstallOldApplications,
   checkAndRemoveEnterpriseAppsOnNonArcane,
   forceAppRemovals,
