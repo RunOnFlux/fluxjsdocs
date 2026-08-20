@@ -556,8 +556,7 @@ async function startFluxFunctions() {
     }, bootDelay(30 * 1000));
     setTimeout(() => {
       appController.stopAllNonFluxRunningApps();
-      // Best effort during boot — the reconciler starts monitoring per app as it settles.
-      monitoringOrchestrator.startMonitoringOfApps(null).catch((error) => log.error(error));
+      monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
       portManager.restoreAppsPortsSupport();
     }, bootDelay(1 * 60 * 1000));
     // Resolve this node's enterprise identity once, up front. Self-reschedules

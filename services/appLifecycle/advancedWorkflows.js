@@ -3518,29 +3518,6 @@ const PeerComponent = Object.freeze({
 // budget buys nothing and costs availability.
 const PEER_PROBE_TIMEOUT_MS = 10 * 1000;
 
-/**
- * How long an instance waits per place in the queue before it may take a primary
- * FDM is reporting as empty.
- *
- * The stagger serialises the candidates so they do not all start against the same
- * volume at once, and its length is set by how long FDM takes to register a node
- * that HAS started - measured at ~110s in production. A place is worth more than
- * that or the wait does not cover what it exists to cover.
- *
- * Read from config on every call, and per place rather than as a total, because
- * the only consumer that overrides it is a test: at three minutes a place, every
- * staggered-start path costs minutes of wall clock to reach, which is why none of
- * them has rig coverage. A suite exercising one compresses it in its own
- * configOverrides - not in the shared harness config, which would re-time every
- * existing g: election suite for the benefit of the one that needs it.
- *
- * @param {number} places how far down the election order, 0 for no wait
- * @returns {number} milliseconds
- */
-function staggerMs(places) {
-  return places * (config.fluxapps.masterSlaveStaggerMs ?? 3 * 60 * 1000);
-}
-
 // Why a silent peer was left alone, in the words an operator reading the log
 // needs: each one is a different thing to go and look at.
 const SILENCE_REASONS = Object.freeze({
@@ -3886,21 +3863,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                       return PeerComponent.NOT_RUNNING;
                     }
 
-                    // The peer HAS the endpoint and it failed. FluxOS answers
-                    // errors in band, so this arrives as a 200 carrying an error
-                    // object rather than a list - indistinguishable from a peer
-                    // too old for the route by shape alone, which is why it is
-                    // separated here.
-                    // Falling through would answer from the container list a
-                    // question the peer has just said it cannot answer, and that
-                    // list cannot see the durable stop lock at all: a primary its
-                    // owner stopped to work on reads as free, and this node
-                    // elects itself over them. Alive and unreadable is UNKNOWN.
-                    if (heldResponse?.data?.status === 'error') {
-                      log.info(`masterSlaveApps: peer node (${label}) at ${ipToCheck} could not answer what it holds for app:${installedApp.name} - alive, and cannot be ruled out, will not start`);
-                      return PeerComponent.UNKNOWN;
-                    }
-
                     const response = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/listrunningapps`, { timeout: PEER_PROBE_TIMEOUT_MS, cancelToken: source.token });
                     const appsRunning = response.data?.data;
                     // A reply this node cannot read is not a clearance. The peer
@@ -3935,28 +3897,8 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 };
 
                 const checkPeersRunning = async (scope) => {
-                  // A lower-only scope with nobody in it is not an answer. At index 0
-                  // there is no node ahead to ask, and index -1 - this node absent
-                  // from the location list - has none either, so the walk below asks
-                  // NOBODY and the caller reads that as clear.
-                  //
-                  // That is the same blind start the index-0 branch takes scope 'all'
-                  // to avoid, reached from the staggered paths instead. It is not
-                  // unreachable there: the stagger is booked at index >= 2, index is
-                  // re-derived from the location list every pass, and the instances
-                  // ahead can age out of that list before the booked turn arrives -
-                  // leaving a node at index 0 holding a schedule. FDM's registration
-                  // lags a node actually starting (~110s in production), so through
-                  // that whole window it reports no primary while an instance is live,
-                  // and starting on "nobody is ahead of me" puts a second writer on
-                  // the shared volume.
-                  //
-                  // Escalate rather than answer: a start is never issued without some
-                  // peer having been asked. An empty 'all' is a real answer - there is
-                  // genuinely no one to ask - and falls through below.
-                  const effectiveScope = scope === 'lower' && index <= 0 ? 'all' : scope;
-                  const limit = effectiveScope === 'all' ? runningAppList.length : index;
-                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // nobody to ask at all
+                  const limit = scope === 'all' ? runningAppList.length : index;
+                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // not found, or no lower nodes to check
 
                   const peers = [];
                   for (let i = 0; i < limit; i += 1) {
@@ -4023,12 +3965,12 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     if (previousMasterIndex >= 0) {
                       log.info(`masterSlaveApps: app:${installedApp.name} had primary running at index: ${previousMasterIndex}`);
                       if (index > previousMasterIndex) {
-                        timetoStartApp += staggerMs(index - 1);
+                        timetoStartApp += (index - 1) * 3 * 60 * 1000;
                       } else {
-                        timetoStartApp += staggerMs(index);
+                        timetoStartApp += index * 3 * 60 * 1000;
                       }
                     } else {
-                      timetoStartApp += staggerMs(index);
+                      timetoStartApp += index * 3 * 60 * 1000;
                     }
                     if (timetoStartApp <= Date.now()) {
                       // Time to start, but check if lower-index nodes are running
@@ -4109,7 +4051,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                 } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
                   // Non-primary node with no history - schedule start based on index
-                  const timetoStartApp = Date.now() + staggerMs(index);
+                  const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);
                   log.info(`masterSlaveApps: scheduling app:${installedApp.name} index: ${index} to start at ${timetoStartApp.toString()}`);
                   timeTostartNewMasterApp.set(identifier, timetoStartApp);
                 } else {
