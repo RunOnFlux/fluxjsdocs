@@ -20,19 +20,6 @@ const STABLE_RUN_MS = config.fluxapps.crashBackoffStableRunMs ?? 10 * 60 * 1000;
 // only the count (capped by the ladder) and the last timestamp are ever read,
 // so the persisted history never needs to grow beyond the ladder length
 const MAX_HISTORY = BACKOFF_DELAYS_MS.length;
-// The exit code cannot prove a fault: an image whose entrypoint is a wrapper
-// script ending in `exit 0` reports a clean stop for a segfault, and no init we
-// wrap around it can recover a status the image already discarded. So pacing on
-// the code alone would leave such a container restarting without limit. This is
-// the cause-blind backstop - this many automatic restarts ALREADY RECORDED
-// inside the window is evidence of a fault whatever Docker reported, and it
-// disposes into the same ladder rather than into a state a human has to clear.
-//
-// The count is of restarts already behind it, so at 5 the SIXTH restart is the
-// one that earns a rung and the seventh is the first one held back. Six free
-// restarts from a knob that reads as five is worth knowing before tuning it.
-const RESTART_BURST_COUNT = config.fluxapps.restartBurstCount ?? 5;
-const RESTART_BURST_WINDOW_MS = config.fluxapps.restartBurstWindowMs ?? 5 * 60 * 1000;
 
 function collection() {
   const db = dbHelper.databaseConnection();
@@ -101,56 +88,13 @@ async function setFields(rawIdentifier, fields) {
  * @param {string} identifier
  * @param {boolean} stopped
  */
-async function setOperatorStopped(identifier, stopped, opts = {}) {
+async function setOperatorStopped(identifier, stopped) {
   // No catch: the lock is the contract that the reconciler will not restart the
   // app. Swallowing a write failure would let the API report success while the
   // lock never persisted - the caller must surface the failure instead.
   const fields = { operatorStopped: stopped };
-  if (stopped) {
-    // A hard kill skips the graceful shutdown window. Durable, so a crash between
-    // the write and the stop cannot quietly downgrade "kill now" to a drain that
-    // waits for the app to finish what it is doing.
-    fields.operatorStopForce = opts.force === true;
-  } else {
-    fields.operatorStopForce = false;
-    fields.restartHistory = [];
-    fields.autoRestartWindow = [];
-  }
+  if (!stopped) fields.restartHistory = [];
   await setFields(identifier, fields);
-}
-
-/**
- * Raises the component's restart generation, which is how an operator restart is
- * expressed as desired state rather than as a docker call from the handler.
- *
- * The reconciler bounces the container when the generation exceeds the one it
- * last actuated, so the request is level-based - replaying it changes nothing -
- * and durable, so it survives a restart of FluxOS itself.
- *
- * No catch, for setOperatorStopped's reason: a request that did not persist must
- * not be reported to the operator as one that did.
- *
- * @param {string} identifier
- */
-async function requestRestart(identifier) {
-  const state = await getState(identifier);
-  const next = ((state && state.restartGeneration) || 0) + 1;
-  await setFields(identifier, { restartGeneration: next });
-}
-
-/**
- * Marks a restart generation as actuated, so the pass that follows the bounce
- * does not bounce it again.
- *
- * @param {string} identifier
- * @param {number} generation
- */
-async function recordRestartGeneration(identifier, generation) {
-  try {
-    await setFields(identifier, { actuatedRestartGeneration: generation });
-  } catch (err) {
-    log.error(`appsRuntimeState - failed to record restart generation for ${identifier}: ${err.message}`);
-  }
 }
 
 /**
@@ -166,75 +110,20 @@ async function isOperatorStopped(identifier) {
 }
 
 /**
- * Every component identifier on this node the operator has deliberately stopped.
- *
- * One query rather than isOperatorStopped per component. The caller is the
- * held-components answer, served on an unauthenticated route a peer reads
- * mid-election, so a findOne apiece would scale its cost with the number of
- * components installed here.
- *
- * Throws where getState swallows, and the difference is the point. getState's
- * callers ask about one component and act on this node: a read failure there
- * reads as "no lock", the reconciler leaves the container alone anyway, and the
- * next pass asks again. This answer LEAVES the node - an empty list tells a peer
- * nothing is held here, and the peer acts on that by starting a second writer on
- * the shared volume. There is no safe way to report a lock set we could not
- * read, so the caller has to fail rather than answer.
- *
- * @returns {Promise<string[]>} bare component identifiers, unprefixed
- */
-async function operatorStoppedIdentifiers() {
-  const database = collection();
-  const docs = await dbHelper.findInDatabase(
-    database,
-    appsRuntimeState,
-    { operatorStopped: true },
-    { projection: { _id: 0, identifier: 1 } },
-  );
-  return docs.map((doc) => doc.identifier).filter(Boolean);
-}
-
-/**
- * Whether the restarts already recorded fill the burst window, read before the
- * current attempt is appended - so it answers "have there already been enough",
- * and the restart asking is the one that carries the count over.
- *
- * That restart is counted, not held: restartWaitMs runs ahead of recordRestart
- * and finds an empty ladder, so it goes back immediately and earns the first
- * rung on its way past. The one after it is the first to be made to wait.
- *
- * @param {object|null} state
- * @returns {boolean}
- */
-function burstExceeded(state) {
-  const recent = (state && state.autoRestartWindow) || [];
-  if (recent.length < RESTART_BURST_COUNT) return false;
-  return Date.now() - recent[0] <= RESTART_BURST_WINDOW_MS;
-}
-
-/**
- * Appends a restart attempt (wall-clock). Every automatic restart lands in the
- * burst window; only one with crash evidence - or one that fills the burst
- * window, which is the same conclusion reached without the exit code - also
- * walks the ladder. Both arrays are trimmed to their own bound so a
- * perpetually restarting container never grows the document unbounded.
+ * Appends a restart attempt (wall-clock) and trims the history to the ladder
+ * length so a perpetually crashing container never grows the array unbounded.
  *
  * @param {string} identifier
- * @param {boolean} crashed - Docker reported a fault (non-zero exit or OOM kill)
  */
-async function recordRestart(identifier, crashed = true) {
+async function recordRestart(identifier) {
   try {
     const state = await getState(identifier);
-    const fields = {
-      autoRestartWindow: [...((state && state.autoRestartWindow) || []), Date.now()].slice(-RESTART_BURST_COUNT),
-    };
-    // A rung is earned by evidence of a fault - a non-zero exit, or restarts
-    // arriving fast enough to be one whatever the code said - and by a component
-    // that already holds rungs, which is that finding still standing.
-    if (crashed || burstExceeded(state) || ((state && state.restartHistory) || []).length > 0) {
-      fields.restartHistory = [...((state && state.restartHistory) || []), Date.now()].slice(-MAX_HISTORY);
+    const history = (state && state.restartHistory) || [];
+    history.push(Date.now());
+    if (history.length > MAX_HISTORY) {
+      history.splice(0, history.length - MAX_HISTORY);
     }
-    await setFields(identifier, fields);
+    await setFields(identifier, { restartHistory: history });
   } catch (err) {
     log.error(`appsRuntimeState - failed to record restart for ${identifier}: ${err.message}`);
   }
@@ -261,25 +150,13 @@ async function recordRestart(identifier, crashed = true) {
  * @param {string} identifier
  * @param {number|null} lastFinishedAtMs - docker State.FinishedAt of the
  *        stopped container (ms epoch), when the caller has inspect data
- * @param {boolean} crashed - Docker reported a fault (non-zero exit or OOM kill)
  * @returns {Promise<number>}
  */
 async function restartWaitMs(identifier, lastFinishedAtMs = null) {
   const state = await getState(identifier);
-  // An empty ladder is a component nothing has found fault with: a clean exit is
-  // the operator's own restart far more often than it is a fault, and pacing that
-  // makes a deliberate restart look like an outage. recordRestart decides what
-  // earns a rung; once a component holds one it is paced until it clears them,
-  // whatever its exit code reads. The burst window empties while a component
-  // sits out a wait, so the ladder is what has to carry the finding across one.
   const history = (state && state.restartHistory) || [];
   if (history.length === 0) return 0;
 
-  // The ladder's last rung IS the component's last start, because a component
-  // holding rungs earns one for every restart. That is what makes this a stable
-  // run and not a wait it just served: if a restart could go unrecorded while
-  // rungs stood, the gap measured here would be the wait itself, and any rung
-  // longer than STABLE_RUN_MS would clear the ladder every time it fired.
   const lastRestart = history[history.length - 1];
   const lastDeath = Math.max(state.lastDiedAt || 0, lastFinishedAtMs || 0);
   if (lastDeath > lastRestart && lastDeath - lastRestart > STABLE_RUN_MS) {
@@ -449,19 +326,11 @@ async function prepareCollection() {
           identifier,
           // a lock anywhere is a lock: never auto-start a deliberately stopped app
           operatorStopped: twins.some((t) => t.operatorStopped === true),
-          // a force anywhere is a force: a kill must never be merged down into a
-          // graceful stop the operator did not ask for
-          operatorStopForce: twins.some((t) => t.operatorStopForce === true),
-          // the highest request wins and the lowest actuation does, so a restart
-          // asked for on either doc still bounces the container once
-          restartGeneration: Math.max(0, ...twins.map((t) => t.restartGeneration || 0)),
-          actuatedRestartGeneration: Math.min(...twins.map((t) => t.actuatedRestartGeneration || 0)),
           // likewise, a heal-removal anywhere means a heal may be mid-flight: keep
           // the reconciler on the recreate path rather than the uninstall path
           networkHealRemoval: twins.some((t) => t.networkHealRemoval === true),
           networkHealHistory: [...new Set(twins.flatMap((t) => t.networkHealHistory || []))].sort((a, b) => a - b).slice(-MAX_HISTORY),
           restartHistory: [...new Set(twins.flatMap((t) => t.restartHistory || []))].sort((a, b) => a - b).slice(-MAX_HISTORY),
-          autoRestartWindow: [...new Set(twins.flatMap((t) => t.autoRestartWindow || []))].sort((a, b) => a - b).slice(-RESTART_BURST_COUNT),
           updatedAt: Math.max(...twins.map((t) => t.updatedAt || 0)),
         };
         const newestExit = twins.filter((t) => t.lastDiedAt !== undefined).sort((a, b) => b.lastDiedAt - a.lastDiedAt)[0];
@@ -487,10 +356,7 @@ module.exports = {
   getState,
   setOperatorStopped,
   isOperatorStopped,
-  operatorStoppedIdentifiers,
   recordRestart,
-  requestRestart,
-  recordRestartGeneration,
   restartWaitMs,
   setNetworkHealRemoval,
   isNetworkHealRemoval,
@@ -502,6 +368,4 @@ module.exports = {
   BACKOFF_DELAYS_MS,
   STABLE_RUN_MS,
   MAX_HISTORY,
-  RESTART_BURST_COUNT,
-  RESTART_BURST_WINDOW_MS,
 };
