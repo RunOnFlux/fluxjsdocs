@@ -50,6 +50,60 @@ const isArcane = Boolean(process.env.FLUXOS_PATH);
 
 // Master/slave app tracking
 const mastersRunningGSyncthingApps = new Map();
+// When the election last reached a CONCLUSIVE verdict for an identifier: FDM
+// answered, and either named a primary or named none. An absent or stale entry
+// means the election is not running - it returns early before it reaches any
+// app while syncthing's first-run mount-safety is outstanding, while syncthing
+// is unhealthy, and per app whenever FDM cannot be reached - and "the election
+// is not running" must not be readable as "there is no primary here".
+//
+// Without this the presence of an entry in mastersRunningGSyncthingApps is the
+// only evidence there is, and its absence carries two opposite meanings at
+// once.
+const primaryElectionCheckedAt = new Map();
+// Consecutive passes on which the safety gate has refused to give up an app,
+// keyed by name. A first refusal is the gate working and says nothing; the
+// twentieth is a node that cannot establish something it needs and has not been
+// able to for hours. Those two are indistinguishable at info level, and the
+// giveUp:safety event does not close the gap - fluxEventBus is disabled on a
+// real node (config.testEventStream is false), so the event exists for the
+// harness and nothing reads it in production.
+//
+// Counted rather than timed because the pass is the unit: it is what re-asks
+// the question, and how long it has been stuck is only meaningful in passes.
+const giveUpRefusals = new Map();
+// About four hours of block passes at the production cadence - long enough that
+// a folder mid-resync, a peer rebooting or a load balancer blipping has been
+// and gone, short enough to still be the same day.
+const REFUSALS_BEFORE_ESCALATING = 12;
+
+// Components this node has stopped in order to hand their app back, mapped to
+// the number of give-up passes since. An evacuating node that is the elected
+// primary cannot leave while it is the one writing to the volume, so it stops
+// writing and asks again next pass, by which time the ordinary election has
+// given the role to a peer.
+//
+// THIS IS ALSO WHAT KEEPS THE COMPONENT STOPPED. masterSlaveApps runs every
+// 30s and would otherwise see the component not running here, clear this node's
+// own stale primary record, find no peer running it yet, and start it straight
+// back up - undoing the stand-down within one election cycle, every cycle. It
+// is read there as a "not a candidate right now" filter, which is the whole
+// mechanism: no new wire state, no negotiation, just this node declining to
+// stand for an office it is trying to leave.
+const standingDown = new Map();
+// Give-up passes a stood-down component may wait before this node gives up on
+// leaving and becomes electable again. The alternative to a cap is an app that
+// is stopped here AND not running anywhere else, which is worse than the
+// stuck-but-serving state the stand-down exists to fix. On expiry the entry is
+// simply dropped: masterSlaveApps then clears this node's stale primary record
+// and the normal paths restart the component wherever it belongs.
+const STAND_DOWN_PASSES_BEFORE_GIVING_UP = 6;
+// Ten election cycles. Derived from the election's own cadence rather than
+// written as its own number, so it stays in the same proportion to the pass
+// that refreshes it at every scale - the harness compresses masterSlaveApps by
+// 10x and this follows exactly, instead of being a constant that silently
+// becomes hundreds of cycles under compression.
+const PRIMARY_ELECTION_STALE_MS = (config.fluxapps.masterSlaveIntervalMs ?? 30 * 1000) * 10;
 const timeTostartNewMasterApp = new Map();
 // Components already reported as operator-stopped, so the exclusion is announced
 // on entry (and again after a restart) instead of every 30s cycle. An operator
@@ -221,11 +275,25 @@ async function getMasterIpFromFdm(appName, axiosOptions) {
     { name: 'ASIA', baseUrl: `http://fdm-sg-1-${fdmIndex}.runonflux.io:16130` },
   ];
 
+  // Whether any region ANSWERED, as against none of them being reachable. The
+  // regions are asked in order and the first to name an ip wins, so a positive
+  // needs one region; a negative only arrives after all three have been asked.
+  // What was missing is the difference between all three answering "no primary"
+  // and all three being unreachable - both returned fdmOk: true, which made the
+  // `if (!fdmOk)` guard below dead code and left a total outage looking exactly
+  // like an app with no primary set.
+  let answered = false;
+
   for (const region of fdmRegions) {
     try {
       const url = `${region.baseUrl}/appips/${appName}`;
       // eslint-disable-next-line no-await-in-loop
       const response = await serviceHelper.axiosGet(url, axiosOptions);
+      // axiosGet is bare axios.get and rejects on any non-2xx, so reaching here
+      // at all means the service replied. Whether the body names a primary is a
+      // separate question, answered below: an unparseable 2xx is FDM being
+      // reachable and telling us nothing, not FDM being down.
+      answered = true;
 
       if (response.data && response.data.status === 'success' && response.data.data) {
         const { ips } = response.data.data;
@@ -239,8 +307,11 @@ async function getMasterIpFromFdm(appName, axiosOptions) {
       log.debug(`getMasterIpFromFdm: No IPs returned from ${region.name} FDM for app ${appName}`);
     } catch (error) {
       if (error.response && error.response.status === 404) {
+        // The service replied: it holds no row for this app. That is an answer.
+        answered = true;
         log.debug(`getMasterIpFromFdm: App ${appName} not found in ${region.name} FDM`);
       } else if (error.response && error.response.status === 503) {
+        // Starting up - it is not answering yet, so it has told us nothing.
         log.debug(`getMasterIpFromFdm: ${region.name} FDM service starting up for app ${appName}`);
       } else {
         log.error(`getMasterIpFromFdm: Failed to reach ${region.name} FDM for app ${appName}: ${error.message}`);
@@ -249,8 +320,8 @@ async function getMasterIpFromFdm(appName, axiosOptions) {
     }
   }
 
-  // All regions failed or returned no IPs
-  return { ip: null, fdmOk: true };
+  // Every region that answered named no primary - or none of them answered.
+  return { ip: null, fdmOk: answered };
 }
 
 /**
@@ -2890,7 +2961,127 @@ async function updateAppGlobalyApi(req, res) {
 }
 
 /**
- * To find and remove apps that are spawned more than maximum number of instances allowed locally.
+ * The app/component identifier a docker container name carries, with the
+ * runtime prefix removed. Containers are named `/flux<identifier>`, and
+ * `/zel<identifier>` for anything installed before the rename.
+ * @param {string} containerName Docker's name, leading slash included.
+ * @returns {string} The identifier the election and the specs both use.
+ */
+function identifierFromContainerName(containerName) {
+  return containerName.startsWith('/zel') ? containerName.slice(4) : containerName.slice(5);
+}
+
+/**
+ * Whether this node is the primary currently elected to run an app's `g:`
+ * component.
+ *
+ * A `g:` component runs on one node at a time, and that node is the one writing
+ * to the volume. Handing the app back from under it drops whatever it has
+ * written since the peer last reported the folder complete, so the primary
+ * stands down and lets masterSlaveApps elect a successor before it may leave.
+ *
+ * The election keys one identifier per app - the app name below v4, and
+ * `<component>_<app>` above it - so both forms are matched.
+ *
+ * Three states, because two cannot express what is known here. An empty
+ * election table means either "no node is primary" or "the election has not
+ * run", and the caller destroys a volume on the difference. Every other
+ * unavailable input in canSafelyRemoveApp refuses; so does this one.
+ *
+ * Only a fresh verdict that NAMES a primary answers false. "FDM named nobody"
+ * is null rather than false, because FDM registration lags a node actually
+ * starting the component by ~110s (see the note at the `all` peer check below),
+ * and throughout that window it reports no primary while an instance is live -
+ * so on a node running the component it is the likeliest single reading of "no
+ * primary" that this node is the one just promoted.
+ *
+ * Null is also returned when no verdict has been recorded for the app, or when
+ * the one on record has gone stale: the election refreshes every
+ * masterSlaveIntervalMs, so an entry older than PRIMARY_ELECTION_STALE_MS means
+ * it has stopped running rather than that nothing has changed.
+ * @param {string} appName Global app name.
+ * @param {string} localSocketAddr This node's socket address.
+ * @param {number} [now] Epoch ms, injectable for tests.
+ * @returns {boolean|null} True if this node is the elected primary, false if
+ *   another node provably is, null if the election cannot say.
+ */
+function isElectedPrimaryHere(appName, localSocketAddr, now = Date.now()) {
+  let namesAPrimary = false;
+  // eslint-disable-next-line no-restricted-syntax
+  for (const [identifier, checkedAt] of primaryElectionCheckedAt) {
+    const namesThisApp = identifier === appName || identifier.endsWith(`_${appName}`);
+    if (!namesThisApp) continue;
+    if (now - checkedAt > PRIMARY_ELECTION_STALE_MS) continue;
+    const masterIp = mastersRunningGSyncthingApps.get(identifier);
+    if (!masterIp) continue;
+    namesAPrimary = true;
+    if (ipsMatch(masterIp, localSocketAddr)) return true;
+  }
+  return namesAPrimary ? false : null;
+}
+
+/**
+ * Whether this node should give up an app, and why.
+ *
+ * Two reasons, one answer. SURPLUS: the app runs on more nodes than it needs and
+ * this node holds the junior instance. EVACUATION: the node is shedding what it
+ * holds because it is no longer fit to serve, and this app's turn has come.
+ *
+ * Only the reason is decided here. Whether it is SAFE to act on it is
+ * appEvacuationSafety's question, and both must agree - a count has never been
+ * able to tell a redundant copy from the last one that holds the data.
+ * @param {object} installedApp Locally installed app record.
+ * @param {object[]} runningAppList Instance locations for the app.
+ * @param {string} localSocketAddr This node's socket address.
+ * @returns {{giveUp: boolean, reason: string, detail: string}}
+ */
+function reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr) {
+  // lazy load to avoid circular dependency
+  // eslint-disable-next-line global-require
+  const residentialNodeDosService = require('../residentialNodeDosService');
+  const minInstances = installedApp.instances || config.fluxapps.minimumInstances;
+
+  if (runningAppList.length > minInstances) {
+    // junior end first: the newest instance stands aside, ties broken
+    // by the shared ordering so every node names the same surplus
+    const ordered = [...runningAppList].sort((a, b) => compareInstanceSeniority(b, a));
+    const index = ordered.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
+    if (index === 0) {
+      return {
+        giveUp: true,
+        reason: 'SURPLUS',
+        detail: `running on ${runningAppList.length} instances (max: ${minInstances}) and this node is the newest`,
+      };
+    }
+  }
+
+  if (residentialNodeDosService.isEvacuating()) {
+    const verdict = residentialNodeDosService.mayEvacuateApp(installedApp.name, runningAppList, localSocketAddr);
+    if (verdict.ok) {
+      return {
+        giveUp: true,
+        reason: 'EVACUATION',
+        detail: 'node is not fit to serve and is handing its apps back',
+      };
+    }
+    return { giveUp: false, reason: 'EVACUATION', detail: verdict.reason };
+  }
+
+  return { giveUp: false, reason: 'NONE', detail: '' };
+}
+
+/**
+ * The single pass that decides whether this node should stop holding an app.
+ *
+ * At most one app goes per pass, and the PASS is the spacing: this returns as
+ * soon as one app has gone, and explorerService runs it again every
+ * removeFluxAppsPeriod * speedMultiplier blocks. config.fluxapps.removal.delay
+ * is not read here, or anywhere else - it paced a serviceHelper.delay() inside
+ * a loop that removed several apps in one pass, and that sleep held the whole
+ * pass open: everything behind it waited, and every decision after it was made
+ * against an installed-app list read minutes earlier. The pass is fired
+ * unawaited from the block handler and guards nothing itself, so a pass long
+ * enough to outlive its own interval could also overlap the next one.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function checkAndRemoveApplicationInstance() {
@@ -2914,36 +3105,215 @@ async function checkAndRemoveApplicationInstance() {
     const appUninstaller = require('./appUninstaller');
     // eslint-disable-next-line global-require
     const registryManager = require('../appDatabase/registryManager');
+    // eslint-disable-next-line global-require
+    const evacuationSafety = require('./appEvacuationSafety');
+    // eslint-disable-next-line global-require
+    const residentialNodeDosService = require('../residentialNodeDosService');
+    // eslint-disable-next-line global-require
+    const { findSyncedPeer } = require('../appMonitoring/syncthingFolderStateMachine');
+
+    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+    if (!localSocketAddr) {
+      log.info('Give-up-an-app pass skipped: local socket address unknown');
+      return;
+    }
+
+    // removeAppLocally refuses when another removal or install holds the lock,
+    // and it refuses by returning - no throw, no status, nothing the caller can
+    // read. So a pass that ran into one logged "locally removed", called
+    // noteEvacuated, burned the whole departure interval and discarded the
+    // app's queue wait, for a removal that never happened.
+    //
+    // They do collide: explorerService invokes this pass WITHOUT awaiting it,
+    // so it outlives the block that started it, and two blocks later the same
+    // scanner awaits expireGlobalApplications, which holds removalInProgress
+    // through a real uninstall.
+    //
+    // Checked here rather than by making removeAppLocally report back: the file
+    // it lives in is untouched by this branch, every force=false caller shares
+    // the same refusal, and a pass that knows it would be refused has no reason
+    // to start. The same guard reinstallOldApplications and softRemoveAppLocally
+    // already use.
+    if (globalState.removalInProgress) {
+      log.info('Give-up-an-app pass skipped: another removal is in progress');
+      return;
+    }
+    if (globalState.installationInProgress) {
+      log.info('Give-up-an-app pass skipped: an installation is in progress');
+      return;
+    }
+
+    // Which components this node is actually running, read once for the pass
+    // rather than once per app. Only the g: ones matter downstream: a node not
+    // running the writer component cannot be the writer, which is what lets the
+    // safety gate answer without FDM on every node that is merely holding a
+    // synced copy.
+    // eslint-disable-next-line global-require
+    const appQueryService = require('../appQuery/appQueryService');
+    const runningRes = await appQueryService.listRunningApps();
+    const runningIdentifiers = runningRes && runningRes.status === 'success' && Array.isArray(runningRes.data)
+      ? new Set(runningRes.data.map((app) => identifierFromContainerName(app.Names[0])))
+      : null;
+    if (!runningIdentifiers) {
+      log.warn('Give-up-an-app pass: running container list unreadable; every g: component is treated as running here');
+    }
+    // Unreadable is not "not running". A container list this node cannot read
+    // says nothing about what is on its disk, and answering "not running" would
+    // route every app straight past the primary check.
+    const isComponentRunningLocally = async (identifier) => (
+      runningIdentifiers ? runningIdentifiers.has(identifier) : true
+    );
+
+    // An app can leave by routes this pass never sees - an operator removal, a
+    // redeploy - and a counter for one this node no longer holds is a leak.
+    const heldNames = new Set(appsInstalled.map((app) => app.name));
+    // eslint-disable-next-line no-restricted-syntax
+    for (const name of giveUpRefusals.keys()) {
+      if (!heldNames.has(name)) giveUpRefusals.delete(name);
+    }
+    // Stood-down components age on the pass that would have removed them, so the
+    // cap is counted in the thing that re-asks the question. Two ways out: the
+    // app left by any route, or this node waited out the cap without being able
+    // to leave. The second matters more than it looks - a component stopped here
+    // and running nowhere is a worse state than the one the stand-down exists to
+    // fix, so the node gives up leaving and stands for election again rather
+    // than holding a stopped app indefinitely.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const [identifier, passes] of standingDown) {
+      const owner = identifier.includes('_') ? identifier.slice(identifier.indexOf('_') + 1) : identifier;
+      if (!heldNames.has(owner)) {
+        standingDown.delete(identifier);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      if (passes >= STAND_DOWN_PASSES_BEFORE_GIVING_UP) {
+        standingDown.delete(identifier);
+        log.warn(`${identifier} stood down ${passes} passes without being able to leave; standing for election again`);
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      standingDown.set(identifier, passes + 1);
+    }
+
     // eslint-disable-next-line no-restricted-syntax
     for (const installedApp of appsInstalled) {
       // eslint-disable-next-line no-await-in-loop
       const runningAppList = await registryManager.appLocation(installedApp.name);
-      const minInstances = installedApp.instances || config.fluxapps.minimumInstances; // introduced in v3 of apps specs
-      if (runningAppList.length > minInstances) {
-        // eslint-disable-next-line no-await-in-loop
-        const appDetails = await registryManager.getApplicationGlobalSpecifications(installedApp.name);
-        if (appDetails) {
-          log.info(`Application ${installedApp.name} is already spawned on ${runningAppList.length} instances. Checking if should be unninstalled from the FluxNode..`);
-          // junior end first: the newest instance stands aside, ties broken
-          // by the shared ordering so every node names the same surplus
-          runningAppList.sort((a, b) => compareInstanceSeniority(b, a));
-          // eslint-disable-next-line no-await-in-loop
-          const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-          if (localSocketAddr) {
-            const index = runningAppList.findIndex((x) => socketAddressesMatch(x.ip, localSocketAddr));
-            if (index === 0) {
-              log.info(`Application ${installedApp.name} going to be removed from node as it was the latest one running it to install it..`);
-              log.warn(`REMOVAL REASON: Too many instances - ${installedApp.name} running on ${runningAppList.length} instances (max: ${minInstances}) - This node is the newest instance`);
-              log.warn(`Removing application ${installedApp.name} locally`);
-              // eslint-disable-next-line no-await-in-loop
-              await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
-              log.warn(`Application ${installedApp.name} locally removed`);
-              // eslint-disable-next-line no-await-in-loop
-              await serviceHelper.delay(config.fluxapps.removal.delay * 1000); // wait for 6 mins so we don't have more removals at the same time
-            }
+      const decision = reasonToGiveUpApp(installedApp, runningAppList, localSocketAddr);
+      // Every pass reports what it decided about every app it holds. Without
+      // this the pass is invisible: it logs nothing at all when it has nothing
+      // to give up, so "never ran" and "ran and declined" read identically, and
+      // a suite can only tell them apart by scraping logs.
+      fluxEventBus.publish('giveUp:considered', {
+        appName: installedApp.name,
+        giveUp: decision.giveUp,
+        reason: decision.reason,
+        detail: decision.detail,
+      });
+      if (!decision.giveUp) {
+        if (decision.reason === 'EVACUATION') {
+          log.info(`${installedApp.name} not handed back yet: ${decision.detail}`);
+        }
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+
+      // eslint-disable-next-line no-await-in-loop
+      const safety = await evacuationSafety.canSafelyRemoveApp(installedApp.name, {
+        appLocation: registryManager.appLocation,
+        getApplicationGlobalSpecifications: registryManager.getApplicationGlobalSpecifications,
+        findSyncedPeer,
+        isElectedPrimary: (name) => isElectedPrimaryHere(name, localSocketAddr),
+        isComponentRunningLocally,
+      });
+      fluxEventBus.publish('giveUp:safety', {
+        appName: installedApp.name,
+        reason: decision.reason,
+        safe: safety.safe,
+        code: safety.code,
+        detail: safety.reason,
+      });
+      if (safety.code === 'STAND_DOWN_REQUIRED' && decision.reason === 'EVACUATION') {
+        // Every other condition has already passed - a connected peer holds each
+        // synced folder in full, and the app is at strength - so the only thing
+        // between this node and leaving is that it is the one writing. Stop
+        // writing. The election hands the role to a peer within a cycle or two,
+        // and the next pass finds the component not running here, re-proves the
+        // peer is complete with nothing left to write, and removes.
+        //
+        // EVACUATION only. SURPLUS picks the JUNIOR instance and the primary is
+        // the senior one, so a surplus giver-up is never the primary; wiring
+        // this there would stop a container for a case that cannot arise.
+        // eslint-disable-next-line no-restricted-syntax
+        for (const identifier of safety.standDown) {
+          try {
+            // The controller's opinion FIRST, and it is not optional. For a g:
+            // component appReconciler reads its desired state from
+            // controllerDesired, so a container stopped while that still says
+            // 'running' is one the reconciler starts again on its next sweep:
+            // the stand-down reports success, the component keeps running, the
+            // election entry goes stale because this node has excluded itself,
+            // and every later pass refuses with ELECTION_UNKNOWN while the node
+            // never leaves. This is the same lever masterSlaveApps pulls to put
+            // a node into standby, which is what standing down makes this one.
+            appReconciler.setControllerDesired(identifier, 'stopped', 'standing down to hand the app back');
+            // eslint-disable-next-line no-await-in-loop
+            await appDockerStop(identifier);
+            standingDown.set(identifier, 0);
+            log.warn(`${installedApp.name}: standing down as ${identifier}'s primary so the app can be handed back`);
+          } catch (error) {
+            // Left unmarked deliberately: a component this node failed to stop
+            // is one it is still writing to, and marking it would make the node
+            // unelectable for a component it is running. The next pass retries.
+            log.error(`${installedApp.name}: could not stand down ${identifier}: ${error.message}`);
           }
         }
+        fluxEventBus.publish('giveUp:standDown', {
+          appName: installedApp.name,
+          components: safety.standDown,
+        });
+        // One action per pass, exactly as a removal is.
+        return;
       }
+      if (!safety.safe) {
+        if (decision.reason === 'EVACUATION') {
+          // The observation window restarts, so the queue wait is served against
+          // an uninterrupted period of the app being whole rather than
+          // accumulated across a gap. Only the evacuation path has a window;
+          // calling this on a surplus refusal cleared a mark nothing had set.
+          residentialNodeDosService.forgetAppObservation(installedApp.name);
+        }
+        const refusals = (giveUpRefusals.get(installedApp.name) ?? 0) + 1;
+        giveUpRefusals.set(installedApp.name, refusals);
+        // No removal follows from this, however long it lasts, and that is
+        // deliberate. Every reason the gate refuses is a reason removing would
+        // be wrong: the peers really are incomplete, so this copy is one of the
+        // few that is not; or this node cannot see them, which is not evidence
+        // about them. Deleting after a timeout does not fix a wedged folder, it
+        // just loses the data more slowly. What a node stuck here needs is to
+        // be VISIBLE - the app is over-served, not down, so nothing about it is
+        // urgent, and the node being unable to establish anything is the part
+        // worth acting on.
+        if (refusals % REFUSALS_BEFORE_ESCALATING !== 0) {
+          log.info(`${installedApp.name} would be given up (${decision.reason}) but it is not safe: ${safety.reason}`);
+        } else {
+          log.warn(`${installedApp.name} has been refused ${refusals} passes running (${decision.reason}, ${safety.code}): ${safety.reason}`);
+        }
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      giveUpRefusals.delete(installedApp.name);
+
+      log.warn(`REMOVAL REASON: ${decision.reason} - ${installedApp.name} ${decision.detail}. Safe: ${safety.reason}`);
+      // eslint-disable-next-line no-await-in-loop
+      await appUninstaller.removeAppLocally(installedApp.name, null, false, true, true);
+      log.warn(`Application ${installedApp.name} locally removed`);
+      if (decision.reason === 'EVACUATION') {
+        residentialNodeDosService.noteEvacuated(installedApp.name);
+      }
+      // One per pass. Removing a second here would take two instances off the
+      // network before the spawner has replaced either.
+      return;
     }
   } catch (error) {
     log.error(error);
@@ -3613,12 +3983,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
 
     // Decrypt enterprise apps (version 8 with encrypted content)
     ({ inPlace: appsInstalled.data } = await decryptEnterpriseApps(appsInstalled.data));
-    const runningAppsNames = runningApps.map((app) => {
-      if (app.Names[0].startsWith('/zel')) {
-        return app.Names[0].slice(4);
-      }
-      return app.Names[0].slice(5);
-    });
+    const runningAppsNames = runningApps.map((app) => identifierFromContainerName(app.Names[0]));
     const agent = new https.Agent({
       rejectUnauthorized: false,
     });
@@ -3658,6 +4023,15 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
       if (!validIdentifiers.has(identifier)) {
         mastersRunningGSyncthingApps.delete(identifier);
         log.info(`masterSlaveApps: Cleaned up stale entry from mastersRunningGSyncthingApps: ${identifier}`);
+      }
+    }
+
+    // And the verdict record beside it. An identifier the node no longer holds
+    // must not keep answering for the app it names.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const identifier of primaryElectionCheckedAt.keys()) {
+      if (!validIdentifiers.has(identifier)) {
+        primaryElectionCheckedAt.delete(identifier);
       }
     }
 
@@ -3709,6 +4083,18 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
         }
       }
       if (needsToBeChecked) {
+        // This node stopped the component in order to hand the app back, so it
+        // is not a candidate. Without this the election restores it within one
+        // cycle: the component is not running here, this node's own stale
+        // primary record is cleared below, no peer has picked it up yet, and the
+        // index-0 branch starts it again - every 30s, forever. Checked in the
+        // same place and for the same reason as operator-stopped, which is the
+        // other way a component this node holds is deliberately not running.
+        if (standingDown.has(identifier)) {
+          log.info(`masterSlaveApps: ${identifier} is standing down to be handed back - excluded from primary election`);
+          // eslint-disable-next-line no-continue
+          continue;
+        }
         // operator explicitly stopped this g: component; don't elect or act on it
         // eslint-disable-next-line no-await-in-loop
         if (await appsRuntimeState.isOperatorStopped(identifier)) {
@@ -3755,6 +4141,12 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
               // eslint-disable-next-line no-continue
               continue;
             }
+            // FDM answered and `ip` is either a primary's address or null for
+            // none. Both are verdicts, and it is the verdict rather than the
+            // table entry that isElectedPrimaryHere reads - a null ip writes
+            // nothing to mastersRunningGSyncthingApps, so without this line the
+            // two ways of having no entry stay indistinguishable.
+            primaryElectionCheckedAt.set(identifier, Date.now());
             if ((!ip)) {
               log.info(`masterSlaveApps: app:${installedApp.name} has currently no primary set`);
               if (!runningAppsNames.includes(identifier)) {
@@ -4223,6 +4615,8 @@ module.exports = {
   installationInProgressReset,
   setInstallationInProgressTrue,
   checkAndRemoveApplicationInstance,
+  reasonToGiveUpApp,
+  isElectedPrimaryHere,
   reinstallOldApplications,
   checkAndRemoveEnterpriseAppsOnNonArcane,
   forceAppRemovals,

@@ -108,6 +108,12 @@ async function trySpawningGlobalApplication() {
       return installDelay;
     }
 
+    if (fluxNetworkHelper.isPlacementHeld()) {
+      log.info(`Node held back from new placements (${fluxNetworkHelper.getPlacementHold()}). Global applications will not be installed`);
+      fluxEventBus.publish('spawner:blocked', { reason: 'placement_hold' });
+      return installDelay;
+    }
+
     let isNodeConfirmed = false;
     isNodeConfirmed = await generalService.isNodeStatusConfirmed().catch(() => null);
     if (!isNodeConfirmed) {
@@ -283,11 +289,21 @@ async function trySpawningGlobalApplication() {
     } else {
       const myNodeLocation = await systemIntegration.nodeFullGeolocation();
 
+      // Where the candidates went. Every filter below removes apps for a
+      // different and entirely reasonable reason, and none of them says so - the
+      // pass ends with "No app currently to be processed" whether one filter
+      // dropped everything or five each took a share. From outside the process
+      // that is indistinguishable from an app nobody wanted, which is how a port
+      // collision looked like a placement failure for a whole day.
+      const survivors = { found: globalAppNamesLocation.length };
+
       // filter apps that failed to install before
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => !runningApps.data.find((appsRunning) => appsRunning.Names[0].slice(5) === app.name)
         && !globalState.spawnErrorsLongerAppCache.has(app.hash)
         && !globalState.trySpawningGlobalAppCache.has(app.hash)
         && !appsToBeCheckedLater.some((appAux) => appAux.appName === app.name));
+      survivors.afterAlreadyHeldOrTried = globalAppNamesLocation.length;
+
       // filter apps that are non enterprise or are marked to install on my node.
       // Enterprise-owned apps that target specific node IPs are strict: only a node
       // whose IP is listed may install them, regardless of version (the version>=8
@@ -334,10 +350,13 @@ async function trySpawningGlobalApplication() {
         // installer arbitrates
       }
       const myLocation = { continentCode: myContinentCode, countryCode: myCountryCode, region: myTableRegion };
+      survivors.afterNodePin = globalAppNamesLocation.length;
       globalAppNamesLocation = globalAppNamesLocation.filter(
         (app) => placementFeasibility.nodeLocationMatchesGeolocation(myLocation, app.geolocation),
       );
+      survivors.afterGeolocation = globalAppNamesLocation.length;
       globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
+      survivors.afterOwnership = globalAppNamesLocation.length;
 
       // Drop candidates whose remaining slots are already claimed, before one is
       // picked at random. The pool counts running instances only, so an app that
@@ -356,8 +375,11 @@ async function trySpawningGlobalApplication() {
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
       ({ shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, appsCountAvailableToInstallOnMyNode));
 
+      survivors.afterClaims = globalAppNamesLocation.length;
+
       if (globalAppNamesLocation.length === 0) {
-        log.info('trySpawningGlobalApplication - No app currently to be processed');
+        log.info(`trySpawningGlobalApplication - No app currently to be processed (${JSON.stringify(survivors)})`);
+        fluxEventBus.publish('spawner:noCandidates', survivors);
         return delayTime;
       }
       log.info(`trySpawningGlobalApplication - Found ${globalAppNamesLocation.length} apps that are missing instances on the network and can be selected to try to spawn on my node.`);
@@ -864,16 +886,23 @@ async function trySpawningGlobalApplication() {
 
     // install the app
     let registerOk = false;
+    // The installer signals failure two ways - a false return and a throw - and
+    // only the reason it throws with says WHICH check refused. A port already
+    // held by another app is raised that way, and reporting the failure without
+    // it leaves a suite unable to tell a refusal from an app that was simply
+    // never selected.
+    let installError = null;
     try {
       registerOk = await appInstaller.registerAppLocally(appSpecifications, null, null, false); // can throw
     } catch (error) {
       log.error(error);
+      installError = error.message ?? String(error);
       registerOk = false;
     }
     if (!registerOk) {
       log.info(`trySpawningGlobalApplication - Install failed for ${appToRun}, adding to local error cache`);
       globalState.spawnErrorsLongerAppCache.set(appHash, '');
-      fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash });
+      fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash, error: installError });
       return shortDelayTime;
     }
 
