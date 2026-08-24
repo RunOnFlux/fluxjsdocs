@@ -54,10 +54,7 @@ const startingClaims = new Set();
 // its appdata mount before the wipe (mirrors the sync layer's prior 500ms delay).
 const DATA_CLEAR_SETTLE_MS = 500;
 
-// id -> promise of the pass (or intent write) currently holding this key. A Map
-// rather than a Set so a caller can WAIT for the holder: applyIntent below needs
-// to know when a pass has finished, not merely that one is running.
-const inFlight = new Map(); // per-key single-flight
+const inFlight = new Set(); // ids currently reconciling (per-key single-flight)
 const dirty = new Set(); // ids re-requested while in flight -> reconcile again
 const bootPending = new Set(); // ids enqueued before the boot gate opened
 const backoffTimers = new Map(); // id -> scheduled retry timeout
@@ -320,9 +317,6 @@ async function dockerActual(identifier) {
       running: !!(info.State && info.State.Running) && !info.State.Paused,
       paused: !!(info.State && info.State.Paused),
       exitCode: everRan ? (info.State.ExitCode ?? null) : null,
-      // the kernel's verdict, not the entrypoint's: an image that swallows its
-      // payload's status still cannot hide this one
-      oomKilled: !!(info.State && info.State.OOMKilled),
       finishedAt,
       // classified from THIS inspect so the running-branch network check needs no
       // second docker call (and no TOCTOU between two inspects).
@@ -379,30 +373,6 @@ async function effectiveDesiredRunning(identifier, spec, exitCode) {
   }
   const desired = policyAllowsRun(getRestartPolicy(spec), exitCode);
   return { desired, reason: desired ? 'running' : 'policy' };
-}
-
-/**
- * The run state the reconciler would converge this component to right now, and
- * why — the same spec read, docker probe and policy a reconcile pass uses, so a
- * caller reporting on an operator command never re-derives the decision.
- *
- * `desired` is null for a g:/r: component whose decider has not spoken: the
- * reconciler takes no action, which is neither running nor stopped.
- *
- * Throws what getLocalComponentSpec throws — a transient spec read is not an
- * answer, and reporting one as "not running" would tell an operator their app
- * is held when nothing has decided anything.
- *
- * @param {string} rawIdentifier
- * @returns {Promise<{desired: boolean|null, reason: string}>}
- */
-async function desiredRunState(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const spec = await getLocalComponentSpec(identifier);
-  if (!spec) return { desired: false, reason: 'notInstalled' };
-  if (spec.invalidSpec) return { desired: false, reason: 'invalidSpec' };
-  const actual = await dockerActual(identifier);
-  return effectiveDesiredRunning(identifier, spec, actual.exitCode);
 }
 
 /**
@@ -751,7 +721,6 @@ async function reconcile(rawIdentifier) {
         if (actualNow.reachable && !actualNow.indeterminate && (actualNow.running || actualNow.paused)) {
           log.info(`appReconciler - ${identifier} data volume unavailable but a stop is desired; stopping the container`);
           await dockerService.appDockerStop(identifier);
-          appInspector.stopAppMonitoring(identifier, false);
           fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'controllerDesired' });
         }
       } catch (err) {
@@ -818,7 +787,6 @@ async function reconcile(rawIdentifier) {
     log.warn(`appReconciler - ${identifier} is paused, which nothing can act on; stopping it so it can be reconciled normally`);
     try {
       await dockerService.appDockerStop(identifier);
-      appInspector.stopAppMonitoring(identifier, false);
       fluxEventBus.publish('reconciler:actuated', { identifier, action: 'unpaused' });
     } catch (err) {
       log.error(`appReconciler - failed to stop the paused ${identifier}: ${err.message}; retrying. No FluxOS primitive releases a paused container - manual remedy on the node: docker unpause ${dockerService.getAppIdentifier(identifier)}`);
@@ -853,7 +821,6 @@ async function reconcile(rawIdentifier) {
       if (actual.running) {
         log.info(`appReconciler - ${identifier} stopping before local appdata clear`);
         await dockerService.appDockerStop(identifier);
-        appInspector.stopAppMonitoring(identifier, false);
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
@@ -886,24 +853,9 @@ async function reconcile(rawIdentifier) {
 
   if (!desired) {
     if (actual.running) {
-      // A hard kill skips the graceful shutdown window, and only an operator asks
-      // for one - every other stop reason is a graceful stop, so the durable flag
-      // is read only where one could have been set.
-      const stopState = reason === 'operatorStopped' ? await appsRuntimeState.getState(identifier) : null;
-      const forceKill = Boolean(stopState && stopState.operatorStopForce);
-      log.info(`appReconciler - ${identifier} desired stopped, ${forceKill ? 'killing' : 'stopping'}`);
-      if (forceKill) {
-        await dockerService.appDockerKill(identifier);
-      } else {
-        await dockerService.appDockerStop(identifier);
-      }
-      // Monitoring follows the container. The per-minute sampler otherwise runs
-      // against a stopped container, logging an error a minute until something
-      // else happens to stop it.
-      appInspector.stopAppMonitoring(identifier, false);
-      fluxEventBus.publish('reconciler:actuated', {
-        identifier, action: 'stopped', reason, forced: forceKill,
-      });
+      log.info(`appReconciler - ${identifier} desired stopped, stopping`);
+      await dockerService.appDockerStop(identifier);
+      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason });
     }
     return;
   }
@@ -919,35 +871,6 @@ async function reconcile(rawIdentifier) {
     // Verify the attachment (from the inspect dockerActual already did) before
     // trusting "running"; heal by recreating, confirmed in-pass and paced.
     if (!dockerService.isContainerDetachedFromNetwork(actual.attachment)) {
-      // An operator restart is a level, not an action: it raises a generation and
-      // this bounces the container once the generation passes the one already
-      // actuated. Not paced by the backoff ladder - a deliberate bounce is not
-      // crash recovery, and pacing it is what made six restarts look like an app
-      // that could not stay up.
-      const restartState = await appsRuntimeState.getState(identifier);
-      const desiredGeneration = (restartState && restartState.restartGeneration) || 0;
-      const actuatedGeneration = (restartState && restartState.actuatedRestartGeneration) || 0;
-      if (desiredGeneration > actuatedGeneration) {
-        log.info(`appReconciler - ${identifier} restart requested (generation ${desiredGeneration}); restarting`);
-        try {
-          await dockerService.appDockerRestart(identifier);
-        } catch (err) {
-          log.error(`appReconciler - failed to restart ${identifier} on request: ${err.message}; retrying`);
-          fluxEventBus.publish('reconciler:actuated', { identifier, action: 'restartRequestFailed', reason: err.message });
-          scheduleRetry(identifier, MANAGED_RETRY_MS);
-          return;
-        }
-        await appsRuntimeState.recordRestartGeneration(identifier, desiredGeneration);
-        fluxEventBus.publish('reconciler:actuated', { identifier, action: 'restarted', reason: 'operatorRequested' });
-        notifyContainerStarted(identifier);
-        // A restart is a start, so it can come up on a stale endpoint the same way.
-        scheduleRetry(identifier, POST_START_VERIFY_MS);
-        return;
-      }
-      // The container is where it should be; monitoring may not be. A stop turns
-      // it off, and a stop docker never carried out leaves a running container
-      // unmonitored with no later pass to notice.
-      appInspector.ensureAppMonitoring(identifier);
       return; // running and properly attached (heal state was cleared above)
     }
     await healDetachedNetwork(identifier, mainAppName, spec);
@@ -993,33 +916,12 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  // exists but stopped, should run -> restart, paced by the ladder only when the
-  // stop carries evidence of a fault (no sleeping; the worker re-enqueues when
-  // the backoff window elapses). A clean exit goes back immediately: it is an
-  // operator restarting their own app far more often than it is a crash, and
-  // pacing that turns a deliberate restart into what looks like an outage.
-  // exitCode null is a container that has never run - an initial start, not a death.
-  const crashed = !!actual.oomKilled || (actual.exitCode !== null && actual.exitCode !== 0);
+  // exists but stopped, should run -> backoff-paced restart (no sleeping; the
+  // worker re-enqueues when the backoff window elapses)
   const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt);
   if (wait > 0) {
-    // name which of the two put it here: a reported fault, or restarts arriving
-    // fast enough to be one whatever the exit code said. Support cannot tell
-    // these apart from the outside, and the difference decides what they do next.
-    const cause = crashed
-      ? `exit ${actual.exitCode}${actual.oomKilled ? ' (OOM-killed)' : ''}`
-      : 'restarting too fast to be healthy';
-    // How far up the ladder this is. waitMs alone cannot say: it is what REMAINS
-    // of the rung, and the worker re-enqueues during a wait, so one rung reports
-    // several times, each smaller than the last. Two backoffs cannot be compared
-    // without it - which is how far a component has escalated, and whether it
-    // ever went backwards. Read on the backoff path only, which is a paced
-    // restart and therefore cold.
-    const backoffState = await appsRuntimeState.getState(identifier);
-    const rung = ((backoffState && backoffState.restartHistory) || []).length;
-    log.warn(`appReconciler - ${identifier} stopped, ${cause}; backing off ${Math.round(wait / 1000)}s before restart (rung ${rung})`);
-    fluxEventBus.publish('reconciler:actuated', {
-      identifier, action: 'backoff', waitMs: wait, rung, crashed,
-    });
+    log.warn(`appReconciler - ${identifier} stopped, backing off ${Math.round(wait / 1000)}s before restart`);
+    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'backoff', waitMs: wait });
     scheduleRetry(identifier, wait);
     return;
   }
@@ -1040,32 +942,20 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  await appsRuntimeState.recordRestart(identifier, crashed);
+  await appsRuntimeState.recordRestart(identifier);
   try {
     await dockerService.appDockerStart(identifier);
   } catch (err) {
     // No die event fires for a failed start (the container never ran), so a
     // dropped throw here leaves the component down until the hourly sweep.
-    // Schedule our own retry. A start that never ran carries no exit code, so it
-    // is not a fault and does not walk the ladder directly - it reaches the
-    // ladder by filling the burst window, which these retries do comfortably
-    // (restartBurstCount x MANAGED_RETRY_MS against restartBurstWindowMs). That
-    // relationship is what bounds a permanently failing start, and the config
-    // comment on the window is where it is stated.
+    // Schedule our own retry; pacing is free - the attempt was recorded above,
+    // so a persistent failure walks the backoff ladder instead of hammering.
     log.error(`appReconciler - failed to start ${identifier}: ${err.message}; retrying`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'startFailed', reason: err.message });
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
   appInspector.startAppMonitoring(identifier);
-  // A restart of a container that was already stopped IS this start, so the
-  // request is satisfied here. Left pending, the pass that next finds it running
-  // would bounce a container the operator has just watched come up.
-  const startedState = await appsRuntimeState.getState(identifier);
-  const pendingGeneration = (startedState && startedState.restartGeneration) || 0;
-  if (pendingGeneration > ((startedState && startedState.actuatedRestartGeneration) || 0)) {
-    await appsRuntimeState.recordRestartGeneration(identifier, pendingGeneration);
-  }
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
   notifyContainerStarted(identifier);
@@ -1089,7 +979,7 @@ function scheduleRetry(identifier, delayMs) {
 }
 
 function runReconcile(identifier) {
-  const pass = reconcile(identifier)
+  reconcile(identifier)
     .catch((err) => log.error(`appReconciler - reconcile ${identifier} failed: ${err.message}`))
     .finally(() => {
       inFlight.delete(identifier);
@@ -1102,10 +992,6 @@ function runReconcile(identifier) {
         setImmediate(() => enqueue(identifier));
       }
     });
-  // Registered synchronously: promise callbacks are microtasks, so the finally
-  // above cannot run before this line and clear an entry that is not there yet.
-  inFlight.set(identifier, pass);
-  return pass;
 }
 
 /**
@@ -1117,74 +1003,14 @@ function enqueue(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   if (!globalState.bootContainerStateSettled) {
     bootPending.add(identifier);
-    return null;
+    return;
   }
   if (inFlight.has(identifier)) {
     dirty.add(identifier);
-    // The pass already running was started against state older than whatever
-    // just changed, so it is NOT the pass a caller wanting actuation should
-    // wait on. The re-run this marks dirty is, and it has no promise yet.
-    return null;
+    return;
   }
-  return runReconcile(identifier);
-}
-
-/**
- * Change what a component is supposed to be doing, without racing a pass that is
- * deciding what to do about it.
- *
- * A reconcile reads the desired state, then acts on that answer some
- * milliseconds later once docker has answered. An intent written in that gap is
- * not seen: the pass starts a container an operator has just stopped, and the
- * next pass stops it again. The lock is written correctly and early - the
- * problem is that the check and the action are not atomic against a concurrent
- * writer, so narrowing the gap with a second check before acting would leave the
- * same defect with a smaller window.
- *
- * Instead the write takes the same per-key slot a pass takes. It waits out a
- * pass already deciding, holds the key while it writes so `enqueue` marks the
- * key dirty rather than starting one, and enqueues on release so the next pass
- * reads the intent it just wrote. The two can no longer interleave because they
- * are mutually exclusive by construction.
- *
- * The wait is bounded by one pass of ONE component - a docker probe and at most
- * one action - so an operator's command is never behind unrelated work.
- * @param {string} rawIdentifier Component identifier.
- * @param {Function} mutate Writes the new intent. Awaited while the key is held.
- * @param {object} [opts]
- * @param {boolean} [opts.awaitPass] Wait for the reconcile that follows, so a
- *   caller can report what was DONE rather than what was asked for. The pass is
- *   awaited to completion, actuated or deferred - it never throws here, since
- *   runReconcile absorbs its own failures.
- * @returns {Promise<boolean>} True when a pass ran to completion. False when the
- *   intent is durable but nothing has acted on it yet - the boot gate is shut,
- *   or another pass is mid-flight and the re-run has not started. Callers that
- *   report to a user must not present false as success.
- */
-async function applyIntent(rawIdentifier, mutate, { awaitPass = false } = {}) {
-  const identifier = canonical(rawIdentifier);
-
-  // A loop, not a single await: releasing the key lets a queued pass start
-  // before this continues, and that pass would be reading the state we are
-  // about to replace.
-  // eslint-disable-next-line no-await-in-loop
-  while (inFlight.has(identifier)) await inFlight.get(identifier).catch(() => {});
-
-  let release;
-  const held = new Promise((resolve) => { release = resolve; });
-  inFlight.set(identifier, held);
-  try {
-    await mutate();
-  } finally {
-    inFlight.delete(identifier);
-    release();
-  }
-
-  const pass = enqueue(identifier);
-  if (!awaitPass) return Boolean(pass);
-  if (!pass) return false;
-  await pass;
-  return true;
+  inFlight.add(identifier);
+  runReconcile(identifier);
 }
 
 /**
@@ -1370,7 +1196,6 @@ function stop() {
 
 module.exports = {
   enqueue,
-  applyIntent,
   enqueueAll,
   setControllerDesired,
   clearControllerDesired,
@@ -1383,14 +1208,6 @@ module.exports = {
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
-  // The one answer to "what is this container actually doing" - it probes the
-  // daemon rather than pattern-matching an inspect error, so it can tell docker
-  // being unreachable from the container being gone. Anything that acts on a
-  // container's run state needs that distinction, not just the reconciler.
-  dockerActual,
-  // What the reconciler would do with this component now, for a caller that has
-  // to report an operator command's outcome truthfully.
-  desiredRunState,
   // exposed for tests
   reconcile,
   policyAllowsRun,
