@@ -1,10 +1,8 @@
 const config = require('config');
 const util = require('util');
+const df = require('node-df');
 const fs = require('node:fs');
 const path = require('node:path');
-const {
-  SYNCTHING_FOLDER_MARKER, SYNCTHING_IGNORE_FILE, SYNCTHING_IGNORE_LINES,
-} = require('../appSystem/volumeReservedNames');
 const nodecmd = require('node-cmd');
 const axios = require('axios');
 const dbHelper = require('../dbHelper');
@@ -18,7 +16,6 @@ const fluxNetworkHelper = require('../fluxNetworkHelper');
 const {
   DEFAULT_API_PORT, extractIp, extractPort, socketAddressesMatch, ipsMatch,
 } = require('../utils/socketAddressUtils');
-const fluxEventBus = require('../utils/fluxEventBus');
 const generalService = require('../generalService');
 const placementFeasibility = require('../appPlacement/placementFeasibility');
 // eslint-disable-next-line no-unused-vars
@@ -31,7 +28,6 @@ const {
   appsFolder,
   appVolumesPath,
   legacyAppVolumesPath,
-  APP_VOLUME_MOUNT_OPTIONS,
 } = require('../utils/appConstants');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { compareInstanceSeniority } = require('../utils/instanceOrdering');
@@ -418,6 +414,7 @@ let dosMountMessage = '';
  * @returns {Promise<void>}
  */
 async function createAppVolume(appSpecifications, appName, isComponent, res) {
+  const dfAsync = util.promisify(df);
   const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
   const appId = dockerService.getAppIdentifier(identifier);
 
@@ -430,7 +427,22 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
     if (res.flush) res.flush();
   }
 
-  const okVolumes = await volumeService.capacityVolumesInGib();
+  // we want whole numbers in GB
+  const options = {
+    prefixMultiplier: 'GB',
+    isDisplayPrefixMultiplier: false,
+    precision: 0,
+  };
+
+  const dfres = await dfAsync(options);
+  const okVolumes = [];
+  dfres.forEach((volume) => {
+    if (volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop') && !volume.mount.includes('boot')) {
+      okVolumes.push(volume);
+    } else if (volume.filesystem.includes('loop') && volume.mount === '/') {
+      okVolumes.push(volume);
+    }
+  });
 
   // Dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -589,7 +601,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       res.write(serviceHelper.ensureString(mountingStatus));
       if (res.flush) res.flush();
     }
-    await execAsRoot('mount', ['-o', APP_VOLUME_MOUNT_OPTIONS, volumeFile, appDir]);
+    await execAsRoot('mount', ['-o', 'loop', volumeFile, appDir]);
     const mountingStatus2 = {
       status: 'Volume mounted',
     };
@@ -761,7 +773,7 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
       // mountpoint - it is syncthing's own guard against syncing an unmounted
       // dir, and the immutable bare mountpoint guarantees it can never be
       // recreated there.
-      await execAsRoot('mkdir', ['-p', path.join(appDir, SYNCTHING_FOLDER_MARKER)]);
+      await execAsRoot('mkdir', ['-p', path.join(appDir, '.stfolder')]);
       const stFolderCreation2 = {
         status: '.stfolder created',
       };
@@ -771,10 +783,9 @@ async function createAppVolume(appSpecifications, appName, isComponent, res) {
         if (res.flush) res.flush();
       }
 
-      // Create .stignore with the FluxOS policy lines - what keeps backup and
-      // an operation's staging off the network (in parent directory; the app
-      // dir is 777 by now so no elevation is needed)
-      await fs.promises.writeFile(path.join(appDir, SYNCTHING_IGNORE_FILE), `${SYNCTHING_IGNORE_LINES.join('\n')}\n`);
+      // Create .stignore file to exclude backup directory (in parent
+      // directory; the app dir is 777 by now so no elevation is needed)
+      await fs.promises.writeFile(path.join(appDir, '.stignore'), '/backup\n');
       const stiFileCreation = {
         status: '.stignore created',
       };
@@ -2087,11 +2098,6 @@ async function requestMasterStartWithPermissionsFix(appname, appId) {
   // in the finally - from a successful start the controllerDesired below carries
   // the claim, and a failed one must stop claiming.
   appReconciler.claimStarting(appname);
-  // A fact - this node has decided to become primary and is committing to it.
-  // The cadence around this decision is a counter, not an event: see the rule at
-  // the top of fluxEventBus.js.
-  fluxEventBus.publish('masterSlave:started', { identifier: appname });
-  fluxEventBus.count('masterSlave:decision', appname, 'started');
   try {
     log.info(`Preparing masterSlave primary ${appname}: fixing permissions before start`);
 
@@ -2449,12 +2455,28 @@ async function testAppMount() {
     await removeTestAppMount();
     const appSize = 1;
     const overHeadRequired = 2;
+    const dfAsync = util.promisify(df);
     const appId = 'flux_fluxTestVol';
 
     log.info('Mount Test: started');
     log.info('Mount Test: Searching available space...');
 
-    const okVolumes = await volumeService.capacityVolumesInGib();
+    // we want whole numbers in GB
+    const options = {
+      prefixMultiplier: 'GB',
+      isDisplayPrefixMultiplier: false,
+      precision: 0,
+    };
+
+    const dfres = await dfAsync(options);
+    const okVolumes = [];
+    dfres.forEach((volume) => {
+      if (volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop') && !volume.mount.includes('boot')) {
+        okVolumes.push(volume);
+      } else if (volume.filesystem.includes('loop') && volume.mount === '/') {
+        okVolumes.push(volume);
+      }
+    });
 
     // check if space is not sharded in some bad way. Always count the fluxSystemReserve
     let useThisVolume = null;
@@ -2497,7 +2519,7 @@ async function testAppMount() {
     log.info('Mount Test: Directory made');
     log.info('Mount Test: Mounting volume...');
 
-    await execAsRoot('mount', ['-o', APP_VOLUME_MOUNT_OPTIONS, volumePath, path.join(appsFolder, appId)]);
+    await execAsRoot('mount', ['-o', 'loop', volumePath, path.join(appsFolder, appId)]);
     log.info('Mount Test: Volume mounted. Test completed.');
     dosMountMessage = '';
     // run removal
@@ -3524,29 +3546,6 @@ const PeerComponent = Object.freeze({
 // budget buys nothing and costs availability.
 const PEER_PROBE_TIMEOUT_MS = 10 * 1000;
 
-/**
- * How long an instance waits per place in the queue before it may take a primary
- * FDM is reporting as empty.
- *
- * The stagger serialises the candidates so they do not all start against the same
- * volume at once, and its length is set by how long FDM takes to register a node
- * that HAS started - measured at ~110s in production. A place is worth more than
- * that or the wait does not cover what it exists to cover.
- *
- * Read from config on every call, and per place rather than as a total, because
- * the only consumer that overrides it is a test: at three minutes a place, every
- * staggered-start path costs minutes of wall clock to reach, which is why none of
- * them has rig coverage. A suite exercising one compresses it in its own
- * configOverrides - not in the shared harness config, which would re-time every
- * existing g: election suite for the benefit of the one that needs it.
- *
- * @param {number} places how far down the election order, 0 for no wait
- * @returns {number} milliseconds
- */
-function staggerMs(places) {
-  return places * (config.fluxapps.masterSlaveStaggerMs ?? 3 * 60 * 1000);
-}
-
 // Why a silent peer was left alone, in the words an operator reading the log
 // needs: each one is a different thing to go and look at.
 const SILENCE_REASONS = Object.freeze({
@@ -3712,10 +3711,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
         // operator explicitly stopped this g: component; don't elect or act on it
         // eslint-disable-next-line no-await-in-loop
         if (await appsRuntimeState.isOperatorStopped(identifier)) {
-          // Outside the once-guard below on purpose: the log line reports the
-          // state change, the counter reports every pass that honoured it, which
-          // is what a test asserting "the election kept skipping it" needs.
-          fluxEventBus.count('masterSlave:decision', identifier, 'operatorStopped');
           if (!operatorStoppedNoted.has(identifier)) {
             operatorStoppedNoted.add(identifier);
             log.info(`masterSlaveApps: ${identifier} is operator-stopped - excluded from primary election until it is started`);
@@ -3890,26 +3885,10 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     const held = heldResponse?.data?.data;
                     if (Array.isArray(held)) {
                       if (held.includes(appId)) {
-                        fluxEventBus.count('masterSlave:decision', identifier, 'heldOnPeer');
                         log.info(`masterSlaveApps: component:${identifier} is held on peer node (${label}) at ${ipToCheck}, will not start`);
                         return PeerComponent.RUNNING;
                       }
                       return PeerComponent.NOT_RUNNING;
-                    }
-
-                    // The peer HAS the endpoint and it failed. FluxOS answers
-                    // errors in band, so this arrives as a 200 carrying an error
-                    // object rather than a list - indistinguishable from a peer
-                    // too old for the route by shape alone, which is why it is
-                    // separated here.
-                    // Falling through would answer from the container list a
-                    // question the peer has just said it cannot answer, and that
-                    // list cannot see the durable stop lock at all: a primary its
-                    // owner stopped to work on reads as free, and this node
-                    // elects itself over them. Alive and unreadable is UNKNOWN.
-                    if (heldResponse?.data?.status === 'error') {
-                      log.info(`masterSlaveApps: peer node (${label}) at ${ipToCheck} could not answer what it holds for app:${installedApp.name} - alive, and cannot be ruled out, will not start`);
-                      return PeerComponent.UNKNOWN;
                     }
 
                     const response = await axios.get(`http://${ipToCheck}:${portToCheck}/apps/listrunningapps`, { timeout: PEER_PROBE_TIMEOUT_MS, cancelToken: source.token });
@@ -3946,28 +3925,8 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 };
 
                 const checkPeersRunning = async (scope) => {
-                  // A lower-only scope with nobody in it is not an answer. At index 0
-                  // there is no node ahead to ask, and index -1 - this node absent
-                  // from the location list - has none either, so the walk below asks
-                  // NOBODY and the caller reads that as clear.
-                  //
-                  // That is the same blind start the index-0 branch takes scope 'all'
-                  // to avoid, reached from the staggered paths instead. It is not
-                  // unreachable there: the stagger is booked at index >= 2, index is
-                  // re-derived from the location list every pass, and the instances
-                  // ahead can age out of that list before the booked turn arrives -
-                  // leaving a node at index 0 holding a schedule. FDM's registration
-                  // lags a node actually starting (~110s in production), so through
-                  // that whole window it reports no primary while an instance is live,
-                  // and starting on "nobody is ahead of me" puts a second writer on
-                  // the shared volume.
-                  //
-                  // Escalate rather than answer: a start is never issued without some
-                  // peer having been asked. An empty 'all' is a real answer - there is
-                  // genuinely no one to ask - and falls through below.
-                  const effectiveScope = scope === 'lower' && index <= 0 ? 'all' : scope;
-                  const limit = effectiveScope === 'all' ? runningAppList.length : index;
-                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // nobody to ask at all
+                  const limit = scope === 'all' ? runningAppList.length : index;
+                  if (limit <= 0) return PeerComponent.NOT_RUNNING; // not found, or no lower nodes to check
 
                   const peers = [];
                   for (let i = 0; i < limit; i += 1) {
@@ -4034,12 +3993,12 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                     if (previousMasterIndex >= 0) {
                       log.info(`masterSlaveApps: app:${installedApp.name} had primary running at index: ${previousMasterIndex}`);
                       if (index > previousMasterIndex) {
-                        timetoStartApp += staggerMs(index - 1);
+                        timetoStartApp += (index - 1) * 3 * 60 * 1000;
                       } else {
-                        timetoStartApp += staggerMs(index);
+                        timetoStartApp += index * 3 * 60 * 1000;
                       }
                     } else {
-                      timetoStartApp += staggerMs(index);
+                      timetoStartApp += index * 3 * 60 * 1000;
                     }
                     if (timetoStartApp <= Date.now()) {
                       // Time to start, but check if lower-index nodes are running
@@ -4120,7 +4079,7 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                   }
                 } else if (index > 0 && !mastersRunningGSyncthingApps.has(identifier) && !timeTostartNewMasterApp.has(identifier)) {
                   // Non-primary node with no history - schedule start based on index
-                  const timetoStartApp = Date.now() + staggerMs(index);
+                  const timetoStartApp = Date.now() + (index * 3 * 60 * 1000);
                   log.info(`masterSlaveApps: scheduling app:${installedApp.name} index: ${index} to start at ${timetoStartApp.toString()}`);
                   timeTostartNewMasterApp.set(identifier, timetoStartApp);
                 } else {
@@ -4129,10 +4088,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
                 }
               }
             } else {
-              // This pass read a primary off FDM. Counted rather than published:
-              // it is the loop's cadence, not an event - see the rule at the top
-              // of fluxEventBus.js.
-              fluxEventBus.count('masterSlave:decision', identifier, 'primaryObserved');
               mastersRunningGSyncthingApps.set(identifier, ip);
               if (timeTostartNewMasterApp.has(identifier)) {
                 log.info(`masterSlaveApps: app:${installedApp.name} removed from timeTostartNewMasterApp cache, already started on another standby node`);
@@ -4188,7 +4143,6 @@ async function masterSlaveApps(globalStateParam, installedApps, listRunningApps,
   } finally {
     // eslint-disable-next-line no-param-reassign
     globalStateParam.masterSlaveAppsRunning = false;
-    fluxEventBus.count('masterSlave:cycles');
     await serviceHelper.delay(config.fluxapps.masterSlaveIntervalMs ?? 30 * 1000);
     masterSlaveApps(globalStateParam, installedApps, listRunningApps, receiveOnlySyncthingAppsCache, backupInProgressParam, restoreInProgressParam, https);
   }
