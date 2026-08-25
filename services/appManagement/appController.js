@@ -13,6 +13,61 @@ const { extractIp, extractPort } = require('../utils/socketAddressUtils');
 const log = require('../../lib/log');
 
 const { globalCmdDelayMs } = config.fluxapps;
+// Guaranteed a finite non-negative integer, so a missing or malformed config
+// value can never spin the retry loop below forever.
+const globalCmdBootRetries = (Number.isInteger(config.fluxapps.globalCmdBootRetries)
+  && config.fluxapps.globalCmdBootRetries >= 0)
+  ? config.fluxapps.globalCmdBootRetries
+  : 8;
+
+// A node still reconciling its apps after boot refuses these routes with 15s.
+const BOOT_RETRY_AFTER_FALLBACK_S = 15;
+// Caps a node's Retry-After so a hostile or absurd value cannot stall delivery.
+const BOOT_RETRY_MAX_WAIT_MS = 60 * 1000;
+
+/**
+ * Send one global command to one instance, retrying only a boot-gate refusal.
+ *
+ * A node that has not finished reconciling its apps after boot answers these
+ * routes with 503 + Retry-After (see requireBootSettled), which is
+ * self-resolving - it settles within its boot window. Retrying that a bounded
+ * number of times keeps a global command from being dropped on the first
+ * refusal: without it a global appremove aimed at a node mid-restart never
+ * lands, the app stays installed and running, and the owner was already told
+ * the removal was queried. ONLY a 503 is retried; any other status is the
+ * node's real answer and is final, and a node still refusing after the bound is
+ * warned about rather than hammered forever.
+ *
+ * Errors are handled internally, so this never rejects - callers fire it and
+ * move on.
+ *
+ * @param {string} url
+ * @param {object} axiosConfig
+ */
+async function deliverGlobalCommand(url, axiosConfig) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const response = await axios.get(url, axiosConfig);
+      log.info(`Successfully sent command to ${url}: ${response.status}`);
+      return;
+    } catch (error) {
+      const status = error.response && error.response.status;
+      if (status !== 503) {
+        log.error(`Axios request failed for ${url}`, error);
+        return;
+      }
+      if (attempt >= globalCmdBootRetries) {
+        log.warn(`Node at ${url} still reconciling apps after boot; command not delivered after ${globalCmdBootRetries} retries`);
+        return;
+      }
+      const headerRetryAfter = Number(error.response.headers && error.response.headers['retry-after']);
+      const retryAfterS = headerRetryAfter > 0 ? headerRetryAfter : BOOT_RETRY_AFTER_FALLBACK_S;
+      // eslint-disable-next-line no-await-in-loop
+      await serviceHelper.delay(Math.min(retryAfterS * 1000, BOOT_RETRY_MAX_WAIT_MS));
+    }
+  }
+}
 
 /**
  * Get application locations from the global database
@@ -83,13 +138,9 @@ async function executeAppGlobalCommand(appname, command, zelidauth, paramA, bypa
       if (paramA) {
         url += `/${paramA}`;
       }
-      axios.get(url, axiosConfig)
-        .then((response) => {
-          log.info(`Successfully sent command to ${url}: ${response.status}`);
-        })
-        .catch((error) => {
-          log.error(`Axios request failed for ${url}`, error);
-        });
+      // Fire-and-forget: each node's delivery, with its own bounded retry of a
+      // boot-gate 503, runs on its own while the loop paces the sends.
+      deliverGlobalCommand(url, axiosConfig);
       // eslint-disable-next-line no-await-in-loop
       await serviceHelper.delay(globalCmdDelayMs);
     }
@@ -559,69 +610,49 @@ async function appKill(req, res) {
 }
 
 /**
- * Pause an application
+ * Pause and unpause were removed: docker reports a paused container as running, so the
+ * reconciler and the load balancer both treat it as healthy and keep routing to it,
+ * while nothing in FluxOS can see that it is frozen. The routes answer with an error
+ * rather than a success so a caller is not told the container stopped when it has not.
  * @param {object} req - Request object
  * @param {object} res - Response object
  * @returns {object} Response message
  */
-async function appPause(req, res) {
+async function deprecatedPauseResponse(req, res) {
   try {
     let { appname } = req.params;
     appname = appname || req.query.appname;
-    // eslint-disable-next-line global-require
-    let { global } = req.params;
-    global = global || req.query.global || false;
-    global = serviceHelper.ensureBoolean(global);
 
-    if (!appname) {
-      throw new Error('No Flux App specified');
-    }
-
-    const mainAppName = appname.split('_')[1] || appname;
-
-    // Use dynamic require to avoid circular dependency
-    // eslint-disable-next-line global-require
-    const verificationHelper = require('../verificationHelper');
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
-    if (!authorized) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-
-    if (global) {
-      executeAppGlobalCommand(appname, 'apppause', req.headers.zelidauth); // do not wait
-      const appResponse = messageHelper.createSuccessMessage(`${appname} queried for global pause`);
-      return res ? res.json(appResponse) : appResponse;
-    }
-
-    const isComponent = appname.includes('_'); // it is a component pause
-    let appRes;
-
-    if (isComponent) {
-      // eslint-disable-next-line no-restricted-syntax
-      appRes = await dockerService.appDockerPause(appname);
-    } else {
-      // Check if app exists before pausing
-      const appSpecs = await registryManager.getApplicationSpecifications(mainAppName);
-      if (!appSpecs) {
-        throw new Error('Application not found');
+    if (appname) {
+      // Validated before anything is done with it. Express's default extended
+      // query parser turns ?appname=a&appname=b into an ARRAY and ?appname[x]=1
+      // into an object, neither of which has .split - and this runs ahead of
+      // verifyPrivilege because the app name is what the privilege is scoped to,
+      // so it is reachable unauthenticated from the open internet.
+      //
+      // Unguarded, the rejection was dropped and the response never written: the
+      // socket stayed open with nothing left to answer it, since fluxServer sets
+      // a two-hour requestTimeout and node stops applying it once the request has
+      // been received.
+      if (typeof appname !== 'string') {
+        throw new Error('Invalid Flux App name specified');
       }
-
-      if (appSpecs.version <= 3) {
-        appRes = await dockerService.appDockerPause(appname);
-      } else {
-        // For composed applications (version > 3), pause all components
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appComponent of appSpecs.compose.reverse()) {
-          // eslint-disable-next-line no-await-in-loop
-          await dockerService.appDockerPause(`${appComponent.name}_${appSpecs.name}`);
-        }
-        appRes = `Application ${appSpecs.name} paused`;
+      const mainAppName = appname.split('_')[1] || appname;
+      // eslint-disable-next-line global-require
+      const verificationHelper = require('../verificationHelper');
+      const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
+      if (!authorized) {
+        const errMessage = messageHelper.errUnauthorizedMessage();
+        return res ? res.json(errMessage) : errMessage;
       }
     }
 
-    const appResponse = messageHelper.createDataMessage(appRes);
-    return res ? res.json(appResponse) : appResponse;
+    const errorResponse = messageHelper.createErrorMessage(
+      'Pausing applications is no longer supported. Use appstop to stop an application.',
+      'Deprecated',
+      410,
+    );
+    return res ? res.json(errorResponse) : errorResponse;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(
@@ -634,80 +665,24 @@ async function appPause(req, res) {
 }
 
 /**
+ * Pause an application
+ * @param {object} req - Request object
+ * @param {object} res - Response object
+ * @returns {object} Response message
+ */
+async function appPause(req, res) {
+  return deprecatedPauseResponse(req, res);
+}
+
+/**
  * Unpause an application
  * @param {object} req - Request object
  * @param {object} res - Response object
  * @returns {object} Response message
  */
 async function appUnpause(req, res) {
-  try {
-    // eslint-disable-next-line global-require
-    let { appname } = req.params;
-    appname = appname || req.query.appname;
-    let { global } = req.params;
-    global = global || req.query.global || false;
-    global = serviceHelper.ensureBoolean(global);
-
-    if (!appname) {
-      throw new Error('No Flux App specified');
-    }
-
-    const mainAppName = appname.split('_')[1] || appname;
-
-    // Use dynamic require to avoid circular dependency
-    // eslint-disable-next-line global-require
-    const verificationHelper = require('../verificationHelper');
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
-    if (!authorized) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-
-    if (global) {
-      executeAppGlobalCommand(appname, 'appunpause', req.headers.zelidauth); // do not wait
-      const appResponse = messageHelper.createSuccessMessage(`${appname} queried for global unpase`);
-      return res ? res.json(appResponse) : appResponse;
-    }
-
-    const isComponent = appname.includes('_'); // it is a component unpause
-    let appRes;
-    // eslint-disable-next-line no-restricted-syntax
-
-    if (isComponent) {
-      appRes = await dockerService.appDockerUnpause(appname);
-    } else {
-      // Check if app exists before unpausing
-      const appSpecs = await registryManager.getApplicationSpecifications(mainAppName);
-      if (!appSpecs) {
-        throw new Error('Application not found');
-      }
-
-      if (appSpecs.version <= 3) {
-        appRes = await dockerService.appDockerUnpause(appname);
-      } else {
-        // For composed applications (version > 3), unpause all components
-        // eslint-disable-next-line no-restricted-syntax
-        for (const appComponent of appSpecs.compose) {
-          // eslint-disable-next-line no-await-in-loop
-          await dockerService.appDockerUnpause(`${appComponent.name}_${appSpecs.name}`);
-        }
-        appRes = `Application ${appSpecs.name} unpaused`;
-      }
-    }
-
-    const appResponse = messageHelper.createDataMessage(appRes);
-    return res ? res.json(appResponse) : appResponse;
-  } catch (error) {
-    log.error(error);
-    const errorResponse = messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    );
-    return res ? res.json(errorResponse) : errorResponse;
-  }
+  return deprecatedPauseResponse(req, res);
 }
-
 /**
  * Docker restart app (internal function)
  * @param {string} appname - Application name
@@ -737,12 +712,19 @@ async function appDockerRestart(appname) {
 
 /**
  * To stop all non Flux running apps. Executes continuously at regular intervals.
+ *
+ * What is kept is everything FluxOS owns, not everything that is an app: the
+ * node runs short-lived containers of its own - a file operation is one - and
+ * those are unnamed, so docker gives them a random name that no prefix test can
+ * tell from a tenant's. Selecting on the ownership label instead means a long
+ * copy is not stopped out from under its caller by a sweep that runs every two
+ * hours.
  */
 async function stopAllNonFluxRunningApps() {
   try {
     log.info('Running non Flux apps check...');
     let apps = await dockerService.dockerListContainers(false);
-    apps = apps.filter((app) => (app.Names[0].slice(1, 4) !== 'zel' && app.Names[0].slice(1, 5) !== 'flux'));
+    apps = apps.filter((app) => !dockerService.isFluxOwnedContainer(app));
     if (apps.length > 0) {
       log.info(`Found ${apps.length} apps to be stopped...`);
       // eslint-disable-next-line no-restricted-syntax
@@ -772,6 +754,7 @@ async function stopAllNonFluxRunningApps() {
 
 module.exports = {
   executeAppGlobalCommand,
+  deliverGlobalCommand,
   appStart,
   appStop,
   appRestart,
