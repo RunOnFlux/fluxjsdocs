@@ -61,6 +61,7 @@ const inFlight = new Map(); // per-key single-flight
 const dirty = new Set(); // ids re-requested while in flight -> reconcile again
 const bootPending = new Set(); // ids enqueued before the boot gate opened
 const backoffTimers = new Map(); // id -> scheduled retry timeout
+const unhandledFailures = new Map(); // id -> consecutive passes that threw
 
 // The boot-drain gate: opens once every boot-held component has completed ONE
 // reconcile pass (started, backoff-deferred, awaiting-controller, or failed
@@ -108,6 +109,18 @@ function notifyContainerStarted(identifier) {
 // container, defer and re-check shortly (the operation also re-enqueues on
 // completion, so this is just a backstop)
 const MANAGED_RETRY_MS = 5000;
+
+// How many consecutive passes may throw before the component is left to the
+// hourly sweep. A pass that throws is by definition one whose failure nobody
+// anticipated: every failure this file expects returns after deciding either to
+// pace a retry (a transient fault) or deliberately not to (an invalid spec, which
+// no retry can fix). An unhandled throw made neither decision, so it reached the
+// sweep - and with the operator's stop now actuated here rather than inline, a
+// container could keep running for an hour after a stop reported success.
+// Retrying is safe because a pass is level-based: it re-derives desired against
+// actual rather than resuming half-finished work. The bound is what keeps a
+// permanent fault from becoming a five-second log loop forever.
+const UNHANDLED_FAILURE_RETRIES = 3;
 
 // an unmountable volume usually means its host filesystem is still coming up
 // (e.g. the encrypted data partition after a reboot) - retry on a pace that
@@ -365,8 +378,21 @@ function isManagedElsewhere(identifier) {
   return false;
 }
 
+/**
+ * What this component should be doing, why, and - when the answer is an operator
+ * stop - whether that operator asked for a hard kill.
+ *
+ * The lock and the force flag are fields of one document, so they come from one
+ * read. The stop branch used to re-read the same document for the flag alone,
+ * and getState returns null for a read failure exactly as it does for "no
+ * record" - so a second read that failed turned "kill now" into a drain. One
+ * read is a window that cannot open, and one round-trip fewer on every stop.
+ *
+ * @returns {Promise<{desired: boolean|null, reason: string, force: boolean}>}
+ */
 async function effectiveDesiredRunning(identifier, spec, exitCode) {
-  if (await appsRuntimeState.isOperatorStopped(identifier)) return { desired: false, reason: 'operatorStopped' };
+  const operatorStop = await appsRuntimeState.operatorStopState(identifier);
+  if (operatorStop.stopped) return { desired: false, reason: 'operatorStopped', force: operatorStop.force };
   if (spec.isG || spec.isR) {
     const cd = controllerDesired.get(identifier) ?? null;
     // No controller opinion yet. controllerDesired is in-memory, so a FluxOS
@@ -374,11 +400,12 @@ async function effectiveDesiredRunning(identifier, spec, exitCode) {
     // the FluxOS process). Take no action - leave the container as-is until the
     // masterSlave/syncthing decider re-derives intent. Treating "unset" as "stop"
     // here would bounce every running syncthing app on every FluxOS restart.
-    if (cd === null) return { desired: null, reason: 'awaitingController' };
-    if (cd !== 'running') return { desired: false, reason: 'controllerDesired' };
+    if (cd === null) return { desired: null, reason: 'awaitingController', force: false };
+    if (cd !== 'running') return { desired: false, reason: 'controllerDesired', force: false };
   }
   const desired = policyAllowsRun(getRestartPolicy(spec), exitCode);
-  return { desired, reason: desired ? 'running' : 'policy' };
+  // Only an operator asks for a hard kill; every other stop reason is a drain.
+  return { desired, reason: desired ? 'running' : 'policy', force: false };
 }
 
 /**
@@ -394,13 +421,13 @@ async function effectiveDesiredRunning(identifier, spec, exitCode) {
  * is held when nothing has decided anything.
  *
  * @param {string} rawIdentifier
- * @returns {Promise<{desired: boolean|null, reason: string}>}
+ * @returns {Promise<{desired: boolean|null, reason: string, force: boolean}>}
  */
 async function desiredRunState(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   const spec = await getLocalComponentSpec(identifier);
-  if (!spec) return { desired: false, reason: 'notInstalled' };
-  if (spec.invalidSpec) return { desired: false, reason: 'invalidSpec' };
+  if (!spec) return { desired: false, reason: 'notInstalled', force: false };
+  if (spec.invalidSpec) return { desired: false, reason: 'invalidSpec', force: false };
   const actual = await dockerActual(identifier);
   return effectiveDesiredRunning(identifier, spec, actual.exitCode);
 }
@@ -878,7 +905,7 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  const { desired, reason } = await effectiveDesiredRunning(identifier, spec, actual.exitCode);
+  const { desired, reason, force } = await effectiveDesiredRunning(identifier, spec, actual.exitCode);
 
   // null = no controller opinion yet for a g:/r: component: neither start nor stop,
   // leave the container in its current state until the decider speaks.
@@ -887,10 +914,10 @@ async function reconcile(rawIdentifier) {
   if (!desired) {
     if (actual.running) {
       // A hard kill skips the graceful shutdown window, and only an operator asks
-      // for one - every other stop reason is a graceful stop, so the durable flag
-      // is read only where one could have been set.
-      const stopState = reason === 'operatorStopped' ? await appsRuntimeState.getState(identifier) : null;
-      const forceKill = Boolean(stopState && stopState.operatorStopForce);
+      // for one - every other stop reason is a drain. The flag arrives with the
+      // decision that read it, from the same document and the same read as the
+      // lock itself, so there is no second read here to disagree with the first.
+      const forceKill = force === true;
       log.info(`appReconciler - ${identifier} desired stopped, ${forceKill ? 'killing' : 'stopping'}`);
       if (forceKill) {
         await dockerService.appDockerKill(identifier);
@@ -937,11 +964,17 @@ async function reconcile(rawIdentifier) {
           scheduleRetry(identifier, MANAGED_RETRY_MS);
           return;
         }
-        await appsRuntimeState.recordRestartGeneration(identifier, desiredGeneration);
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'restarted', reason: 'operatorRequested' });
         notifyContainerStarted(identifier);
         // A restart is a start, so it can come up on a stale endpoint the same way.
         scheduleRetry(identifier, POST_START_VERIFY_MS);
+        // Last, because it throws. The bounce above already happened, so a write
+        // failure must not also cost the event, the peer notification and the
+        // attachment check a successful restart is owed - it is the record that
+        // failed, not the restart. The throw reaches the pass-level retry, which
+        // paces it and gives up, rather than the swallow that bounced the
+        // container every POST_START_VERIFY_MS for as long as writes failed.
+        await appsRuntimeState.recordRestartGeneration(identifier, desiredGeneration);
         return;
       }
       // The container is where it should be; monitoring may not be. A stop turns
@@ -1063,9 +1096,7 @@ async function reconcile(rawIdentifier) {
   // would bounce a container the operator has just watched come up.
   const startedState = await appsRuntimeState.getState(identifier);
   const pendingGeneration = (startedState && startedState.restartGeneration) || 0;
-  if (pendingGeneration > ((startedState && startedState.actuatedRestartGeneration) || 0)) {
-    await appsRuntimeState.recordRestartGeneration(identifier, pendingGeneration);
-  }
+  const satisfiesRestart = pendingGeneration > ((startedState && startedState.actuatedRestartGeneration) || 0);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
   notifyContainerStarted(identifier);
@@ -1074,6 +1105,11 @@ async function reconcile(rawIdentifier) {
   // BEFORE this start, so verify the new one shortly - otherwise a detached-at-boot
   // container waits for the hourly sweep.
   scheduleRetry(identifier, POST_START_VERIFY_MS);
+  // Last, because it throws - the start above already happened, and the record
+  // failing must not cost the bookkeeping that start is owed.
+  if (satisfiesRestart) {
+    await appsRuntimeState.recordRestartGeneration(identifier, pendingGeneration);
+  }
 }
 
 // --- workqueue (per-key single-flight, boot-gated) -----------------------
@@ -1090,7 +1126,28 @@ function scheduleRetry(identifier, delayMs) {
 
 function runReconcile(identifier) {
   const pass = reconcile(identifier)
-    .catch((err) => log.error(`appReconciler - reconcile ${identifier} failed: ${err.message}`))
+    .then(() => {
+      // A pass that got through is the only evidence the fault has cleared.
+      unhandledFailures.delete(identifier);
+    })
+    .catch((err) => {
+      const attempt = (unhandledFailures.get(identifier) || 0) + 1;
+      unhandledFailures.set(identifier, attempt);
+      const retrying = attempt <= UNHANDLED_FAILURE_RETRIES;
+      log.error(
+        `appReconciler - reconcile ${identifier} failed: ${err.message}`
+        + (retrying
+          ? `; retrying (${attempt}/${UNHANDLED_FAILURE_RETRIES})`
+          : `; ${attempt} consecutive failures, leaving it to the hourly sweep`),
+      );
+      // Published for every unhandled failure rather than at each throw site: the
+      // sites that can throw are the ones nobody thought to guard, so an event
+      // added per site would miss exactly the same ones the retry did.
+      fluxEventBus.publish('reconciler:actuated', {
+        identifier, action: 'reconcileFailed', reason: err.message, attempt, retrying,
+      });
+      if (retrying) scheduleRetry(identifier, MANAGED_RETRY_MS);
+    })
     .finally(() => {
       inFlight.delete(identifier);
       // one completed pass (actuated or deferred) is all the boot drain needs
@@ -1294,6 +1351,10 @@ function forgetDesiredState(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   controllerDesired.delete(identifier);
   dataDesired.delete(identifier);
+  // A removed component keeps no failure history: the map is keyed by identifier
+  // and a reinstall under the same name would otherwise start part-way up the
+  // count and reach the sweep sooner than a first failure should.
+  unhandledFailures.delete(identifier);
 }
 
 /**
@@ -1358,6 +1419,7 @@ function stop() {
   started = false;
   backoffTimers.forEach((t) => clearTimeout(t));
   backoffTimers.clear();
+  unhandledFailures.clear();
   if (bootDrainCapTimer) {
     clearTimeout(bootDrainCapTimer);
     bootDrainCapTimer = null;

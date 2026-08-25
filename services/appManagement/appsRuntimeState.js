@@ -142,15 +142,20 @@ async function requestRestart(identifier) {
  * Marks a restart generation as actuated, so the pass that follows the bounce
  * does not bounce it again.
  *
+ * Throws, unlike the recorders either side of it, because this write is not
+ * history - it is the only thing that stops the next pass bouncing the container
+ * again. Swallowed, a failure here read as "recorded" and the pass that followed
+ * found the request still outstanding: on a node whose reads work and whose
+ * writes do not, that restarted the app every POST_START_VERIFY_MS forever, on
+ * the one path deliberately exempt from the backoff ladder. Losing an exit code
+ * (recordExit) costs a log line; losing this one costs the app.
+ *
  * @param {string} identifier
  * @param {number} generation
+ * @throws when the write fails
  */
 async function recordRestartGeneration(identifier, generation) {
-  try {
-    await setFields(identifier, { actuatedRestartGeneration: generation });
-  } catch (err) {
-    log.error(`appsRuntimeState - failed to record restart generation for ${identifier}: ${err.message}`);
-  }
+  await setFields(identifier, { actuatedRestartGeneration: generation });
 }
 
 /**
@@ -163,6 +168,27 @@ async function recordRestartGeneration(identifier, generation) {
 async function isOperatorStopped(identifier) {
   const state = await getState(identifier);
   return state?.operatorStopped === true;
+}
+
+/**
+ * The operator's stop lock and the mode they asked for, from ONE read.
+ *
+ * They are two fields of one document, and a caller needing both must not ask
+ * twice: getState returns null for a read failure exactly as it does for "no
+ * record", so a second read that failed reported no force flag and turned the
+ * operator's "kill now" into a drain they did not ask for. Answering both from a
+ * single read is a window that cannot open - and one round-trip fewer on every
+ * stop the reconciler performs.
+ *
+ * @param {string} identifier
+ * @returns {Promise<{stopped: boolean, force: boolean}>}
+ */
+async function operatorStopState(identifier) {
+  const state = await getState(identifier);
+  return {
+    stopped: state?.operatorStopped === true,
+    force: state?.operatorStopForce === true,
+  };
 }
 
 /**
@@ -261,7 +287,6 @@ async function recordRestart(identifier, crashed = true) {
  * @param {string} identifier
  * @param {number|null} lastFinishedAtMs - docker State.FinishedAt of the
  *        stopped container (ms epoch), when the caller has inspect data
- * @param {boolean} crashed - Docker reported a fault (non-zero exit or OOM kill)
  * @returns {Promise<number>}
  */
 async function restartWaitMs(identifier, lastFinishedAtMs = null) {
@@ -487,6 +512,7 @@ module.exports = {
   getState,
   setOperatorStopped,
   isOperatorStopped,
+  operatorStopState,
   operatorStoppedIdentifiers,
   recordRestart,
   requestRestart,
