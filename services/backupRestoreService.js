@@ -2,7 +2,7 @@ const log = require('../lib/log');
 const path = require('path');
 const messageHelper = require('./messageHelper');
 const verificationHelper = require('./verificationHelper');
-const serviceHelper = require('./serviceHelper');
+const { sendFile } = require('./utils/fileTransfer');
 const IOUtils = require('./IOUtils');
 const fs = require('fs').promises;
 const { sanitizePath, verifyRealPath } = require('./utils/pathSecurity');
@@ -84,11 +84,13 @@ async function getVolumeDataOfComponent(req, res) {
     }
     const authorized = res ? await verificationHelper.verifyPrivilege('appownerabove', req, appname) : true;
     if (authorized === true) {
-      const dfInfoData = await IOUtils.getVolumeInfo(appname, component, multiplier, decimal, fields);
-      if (dfInfoData === null) {
+      const { error, mounts } = await IOUtils.getVolumeInfo(appname, component, multiplier, decimal, fields);
+      // A mount table that could not be read and a volume that is not mounted
+      // are both "no data to report" to this endpoint.
+      if (error || !mounts.length) {
         throw new Error('No matching mount found');
       }
-      const response = messageHelper.createDataMessage(dfInfoData[0]);
+      const response = messageHelper.createDataMessage(mounts[0]);
       return res ? res.json(response) : response;
       // eslint-disable-next-line no-else-return
     } else {
@@ -271,11 +273,7 @@ async function downloadLocalFile(req, res) {
       await verifyRealPath(filepath, appsFolder);
       const fileNameArray = filepath.split('/');
       const fileName = fileNameArray[fileNameArray.length - 1];
-      const chmodResult = await serviceHelper.runCommand('chmod', { runAsRoot: true, params: ['777', filepath] });
-      if (chmodResult.error) {
-        throw chmodResult.error;
-      }
-      return res.download(filepath, fileName);
+      return await sendFile(res, filepath, fileName);
       // eslint-disable-next-line no-else-return
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();

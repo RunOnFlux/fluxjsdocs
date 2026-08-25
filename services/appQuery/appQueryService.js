@@ -4,6 +4,7 @@ const dbHelper = require('../dbHelper');
 const messageHelper = require('../messageHelper');
 const dockerService = require('../dockerService');
 const registryManager = require('../appDatabase/registryManager');
+const appsRuntimeState = require('../appManagement/appsRuntimeState');
 const appConstants = require('../utils/appConstants');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
@@ -181,7 +182,7 @@ async function listRunningApps(req, res) {
   try {
     let apps = await dockerService.dockerListContainers(false);
     if (apps.length > 0) {
-      apps = apps.filter((app) => (app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux'));
+      apps = apps.filter((app) => dockerService.isAppContainer(app));
     }
 
     // Include apps that are in backup or restore as "running" even if container is stopped
@@ -193,7 +194,7 @@ async function listRunningApps(req, res) {
     if (appsInBackupRestore.length > 0) {
       // Get all containers including stopped ones
       const allContainers = await dockerService.dockerListContainers(true);
-      const fluxContainers = allContainers.filter((app) => (app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux'));
+      const fluxContainers = allContainers.filter((app) => dockerService.isAppContainer(app));
 
       // Find stopped containers that are in backup/restore and add them to running list
       fluxContainers.forEach((container) => {
@@ -239,17 +240,37 @@ async function listRunningApps(req, res) {
 }
 
 /**
- * Component identifiers this node holds: running here, or committed to running
- * and not started yet.
+ * Component identifiers this node holds: running here, committed to running and
+ * not started yet, or deliberately stopped here by the operator.
  *
- * The question a primary election actually asks a peer. Running containers alone
- * answer it wrongly during the masterSlave primary path, which fixes ownership on
- * the persistent data before it starts anything - for that whole window the node
- * has decided but has no container, so a peer reading running containers is told
- * the component is free and starts a second writer on the shared volume.
+ * The question a primary election actually asks a peer, and the answer is about
+ * OWNERSHIP, not about what is up. Three sources, because no one of them answers
+ * it on its own:
  *
- * Uncached, unlike listrunningapps: a 15-second-stale answer reopens the same
- * window it exists to close.
+ * - Running containers miss the masterSlave primary path, which fixes ownership
+ *   on the persistent data before it starts anything. For that whole window the
+ *   node has decided but has no container.
+ * - committedIdentifiers covers that window, but it is in-memory and re-derived
+ *   from live truth, so a FluxOS restart empties it. It is also only ever written
+ *   at the moment a node wins an election, never re-asserted while it goes on
+ *   being the primary.
+ * - The operator stop lock is the durable one. `appstop` writes it to hold the
+ *   component down HERE - the election skips this node and the reconciler will
+ *   not restart it - and until this endpoint reported it, that intent never left
+ *   the node. A peer saw no container and no commitment, concluded the component
+ *   was free, and elected a new primary over an owner who had stopped theirs to
+ *   work on it. Whether that happened at all turned on whether this node's FluxOS
+ *   had restarted since it was elected, which is not something an owner can see.
+ *
+ * Not filtered to g: components. The list answers "is this component mine", which
+ * is true of a stopped component whatever its storage mode, and the only caller
+ * asks about g: components alone - so filtering would cost a spec lookup to leave
+ * out entries nobody looks up.
+ *
+ * Cached for one second at the route, not the fifteen listrunningapps takes: long
+ * enough to bound an anonymous caller to one pass of this work per second, short
+ * enough to be meaningless against the tens of seconds the window it closes runs
+ * for.
  *
  * @param {object} req Request.
  * @param {object} res Response.
@@ -267,7 +288,10 @@ async function heldComponents(req, res) {
     const committed = appReconciler.committedIdentifiers()
       .map((identifier) => dockerService.getAppIdentifier(identifier));
 
-    const held = [...new Set([...running, ...committed])];
+    const operatorStopped = (await appsRuntimeState.operatorStoppedIdentifiers())
+      .map((identifier) => dockerService.getAppIdentifier(identifier));
+
+    const held = [...new Set([...running, ...committed, ...operatorStopped])];
     const response = messageHelper.createDataMessage(held);
     return res ? res.json(response) : response;
   } catch (error) {
@@ -341,7 +365,7 @@ async function listAllApps(req, res) {
   try {
     let apps = await dockerService.dockerListContainers(true);
     if (apps.length > 0) {
-      apps = apps.filter((app) => (app.Names[0].slice(1, 4) === 'zel' || app.Names[0].slice(1, 5) === 'flux'));
+      apps = apps.filter((app) => dockerService.isAppContainer(app));
     }
     const modifiedApps = [];
     apps.forEach((app) => {
