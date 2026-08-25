@@ -118,7 +118,7 @@ async function setNodeGeolocation() {
           dataCenter: ipRes.data.hosting,
         };
       } else {
-        const statsApiUrl = `${config.stats.baseUrl}/fluxlocation/${localIp}`;
+        const statsApiUrl = `${config.geolocation.statsApiBaseUrl}/fluxlocation/${localIp}`;
         const statsRes = await serviceHelper.axiosGet(statsApiUrl);
         if (statsRes.data.status === 'success' && statsRes.data.data) {
           storedGeolocation = {
@@ -250,7 +250,9 @@ async function getNodeGeolocation() {
   const dbData = await getGeolocationFromDb();
   if (dbData.geolocation) {
     storedGeolocation = dbData.geolocation;
-    ({ staticIp, dataCenter, lastIpChangeDate } = dbData);
+    staticIp = dbData.staticIp;
+    dataCenter = dbData.dataCenter;
+    lastIpChangeDate = dbData.lastIpChangeDate;
     log.info('Geolocation restored from database');
   }
   return storedGeolocation;
