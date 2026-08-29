@@ -8,31 +8,7 @@ const config = require('config');
 const signatureVerifier = require('./signatureVerifier');
 const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
-const configManager = require('./utils/configManager');
 // Removed registryManager to avoid circular dependency - will use dynamic require where needed
-
-/**
- * The Flux ID this node's operator administers it with, or null when the node
- * has not read its own configuration yet.
- *
- * Read through configManager rather than off globalThis. The manager loads the
- * file in its own constructor, so requiring it is what guarantees the config has
- * been read at all - a module that only reads the global is relying on some other
- * module having imported the manager first, and a privilege check that runs before
- * that import sees nothing and throws.
- *
- * Null still has to be handled, because a load that fails installs defaults
- * carrying no zelid rather than a config. It is the only safe answer there: a
- * comparison against an identity we do not hold must fail rather than pass, and
- * must never quietly resolve the caller to a lesser privilege as though the
- * question had been answered. Callers that grant privileges on the result
- * therefore refuse outright while it is null.
- *
- * @returns {string|null}
- */
-function nodeAdminZelid() {
-  return configManager.getConfigValue('initial.zelid') ?? null;
-}
 
 /**
  * Verifies admin session
@@ -44,7 +20,8 @@ async function verifyAdminSession(headers) {
   if (!headers || !headers.zelidauth) return false;
   const auth = serviceHelper.ensureObject(headers.zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  if (auth.zelid !== nodeAdminZelid()) return false;
+  const userconfig = globalThis.userconfig;
+  if (auth.zelid !== userconfig.initial.zelid) return false;
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.local.database);
@@ -154,7 +131,8 @@ async function verifyAdminAndFluxTeamSession(headers) {
   if (!headers || !headers.zelidauth) return false;
   const auth = serviceHelper.ensureObject(headers.zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  if (auth.zelid !== config.fluxTeamFluxID && auth.zelid !== nodeAdminZelid() && auth.zelid !== config.fluxSupportTeamFluxID) return false; // admin is considered as fluxTeam
+  const userconfig = globalThis.userconfig;
+  if (auth.zelid !== config.fluxTeamFluxID && auth.zelid !== userconfig.initial.zelid && auth.zelid !== config.fluxSupportTeamFluxID) return false; // admin is considered as fluxTeam
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.local.database);
@@ -236,61 +214,8 @@ async function verifyAppOwnerOrHigherSession(headers, appName) {
   // eslint-disable-next-line global-require
   const registryManager = require('./appDatabase/registryManager');
   const ownerFluxID = await registryManager.getApplicationOwner(appName);
-  if (auth.zelid !== ownerFluxID && auth.zelid !== config.fluxTeamFluxID && auth.zelid !== nodeAdminZelid() && auth.zelid !== config.fluxSupportTeamFluxID) return false;
-
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.local.database);
-  const collection = config.database.local.collections.loggedUsers;
-  const query = { $and: [{ loginPhrase: auth.loginPhrase }, { zelid: auth.zelid }] };
-  const projection = {};
-  const loggedUser = await dbHelper.findOneInDatabase(database, collection, query, projection);
-  // if not logged, check if not older than 2 hours
-  if (!loggedUser) {
-    const timestamp = Date.now();
-    const message = auth.loginPhrase;
-    const maxHours = 2 * 60 * 60 * 1000;
-    if (Number(message.substring(0, 13)) < (timestamp - maxHours) || Number(message.substring(0, 13)) > timestamp || message.length > 70 || message.length < 40) {
-      return false;
-    }
-  }
-
-  // check if signature corresponds to message with that zelid
-  let valid = false;
-  try {
-    valid = signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature);
-  } catch (error) {
-    return false;
-  }
-  if (valid) {
-    // now we know this is indeed a logged application owner
-    return true;
-  }
-  return false;
-}
-
-/**
- * Verifies an app-owner or flux-team session: the app's owner and the flux team,
- * but NOT the node operator.
- *
- * verifyAppOwnerOrHigherSession also admits the node's own admin, which is right
- * for reading and for the ordinary lifecycle controls - the operator hosts the
- * container and needs them. It is wrong for a control whose whole purpose is to
- * end an app abruptly: the node operator is not the party entitled to decide
- * that someone else's app takes a hard kill rather than a graceful stop.
- *
- * @param {object} headers
- * @param {string} appName
- * @returns {Promise<boolean>} authorized
- */
-async function verifyAppOwnerOrFluxTeamSession(headers, appName) {
-  if (!headers || !headers.zelidauth || !appName) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
-  if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  // Use dynamic require to avoid circular dependency
-  // eslint-disable-next-line global-require
-  const registryManager = require('./appDatabase/registryManager');
-  const ownerFluxID = await registryManager.getApplicationOwner(appName);
-  if (auth.zelid !== ownerFluxID && auth.zelid !== config.fluxTeamFluxID && auth.zelid !== config.fluxSupportTeamFluxID) return false;
+  const userconfig = globalThis.userconfig;
+  if (auth.zelid !== ownerFluxID && auth.zelid !== config.fluxTeamFluxID && auth.zelid !== userconfig.initial.zelid && auth.zelid !== config.fluxSupportTeamFluxID) return false;
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.local.database);
@@ -323,10 +248,8 @@ async function verifyAppOwnerOrFluxTeamSession(headers, appName) {
 }
 
 module.exports = {
-  nodeAdminZelid,
   verifyAdminAndFluxTeamSession,
   verifyAdminSession,
-  verifyAppOwnerOrFluxTeamSession,
   verifyAppOwnerOrHigherSession,
   verifyAppOwnerSession,
   verifyFluxTeamSession,
