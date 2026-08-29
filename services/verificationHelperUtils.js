@@ -30,21 +30,21 @@ const configManager = require('./utils/configManager');
  *
  * @returns {string|null}
  */
-function nodeAdminZelid() {
+function nodeOperatorZelid() {
   return configManager.getConfigValue('initial.zelid') ?? null;
 }
 
 /**
  * Verifies admin session
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  *
  * @returns {Promise<boolean>}
  */
-async function verifyAdminSession(headers) {
-  if (!headers || !headers.zelidauth) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyNodeOperatorSession(zelidauth) {
+  if (!zelidauth) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  if (auth.zelid !== nodeAdminZelid()) return false;
+  if (auth.zelid !== nodeOperatorZelid()) return false;
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.local.database);
@@ -70,13 +70,13 @@ async function verifyAdminSession(headers) {
 
 /**
  * Verifies user session
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  *
  * @returns {Promise<boolean>}
  */
-async function verifyUserSession(headers) {
-  if (!headers || !headers.zelidauth) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyUserSession(zelidauth) {
+  if (!zelidauth) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
 
   const db = dbHelper.databaseConnection();
@@ -112,13 +112,13 @@ async function verifyUserSession(headers) {
 
 /**
  * Verifies flux team session
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  *
  * @returns {Promise<boolean>}
  */
-async function verifyFluxTeamSession(headers) {
-  if (!headers || !headers.zelidauth) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyFluxTeamSession(zelidauth) {
+  if (!zelidauth) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
   if (auth.zelid !== config.fluxTeamFluxID && auth.zelid !== config.fluxSupportTeamFluxID) return false;
 
@@ -146,15 +146,15 @@ async function verifyFluxTeamSession(headers) {
 
 /**
  * Verifies admin or flux team session
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  *
  * @returns {Promise<boolean>}
  */
-async function verifyAdminAndFluxTeamSession(headers) {
-  if (!headers || !headers.zelidauth) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyNodeOperatorOrFluxTeamSession(zelidauth) {
+  if (!zelidauth) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  if (auth.zelid !== config.fluxTeamFluxID && auth.zelid !== nodeAdminZelid() && auth.zelid !== config.fluxSupportTeamFluxID) return false; // admin is considered as fluxTeam
+  if (auth.zelid !== config.fluxTeamFluxID && auth.zelid !== nodeOperatorZelid() && auth.zelid !== config.fluxSupportTeamFluxID) return false; // admin is considered as fluxTeam
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.local.database);
@@ -179,13 +179,13 @@ async function verifyAdminAndFluxTeamSession(headers) {
 
 /**
  * Verifies app owner session
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  *
  * @returns {Promise<boolean>}
  */
-async function verifyAppOwnerSession(headers, appName) {
-  if (!headers || !headers.zelidauth || !appName) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyAppOwnerSession(zelidauth, appName) {
+  if (!zelidauth || !appName) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
   // Use dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -223,52 +223,6 @@ async function verifyAppOwnerSession(headers, appName) {
 }
 
 /**
- * Verifies app owner (or higher privilege) session
- * @param {object} headers
- *
- * @returns {Promise<boolean>}
- */
-async function verifyAppOwnerOrHigherSession(headers, appName) {
-  if (!headers || !headers.zelidauth || !appName) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
-  if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
-  // Use dynamic require to avoid circular dependency
-  // eslint-disable-next-line global-require
-  const registryManager = require('./appDatabase/registryManager');
-  const ownerFluxID = await registryManager.getApplicationOwner(appName);
-  if (auth.zelid !== ownerFluxID && auth.zelid !== config.fluxTeamFluxID && auth.zelid !== nodeAdminZelid() && auth.zelid !== config.fluxSupportTeamFluxID) return false;
-
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.local.database);
-  const collection = config.database.local.collections.loggedUsers;
-  const query = { $and: [{ loginPhrase: auth.loginPhrase }, { zelid: auth.zelid }] };
-  const projection = {};
-  const loggedUser = await dbHelper.findOneInDatabase(database, collection, query, projection);
-  // if not logged, check if not older than 2 hours
-  if (!loggedUser) {
-    const timestamp = Date.now();
-    const message = auth.loginPhrase;
-    const maxHours = 2 * 60 * 60 * 1000;
-    if (Number(message.substring(0, 13)) < (timestamp - maxHours) || Number(message.substring(0, 13)) > timestamp || message.length > 70 || message.length < 40) {
-      return false;
-    }
-  }
-
-  // check if signature corresponds to message with that zelid
-  let valid = false;
-  try {
-    valid = signatureVerifier.verifySignature(auth.loginPhrase, auth.zelid, auth.signature);
-  } catch (error) {
-    return false;
-  }
-  if (valid) {
-    // now we know this is indeed a logged application owner
-    return true;
-  }
-  return false;
-}
-
-/**
  * Verifies an app-owner or flux-team session: the app's owner and the flux team,
  * but NOT the node operator.
  *
@@ -277,8 +231,9 @@ async function verifyAppOwnerOrHigherSession(headers, appName) {
  * redeploy, remove, the volume operations and backup/restore - and everything
  * that discloses what is inside it - logs, inspect, stats, the process list, the
  * file listings and downloads, and a decrypted enterprise spec.
- * verifyAppOwnerOrHigherSession admits the node's own admin as well, which none
- * of those may.
+ *
+ * The node operator is the node's own admin, so verifyNodeOperatorSession admits them
+ * and this must not.
  *
  * Hosting an app is not owning it, and the two halves of that have the same
  * answer. On run state: an app cannot exceed what was bought - dockerService
@@ -297,13 +252,13 @@ async function verifyAppOwnerOrHigherSession(headers, appName) {
  * serving the same data over an authenticated API - remote, scriptable across a
  * fleet, and exposed with the operator's zelid rather than with their machine.
  *
- * @param {object} headers
+ * @param {string|object} zelidauth - the value of the zelidauth header
  * @param {string} appName
  * @returns {Promise<boolean>} authorized
  */
-async function verifyAppOwnerOrFluxTeamSession(headers, appName) {
-  if (!headers || !headers.zelidauth || !appName) return false;
-  const auth = serviceHelper.ensureObject(headers.zelidauth);
+async function verifyAppOwnerOrFluxTeamSession(zelidauth, appName) {
+  if (!zelidauth || !appName) return false;
+  const auth = serviceHelper.ensureObject(zelidauth);
   if (!auth.zelid || !auth.signature || !auth.loginPhrase) return false;
   // Use dynamic require to avoid circular dependency
   // eslint-disable-next-line global-require
@@ -342,11 +297,10 @@ async function verifyAppOwnerOrFluxTeamSession(headers, appName) {
 }
 
 module.exports = {
-  nodeAdminZelid,
-  verifyAdminAndFluxTeamSession,
-  verifyAdminSession,
+  nodeOperatorZelid,
+  verifyNodeOperatorOrFluxTeamSession,
+  verifyNodeOperatorSession,
   verifyAppOwnerOrFluxTeamSession,
-  verifyAppOwnerOrHigherSession,
   verifyAppOwnerSession,
   verifyFluxTeamSession,
   verifyUserSession,

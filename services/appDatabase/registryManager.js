@@ -10,6 +10,7 @@ const fluxEventBus = require('../utils/fluxEventBus');
 const { checkAndDecryptAppSpecs, encryptEnterpriseFromSession } = require('../utils/enterpriseHelper');
 const { specificationFormatter, updateToLatestAppSpecifications } = require('../utils/appUtilities');
 const placementFeasibility = require('../appPlacement/placementFeasibility');
+const mountParser = require('../utils/mountParser');
 const {
   SIGTERM_EXPIRY_MS,
   globalAppsInformation,
@@ -23,6 +24,7 @@ const {
   appsHashesCollection,
   scannedHeightCollection,
 } = require('../utils/appConstants');
+const { Privilege, authOf } = require('../utils/privileges');
 
 let reindexRunning = false;
 
@@ -826,7 +828,7 @@ async function getApplicationComponentNamesAPI(req, res) {
     // fluxteam, not appownerorfluxteam: an owner reads the specification itself
     // and has no use for this, and the node operator is not a party to a
     // customer's app at all.
-    const authorized = await verificationHelper.verifyPrivilege('fluxteam', req, mainAppName);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
@@ -854,7 +856,10 @@ async function getApplicationComponentNamesAPI(req, res) {
     const response = messageHelper.createDataMessage({
       components: components.map((component) => ({
         name: component.name,
-        masterSlave: Boolean(component.containerData && component.containerData.includes('g:')),
+        // The classifier the election itself uses. A sync flag counts only on the
+        // primary mount, so this must agree with what decides the component's
+        // fate rather than with anywhere the letters happen to appear.
+        masterSlave: mountParser.isGComponent(component.containerData || ''),
       })),
       resources,
     });
@@ -935,9 +940,9 @@ async function getApplicationSpecificationAPI(req, res) {
     // deliberate act by a named person rather than a side effect of opening a
     // page.
     const authorized = await verificationHelper.verifyPrivilege(
-      'appowner',
-      req,
-      mainAppName,
+      Privilege.APP_OWNER,
+      authOf(req),
+      { appName: mainAppName },
     );
 
     if (authorized !== true) {
@@ -1047,9 +1052,9 @@ async function updateApplicationSpecificationAPI(req, res) {
     // supplies - environmentParameters and repoauth included - which is the
     // spec its owner is about to re-sign, and nobody else's business.
     const authorized = await verificationHelper.verifyPrivilege(
-      'appowner',
-      req,
-      mainAppName,
+      Privilege.APP_OWNER,
+      authOf(req),
+      { appName: mainAppName },
     );
 
     if (!authorized) {
@@ -1794,7 +1799,7 @@ async function reconstructAppMessagesHashCollection() {
  */
 async function reconstructAppMessagesHashCollectionAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized) {
       const result = await reconstructAppMessagesHashCollection();
       const message = messageHelper.createSuccessMessage(result);
@@ -1845,7 +1850,7 @@ async function registerAppGlobalyApi(req, res) {
   });
   req.on('end', async () => {
     try {
-      const authorized = await verificationHelper.verifyPrivilege('user', req);
+      const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
       if (!authorized) {
         const errMessage = messageHelper.errUnauthorizedMessage();
         res.json(errMessage);
@@ -2033,7 +2038,7 @@ async function reindexGlobalAppsLocation() {
  */
 async function reindexGlobalAppsLocationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await reindexGlobalAppsLocation();
       const message = messageHelper.createSuccessMessage('Reindex successfull');
@@ -2060,7 +2065,7 @@ async function reindexGlobalAppsLocationAPI(req, res) {
  */
 async function reindexGlobalAppsInformationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await reindexGlobalAppsInformation();
       const message = messageHelper.createSuccessMessage('Reindex successfull');
@@ -2127,7 +2132,7 @@ async function rescanGlobalAppsInformation(height = 0, removeLastInformation = f
  */
 async function rescanGlobalAppsInformationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       let { blockheight } = req.params; // we accept both help/command and help?command=getinfo
       blockheight = blockheight || req.query.blockheight;
