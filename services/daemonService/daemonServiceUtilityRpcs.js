@@ -2,7 +2,6 @@ const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const serviceHelper = require('../serviceHelper');
 const verificationHelper = require('../verificationHelper');
-const { Privilege, authOf } = require('../utils/privileges');
 
 let response = messageHelper.createErrorMessage();
 
@@ -123,7 +122,7 @@ async function validateAddress(req, res) {
     return response;
   }
 
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('admin', req);
   if (authorized !== true) {
     delete response.data.ismine;
     delete response.data.iswatchonly;

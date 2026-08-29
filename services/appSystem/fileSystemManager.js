@@ -66,7 +66,6 @@ const { sendFile } = require('../utils/fileTransfer');
 const executor = require('./volumeExecutor');
 const jobRegistry = require('../utils/jobRegistry');
 const operationsController = require('../appManagement/operationsController');
-const { Privilege, authOf } = require('../utils/privileges');
 
 /**
  * Reclaim an upload's operation slot if the request stops sending bytes at the
@@ -295,17 +294,17 @@ async function removeAppsObject(req, res) {
 }
 
 /**
- * To download a zip folder for a specified directory. The app owner or the flux team.
+ * To download a zip folder for a specified directory. Only accessible by admins.
  * @param {object} req Request.
  * @param {object} res Response.
- * @param {boolean} authorized False until the caller is verified.
+ * @param {boolean} authorized False until verified as an admin.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
 async function downloadAppsFolder(req, res) {
   try {
     let { appname } = req.params;
     appname = appname || req.query.appname || '';
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: appname });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, appname);
     if (authorized) {
       let { folder } = req.params;
       folder = folder || req.query.folder;
@@ -371,7 +370,7 @@ async function downloadAppsFolder(req, res) {
 }
 
 /**
- * To download a specified file. The app owner or the flux team.
+ * To download a specified file. Only accessible by admins.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
@@ -380,7 +379,7 @@ async function downloadAppsFile(req, res) {
   try {
     let { appname } = req.params;
     appname = appname || req.query.appname || '';
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: appname });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, appname);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;

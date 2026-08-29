@@ -37,7 +37,6 @@ const hwRequirements = require('../appRequirements/hwRequirements');
 const config = require('config');
 const fluxEventBus = require('../utils/fluxEventBus');
 const volumeService = require('../utils/volumeService');
-const { Privilege, authOf } = require('../utils/privileges');
 
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
@@ -957,7 +956,7 @@ async function installAppLocally(req, res) {
     }
     let blockAllowance = config.fluxapps.ownerAppAllowance;
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized) {
       let appSpecifications;
       // anyone can deploy temporary app
@@ -971,19 +970,8 @@ async function installAppLocally(req, res) {
         blockAllowance = config.fluxapps.temporaryAppAllowance;
       }
       if (!appSpecifications) {
-        // Placing a registered app on a node is not the node operator's call, for
-        // the same reason removing one is not: hosting an app is not owning it.
-        // This branch resolves an app BY NAME from the marketplace, the global
-        // registry or a permanent message, so an operator reaching it is choosing
-        // which customer's app runs on hardware they control - and for a g:/r: app
-        // the new instance syncs that customer's data down to it. The spawner
-        // decides placement; the owner decides everything else.
-        //
-        // The temporary-message branch above is untouched and stays open to any
-        // logged-in user: that is how an app is tested before it is registered,
-        // it is addressed by hash rather than by name, and it expires on its own
-        // (temporaryAppAllowance).
-        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+        // only owner can deploy permanent message or existing app
+        const ownerAuthorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
@@ -1130,7 +1118,7 @@ async function testAppInstall(req, res) {
     let blockAllowance = config.fluxapps.ownerAppAllowance;
 
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized) {
       let appSpecifications;
 
@@ -1146,19 +1134,8 @@ async function testAppInstall(req, res) {
       }
 
       if (!appSpecifications) {
-        // Placing a registered app on a node is not the node operator's call, for
-        // the same reason removing one is not: hosting an app is not owning it.
-        // This branch resolves an app BY NAME from the marketplace, the global
-        // registry or a permanent message, so an operator reaching it is choosing
-        // which customer's app runs on hardware they control - and for a g:/r: app
-        // the new instance syncs that customer's data down to it. The spawner
-        // decides placement; the owner decides everything else.
-        //
-        // The temporary-message branch above is untouched and stays open to any
-        // logged-in user: that is how an app is tested before it is registered,
-        // it is addressed by hash rather than by name, and it expires on its own
-        // (temporaryAppAllowance).
-        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+        // only owner can deploy permanent message or existing app
+        const ownerAuthorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
