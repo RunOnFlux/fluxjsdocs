@@ -8,7 +8,6 @@ const nodecmd = require('node-cmd');
 const util = require('util');
 
 const log = require('../lib/log');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const client = new natUpnp.Client();
 
@@ -311,7 +310,7 @@ async function removeMapUpnpPort(port) {
  */
 async function mapPortApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       let { port } = req.params;
       port = port || req.query.port;
@@ -358,7 +357,7 @@ async function mapPortApi(req, res) {
  */
 async function removeMapPortApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       let { port } = req.params;
       port = port || req.query.port;
@@ -398,7 +397,7 @@ async function removeMapPortApi(req, res) {
  */
 async function getMapApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       const map = await client.getMappings();
       const message = messageHelper.createDataMessage(map);
@@ -425,7 +424,7 @@ async function getMapApi(req, res) {
  */
 async function getIpApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       const ip = await client.getPublicIp();
       const message = messageHelper.createDataMessage(ip);
@@ -452,7 +451,7 @@ async function getIpApi(req, res) {
  */
 async function getGatewayApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (authorized) {
       const gateway = await client.getGateway();
       const message = messageHelper.createDataMessage(gateway);

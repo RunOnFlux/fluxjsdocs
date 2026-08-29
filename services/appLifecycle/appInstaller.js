@@ -37,7 +37,6 @@ const hwRequirements = require('../appRequirements/hwRequirements');
 const config = require('config');
 const fluxEventBus = require('../utils/fluxEventBus');
 const volumeService = require('../utils/volumeService');
-const { Privilege, authOf } = require('../utils/privileges');
 
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
@@ -957,7 +956,7 @@ async function installAppLocally(req, res) {
     }
     let blockAllowance = config.fluxapps.ownerAppAllowance;
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized) {
       let appSpecifications;
       // anyone can deploy temporary app
@@ -983,7 +982,7 @@ async function installAppLocally(req, res) {
         // logged-in user: that is how an app is tested before it is registered,
         // it is addressed by hash rather than by name, and it expires on its own
         // (temporaryAppAllowance).
-        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+        const ownerAuthorized = await verificationHelper.verifyPrivilege('fluxteam', req);
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
@@ -1130,7 +1129,7 @@ async function testAppInstall(req, res) {
     let blockAllowance = config.fluxapps.ownerAppAllowance;
 
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized) {
       let appSpecifications;
 
@@ -1158,7 +1157,7 @@ async function testAppInstall(req, res) {
         // logged-in user: that is how an app is tested before it is registered,
         // it is addressed by hash rather than by name, and it expires on its own
         // (temporaryAppAllowance).
-        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+        const ownerAuthorized = await verificationHelper.verifyPrivilege('fluxteam', req);
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
