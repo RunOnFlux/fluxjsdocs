@@ -33,6 +33,7 @@ const tar = require('tar/create');
 // use non promises stream for node 14.x compatibility
 // const stream = require('node:stream/promises');
 const stream = require('node:stream');
+const { Privilege, authOf } = require('./utils/privileges');
 
 const isArcane = Boolean(process.env.FLUXOS_PATH);
 
@@ -143,31 +144,38 @@ async function fluxBackendFolder(req, res) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-async function getCurrentCommitId(req, res) {
+async function getCurrentCommitId() {
   // Fix - this breaks if head in detached state? (or something, can't remember)
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
-
   const { stdout: commitId, error } = await serviceHelper.runCommand('git', {
     logError: false, params: ['rev-parse', '--short', 'HEAD'],
   });
 
-  if (error) {
-    const errMsg = messageHelper.createErrorMessage(
+  if (error) throw error;
+
+  return commitId.trim();
+}
+
+/**
+ * To show the current short commit id. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function getCurrentCommitIdApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
+  }
+
+  try {
+    return res.json(messageHelper.createSuccessMessage(await getCurrentCommitId()));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(
       `Error getting current commit id of Flux: ${error.message}`,
       error.name,
       error.code,
-    );
-    return res ? res.json(errMsg) : errMsg;
+    ));
   }
-
-  const successMsg = messageHelper.createSuccessMessage(commitId.trim());
-  return res ? res.json(successMsg) : successMsg;
 }
 
 /**
@@ -176,31 +184,38 @@ async function getCurrentCommitId(req, res) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-async function getCurrentBranch(req, res) {
+async function getCurrentBranch() {
   // ToDo: Fix - this breaks if head in detached state (or something similar)
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
-
-  const { stdout: commitId, error } = await serviceHelper.runCommand('git', {
+  const { stdout: branch, error } = await serviceHelper.runCommand('git', {
     logError: false, params: ['rev-parse', '--abbrev-ref', 'HEAD'],
   });
 
-  if (error) {
-    const errMsg = messageHelper.createErrorMessage(
+  if (error) throw error;
+
+  return branch.trim();
+}
+
+/**
+ * To show the currently selected branch. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function getCurrentBranchApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
+  }
+
+  try {
+    return res.json(messageHelper.createSuccessMessage(await getCurrentBranch()));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(
       `Error getting current branch of Flux: ${error.message}`,
       error.name,
       error.code,
-    );
-    return res ? res.json(errMsg) : errMsg;
+    ));
   }
-
-  const successMsg = messageHelper.createSuccessMessage(commitId.trim());
-  return res ? res.json(successMsg) : successMsg;
 }
 
 /**
@@ -237,27 +252,33 @@ async function checkoutBranch(branch, options = {}) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-// eslint-disable-next-line consistent-return
-async function enterMaster(req, res) {
+async function enterMaster() {
   // why use npm for this?
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
   const cwd = path.join(__dirname, '../../../');
 
   const { error } = await serviceHelper.runCommand('npm', { cwd, params: ['run', 'entermaster'] });
 
-  if (error) {
-    const errMessage = messageHelper.createErrorMessage(`Error entering master branch of Flux: ${error.message}`, error.name, error.code);
-    return res ? res.json(errMessage) : errMessage;
+  if (error) throw error;
+}
+
+/**
+ * To switch to master branch of FluxOS. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function enterMasterApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
   }
 
-  const message = messageHelper.createSuccessMessage('Master branch successfully entered');
-  return res ? res.json(message) : message;
+  try {
+    await enterMaster();
+    return res.json(messageHelper.createSuccessMessage('Master branch successfully entered'));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(`Error entering master branch of Flux: ${error.message}`, error.name, error.code));
+  }
 }
 
 /**
@@ -266,26 +287,32 @@ async function enterMaster(req, res) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-// eslint-disable-next-line consistent-return
-async function enterDevelopment(req, res) {
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
+async function enterDevelopment() {
   const cwd = path.join(__dirname, '../../../');
 
   const { error } = await serviceHelper.runCommand('npm', { cwd, params: ['run', 'enterdevelopment'] });
 
-  if (error) {
-    const errMessage = messageHelper.createErrorMessage(`Error entering development branch of Flux: ${error.message}`, error.name, error.code);
-    return res ? res.json(errMessage) : errMessage;
+  if (error) throw error;
+}
+
+/**
+ * To switch to development branch of FluxOS. Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function enterDevelopmentApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
   }
 
-  const message = messageHelper.createSuccessMessage('Development branch successfully entered');
-  return res ? res.json(message) : message;
+  try {
+    await enterDevelopment();
+    return res.json(messageHelper.createSuccessMessage('Development branch successfully entered'));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(`Error entering development branch of Flux: ${error.message}`, error.name, error.code));
+  }
 }
 
 /**
@@ -296,7 +323,7 @@ async function enterDevelopment(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function updateFlux(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -321,27 +348,32 @@ async function updateFlux(req, res) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-// eslint-disable-next-line consistent-return
-async function softUpdateFlux(req, res) {
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
-
+async function softUpdateFlux() {
   const cwd = path.join(__dirname, '../../../');
 
   const { error } = await serviceHelper.runCommand('npm', { cwd, params: ['run', 'softupdate'] });
 
-  if (error) {
-    const errMessage = messageHelper.createErrorMessage(`Error soft updating Flux: ${error.message}`, error.name, error.code);
-    return res ? res.json(errMessage) : errMessage;
+  if (error) throw error;
+}
+
+/**
+ * To soft update FluxOS version (executes the command `npm run softupdate` on the node machine). Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function softUpdateFluxApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
   }
 
-  const message = messageHelper.createSuccessMessage('Flux successfully soft updated');
-  return res ? res.json(message) : message;
+  try {
+    await softUpdateFlux();
+    return res.json(messageHelper.createSuccessMessage('Flux successfully soft updated'));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(`Error soft updating Flux: ${error.message}`, error.name, error.code));
+  }
 }
 
 /**
@@ -350,27 +382,32 @@ async function softUpdateFlux(req, res) {
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
  */
-// eslint-disable-next-line consistent-return
-async function softUpdateFluxInstall(req, res) {
-  if (req) {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
-    if (authorized !== true) {
-      const errMessage = messageHelper.errUnauthorizedMessage();
-      return res ? res.json(errMessage) : errMessage;
-    }
-  }
-
+async function softUpdateFluxInstall() {
   const cwd = path.join(__dirname, '../../../');
 
   const { error } = await serviceHelper.runCommand('npm', { cwd, params: ['run', 'softupdateinstall'] });
 
-  if (error) {
-    const errMessage = messageHelper.createErrorMessage(`Error soft updating Flux with installation: ${error.message}`, error.name, error.code);
-    return res ? res.json(errMessage) : errMessage;
+  if (error) throw error;
+}
+
+/**
+ * To install the soft update of FluxOS (executes the command `npm run softupdateinstall` on the node machine). Only accessible by admins and Flux team members.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<object>} Message.
+ */
+async function softUpdateFluxInstallApi(req, res) {
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  if (authorized !== true) {
+    return res.json(messageHelper.errUnauthorizedMessage());
   }
 
-  const message = messageHelper.createSuccessMessage('Flux successfully soft updated with installation');
-  return res ? res.json(message) : message;
+  try {
+    await softUpdateFluxInstall();
+    return res.json(messageHelper.createSuccessMessage('Flux successfully soft updated with installation'));
+  } catch (error) {
+    return res.json(messageHelper.createErrorMessage(`Error soft updating Flux with installation: ${error.message}`, error.name, error.code));
+  }
 }
 
 /**
@@ -381,7 +418,7 @@ async function softUpdateFluxInstall(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function hardUpdateFlux(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -408,7 +445,7 @@ async function hardUpdateFlux(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function rebuildHome(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -435,7 +472,7 @@ async function rebuildHome(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function updateDaemon(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -463,7 +500,7 @@ async function updateDaemon(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function updateBenchmark(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -491,7 +528,7 @@ async function updateBenchmark(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function startBenchmark(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -521,7 +558,7 @@ async function startBenchmark(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function restartBenchmark(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -549,7 +586,7 @@ async function restartBenchmark(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function startDaemon(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -579,7 +616,7 @@ async function startDaemon(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function restartDaemon(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -607,7 +644,7 @@ async function restartDaemon(req, res) {
  */
 // eslint-disable-next-line consistent-return
 async function reindexDaemon(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('admin', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -670,7 +707,7 @@ async function getFluxIP(req, res) {
  * @returns {object} Message.
  */
 function getFluxZelID(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const zelID = userconfig.initial.zelid;
   const message = messageHelper.createDataMessage(zelID);
   return res ? res.json(message) : message;
@@ -723,7 +760,7 @@ async function getFluxGeolocation(req, res) {
  * @returns {object} Message.
  */
 function getFluxPGPidentity(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const pgp = userconfig.initial.pgpPublicKey;
   const message = messageHelper.createDataMessage(pgp);
   return res ? res.json(message) : message;
@@ -736,7 +773,7 @@ function getFluxPGPidentity(req, res) {
  * @returns {object} Message.
  */
 function getFluxKadena(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const kadena = userconfig.initial.kadena || null;
   const message = messageHelper.createDataMessage(kadena);
   return res ? res.json(message) : message;
@@ -749,7 +786,7 @@ function getFluxKadena(req, res) {
  * @returns {object} Message.
  */
 function getRouterIP(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const routerIP = userconfig.initial.routerIP || '';
   const message = messageHelper.createDataMessage(routerIP);
   return res ? res.json(message) : message;
@@ -762,7 +799,7 @@ function getRouterIP(req, res) {
  * @returns {object} Message.
  */
 function getBlockedPorts(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const blockedPorts = userconfig.initial.blockedPorts || [];
   const message = messageHelper.createDataMessage(blockedPorts);
   return res ? res.json(message) : message;
@@ -775,7 +812,7 @@ function getBlockedPorts(req, res) {
  * @returns {object} Message.
  */
 function getAPIPort(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const routerIP = userconfig.initial.apiport || '16127';
   const message = messageHelper.createDataMessage(routerIP);
   return res ? res.json(message) : message;
@@ -788,7 +825,7 @@ function getAPIPort(req, res) {
  * @returns {object} Message.
  */
 function getBlockedRepositories(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const blockedPorts = userconfig.initial.blockedRepositories || [];
   const message = messageHelper.createDataMessage(blockedPorts);
   return res ? res.json(message) : message;
@@ -813,7 +850,7 @@ function getEnterpriseAppOwners(req, res) {
  * @returns {object} Message.
  */
 function getMarketplaceURL(req, res) {
-  const userconfig = globalThis.userconfig;
+  const { userconfig } = globalThis;
   const development = userconfig.initial.development || false;
   let marketPlaceUrl = `${config.stats.baseUrl}/marketplace/listapps`;
   if (development) {
@@ -830,7 +867,7 @@ function getMarketplaceURL(req, res) {
  * @returns {Promise<object>} Debug.log file for Flux daemon.
  */
 async function daemonDebug(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -850,7 +887,7 @@ async function daemonDebug(req, res) {
  * @returns {Promise<object>} Debug.log file for Flux benchmark.
  */
 async function benchmarkDebug(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     return res.json(errMessage);
@@ -874,7 +911,7 @@ async function benchmarkDebug(req, res) {
  * @param {object} res Response.
  */
 async function tailDaemonDebug(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
@@ -905,7 +942,7 @@ async function tailDaemonDebug(req, res) {
  * @param {object} res Response.
  */
 async function tailBenchmarkDebug(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
@@ -957,7 +994,7 @@ async function fluxLog(res, filelog) {
  */
 async function fluxErrorLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -977,7 +1014,7 @@ async function fluxErrorLog(req, res) {
  */
 async function fluxWarnLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -997,7 +1034,7 @@ async function fluxWarnLog(req, res) {
  */
 async function fluxInfoLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -1017,7 +1054,7 @@ async function fluxInfoLog(req, res) {
  */
 async function fluxDebugLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -1036,7 +1073,7 @@ async function fluxDebugLog(req, res) {
  * @param {Promise<string>} logfile Log file name (excluding `.log`).
  */
 async function tailFluxLog(req, res, logfile) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
@@ -1067,7 +1104,7 @@ async function tailFluxLog(req, res, logfile) {
  */
 async function tailFluxErrorLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await tailFluxLog(req, res, 'error');
     } else {
@@ -1086,7 +1123,7 @@ async function tailFluxErrorLog(req, res) {
  */
 async function tailFluxWarnLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await tailFluxLog(req, res, 'warn');
     } else {
@@ -1105,7 +1142,7 @@ async function tailFluxWarnLog(req, res) {
  */
 async function tailFluxInfoLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await tailFluxLog(req, res, 'info');
     } else {
@@ -1124,7 +1161,7 @@ async function tailFluxInfoLog(req, res) {
  */
 async function tailFluxDebugLog(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await tailFluxLog(req, res, 'debug');
     } else {
@@ -1282,7 +1319,7 @@ async function getFluxInfo(req, res) {
       info.flux.arcaneHumanVersion = arcaneHumanVersion;
     }
     info.flux.appsDos = dosAppsResult.data;
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     info.flux.development = userconfig.initial.development || false;
     const daemonInfoRes = await daemonServiceControlRpcs.getInfo();
     if (daemonInfoRes.status === 'error') {
@@ -1377,7 +1414,7 @@ async function getFluxInfo(req, res) {
  */
 async function adjustKadenaAccount(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       let { account } = req.params;
       account = account || req.query.account;
@@ -1394,7 +1431,7 @@ async function adjustKadenaAccount(req, res) {
         throw new Error(`Invalid Chain ID ${chainid} provided.`);
       }
       const kadenaURI = `kadena:${account}?chainid=${chainid}`;
-      const userconfig = globalThis.userconfig;
+      const { userconfig } = globalThis;
       const fluxDirPath = path.join(__dirname, '../../../config/userconfig.js');
       const dataToWrite = `module.exports = {
   initial: {
@@ -1434,12 +1471,12 @@ async function adjustKadenaAccount(req, res) {
  */
 async function adjustRouterIP(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       let { routerip } = req.params;
       routerip = routerip || req.query.routerip || '';
 
-      const userconfig = globalThis.userconfig;
+      const { userconfig } = globalThis;
       const dataToWrite = `module.exports = {
         initial: {
           ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
@@ -1477,7 +1514,7 @@ async function adjustRouterIP(req, res) {
  * @param {object} res Response.
  */
 async function adjustBlockedPorts(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
@@ -1495,7 +1532,7 @@ async function adjustBlockedPorts(req, res) {
     if (!Array.isArray(blockedPorts)) {
       throw new Error('Blocked Ports is not a valid array');
     }
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     const dataToWrite = `module.exports = {
             initial: {
               ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
@@ -1533,7 +1570,7 @@ async function adjustBlockedPorts(req, res) {
  */
 async function adjustAPIPort(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       let { apiport } = req.params;
       apiport = apiport || req.query.apiport || '';
@@ -1545,7 +1582,7 @@ async function adjustAPIPort(req, res) {
         return;
       }
 
-      const userconfig = globalThis.userconfig;
+      const { userconfig } = globalThis;
       const dataToWrite = `module.exports = {
         initial: {
           ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
@@ -1583,7 +1620,7 @@ async function adjustAPIPort(req, res) {
  * @param {object} res Response.
  */
 async function adjustBlockedRepositories(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
@@ -1609,7 +1646,7 @@ async function adjustBlockedRepositories(req, res) {
       }
     });
 
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     const dataToWrite = `module.exports = {
             initial: {
               ipaddress: '${userconfig.initial.ipaddress || '127.0.0.1'}',
@@ -1680,7 +1717,7 @@ async function getNodeTier(req, res) {
  * @param {object} res Response.
  */
 async function restartFluxOS(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('admin', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
   if (authorized !== true) {
     const errMessage = messageHelper.errUnauthorizedMessage();
     res.json(errMessage);
@@ -2113,7 +2150,9 @@ module.exports = {
   checkoutBranch,
   daemonDebug,
   enterDevelopment,
+  enterDevelopmentApi,
   enterMaster,
+  enterMasterApi,
   fluxBackendFolder,
   fluxDebugLog,
   fluxErrorLog,
@@ -2124,7 +2163,9 @@ module.exports = {
   getBlockedRepositories,
   getEnterpriseAppOwners,
   getCurrentBranch,
+  getCurrentBranchApi,
   getCurrentCommitId,
+  getCurrentCommitIdApi,
   getFluxGeolocation,
   getFluxInfo,
   getFluxIP,
@@ -2146,7 +2187,9 @@ module.exports = {
   restartDaemon,
   restartFluxOS,
   softUpdateFlux,
+  softUpdateFluxApi,
   softUpdateFluxInstall,
+  softUpdateFluxInstallApi,
   startBenchmark,
   startDaemon,
   streamChainPreparation,
