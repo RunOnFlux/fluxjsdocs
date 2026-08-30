@@ -220,6 +220,11 @@ async function performRequest(method = 'get', urlpath = '', data, config) {
     return successResponse;
   } catch (error) {
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    // The axios code is a category - ERR_BAD_REQUEST spans every 4xx - so the
+    // HTTP status rides along as itself: a caller telling "no such folder"
+    // (404) from a denial (403) needs the number, and the message's wording
+    // belongs to axios, not to us. Null when no HTTP answer arrived at all.
+    errorResponse.data.httpStatus = error.response?.status ?? null;
     return errorResponse;
   }
 }
@@ -1524,6 +1529,31 @@ async function getDbIgnores(req, res) {
 }
 
 /**
+ * Read a folder's ignore patterns, for internal callers. Returns the standard
+ * message shape - { status, data: { ignore, expanded } } on success - and never
+ * throws, so the caller checks status rather than catching.
+ * @param {string} folderId syncthing folder id
+ * @returns {Promise<object>} message
+ */
+async function getFolderIgnores(folderId) {
+  return performRequest('get', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`);
+}
+
+/**
+ * Set a folder's ignore patterns, for internal callers. Syncthing owns and
+ * writes .stignore itself (atomically, and it never replicates it), so this is
+ * how FluxOS sets the ignores rather than writing the file. REPLACES the whole
+ * set - pass the complete desired list. Returns the standard message shape and
+ * never throws.
+ * @param {string} folderId syncthing folder id
+ * @param {Array<string>} lines the full ignore pattern list
+ * @returns {Promise<object>} message
+ */
+async function setFolderIgnores(folderId, lines) {
+  return performRequest('post', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`, { ignore: lines });
+}
+
+/**
  * Returns the list of files which were changed locally in a receive-only folder. Takes one mandatory parameter, {folder}
  * @param {object} req Request.
  * @param {object} res Response.
@@ -1650,7 +1680,13 @@ async function postDbIgnores(req, res) {
       if (folder) {
         apiPath += `?folder=${folder}`;
       }
-      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      // fluxteam, not adminandfluxteam like its siblings. .stignore decides what
+      // LEAVES this node for an app the node operator does not own, and a pattern
+      // dropped here replicates that app's backup and operation staging to every
+      // other node running it - so the blast radius of this one call is the fleet,
+      // not the box. Reading the volume is the operator's already; choosing what
+      // the network carries is not.
+      const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
@@ -2355,10 +2391,6 @@ async function adjustSyncthing() {
         }
       }
     }
-    const restartRequired = await getConfigRestartRequired();
-    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
-      await systemRestart();
-    }
   } catch (error) {
     log.error(error);
   }
@@ -2802,6 +2834,19 @@ async function collectSyncthingMetrics() {
                   errors,
                 };
                 metrics.overall.issues.push(`Folder ${folder.label || folderId} has ${errors + pullErrors} error(s)`);
+                // The counts alone cannot be diagnosed from a log dump -
+                // surface the file-level causes, bounded so a sick folder
+                // cannot flood the log.
+                // eslint-disable-next-line no-await-in-loop
+                const folderErrorsResponse = await getFolderIdErrors(folderId);
+                const fileErrors = folderErrorsResponse.status === 'success' ? (folderErrorsResponse.data?.errors ?? []) : [];
+                const shown = fileErrors.slice(0, 5);
+                shown.forEach((fileError) => {
+                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileError.path}: ${fileError.error}`);
+                });
+                if (fileErrors.length > shown.length) {
+                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileErrors.length - shown.length} further file error(s) not shown`);
+                }
               }
             }
           } catch (error) {
@@ -2831,14 +2876,22 @@ async function collectSyncthingMetrics() {
       metrics.overall.issues.push(`Failed to collect folder metrics: ${error.message}`);
     }
 
-    // Collect system errors
+    // Drain syncthing's system error buffer. The buffer is cumulative for
+    // the daemon's lifetime and the daemon outlives FluxOS restarts, so each
+    // entry is an occurrence, not a state: log its content, clear the
+    // buffer, and report unhealthy only for the pass the errors arrived in.
     try {
       const errorsResponse = await performRequest('get', '/rest/system/error');
-      if (errorsResponse.status === 'success' && errorsResponse.data?.errors) {
+      if (errorsResponse.status === 'success' && errorsResponse.data?.errors?.length) {
         metrics.errors.system = errorsResponse.data.errors;
-        if (metrics.errors.system.length > 0) {
-          metrics.overall.healthy = false;
-          metrics.overall.issues.push(`${metrics.errors.system.length}`);
+        metrics.overall.healthy = false;
+        metrics.overall.issues.push(`${metrics.errors.system.length} syncthing system error(s) this pass`);
+        metrics.errors.system.forEach((systemError) => {
+          log.error(`Syncthing system error at ${systemError.when}: ${systemError.message}`);
+        });
+        const clearResponse = await performRequest('post', '/rest/system/error/clear');
+        if (clearResponse.status !== 'success') {
+          log.warn(`Failed to clear syncthing system errors, they will re-log next pass: ${clearResponse.data?.message}`);
         }
       }
     } catch (error) {
@@ -3393,6 +3446,8 @@ module.exports = {
   getDbCompletion,
   getDbFile,
   getDbIgnores,
+  getFolderIgnores,
+  setFolderIgnores,
   getDbLocalchanged,
   getDbNeed,
   getDbRemoteNeed,

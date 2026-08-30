@@ -2,8 +2,6 @@ const config = require('config');
 const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
-// eslint-disable-next-line no-unused-vars
-const pgpService = require('../pgpService');
 const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
@@ -36,11 +34,9 @@ function classifyVerificationError(error, errorMeta) {
         return { ttlMs: 2 * FluxCacheManager.oneHour, reason: 'Rate limiting (429)' };
       case 'server_error':
         return { ttlMs: 3 * FluxCacheManager.oneHour, reason: 'Server error (5xx)' };
-      case 'whitelist_fetch_error':
       case 'auth_unavailable':
         return { ttlMs: 2 * FluxCacheManager.oneHour, reason: 'Temporary service issue' };
       // Permanent errors - longer cache
-      case 'not_whitelisted':
       case 'invalid_format':
       case 'unsupported_architecture':
       case 'unsupported_media_type':
@@ -182,7 +178,7 @@ async function getBlockedRepositores() {
     if (cachedResponse) {
       return cachedResponse;
     }
-    const resBlockedRepo = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/blockedrepositories.json`);
+    const resBlockedRepo = await serviceHelper.axiosGet(`${config.policy.baseUrl}/blockedrepositories.json`);
     if (resBlockedRepo.data) {
       fluxCaching.blockedRepositoriesCache.set('blockedRepositories', resBlockedRepo.data);
       return resBlockedRepo.data;
@@ -205,7 +201,7 @@ async function getVettedRepositories() {
     if (cachedResponse) {
       return cachedResponse;
     }
-    const resVettedRepo = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/vettedrepositories.json`);
+    const resVettedRepo = await serviceHelper.axiosGet(`${config.policy.baseUrl}/vettedrepositories.json`);
     if (resVettedRepo.data) {
       fluxCaching.blockedRepositoriesCache.set('vettedRepositories', resVettedRepo.data);
       return resVettedRepo.data;
@@ -288,7 +284,7 @@ async function getUserBlockedRepositores() {
       return cacheUserBlockedRepos;
     }
 
-    const userconfig = globalThis.userconfig;
+    const { userconfig } = globalThis;
     const userBlockedRepos = userconfig.initial.blockedRepositories || [];
     if (userBlockedRepos.length === 0) {
       return userBlockedRepos;
@@ -633,8 +629,12 @@ async function checkApplicationsCompliance(installedApps, removeAppLocally) {
       throw new Error('Failed to get installed Apps');
     }
     // Decrypt enterprise apps (version 8 with encrypted content)
-    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
-    const appsInstalled = installedAppsRes.data;
+    const { readable: appsInstalled, unreadable } = await decryptEnterpriseApps(installedAppsRes.data);
+    if (unreadable.length) {
+      // their repotags are inside the blob, so a blocked image in one cannot be
+      // seen here - it is not cleared, it is unexamined
+      log.warn(`Cannot check blocked images for undecryptable apps: ${unreadable.map((app) => app.name).join(', ')}`);
+    }
     const appsToRemoveNames = [];
     // eslint-disable-next-line no-restricted-syntax
     for (const app of appsInstalled) {

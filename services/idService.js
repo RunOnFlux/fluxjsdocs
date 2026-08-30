@@ -6,14 +6,13 @@ const serviceHelper = require('./serviceHelper');
 const messageHelper = require('./messageHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
+const verificationHelperUtils = require('./verificationHelperUtils');
 const generalService = require('./generalService');
 const dockerService = require('./dockerService');
 const syncthingService = require('./syncthingService');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const appInspector = require('./appManagement/appInspector');
 const signatureVerifier = require('./signatureVerifier');
-
-const goodchars = /^[1-9a-km-zA-HJ-NP-Z]+$/;
 
 async function deleteLoginPhrase(phrase) {
   try {
@@ -27,7 +26,6 @@ async function deleteLoginPhrase(phrase) {
     log.error(error);
   }
 }
-const ethRegex = /^0x[a-fA-F0-9]{40}$/;
 
 let syncthingWorking = false;
 
@@ -255,18 +253,7 @@ async function verifyLogin(req, res) {
         throw new Error('No Flux ID is specified');
       }
 
-      if (address[0] !== '1' && address[0] !== '0') {
-        throw new Error('Flux ID is not valid');
-      }
-
-      if (address[0] === '1') {
-        if (!goodchars.test(address)) {
-          throw new Error('Flux ID is not valid');
-        }
-        if (address.length > 34 || address.length < 25) {
-          throw new Error('Flux ID is not valid');
-        }
-      } else if (!ethRegex.test(address)) {
+      if (!signatureVerifier.isValidSigningIdentity(address)) {
         throw new Error('Flux ID is not valid');
       }
 
@@ -316,11 +303,18 @@ async function verifyLogin(req, res) {
               createdAt,
               expireAt,
             };
-            const userconfig = globalThis.userconfig;
+            const adminZelid = verificationHelperUtils.nodeAdminZelid();
+            if (!adminZelid) {
+              // The node answers HTTP before it has read its own configuration, so
+              // this window is reachable on any restart. Granting 'user' here would
+              // hand the operator a session with their own rights stripped and no
+              // indication why; refusing says what is true and costs one retry.
+              throw new Error('Node is still starting and cannot establish privileges yet');
+            }
             let privilage = 'user';
             if (address === config.fluxTeamFluxID || address === config.fluxSupportTeamFluxID) {
               privilage = 'fluxteam';
-            } else if (address === userconfig.initial.zelid) {
+            } else if (address === adminZelid) {
               privilage = 'admin';
             }
             const loggedUsersCollection = config.database.local.collections.loggedUsers;
@@ -387,18 +381,7 @@ async function provideSign(req, res) {
         throw new Error('No Flux ID is specified');
       }
 
-      if (address[0] !== '1' && address[0] !== '0') {
-        throw new Error('Flux ID is not valid');
-      }
-
-      if (address[0] === '1') {
-        if (!goodchars.test(address)) {
-          throw new Error('Flux ID is not valid');
-        }
-        if (address.length > 34 || address.length < 25) {
-          throw new Error('Flux ID is not valid');
-        }
-      } else if (!ethRegex.test(address)) {
+      if (!signatureVerifier.isValidSigningIdentity(address)) {
         throw new Error('Flux ID is not valid');
       }
 
@@ -701,11 +684,14 @@ async function wsRespondLoginPhrase(ws, loginphrase) {
       });
       if (result) {
         // user is logged, all ok
-        const userconfig = globalThis.userconfig;
+        const adminZelid = verificationHelperUtils.nodeAdminZelid();
+        if (!adminZelid) {
+          throw new Error('Node is still starting and cannot establish privileges yet');
+        }
         let privilage = 'user';
         if (result.zelid === config.fluxTeamFluxID || result.zelid === config.fluxSupportTeamFluxID) {
           privilage = 'fluxteam';
-        } else if (result.zelid === userconfig.initial.zelid) {
+        } else if (result.zelid === adminZelid) {
           privilage = 'admin';
         }
         const resData = {
