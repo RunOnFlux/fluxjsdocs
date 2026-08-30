@@ -10,6 +10,7 @@ const fluxNetworkHelper = require('../fluxNetworkHelper');
 const { extractIp, extractPort } = require('../utils/socketAddressUtils');
 const fluxEventBus = require('../utils/fluxEventBus');
 const log = require('../../lib/log');
+const { Privilege, authOf } = require('../utils/privileges');
 
 const { globalCmdDelayMs } = config.fluxapps;
 // Guaranteed a finite non-negative integer, so a missing or malformed config
@@ -350,14 +351,17 @@ async function appStart(req, res) {
     // Use dynamic require to avoid circular dependency
     // eslint-disable-next-line global-require
     const verificationHelper = require('../verificationHelper');
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
+    // This refuses the node operator, and whether someone
+    // else's app runs is not theirs to decide. The same gate appkill and
+    // appremove ask for; the argument is on verifyAppOwnerOrFluxTeamSession.
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
     }
 
     if (global) {
-      executeAppGlobalCommand(appname, 'appstart', req.headers.zelidauth); // do not wait
+      executeAppGlobalCommand(appname, 'appstart', authOf(req)); // do not wait
       const appResponse = messageHelper.createSuccessMessage(`${appname} queried for global start`);
       return res ? res.json(appResponse) : appResponse;
     }
@@ -433,14 +437,17 @@ async function appStop(req, res) {
     // Use dynamic require to avoid circular dependency
     // eslint-disable-next-line global-require
     const verificationHelper = require('../verificationHelper');
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
+    // This refuses the node operator, and whether someone
+    // else's app runs is not theirs to decide. The same gate appkill and
+    // appremove ask for; the argument is on verifyAppOwnerOrFluxTeamSession.
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
     }
 
     if (global) {
-      executeAppGlobalCommand(appname, 'appstop', req.headers.zelidauth); // do not wait
+      executeAppGlobalCommand(appname, 'appstop', authOf(req)); // do not wait
       const appResponse = messageHelper.createSuccessMessage(`${appname} queried for global stop`);
       return res ? res.json(appResponse) : appResponse;
     }
@@ -519,14 +526,17 @@ async function appRestart(req, res) {
     // Use dynamic require to avoid circular dependency
     // eslint-disable-next-line global-require
     const verificationHelper = require('../verificationHelper');
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
+    // This refuses the node operator, and whether someone
+    // else's app runs is not theirs to decide. The same gate appkill and
+    // appremove ask for; the argument is on verifyAppOwnerOrFluxTeamSession.
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
     }
 
     if (global) {
-      executeAppGlobalCommand(appname, 'apprestart', req.headers.zelidauth); // do not wait
+      executeAppGlobalCommand(appname, 'apprestart', authOf(req)); // do not wait
       const appResponse = messageHelper.createSuccessMessage(`${appname} queried for global restart`);
       return res ? res.json(appResponse) : appResponse;
     }
@@ -587,10 +597,10 @@ async function appKill(req, res) {
     // Use dynamic require to avoid circular dependency
     // eslint-disable-next-line global-require
     const verificationHelper = require('../verificationHelper');
-    // Not appownerabove: that admits the node operator, and a hard kill of
+    // This refuses the node operator, and a hard kill of
     // someone else's app is not theirs to order. The owner and the flux team
-    // only - the operator keeps every other lifecycle control.
-    const authorized = await verificationHelper.verifyPrivilege('appownerorfluxteam', req, mainAppName);
+    // only, as for every other verb that decides whether the app runs.
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
@@ -659,7 +669,7 @@ async function deprecatedPauseResponse(req, res) {
       const mainAppName = appname.split('_')[1] || appname;
       // eslint-disable-next-line global-require
       const verificationHelper = require('../verificationHelper');
-      const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
+      const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
       if (!authorized) {
         const errMessage = messageHelper.errUnauthorizedMessage();
         return res ? res.json(errMessage) : errMessage;
