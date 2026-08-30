@@ -157,7 +157,7 @@ async function getCurrentCommitId() {
 }
 
 /**
- * To show the current short commit id. Only accessible by admins and Flux team members.
+ * To show the current short commit id. Flux team only: which code a node runs is not the operator's to choose or to read.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -197,7 +197,7 @@ async function getCurrentBranch() {
 }
 
 /**
- * To show the currently selected branch. Only accessible by admins and Flux team members.
+ * To show the currently selected branch. Flux team only: which code a node runs is not the operator's to choose or to read.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -220,11 +220,68 @@ async function getCurrentBranchApi(req, res) {
 }
 
 /**
- * Check out a branch that exists locally.
+ * Bring a branch onto a node that has no reference to it, without widening what the
+ * clone tracks.
+ *
+ * The installer clones `--depth 1 --single-branch`, so a node carries exactly the branch
+ * it was installed on: no local branch for any other, and no remote-tracking ref either,
+ * because `remote.origin.fetch` maps only the one. Nothing on such a node can check out
+ * another branch, and that is not a state a switch should refuse - it is the ordinary
+ * state of every node.
+ *
+ * Fetched into `refs/heads/<branch>` rather than a tracking ref, because git decides what
+ * counts as a remote branch from the configured refspec: with a single-branch mapping it
+ * refuses to check out or track a `refs/remotes/origin/<branch>` this fetch created,
+ * saying it "is not a branch". Fetching the local branch directly sidesteps that, and
+ * leaves `remote.origin.fetch` exactly as the installer set it - the clone stays
+ * single-branch and stays shallow.
+ *
+ * The upstream is then written by hand for the same reason, and it is not optional: the
+ * update paths run `git pull`, which has nothing to pull without it.
+ *
+ * The depth is conditional. Passing `--depth` to a fetch on a FULL clone makes that
+ * repository shallow - a legacy node would be quietly truncated by a branch switch - so
+ * it is passed only where the repository already is.
+ *
+ * @param {string} branch The branch to bring down
+ * @returns {Promise<void>}
+ */
+async function fetchBranch(branch) {
+  const { stdout: shallow } = await serviceHelper.runCommand('git', {
+    params: ['rev-parse', '--is-shallow-repository'],
+  });
+
+  const depth = String(shallow).trim() === 'true' ? ['--depth', '1'] : [];
+
+  const { error: fetchError } = await serviceHelper.runCommand('git', {
+    params: ['fetch', ...depth, 'origin', `${branch}:refs/heads/${branch}`],
+  });
+
+  if (fetchError) throw new Error(`Branch ${branch} is not on this node and could not be fetched: ${fetchError.message}`);
+
+  const { error: remoteError } = await serviceHelper.runCommand('git', {
+    params: ['config', `branch.${branch}.remote`, 'origin'],
+  });
+  const { error: mergeError } = await serviceHelper.runCommand('git', {
+    params: ['config', `branch.${branch}.merge`, `refs/heads/${branch}`],
+  });
+
+  if (remoteError || mergeError) throw new Error(`Fetched ${branch} but could not set it to track origin`);
+}
+
+/**
+ * Check out a branch this node can reach.
  *
  * Each step names itself when it fails, because the caller reports the reason to whoever
  * asked and "could not switch branch" does not distinguish a branch this node has never
  * fetched from a working tree with changes in it.
+ *
+ * The branch is looked for where `git checkout` looks. A node carries only the branch it
+ * was installed on and remote-tracking refs for the rest - the installer clones shallow
+ * but tracks every head - and checkout creates the local branch from origin/<branch> when
+ * there is no local one. `rev-parse --verify <branch>` never resolves a remote-tracking
+ * ref, so asking only that refuses a switch the node can perfectly well make: on an
+ * Arcane node sitting on master, `origin/development` resolves and `development` does not.
  *
  * @param {string} branch The branch to checkout
  * @param {{pull?: Boolean}} options
@@ -232,11 +289,17 @@ async function getCurrentBranchApi(req, res) {
  */
 async function checkoutBranch(branch, options = {}) {
   // ToDo: this will break if multiple remotes
-  const { error: verifyError } = await serviceHelper.runCommand('git', {
-    params: ['rev-parse', '--verify', branch],
+  const { error: localMissing } = await serviceHelper.runCommand('git', {
+    params: ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`],
   });
 
-  if (verifyError) throw new Error(`Branch ${branch} not found on this node: ${verifyError.message}`);
+  if (localMissing) {
+    const { error: trackingMissing } = await serviceHelper.runCommand('git', {
+      params: ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`],
+    });
+
+    if (trackingMissing) await fetchBranch(branch);
+  }
 
   const { error: checkoutError } = await serviceHelper.runCommand('git', {
     params: ['checkout', branch],
@@ -270,7 +333,7 @@ async function currentCheckout() {
 }
 
 /**
- * To switch to master branch of FluxOS. Only accessible by admins and Flux team members.
+ * To switch to master branch of FluxOS. Flux team only: an operator updates along the branch their node is on, and does not choose a different one.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -280,7 +343,7 @@ async function enterMaster() {
 }
 
 /**
- * To switch to master branch of FluxOS. Only accessible by admins and Flux team members.
+ * To switch to master branch of FluxOS. Flux team only: an operator updates along the branch their node is on, and does not choose a different one.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -303,7 +366,7 @@ async function enterMasterApi(req, res) {
 }
 
 /**
- * To switch to development branch of FluxOS. Only accessible by admins and Flux team members.
+ * To switch to development branch of FluxOS. Flux team only: an operator updates along the branch their node is on, and does not choose a different one.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -313,7 +376,7 @@ async function enterDevelopment() {
 }
 
 /**
- * To switch to development branch of FluxOS. Only accessible by admins and Flux team members.
+ * To switch to development branch of FluxOS. Flux team only: an operator updates along the branch their node is on, and does not choose a different one.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {Promise<object>} Message.
@@ -471,9 +534,23 @@ async function rebuildUi(req, res) {
     return res.json(errMessage);
   }
 
+  // Refused on ArcaneOS, where the watchdog owns CloudUI: the periodic check
+  // stands aside there for that reason, and this must not walk under that by
+  // reaching the script directly. Answered rather than done quietly, so the
+  // caller learns which component to ask.
+  if (cloudUIUpdateService.watchdogManagesCloudUI()) {
+    const errMessage = messageHelper.createErrorMessage('CloudUI is managed by the watchdog on ArcaneOS, so it is not rebuilt from here');
+    return res.json(errMessage);
+  }
+
   // The UI is fetched, not built here. It is a published release of a separate
   // repository, so rebuilding it means taking that release again through the one path
   // that knows which host to ask - the same path the periodic check uses.
+  //
+  // Unconditionally, unlike the periodic check: that one stands down when the
+  // installed hash already matches the release, and a CloudUI which is damaged
+  // rather than out of date matches all the same. Repairing one is what this is
+  // for, so it takes the release again whatever is on disk.
   const rebuilt = await cloudUIUpdateService.runUpdateScript();
 
   if (!rebuilt) {
@@ -1388,7 +1465,10 @@ async function getFluxInfo(req, res) {
     if (appsResources.status === 'error') {
       throw appsResources.data;
     }
-    info.apps.resources = appsResources.data;
+    // The same three numbers /apps/appsresources publishes. This endpoint embeds
+    // them, and a field kept from one exit and not the other is the shape that
+    // catches this file out.
+    info.apps.resources = resourceQueryService.publicResourceView(appsResources.data);
     // eslint-disable-next-line global-require
     const registryManager = require('./appDatabase/registryManager');
     const appHashes = await registryManager.getAppHashes();
