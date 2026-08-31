@@ -109,6 +109,12 @@ async function trySpawningGlobalApplication() {
       return installDelay;
     }
 
+    if (fluxNetworkHelper.isPlacementHeld()) {
+      log.info(`Node held back from new placements (${fluxNetworkHelper.getPlacementHold()}). Global applications will not be installed`);
+      fluxEventBus.publish('spawner:blocked', { reason: 'placement_hold' });
+      return installDelay;
+    }
+
     let isNodeConfirmed = false;
     isNodeConfirmed = await generalService.isNodeStatusConfirmed().catch(() => null);
     if (!isNodeConfirmed) {
@@ -284,11 +290,21 @@ async function trySpawningGlobalApplication() {
     } else {
       const myNodeLocation = await systemIntegration.nodeFullGeolocation();
 
+      // Where the candidates went. Every filter below removes apps for a
+      // different and entirely reasonable reason, and none of them says so - the
+      // pass ends with "No app currently to be processed" whether one filter
+      // dropped everything or five each took a share. From outside the process
+      // that is indistinguishable from an app nobody wanted, which is how a port
+      // collision looked like a placement failure for a whole day.
+      const survivors = { found: globalAppNamesLocation.length };
+
       // filter apps that failed to install before
       globalAppNamesLocation = globalAppNamesLocation.filter((app) => !runningApps.data.find((appsRunning) => appsRunning.Names[0].slice(5) === app.name)
         && !globalState.spawnErrorsLongerAppCache.has(app.hash)
         && !globalState.trySpawningGlobalAppCache.has(app.hash)
         && !appsToBeCheckedLater.some((appAux) => appAux.appName === app.name));
+      survivors.afterAlreadyHeldOrTried = globalAppNamesLocation.length;
+
       // filter apps that are non enterprise or are marked to install on my node.
       // Enterprise-owned apps that target specific node IPs are strict: only a node
       // whose IP is listed may install them, regardless of version (the version>=8
@@ -335,10 +351,13 @@ async function trySpawningGlobalApplication() {
         // installer arbitrates
       }
       const myLocation = { continentCode: myContinentCode, countryCode: myCountryCode, region: myTableRegion };
+      survivors.afterNodePin = globalAppNamesLocation.length;
       globalAppNamesLocation = globalAppNamesLocation.filter(
         (app) => placementFeasibility.nodeLocationMatchesGeolocation(myLocation, app.geolocation),
       );
+      survivors.afterGeolocation = globalAppNamesLocation.length;
       globalAppNamesLocation = enterpriseNetwork.filterAppsByOwnership(globalAppNamesLocation, isEnterprise);
+      survivors.afterOwnership = globalAppNamesLocation.length;
 
       // Drop candidates whose remaining slots are already claimed, before one is
       // picked at random. The pool counts running instances only, so an app that
@@ -357,8 +376,11 @@ async function trySpawningGlobalApplication() {
       appsCountAvailableToInstallOnMyNode = globalAppNamesLocation.length + appsSyncthingToBeCheckedLater.length + appsToBeCheckedLater.length;
       ({ shortDelayTime, delayTime } = enterpriseNetwork.getSpawnDelays(isEnterprise, appsCountAvailableToInstallOnMyNode));
 
+      survivors.afterClaims = globalAppNamesLocation.length;
+
       if (globalAppNamesLocation.length === 0) {
-        log.info('trySpawningGlobalApplication - No app currently to be processed');
+        log.info(`trySpawningGlobalApplication - No app currently to be processed (${JSON.stringify(survivors)})`);
+        fluxEventBus.publish('spawner:noCandidates', survivors);
         return delayTime;
       }
       log.info(`trySpawningGlobalApplication - Found ${globalAppNamesLocation.length} apps that are missing instances on the network and can be selected to try to spawn on my node.`);
@@ -531,6 +553,25 @@ async function trySpawningGlobalApplication() {
     runningAppList = await registryManager.appLocation(appToRun);
     installingAppList = await registryManager.appInstallingLocation(appToRun);
     if (runningAppList.length + installingAppList.length >= minInstances) {
+      // KEPT when the running copies alone meet the count, CLEARED when the
+      // claims were needed to reach it.
+      //
+      // A running copy is a durable fact and caching it is the point of the
+      // cache - the app is covered, and re-deciding that every pass is waste.
+      // A claim is not: it is withdrawn as soon as its node finds the share
+      // already filled, seconds later and by design, because the share is
+      // checked after the claim goes out. Cached on a count that needed those
+      // claims, this node remembers "covered" for the cache's twelve hours and
+      // never reconsiders, so an app that falls back below its instance count
+      // waits out the day on every node that glanced inside that window.
+      //
+      // Clearing unconditionally is the other way to be wrong: an app whose
+      // count is genuinely met would re-enter the candidate pool on every pass
+      // and be declined again forever, never cached because it was never
+      // installed.
+      if (runningAppList.length < minInstances) {
+        globalState.trySpawningGlobalAppCache.delete(appHash);
+      }
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
       return shortDelayTime;
     }
@@ -783,6 +824,25 @@ async function trySpawningGlobalApplication() {
     runningAppList = await registryManager.appLocation(appToRun);
     installingAppList = await registryManager.appInstallingLocation(appToRun);
     if (runningAppList.length + installingAppList.length >= minInstances) {
+      // KEPT when the running copies alone meet the count, CLEARED when the
+      // claims were needed to reach it.
+      //
+      // A running copy is a durable fact and caching it is the point of the
+      // cache - the app is covered, and re-deciding that every pass is waste.
+      // A claim is not: it is withdrawn as soon as its node finds the share
+      // already filled, seconds later and by design, because the share is
+      // checked after the claim goes out. Cached on a count that needed those
+      // claims, this node remembers "covered" for the cache's twelve hours and
+      // never reconsiders, so an app that falls back below its instance count
+      // waits out the day on every node that glanced inside that window.
+      //
+      // Clearing unconditionally is the other way to be wrong: an app whose
+      // count is genuinely met would re-enter the candidate pool on every pass
+      // and be declined again forever, never cached because it was never
+      // installed.
+      if (runningAppList.length < minInstances) {
+        globalState.trySpawningGlobalAppCache.delete(appHash);
+      }
       log.info(`trySpawningGlobalApplication - Application ${appToRun} is already spawned or being installed on ${runningAppList.length + installingAppList.length} instances.`);
       return shortDelayTime;
     }
@@ -898,16 +958,23 @@ async function trySpawningGlobalApplication() {
 
     // install the app
     let registerOk = false;
+    // The installer signals failure two ways - a false return and a throw - and
+    // only the reason it throws with says WHICH check refused. A port already
+    // held by another app is raised that way, and reporting the failure without
+    // it leaves a suite unable to tell a refusal from an app that was simply
+    // never selected.
+    let installError = null;
     try {
       registerOk = await appInstaller.registerAppLocally(appSpecifications, null, null, false); // can throw
     } catch (error) {
       log.error(error);
+      installError = error.message ?? String(error);
       registerOk = false;
     }
     if (!registerOk) {
       log.info(`trySpawningGlobalApplication - Install failed for ${appToRun}, adding to local error cache`);
       globalState.spawnErrorsLongerAppCache.set(appHash, '');
-      fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash });
+      fluxEventBus.publish('spawner:installFailed', { appName: appToRun, hash: appHash, error: installError });
       return shortDelayTime;
     }
 
