@@ -14,6 +14,7 @@ const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { localAppsInformation, globalAppsInformation } = require('../utils/appConstants');
 const { Privilege, authOf } = require('../utils/privileges');
 const fluxCaching = require('../utils/cacheManager');
+const fluxEventBus = require('../utils/fluxEventBus');
 
 // Global cache for failed nodes
 const failedNodesTestPortsCache = new Map();
@@ -444,33 +445,36 @@ async function portsInUse() {
  * @returns {Promise<void>}
  */
 async function portsInUseApi(req, res) {
-  let body = '';
-  req.on('data', (data) => {
-    body += data;
-  });
-  req.on('end', async () => {
-    try {
-      const processedBody = serviceHelper.ensureObject(body);
+  try {
+    // req.body, not the raw stream. express.json() is global (fluxServer.js), so
+    // for a JSON content type the body is already consumed by the time a handler
+    // runs and a stream read waits for an 'end' that has been and gone - the
+    // request then hangs until the caller times out, which is what it did.
+    //
+    // The older handlers on this path read the stream because the product posts
+    // JSON.stringify(...) as a STRING, which axios does not label as JSON, so
+    // the parser skips it and leaves the stream untouched. Both work; only one
+    // of them works for both kinds of caller.
+    const processedBody = serviceHelper.ensureObject(req.body);
 
-      const signed = await fluxNetworkHelper.verifySignedFluxnodeRequest(processedBody);
-      const authorized = signed
-        ? true
-        : await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const signed = await fluxNetworkHelper.verifySignedFluxnodeRequest(processedBody);
+    const authorized = signed
+      ? true
+      : await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
-      if (signed !== true && authorized !== true) {
-        throw new Error('Unable to verify request authenticity');
-      }
-
-      res.json(messageHelper.createDataMessage(await portsInUse()));
-    } catch (error) {
-      log.error(error);
-      res.json(messageHelper.createErrorMessage(
-        error.message || error,
-        error.name,
-        error.code,
-      ));
+    if (signed !== true && authorized !== true) {
+      throw new Error('Unable to verify request authenticity');
     }
-  });
+
+    res.json(messageHelper.createDataMessage(await portsInUse()));
+  } catch (error) {
+    log.error(error);
+    res.json(messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    ));
+  }
 }
 
 
@@ -818,11 +822,17 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
     // Peer address -> the port its reading said was not ours. Keyed by peer so
     // that redrawing the same one does not read as a second opinion.
     const disagreements = new Map();
+    // Every peer already asked, so a redraw is ANOTHER peer rather than another
+    // draw. Without this the picker can hand back the one just asked - which on
+    // a budget of two attempts it often does - and a check counting distinct
+    // witnesses never reaches two however many times it tries.
+    const asked = [];
     while (!finished && i < config.fluxapps.portTestMaxAttempts) {
       i += 1;
       // eslint-disable-next-line no-await-in-loop
       const randomSocketAddress = await networkStateService.getRandomExternalObserver(
         localSocketAddress,
+        { exclude: asked },
       );
 
       // Nobody outside this address to ask. A Flux node sharing our public
@@ -833,13 +843,28 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
       // "nothing was learned" path the older-peer case below takes - which is
       // exactly what this node did before the check existed.
       if (!randomSocketAddress) {
-        log.warn('checkInstallingAppPortAvailable - no Flux node outside this address could be asked; proceeding on reachability alone');
+        // Two different things end up here and they should not read the same.
+        // Nobody outside this address at all is one; having asked everyone there
+        // was and run out is the other - and in the second case a peer HAS
+        // disagreed, which anyone reading this log needs to know.
+        if (disagreements.size) {
+          log.warn(`checkInstallingAppPortAvailable - ${disagreements.size} peer(s) read a port that was not ours `
+            + `(${[...disagreements.keys()].join(', ')}) and there is no other Flux node outside this address to ask; `
+            + 'proceeding on reachability alone');
+        } else {
+          log.warn('checkInstallingAppPortAvailable - no Flux node outside this address could be asked; proceeding on reachability alone');
+        }
+        fluxEventBus.publish('ports:unproven', {
+          reason: disagreements.size ? 'noOtherObserver' : 'noObserver',
+          peers: [...disagreements.keys()],
+        });
         portsStatus = true;
         break;
       }
 
       const askingIP = extractIp(randomSocketAddress);
       const askingIpPort = extractPort(randomSocketAddress);
+      asked.push(randomSocketAddress);
 
       // first check against our IP address
       // eslint-disable-next-line no-await-in-loop
@@ -880,6 +905,7 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
             continue;
           }
           log.warn('checkInstallingAppPortAvailable - no peer could read the ports back; proceeding on reachability alone');
+          fluxEventBus.publish('ports:unproven', { reason: 'noReader', peers: asked.map(extractIp) });
           portsStatus = true;
           finished = true;
         } else {
@@ -905,12 +931,21 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
               // node installing: it takes the same "nothing was learned" path an
               // older peer produces.
               log.warn(`checkInstallingAppPortAvailable - only ${askingIP} read a port that was not ours and no second peer could be asked; proceeding on reachability alone`);
+              fluxEventBus.publish('ports:unproven', {
+                reason: 'singleWitness',
+                port: notOurs,
+                peers: [...disagreements.keys()],
+              });
               portsStatus = true;
             } else {
               // Behind a shared address that is a neighbour's application
               // holding the router's forward, which is exactly what this
               // refuses - and now more than one peer has seen it.
               log.warn(`checkInstallingAppPortAvailable - port ${refused} is answered by something other than this node at this address, as read by ${disagreements.size} peers (${[...disagreements.keys()].join(', ')}). Installation aborted.`);
+              fluxEventBus.publish('ports:notOurs', {
+                port: refused,
+                peers: [...disagreements.keys()],
+              });
               portsStatus = false;
             }
             finished = true;
