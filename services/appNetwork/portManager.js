@@ -8,6 +8,7 @@ const verificationHelper = require('../verificationHelper');
 const log = require('../../lib/log');
 const upnpService = require('../upnpService');
 const serviceHelper = require('../serviceHelper');
+const messageHelper = require('../messageHelper');
 const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
@@ -382,6 +383,190 @@ async function getAllUsedPorts() {
 }
 
 /**
+ * The host ports this node's applications hold.
+ *
+ * Answered from this node's own record of what it has installed rather than
+ * from its containers. That record covers an enterprise application like any
+ * other - a node decrypts its own specifications - and it covers an application
+ * that is installed but stopped, which still holds the router's forward.
+ *
+ * @returns {Promise<number[]>} the ports, ascending
+ */
+async function portsInUse() {
+  const ports = await getAllUsedPorts();
+
+  return ports.map(Number).filter(Number.isInteger).sort((a, b) => a - b);
+}
+
+/**
+ * GET /flux/portsinuse - the ports this node holds.
+ *
+ * Read by another Flux node on the same public address, deciding whether a port
+ * it is about to install onto is already spoken for. The router forwards each
+ * port to exactly one node, so two applications wanting the same port at one
+ * address cannot both be reached, whichever applications they are - which is why
+ * the answer is ports alone and names no application.
+ *
+ * Nothing here is withheld elsewhere: a port in use at an address is what a port
+ * scan of that address reports, and this names nothing that would attribute one
+ * to an application.
+ *
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {Promise<void>}
+ */
+async function portsInUseApi(req, res) {
+  try {
+    res.json(messageHelper.createDataMessage(await portsInUse()));
+  } catch (error) {
+    log.error(error);
+    res.json(messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    ));
+  }
+}
+
+/**
+ * The host ports a specification asks for.
+ *
+ * @param {object} appSpecFormatted - App specification
+ * @returns {number[]}
+ */
+function specifiedPorts(appSpecFormatted) {
+  if (appSpecFormatted.version === 1) {
+    return appSpecFormatted.port ? [Number(appSpecFormatted.port)] : [];
+  }
+  if (appSpecFormatted.version <= 3) {
+    return (appSpecFormatted.ports || []).map(Number);
+  }
+
+  return (appSpecFormatted.compose || [])
+    .flatMap((component) => (component.ports || []).map(Number));
+}
+
+/**
+ * The other Flux nodes sharing our public address.
+ *
+ * Taken from the node list rather than from app locations, so a node that is not
+ * running anything yet is still counted - that is the node most likely to be
+ * installing.
+ *
+ * @param {string} localSocketAddress - our own ip:port
+ * @returns {string[]|null} their socket addresses, or null when the node list is
+ *   not known - which is an absence of information, not an absence of siblings
+ */
+function siblingSocketAddresses(localSocketAddress) {
+  const ip = extractIp(localSocketAddress);
+  if (!ip || !networkStateService.isReady()) return null;
+
+  const ownPort = extractPort(localSocketAddress);
+
+  return networkStateService.networkState()
+    .map((node) => node.ip)
+    .filter((address) => address
+      && extractIp(address) === ip
+      && extractPort(address) !== ownPort);
+}
+
+/**
+ * The Flux node at our public address holding a port this specification wants,
+ * if there is one.
+ *
+ * Each node behind a shared address keeps its own database and its own docker,
+ * so every one of them binds the port and only the one the router forwards to
+ * ever receives traffic. The rest run unreachable while still being broadcast as
+ * live instances.
+ *
+ * Asked before the firewall is opened and before any mapping is attempted, so a
+ * refusal costs nothing to unwind.
+ *
+ * Answers rather than throws. This is the same class of fact as "the ports are
+ * not reachable from outside" and is handled on the same path. A thrown error
+ * would file the app in the pre-install error cache, and a port that belongs to
+ * a neighbour is an ordinary answer rather than a fault.
+ *
+ * Advisory. A sibling that is down, or answers nothing we can read, leaves us no
+ * wiser - and silence is never read as clearance, because the port test that
+ * follows is what decides.
+ *
+ * @param {object} appSpecFormatted - App specification
+ * @param {string} localSocketAddress - our own ip:port
+ * @returns {Promise<{address: string, port: number}|null>} the sibling and the
+ *   port it holds, or null when none of them reported one
+ */
+async function siblingHoldingPort(appSpecFormatted, localSocketAddress) {
+  const wanted = new Set(specifiedPorts(appSpecFormatted).filter(Number.isInteger));
+  if (!wanted.size) return null;
+
+  const siblings = siblingSocketAddresses(localSocketAddress);
+  if (!siblings || !siblings.length) return null;
+
+  const timeout = config.fluxapps.siblingPortsTimeoutMs;
+
+  const answers = await Promise.all(siblings.map(async (address) => {
+    const response = await serviceHelper.axiosGet(
+      `http://${extractIp(address)}:${extractPort(address)}/flux/portsinuse`,
+      // A list of port numbers, so the ceiling is generous by orders of
+      // magnitude. Bounded at all because axios does not bound a response body
+      // by default, and this address is only as trustworthy as whatever is
+      // answering on it.
+      { timeout, maxContentLength: 64 * 1024, maxBodyLength: 64 * 1024 },
+    ).catch(() => null);
+
+    const body = response && response.data;
+    if (!body || body.status !== 'success' || !Array.isArray(body.data)) return null;
+
+    return { address, ports: body.data.map(Number) };
+  }));
+
+  // eslint-disable-next-line no-restricted-syntax
+  for (const answer of answers) {
+    if (answer) {
+      const held = answer.ports.find((port) => wanted.has(port));
+      if (held) return { address: answer.address, port: held };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * The first port a peer's pass did not actually prove, or null if it proved them all.
+ *
+ * A peer reports that something answered at our public address. Where several
+ * Flux nodes share that address the router forwards each port to exactly one of
+ * them, so what answered can be a sibling's application while our own test
+ * server sat unreached - and the peer cannot tell the difference, because from
+ * outside there is none.
+ *
+ * Our test servers can. Each records the addresses that reached it, so the
+ * question becomes whether the peer we just asked arrived here. Matching on that
+ * peer, rather than on any caller, keeps an unrelated connection during the test
+ * window from reading as proof the port is ours.
+ *
+ * Only ports the peer would have probed are required to show a connection: it
+ * skips any outside the app port range, and a port it never tried says nothing
+ * either way.
+ *
+ * @param {number[]} portsToTest - the ports, in the order their servers were made
+ * @param {Array<{reachedBy: Function}>} servers - one test server per port
+ * @param {string} askingIP - the peer we sent
+ * @returns {number|null}
+ */
+function portNotReached(portsToTest, servers, askingIP) {
+  const at = servers.findIndex((server, index) => {
+    const port = portsToTest[index];
+    const probed = port >= config.fluxapps.portMin && port <= config.fluxapps.portMax;
+
+    return probed && !server.reachedBy(askingIP);
+  });
+
+  return at === -1 ? null : portsToTest[at];
+}
+
+/**
  * Check if a specific port is available
  * @param {number} port - Port number to check
  * @param {string} excludeApp - App name to exclude from check (for updates)
@@ -576,7 +761,20 @@ async function checkInstallingAppPortAvailable(portsToTest = []) {
         portsStatus = false;
         finished = true;
       } else if (resMyAppAvailability && resMyAppAvailability.data.status === 'success') {
-        portsStatus = true;
+        const unreachedPort = portNotReached(portsToTest, beforeAppInstallTestingServers, askingIP);
+
+        if (unreachedPort === null) {
+          portsStatus = true;
+        } else {
+          log.warn(`checkInstallingAppPortAvailable - port ${unreachedPort} answered ${askingIP} from somewhere other than this node`);
+          portsNotWorking.add(unreachedPort);
+          if (!originalPortFailed) {
+            originalPortFailed = unreachedPort;
+            // eslint-disable-next-line no-unused-vars
+            nextTestingPort = unreachedPort < 65535 ? unreachedPort + 1 : unreachedPort - 1;
+          }
+          portsStatus = false;
+        }
         finished = true;
       }
     }
@@ -748,6 +946,11 @@ module.exports = {
   restoreAppsPortsSupport,
   restorePortsSupport,
   getAllUsedPorts,
+  portsInUse,
+  portsInUseApi,
+  specifiedPorts,
+  portNotReached,
+  siblingHoldingPort,
   isPortAvailable,
   findNextAvailablePort,
   signCheckAppData,
