@@ -215,10 +215,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       return;
     }
 
-    // An external observer: this asks a peer whether it can reach US, and a Flux
-    // node sharing our public address cannot answer that. Null when there is no
-    // such node, which the retry below already handles.
-    const remoteSocketAddress = await networkStateService.getRandomExternalObserver(localSocketAddress);
+    const remoteSocketAddress = await networkStateService.getRandomSocketAddress(localSocketAddress);
     if (!remoteSocketAddress) {
       await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));

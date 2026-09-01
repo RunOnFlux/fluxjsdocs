@@ -37,7 +37,6 @@ const { FluxPeerManager, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES } = require(
 const { NAK_REASON, buildSyncSignatureMessage } = require('./utils/peerCodec');
 const { networkHealthMonitor } = require('./utils/NetworkHealthMonitor');
 const verifyPool = require('./utils/verifyPool');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const DISCOVERY = {
   maxOutbound: 14,
@@ -909,7 +908,7 @@ async function removePeer(req, res) {
     let { ip } = req.params;
     ip = ip || req.query.ip;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
     if (authorized !== true) {
       const message = messageHelper.errUnauthorizedMessage();
@@ -953,7 +952,7 @@ async function removeIncomingPeer(req, res) {
     let { ip } = req.params;
     ip = ip || req.query.ip;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
     if (authorized !== true) {
       const message = messageHelper.errUnauthorizedMessage();
@@ -1039,26 +1038,13 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
     const key = `${ip}:${port}`;
     if (peerManager.has(key) || peerManager.isPending(key)) return;
     peerManager.markPending(key);
-
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    if (!localSocketAddr) {
-      peerManager.clearPending(key);
-      return;
-    }
-    myPort = extractPort(localSocketAddr);
-
-    // Never ourselves, and refused HERE rather than by each caller. fluxDiscovery
-    // filters its own address before dialling, but it is one of four ways in -
-    // manual, deterministic, reconnect and random all arrive through this
-    // function, and the reconnect queue in particular re-dials whatever it holds
-    // without asking whose address it is. A self-connection is not merely a
-    // wasted socket: it occupies a peer slot, is offered back as a peer to
-    // gossip and to sync from, and answers every question with what this node
-    // already knows.
-    if (socketAddressesMatch(key, localSocketAddr)) {
-      log.warn(`initiateAndHandleConnection - refusing to connect to ourselves at ${key} (source ${source})`);
-      peerManager.clearPending(key);
-      return;
+    if (!myPort) {
+      const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+      if (!localSocketAddr) {
+        peerManager.clearPending(key);
+        return;
+      }
+      myPort = extractPort(localSocketAddr);
     }
     const options = {
       handshakeTimeout: config.fluxapps.wsHandshakeTimeoutMs ?? 10000,
@@ -1210,8 +1196,8 @@ async function addPeer(req, res) {
     ip = ip || req.query.ip;
 
     const authorized = await verificationHelper.verifyPrivilege(
-      Privilege.NODE_OPERATOR_OR_FLUX_TEAM,
-      authOf(req),
+      'adminandfluxteam',
+      req,
     );
 
     if (authorized !== true) {
@@ -1324,7 +1310,7 @@ function startDiscovery() {
 
 async function startDiscoveryApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('fluxteam', req);
     if (authorized !== true) {
       return res.json(messageHelper.errUnauthorizedMessage());
     }
@@ -1642,7 +1628,7 @@ function getUnstableNodes(req, res) {
  * @param {object} res Response.
  */
 async function getPeerHistory(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
   if (authorized !== true) {
     return res.json(messageHelper.errUnauthorizedMessage());
   }

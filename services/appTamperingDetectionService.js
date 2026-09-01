@@ -491,11 +491,7 @@ async function prepareIncidentRollup() {
     const byKey = new Map();
     // eslint-disable-next-line no-restricted-syntax
     for (const doc of rollups) {
-      // NUL as the separator, written as an escape: it cannot occur in any of the
-      // three parts, so no combination of them can collide on one key. The raw
-      // byte in the source classifies the whole file as binary, and grep then
-      // finds nothing in it while reporting success.
-      const key = `${doc.appName}\x00${doc.eventType}\x00${doc.incidentKey}`;
+      const key = `${doc.appName} ${doc.eventType} ${doc.incidentKey}`;
       const group = byKey.get(key) || [];
       group.push(doc);
       byKey.set(key, group);

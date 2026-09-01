@@ -12,34 +12,8 @@ class FluxHttpTestServer extends http.Server {
 
   #currentConnectionId = 0;
 
-
-  /**
-   * The secret this server answers with, for this port test only.
-   *
-   * A peer asked to test a port reports whether something answered at our
-   * public address. Where several Flux nodes share that address the router
-   * forwards each port to exactly one of them, so what answered can be a
-   * neighbour's application - and the peer cannot tell, because from outside
-   * there is nothing to tell.
-   *
-   * Answering with a secret the requester never handed out makes it tellable:
-   * only the thing the requester started can produce it. The neighbour's
-   * application has never seen it.
-   */
-  #token = null;
-
-  constructor(token = null) {
-    super((req, res) => {
-      if (!this.#token) {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'success', data: { token: this.#token } }));
-    });
-
-    this.#token = token;
+  constructor() {
+    super(() => { });
 
     this.addListener('connection', (socket) => this.#handleConnection(socket));
   }
@@ -53,8 +27,6 @@ class FluxHttpTestServer extends http.Server {
       delete this.#connections[connectionid];
     });
   }
-
-
 
   close(callback) {
     super.close(callback);

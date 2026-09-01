@@ -8,7 +8,6 @@ const globalState = require('../utils/globalState');
 const cpuBurstHelper = require('../utils/cpuBurstHelper');
 const log = require('../../lib/log');
 const { getContainerStorage } = require('../utils/appUtilities');
-const { Privilege, authOf } = require('../utils/privileges');
 
 const dosState = 0;
 const dosMessage = null;
@@ -31,14 +30,7 @@ async function appTop(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    // Every endpoint in this module asks for appownerorfluxteam, which refuses
-    // the node operator. Hosting a container is a reason to know what it costs
-    // you, and /apps/appsresources answers that without authentication; it is
-    // not a reason to read what is inside it. What these return is the
-    // customer's: a process list carries argv, appInspect returns dockerode's
-    // object whole - Config.Env and all - and the log endpoints are whatever
-    // the application prints.
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       return res ? res.json(errMessage) : errMessage;
@@ -78,7 +70,7 @@ async function appLog(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       let logs = await dockerService.dockerContainerLogs(appname, lines);
       logs = serviceHelper.dockerBufferToString(logs);
@@ -116,7 +108,7 @@ async function appLogStream(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       res.setHeader('Content-Type', 'application/json');
       dockerService.dockerContainerLogsStream(appname, res, (error) => {
@@ -169,7 +161,7 @@ async function appLogPolling(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       let parsedLineCount;
       if (lines === 'all') {
@@ -231,7 +223,7 @@ async function appInspect(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       const response = await dockerService.dockerContainerInspect(appname);
       const appResponse = messageHelper.createDataMessage(response);
@@ -268,7 +260,7 @@ async function appStats(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       const appResponse = messageHelper.createDataMessage(await latestStats(appname));
       res.json(appResponse);
@@ -539,7 +531,7 @@ async function appMonitorAPI(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       const appResponse = messageHelper.createDataMessage(appMonitor(appname, range));
       res.json(appResponse);
@@ -738,10 +730,7 @@ async function appExec(req, res) {
 
       const mainAppName = processedBody.appname.split('_')[1] || processedBody.appname;
 
-      // The container terminal's privilege: it reaches this component with more -
-      // an interactive session on a caller-named user - so a narrower gate here
-      // refuses nothing.
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+      const authorized = await verificationHelper.verifyPrivilege('appowner', req, mainAppName);
       if (authorized === true) {
         let cmd = processedBody.cmd || [];
         let env = processedBody.env || [];
@@ -802,7 +791,7 @@ async function appChanges(req, res) {
 
     const mainAppName = appname.split('_')[1] || appname;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.APP_OWNER_OR_FLUX_TEAM, authOf(req), { appName: mainAppName });
+    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
     if (authorized === true) {
       const response = await dockerService.dockerContainerChanges(appname);
       const appResponse = messageHelper.createDataMessage(response);
@@ -823,54 +812,24 @@ async function appChanges(req, res) {
 }
 
 /**
- * Every docker image on this node.
- * @returns {Promise<object>} Message carrying the image list
+ * List Docker images used by apps
+ * @param {object} req - Request object
+ * @param {object} res - Response object
+ * @returns {Promise<object>} List of Docker images
  */
-async function listAppsImages() {
+async function listAppsImages(req, res) {
   try {
     const apps = await dockerService.dockerListImages();
-    return messageHelper.createDataMessage(apps);
+    const appsResponse = messageHelper.createDataMessage(apps);
+    return res ? res.json(appsResponse) : appsResponse;
   } catch (error) {
     log.error(error);
-    return messageHelper.createErrorMessage(
+    const errorResponse = messageHelper.createErrorMessage(
       error.message || error,
       error.name,
       error.code,
     );
-  }
-}
-
-/**
- * GET /apps/listappsimages - the image list, for the flux team.
- *
- * An image entry cannot be attributed to the application that uses it: nothing
- * in a row names one, and the field that would - Containers - reads -1, because
- * docker does not compute it for a plain list. So the row is the smallest thing
- * this can answer with, and the whole list is either given or it is not.
- *
- * The route carries no cache. apicache answers from its store before the
- * handler runs and keys on the request URL alone, so a privilege checked here
- * would be checked for the first caller and no one after them.
- *
- * @param {object} req - Request object
- * @param {object} res - Response object
- * @returns {Promise<void>}
- */
-async function listAppsImagesApi(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
-    if (!authorized) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    res.json(await listAppsImages());
-  } catch (error) {
-    log.error(error);
-    res.json(messageHelper.createErrorMessage(
-      error.message || error,
-      error.name,
-      error.code,
-    ));
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1273,7 +1232,6 @@ module.exports = {
   ensureAppMonitoring,
   stopAppMonitoring,
   listAppsImages,
-  listAppsImagesApi,
   getAppsDOSState,
   checkApplicationsCpuUSage,
   monitorSharedDBApps,
