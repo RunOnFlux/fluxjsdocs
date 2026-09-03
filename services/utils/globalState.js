@@ -42,6 +42,21 @@ const runningAppsCache = new Set();
 // Containers intentionally stopped by FluxOS — crash recovery skips die events for these
 const stoppingContainers = new Set();
 
+// Syncthing folders this node holds writable (sendreceive), refreshed by the
+// syncthing monitor each pass and served to peers that ask before promoting a
+// folder of their own. Kept here rather than read from syncthing per request:
+// the route is unauthenticated, and an on-demand read would be an amplifier into
+// syncthing on a node any peer can reach.
+//
+// null until the monitor's first validated read, and a Set from then on. "I hold
+// nothing writable" and "I have not looked yet" are the same empty set but
+// opposite answers to a peer deciding whether to promote, so they must not be the
+// same value: a node that IS holding a folder would otherwise read as free, and
+// the peer would promote alongside it. On a booting node that pass is not
+// immediate, and a fleet-wide restart puts every holder of an app in the state at
+// once. Same null-is-no-opinion convention appReconciler's controllerDesired uses.
+let promotedFolderIds = null;
+
 
 // Cache references - these will be initialized from cacheManager
 let spawnErrorsLongerAppCache = null;
@@ -52,7 +67,7 @@ function initializeCaches(cacheManager) {
   if (cacheManager && cacheManager.appSpawnErrorCache && cacheManager.appSpawnCache) {
     spawnErrorsLongerAppCache = cacheManager.appSpawnErrorCache;
     trySpawningGlobalAppCache = cacheManager.appSpawnCache;
-    pendingAppUpdatesCache = cacheManager.pendingAppUpdatesCache;
+    ({ pendingAppUpdatesCache } = cacheManager);
   }
 }
 
@@ -98,8 +113,39 @@ module.exports = {
   get syncthingAppsFirstRun() { return syncthingAppsFirstRun; },
   set syncthingAppsFirstRun(value) { syncthingAppsFirstRun = value; },
 
-  get backupInProgress() { return backupInProgress; },
-  get restoreInProgress() { return restoreInProgress; },
+  // A frozen snapshot, not the live array: readers (the monitor, the election,
+  // the reconciler) only ever test membership, and handing out the backing
+  // array let any of them push or splice it and bypass the atomic claim below.
+  // Frozen rather than merely copied so that a stray write throws here instead
+  // of silently mutating a copy nobody reads. The claim and release are the
+  // only writers, and they hold the real arrays.
+  get backupInProgress() { return Object.freeze([...backupInProgress]); },
+  get restoreInProgress() { return Object.freeze([...restoreInProgress]); },
+
+  // Claiming an app for a backup or a restore is a test-and-set, not a read
+  // then a later write: these run to completion before the event loop hands the
+  // next request in, so two overlapping requests for one app cannot both find it
+  // free. The lists stay the observable "this app is busy" signal the monitor,
+  // the election and the reconciler read; only the claim on them is made
+  // indivisible here so a caller cannot split the test from the set.
+  tryStartBackup(appname) {
+    if (backupInProgress.includes(appname)) return false;
+    backupInProgress.push(appname);
+    return true;
+  },
+  finishBackup(appname) {
+    const index = backupInProgress.indexOf(appname);
+    if (index !== -1) backupInProgress.splice(index, 1);
+  },
+  tryStartRestore(appname) {
+    if (restoreInProgress.includes(appname)) return false;
+    restoreInProgress.push(appname);
+    return true;
+  },
+  finishRestore(appname) {
+    const index = restoreInProgress.indexOf(appname);
+    if (index !== -1) restoreInProgress.splice(index, 1);
+  },
 
   get appsMonitored() { return appsMonitored; },
   set appsMonitored(value) { appsMonitored = value; },
@@ -120,6 +166,8 @@ module.exports = {
   get appsToBeCheckedLater() { return appsToBeCheckedLater; },
   get appsSyncthingToBeCheckedLater() { return appsSyncthingToBeCheckedLater; },
   get receiveOnlySyncthingAppsCache() { return receiveOnlySyncthingAppsCache; },
+  get promotedFolderIds() { return promotedFolderIds; },
+  set promotedFolderIds(ids) { promotedFolderIds = ids; },
   get syncthingDevicesIDCache() { return syncthingDevicesIDCache; },
   get folderHealthCache() { return folderHealthCache; },
   get runningAppsCache() { return runningAppsCache; },

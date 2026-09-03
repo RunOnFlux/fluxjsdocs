@@ -9,6 +9,7 @@ const { peerManager } = require('./utils/peerState');
 const cacheManager = require('./utils/cacheManager').default;
 const { serialiseAndSignFluxBroadcast, getFluxMessageSignature } = require('./utils/fluxBroadcastHelper');
 const fluxEventBus = require('./utils/fluxEventBus');
+const { Privilege, authOf } = require('./utils/privileges');
 
 const myMessageCache = cacheManager.tempMessageCache;
 
@@ -22,6 +23,7 @@ const myMessageCache = cacheManager.tempMessageCache;
 async function sendSignedMessage(message, peer, options = {}) {
   try {
     const messageSigned = await serialiseAndSignFluxBroadcast(message);
+    if (!messageSigned) return;
     if (options.awaitDrain) {
       await peer.sendAsync(messageSigned);
     } else {
@@ -135,6 +137,7 @@ async function relay(data, excludeKey) {
  */
 async function broadcastMessageToAll(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
+  if (!serialisedData) return null;
   await relay(serialisedData);
   return JSON.parse(serialisedData);
 }
@@ -145,6 +148,7 @@ async function broadcastMessageToAll(dataToBroadcast) {
  */
 async function broadcastMessageToRandomOutgoing(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
+  if (!serialisedData) return;
   const peer = peerManager.getRandomPeer('outbound');
   if (peer) peer.send(serialisedData);
 }
@@ -155,6 +159,7 @@ async function broadcastMessageToRandomOutgoing(dataToBroadcast) {
  */
 async function broadcastMessageToRandomIncoming(dataToBroadcast) {
   const serialisedData = await serialiseAndSignFluxBroadcast(dataToBroadcast);
+  if (!serialisedData) return;
   const peer = peerManager.getRandomPeer('inbound');
   if (peer) peer.send(serialisedData);
 }
@@ -203,7 +208,7 @@ async function broadcastMessageFromUser(req, res) {
     if (data === undefined || data === null) {
       throw new Error('No message to broadcast attached.');
     }
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
     let message;
 
@@ -241,7 +246,7 @@ async function broadcastMessageFromUserPost(req, res) {
         throw new Error('No message to broadcast attached.');
       }
       const processedBody = serviceHelper.ensureObject(body);
-      const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
       let message;
 
