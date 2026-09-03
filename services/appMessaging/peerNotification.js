@@ -73,7 +73,7 @@ async function checkAndNotifyPeersOfRunningApps() {
       throw new Error('Failed to get installed Apps');
     }
     let appsInstalled = installedAppsRes.data;
-    ({ inPlace: appsInstalled } = await decryptEnterpriseApps(appsInstalled, { formatSpecs: false }));
+    appsInstalled = await decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
     const runningAppsRes = await appQueryService.listRunningApps();
     if (runningAppsRes.status !== 'success') {
       throw new Error('Unable to check running Apps');
@@ -162,7 +162,7 @@ async function checkAndNotifyPeersOfRunningApps() {
     } catch (err) {
       log.error(err);
     }
-    const { runningAppsCache } = globalState;
+    const runningAppsCache = globalState.runningAppsCache;
     runningAppsCache.clear();
     apps.forEach((app) => {
       runningAppsCache.add(app.name);

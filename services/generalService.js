@@ -213,16 +213,20 @@ async function checkSynced() {
 }
 
 /**
- * @deprecated The image whitelist is retired - nothing has enforced it since
- * July 2024 and the network accepts any image (the blocklist still governs).
- * Kept returning an empty list so existing callers get a valid answer instead
- * of a 404. Remove once no supported release could still call it.
+ * To create a JSON response showing a list of whitelisted Github repositories.
  * @param {object} req Request.
  * @param {object} res Response.
  */
 async function whitelistedRepositories(req, res) {
-  const resultsResponse = messageHelper.createDataMessage([]);
-  res.json(resultsResponse);
+  try {
+    const whitelisted = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/repositories.json`);
+    const resultsResponse = messageHelper.createDataMessage(whitelisted.data);
+    res.json(resultsResponse);
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
 }
 
 /**

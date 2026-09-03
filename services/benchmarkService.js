@@ -11,7 +11,6 @@ const generalService = require('./generalService');
 const upnpService = require('./upnpService');
 const fluxRpc = require('./utils/fluxRpc');
 const dbHelper = require('./dbHelper');
-const { Privilege, authOf } = require('./utils/privileges');
 
 // eslint-disable-next-line no-unused-vars
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -184,7 +183,7 @@ async function getStatus(req, res) {
  * @returns {object} Message.
  */
 async function restartNodeBenchmarks(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
   let response;
 
@@ -206,7 +205,7 @@ async function restartNodeBenchmarks(req, res) {
  * @returns {object} Message.
  */
 async function signFluxTransaction(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('admin', req);
   let { hexstring } = req.params;
   hexstring = hexstring || req.query.hexstring;
 
@@ -224,7 +223,7 @@ async function signFluxTransaction(req, res) {
     response = messageHelper.errUnauthorizedMessage();
   }
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -240,7 +239,7 @@ async function signFluxTransactionPost(req, res) {
   req.on('end', async () => {
     const processedBody = serviceHelper.ensureObject(body);
     const { hexstring } = processedBody;
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
 
     let response;
 
@@ -314,7 +313,7 @@ async function help(req, res) {
 
   const response = await executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -324,7 +323,7 @@ async function help(req, res) {
  * @returns {object} Message.
  */
 async function stop(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('admin', req);
 
   let response;
 

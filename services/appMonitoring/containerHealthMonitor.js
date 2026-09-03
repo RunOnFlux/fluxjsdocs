@@ -37,12 +37,9 @@ async function recreateMissingContainers(componentIdentifier, options = {}) {
     throw new Error(`App ${mainAppName} not found in local database`);
   }
 
-  const { readable: [decryptedSpec] } = await decryptEnterpriseApps([appSpec], { formatSpecs: false });
-  if (!decryptedSpec) {
-    // its components are inside the blob, so there is nothing to recreate from
-    throw new Error(`App ${mainAppName} could not be decrypted`);
-  }
-  appSpec = decryptedSpec;
+  appSpec = await decryptEnterpriseApps([appSpec], { formatSpecs: false });
+  // eslint-disable-next-line prefer-destructuring
+  appSpec = appSpec[0];
 
   if (!appSpec.compose || appSpec.compose.length === 0) {
     throw new Error(`App ${mainAppName} has no components to install`);

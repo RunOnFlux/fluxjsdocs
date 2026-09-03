@@ -1,11 +1,13 @@
 const config = require('config');
 const crypto = require('crypto');
 const path = require('path');
+const df = require('node-df');
 const fs = require('fs');
 const { formidable } = require('formidable');
 const archiver = require('archiver');
+// eslint-disable-next-line import/no-extraneous-dependencies
+const util = require('util');
 const serviceHelper = require('./serviceHelper');
-const volumeService = require('./utils/volumeService');
 const messageHelper = require('./messageHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
@@ -13,7 +15,6 @@ const generalService = require('./generalService');
 const log = require('../lib/log');
 const IOUtils = require('./IOUtils');
 const { sanitizePath } = require('./utils/pathSecurity');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const dirpath = path.join(__dirname, '../../../');
 const appsFolder = process.env.FLUX_APPS_FOLDER || path.join(dirpath, 'ZelApps');
@@ -183,7 +184,7 @@ async function fluxShareSharedFiles() {
  */
 async function fluxShareGetSharedFiles(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       const files = await fluxShareSharedFiles();
       const resultsResponse = messageHelper.createDataMessage(files);
@@ -215,7 +216,7 @@ async function fluxShareGetSharedFiles(req, res) {
  */
 async function fluxShareUnshareFile(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;
@@ -250,7 +251,7 @@ async function fluxShareUnshareFile(req, res) {
  */
 async function fluxShareShareFile(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;
@@ -289,7 +290,7 @@ async function fluxShareDownloadFolder(req, res, authorized = false) {
   try {
     let auth = authorized;
     if (!auth) {
-      auth = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+      auth = await verificationHelper.verifyPrivilege('admin', req);
     }
 
     if (auth) {
@@ -354,7 +355,7 @@ async function fluxShareDownloadFile(req, res) {
   try {
     // Define base path for sanitization
     const zelShareBase = path.join(appsFolder, 'ZelShare');
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;
@@ -438,7 +439,7 @@ async function fluxShareDownloadFile(req, res) {
  */
 async function fluxShareRename(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { oldpath } = req.params;
       oldpath = oldpath || req.query.oldpath;
@@ -499,7 +500,7 @@ async function fluxShareRename(req, res) {
  */
 async function fluxShareRemoveFile(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;
@@ -545,7 +546,7 @@ async function fluxShareRemoveFile(req, res) {
  */
 async function fluxShareRemoveFolder(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { folder } = req.params;
       folder = folder || req.query.folder;
@@ -587,7 +588,7 @@ async function fluxShareRemoveFolder(req, res) {
  */
 async function fluxShareGetFolder(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { folder } = req.params;
       folder = folder || req.query.folder || '';
@@ -659,7 +660,7 @@ async function fluxShareGetFolder(req, res) {
  */
 async function fluxShareCreateFolder(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { folder } = req.params;
       folder = folder || req.query.folder || '';
@@ -690,7 +691,7 @@ async function fluxShareCreateFolder(req, res) {
  */
 async function fluxShareFileExists(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       let { file } = req.params;
       file = file || req.query.file;
@@ -738,7 +739,23 @@ async function fluxShareFileExists(req, res) {
  * @returns {number} The quantity of space available (GB).
  */
 async function getSpaceAvailableForFluxShare() {
-  const okVolumes = await volumeService.capacityVolumesInGib();
+  const dfAsync = util.promisify(df);
+  // we want whole numbers in GB
+  const options = {
+    prefixMultiplier: 'GB',
+    isDisplayPrefixMultiplier: false,
+    precision: 0,
+  };
+
+  const dfres = await dfAsync(options);
+  const okVolumes = [];
+  dfres.forEach((volume) => {
+    if (volume.filesystem.includes('/dev/') && !volume.filesystem.includes('loop') && !volume.mount.includes('boot')) {
+      okVolumes.push(volume);
+    } else if (volume.filesystem.includes('loop') && volume.mount === '/') {
+      okVolumes.push(volume);
+    }
+  });
 
   // now we know that most likely there is a space available. IF user does not have his own stuff on the node or space may be sharded accross hdds.
   let totalSpace = 0;
@@ -762,7 +779,7 @@ async function getSpaceAvailableForFluxShare() {
  */
 async function fluxShareStorageStats(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (authorized) {
       const spaceAvailableForFluxShare = await getSpaceAvailableForFluxShare();
       let spaceUsedByFluxShare = getFluxShareSize();
@@ -792,7 +809,7 @@ async function fluxShareStorageStats(req, res) {
  */
 async function fluxShareUpload(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
     if (!authorized) {
       throw new Error('Unauthorized. Access denied.');
     }

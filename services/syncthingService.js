@@ -14,7 +14,6 @@ const log = require('../lib/log');
 const messageHelper = require('./messageHelper');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const syncthingURL = `http://${config.syncthing.ip}:${config.syncthing.port}`;
 
@@ -221,120 +220,31 @@ async function performRequest(method = 'get', urlpath = '', data, config) {
     return successResponse;
   } catch (error) {
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    // The axios code is a category - ERR_BAD_REQUEST spans every 4xx - so the
-    // HTTP status rides along as itself: a caller telling "no such folder"
-    // (404) from a denial (403) needs the number, and the message's wording
-    // belongs to axios, not to us. Null when no HTTP answer arrived at all.
-    errorResponse.data.httpStatus = error.response?.status ?? null;
     return errorResponse;
   }
 }
-
-/**
- * The failure of a syncthing request, as an exception rather than an envelope.
- *
- * Carries the HTTP status because absence and refusal are different answers and
- * only the number separates them: a folder syncthing does not know answers 404,
- * a stale api key answers 403, and axios reports both as ERR_BAD_REQUEST. A
- * caller that acts on absence reads `httpStatus`; one that does not ignores it.
- */
-class SyncthingError extends Error {
-  constructor(message, { name, code, httpStatus } = {}) {
-    super(message || 'syncthing request failed');
-    // axios's own name and code, so the envelope the Api half rebuilds is the
-    // one these endpoints have always answered
-    this.name = name || 'SyncthingError';
-    this.code = code;
-    this.httpStatus = httpStatus ?? null;
-  }
-}
-
-/**
- * A syncthing request: its data, or a throw.
- *
- * performRequest answers in band because that is the shape the wire needs, and
- * a route serialises it unchanged. Nothing above this line wants the envelope
- * or its vocabulary, so this is the seam - internal callers speak data and
- * exceptions, and the Api half puts the envelope back on.
- * @param {string} method HTTP method.
- * @param {string} urlpath Syncthing REST path.
- * @param {object} [data] Request body.
- * @param {object} [config] Axios config.
- * @returns {Promise<*>} The response data.
- */
-async function request(method, urlpath, data, config) {
-  const response = await performRequest(method, urlpath, data, config);
-  if (response.status === 'success') return response.data;
-  const details = response.data || {};
-  throw new SyncthingError(details.message, {
-    name: details.name,
-    code: details.code,
-    httpStatus: details.httpStatus,
-  });
-}
-
-/**
- * The error envelope for a handler whose work threw.
- *
- * A SyncthingError carries the status its request failed with, which has always
- * been on the wire for these endpoints; a validation error raised before any
- * request went out has no status and never carried the key.
- * @param {Error} error The thrown error.
- * @returns {object} Message
- */
-function errorEnvelope(error) {
-  const response = messageHelper.createErrorMessage(error.message, error.name, error.code);
-  if (error instanceof SyncthingError) response.data.httpStatus = error.httpStatus;
-  return response;
-}
 /**
  * To get meta
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message.
  */
-async function getMeta() {
-  // "var metadata = {\"deviceID\":\"K6VOO4G-5RLTF3B-JTUFMHH-JWITKGM-63DTTMT-I6BMON6-7E3LVFW-V5WAIAO\"};\n"
-  return request('get', '/meta.js');
-}
-
-/**
- * To get meta
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message.
- */
-async function getMetaApi(req, res) {
+async function getMeta(req, res) {
   // does not require authentication
-  try {
-    res.json(messageHelper.createDataMessage(await getMeta()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+  const response = await performRequest('get', '/meta.js');
+  // "var metadata = {\"deviceID\":\"K6VOO4G-5RLTF3B-JTUFMHH-JWITKGM-63DTTMT-I6BMON6-7E3LVFW-V5WAIAO\"};\n"
+  return res ? res.json(response) : response;
 }
 
 /**
- * Syncthing's own health check. The one syncthing endpoint that needs no api key.
- * @returns {Promise<object>} System health, {"status": "OK"}.
- */
-async function getHealth() {
-  return request('get', '/rest/noauth/health');
-}
-
-/**
- * To get Syncthing health
+ * To get Syhcthing health
  * @param {object} req Request.
  * @param {object} res Response.
- * @returns {object} Message
+ * @returns {object} System health, {"status": "OK"}.
  */
-async function getHealthApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await getHealth()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+async function getHealth(req, res) {
+  const response = await performRequest('get', '/rest/noauth/health');
+  return res ? res.json(response) : response;
 }
 
 // === STATISTICS ENDPOINTS ===
@@ -376,14 +286,14 @@ async function systemBrowse(req, res) {
   if (current) {
     apiPath += `?current=${current}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -420,14 +330,14 @@ async function systemDebug(req, res) {
   } else if (disable) {
     apiPath += `?disable=${disable}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest(method, apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -450,14 +360,14 @@ async function systemDiscovery(req, res) {
     method = 'post';
     apiPath += `?device=${device}&addr=${addr}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest(method, apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -467,14 +377,14 @@ async function systemDiscovery(req, res) {
  * @returns {object} Message
  */
 async function systemErrorClear(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('post', '/rest/system/error/clear');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -491,14 +401,14 @@ async function systemError(req, res) {
   if (message) {
     method = 'post';
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest(method, apiPath, message);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -515,18 +425,18 @@ async function postSystemError(req, res) {
   req.on('end', async () => {
     const message = serviceHelper.ensureObject(body);
     try {
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest('post', '/rest/system/error', message);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -544,14 +454,14 @@ async function systemLog(req, res) {
   if (since) {
     apiPath += `?since=${since}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -567,14 +477,14 @@ async function systemLogTxt(req, res) {
   if (since) {
     apiPath += `?since=${since}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -584,28 +494,14 @@ async function systemLogTxt(req, res) {
  * @returns {object} Message
  */
 async function systemPaths(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', '/rest/system/paths');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
-}
-
-/**
- * Pause a device, or every device when none is named. A paused device holds no
- * connection, so every folder shared with it stops moving data until it resumes.
- * @param {string} [device] Device ID.
- * @returns {Promise<*>} Syncthing's answer.
- */
-async function systemPause(device) {
-  let apiPath = '/rest/system/pause';
-  if (device) {
-    apiPath += `?device=${device}`;
-  }
-  return request('post', apiPath);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -614,18 +510,21 @@ async function systemPause(device) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemPauseApi(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
-    if (authorized !== true) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    res.json(messageHelper.createDataMessage(await systemPause(req.params.device || req.query.device)));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function systemPause(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
+  let apiPath = '/rest/system/pause';
+  if (device) {
+    apiPath += `?device=${device}`;
   }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -634,23 +533,9 @@ async function systemPauseApi(req, res) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemPing() {
-  return request('get', '/rest/system/ping'); // can also be 'post', same
-}
-
-/**
- * Returns a {"ping": "pong"} object.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message
- */
-async function systemPingApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await systemPing()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+async function systemPing(req, res) {
+  const response = await performRequest('get', '/rest/system/ping'); // can also be 'post', same
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -667,14 +552,14 @@ async function systemReset(req, res) {
   if (folder) {
     apiPath += `?folder=${folder}`;
   }
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('post', apiPath);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -694,49 +579,22 @@ async function systemResetFolderId(folderId) {
 }
 
 /**
- * Restart the syncthing process. Every folder's transfers stop and start again,
- * which is why the folder-level nudge exists for the cases that only need one
- * folder's index re-exchanged.
- * @returns {Promise<*>} Syncthing's answer.
- */
-async function systemRestart() {
-  log.info('Restarting Syncthing...');
-  const data = await request('post', '/rest/system/restart');
-  log.info('Syncthing restarted');
-  return data;
-}
-
-/**
  * To immediately restart Syncthing
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemRestartApi(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
-    if (authorized !== true) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    res.json(messageHelper.createDataMessage(await systemRestart()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function systemRestart(req, res) {
+  log.info('Restarting Syncthing...');
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/restart');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
   }
-}
-
-/**
- * Resume a device, or every device when none is named.
- * @param {string} [device] Device ID.
- * @returns {Promise<*>} Syncthing's answer.
- */
-async function systemResume(device) {
-  let apiPath = '/rest/system/resume';
-  if (device) {
-    apiPath += `?device=${device}`;
-  }
-  return request('post', apiPath);
+  log.info('Syncthing restarted');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -745,18 +603,21 @@ async function systemResume(device) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemResumeApi(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
-    if (authorized !== true) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    res.json(messageHelper.createDataMessage(await systemResume(req.params.device || req.query.device)));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function systemResume(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
+  let apiPath = '/rest/system/resume';
+  if (device) {
+    apiPath += `?device=${device}`;
   }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -766,14 +627,14 @@ async function systemResumeApi(req, res) {
  * @returns {object} Message
  */
 async function systemShutdown(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('post', '/rest/system/shutdown');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -794,14 +655,14 @@ async function systemStatus(req, res) {
  * @returns {object} Message
  */
 async function systemUpgrade(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', '/rest/system/upgrade');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -811,22 +672,14 @@ async function systemUpgrade(req, res) {
  * @returns {object} Message
  */
 async function postSystemUpgrade(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('post', '/rest/system/upgrade');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
-}
-
-/**
- * The running syncthing's version.
- * @returns {Promise<object>} Version information.
- */
-async function systemVersion() {
-  return request('get', '/rest/system/version');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -835,24 +688,12 @@ async function systemVersion() {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemVersionApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await systemVersion()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+async function systemVersion(req, res) {
+  const response = await performRequest('get', '/rest/system/version');
+  return res ? res.json(response) : response;
 }
 
 // === CONFIG ENDPOINTS ===
-
-/**
- * The entire syncthing configuration - every folder and every device.
- * @returns {Promise<object>} The configuration.
- */
-async function getConfig() {
-  return request('get', '/rest/config');
-}
 
 /**
  * Returns the entire config.
@@ -860,18 +701,15 @@ async function getConfig() {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigApi(req, res) {
-  try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
-    if (authorized !== true) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    res.json(messageHelper.createDataMessage(await getConfig()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function getConfig(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/config');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
   }
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -889,18 +727,18 @@ async function postConfig(req, res) {
     try {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest('put', '/rest/config', newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -917,50 +755,31 @@ async function getConfigRestartRequired(req, res) {
 }
 
 /**
- * The configured folders, or the one folder with the given id.
- * @param {string} [id] Folder ID. Omitted, every folder.
- * @returns {Promise<Array|object>} The folder configuration.
- */
-async function getConfigFolders(id) {
-  let apiPath = '/rest/config/folders';
-  if (id) {
-    if (!goodSyncthingChars.test(id)) {
-      throw new Error('Invalid ID supplied');
-    }
-    apiPath += `/${id}`;
-  }
-  return request('get', apiPath);
-}
-
-/**
  * Returns the folder for the given ID.
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigFoldersApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await getConfigFolders(req.params.id || req.query.id)));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function getConfigFolders(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
   }
-}
-
-/**
- * The configured devices, or the one device with the given id.
- * @param {string} [id] Device ID. Omitted, every device.
- * @returns {Promise<Array|object>} The device configuration.
- */
-async function getConfigDevices(id) {
-  let apiPath = '/rest/config/devices';
+  let { id } = req.params;
+  id = id || req.query.id;
+  let apiPath = '/rest/config/folders';
   if (id) {
     if (!goodSyncthingChars.test(id)) {
-      throw new Error('Invalid ID supplied');
+      const response = messageHelper.createErrorMessage('Invalid ID supplied');
+      return res ? res.json(response) : response;
     }
     apiPath += `/${id}`;
   }
-  return request('get', apiPath);
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -969,13 +788,26 @@ async function getConfigDevices(id) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigDevicesApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await getConfigDevices(req.params.id || req.query.id)));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function getConfigDevices(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
   }
+  let { id } = req.params;
+  id = id || req.query.id;
+  let apiPath = '/rest/config/devices';
+  if (id) {
+    if (!goodSyncthingChars.test(id)) {
+      const response = messageHelper.createErrorMessage('Invalid ID supplied');
+      return res ? res.json(response) : response;
+    }
+    apiPath += `/${id}`;
+  }
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1015,18 +847,18 @@ async function postConfigFolders(req, res) {
       const newConfig = processedBody.config;
       const { id } = processedBody;
       const method = (processedBody.method || 'post').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await adjustConfigFolders(method, newConfig, id);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1068,18 +900,18 @@ async function postConfigDevices(req, res) {
       const newConfig = processedBody.config;
       const { id } = processedBody;
       const method = (processedBody.method || 'post').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await adjustConfigDevices(method, newConfig, id);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1090,23 +922,9 @@ async function postConfigDevices(req, res) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigDefaultsFolder() {
-  return request('get', '/rest/config/defaults/folder');
-}
-
-/**
- * Returns the default folder config.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {object} Message
- */
-async function getConfigDefaultsFolderApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await getConfigDefaultsFolder()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+async function getConfigDefaultsFolder(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/folder');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1149,18 +967,18 @@ async function postConfigDefaultsFolder(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = (processedBody.method || 'put').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await adjustConfigDefaultsFolder(method, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1181,18 +999,18 @@ async function postConfigDefaultsDevice(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = (processedBody.method || 'put').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, '/rest/config/defaults/device', newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1224,18 +1042,18 @@ async function postConfigDefaultsIgnores(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = 'put';
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, '/rest/config/defaults/ignores', newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1246,51 +1064,27 @@ async function postConfigDefaultsIgnores(req, res) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigOptions() {
-  return request('get', '/rest/config/options');
+async function getConfigOptions(req, res) {
+  const response = await performRequest('get', '/rest/config/options');
+
+  return res ? res.json(response) : response;
 }
 
 /**
- * Returns the options.
+ * Returns the gui object
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigOptionsApi(req, res) {
-  try {
-    res.json(messageHelper.createDataMessage(await getConfigOptions()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
+async function getConfigGui(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/config/gui');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
   }
-}
-
-/**
- * The syncthing GUI's own configuration.
- * @returns {Promise<object>} The gui configuration.
- */
-async function getConfigGui() {
-  return request('get', '/rest/config/gui');
-}
-
-/**
- * To show the GUI configuration. Flux team only.
- * @param {object} req Request.
- * @param {object} res Response.
- * @returns {Promise<void>}
- */
-async function getConfigGuiApi(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
-  if (authorized !== true) {
-    res.json(messageHelper.errUnauthorizedMessage());
-    return;
-  }
-  try {
-    res.json(messageHelper.createDataMessage(await getConfigGui()));
-  } catch (error) {
-    log.error(error);
-    res.json(errorEnvelope(error));
-  }
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -1333,18 +1127,18 @@ async function postConfigOptions(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = (processedBody.method || 'put').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await adjustConfigOptions(method, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1365,18 +1159,18 @@ async function postConfigGui(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = (processedBody.method || 'put').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, '/rest/config/gui', newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1397,18 +1191,18 @@ async function postConfigLdap(req, res) {
       const processedBody = serviceHelper.ensureObject(body);
       const newConfig = processedBody.config;
       const method = (processedBody.method || 'put').toLowerCase();
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, '/rest/config/ldap', newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1447,18 +1241,18 @@ async function postClusterPendigDevices(req, res) {
       if (device) {
         apiPath += `?device=${device}`;
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1495,18 +1289,18 @@ async function postClusterPendigFolders(req, res) {
       if (folder) {
         apiPath += `?folder=${folder}`;
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1542,11 +1336,11 @@ async function getFolderErrors(req, res) {
       throw new Error('folder parameter is mandatory');
     }
     const response = await getFolderIdErrors(folder);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1567,11 +1361,11 @@ async function getFolderVersions(req, res) {
       throw new Error('folder parameter is mandatory');
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1596,18 +1390,18 @@ async function postFolderVersions(req, res) {
       if (folder) {
         apiPath += `?folder=${folder}`;
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1640,30 +1434,12 @@ async function getDbBrowse(req, res) {
     const qqStr = qs.stringify(qq);
     apiPath += `?${qqStr}`;
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
-}
-
-/**
- * How complete a folder is, optionally as one device sees it.
- *
- * `remoteState` is only set when a device is named, and it is the connectivity
- * discriminator a caller needs: completion is computed from the last known
- * index, so an offline peer still reports 100.
- * @param {object} [selector] Selector.
- * @param {string} [selector.folder] Folder ID.
- * @param {string} [selector.device] Device ID.
- * @returns {Promise<object>} Completion percentage and byte/item counts.
- */
-async function getDbCompletion({ folder, device } = {}) {
-  let apiPath = '/rest/db/completion';
-  const query = qs.stringify({ folder, device });
-  if (query) apiPath += `?${query}`;
-  return request('get', apiPath);
 }
 
 /**
@@ -1672,16 +1448,28 @@ async function getDbCompletion({ folder, device } = {}) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getDbCompletionApi(req, res) {
+async function getDbCompletion(req, res) {
   try {
-    const data = await getDbCompletion({
-      folder: req.params.folder || req.query.folder,
-      device: req.params.device || req.query.device,
-    });
-    res.json(messageHelper.createDataMessage(data));
+    // tolerate being called internally with only a query (no params): callers like
+    // checkIfPeersAreSynced pass { query: {...} }, so req.params is undefined and a
+    // bare `const { folder } = req.params` would throw. Default the containers.
+    const { params = {}, query = {} } = req || {};
+    const folder = params.folder || query.folder;
+    const device = params.device || query.device;
+    let apiPath = '/rest/db/completion';
+    if (folder || device) apiPath += '?';
+    const qq = {
+      folder,
+      device,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
-    res.json(errorEnvelope(error));
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1706,11 +1494,11 @@ async function getDbFile(req, res) {
     const qqStr = qs.stringify(qq);
     apiPath += `${qqStr}`;
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1727,37 +1515,12 @@ async function getDbIgnores(req, res) {
     let apiPath = '/rest/db/ignores';
     if (folder) apiPath += `?folder=${folder}`;
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
-}
-
-/**
- * Read a folder's ignore patterns, for internal callers. Returns the standard
- * message shape - { status, data: { ignore, expanded } } on success - and never
- * throws, so the caller checks status rather than catching.
- * @param {string} folderId syncthing folder id
- * @returns {Promise<object>} message
- */
-async function getFolderIgnores(folderId) {
-  return performRequest('get', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`);
-}
-
-/**
- * Set a folder's ignore patterns, for internal callers. Syncthing owns and
- * writes .stignore itself (atomically, and it never replicates it), so this is
- * how FluxOS sets the ignores rather than writing the file. REPLACES the whole
- * set - pass the complete desired list. Returns the standard message shape and
- * never throws.
- * @param {string} folderId syncthing folder id
- * @param {Array<string>} lines the full ignore pattern list
- * @returns {Promise<object>} message
- */
-async function setFolderIgnores(folderId, lines) {
-  return performRequest('post', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`, { ignore: lines });
 }
 
 /**
@@ -1777,11 +1540,11 @@ async function getDbLocalchanged(req, res) {
       throw new Error('folder parameter is mandatory');
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1802,11 +1565,11 @@ async function getDbNeed(req, res) {
       throw new Error('folder parameter is mandatory');
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1834,27 +1597,12 @@ async function getDbRemoteNeed(req, res) {
       throw new Error('device parameter is mandatory');
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
-}
-
-/**
- * A folder's current status.
- *
- * Throws with `httpStatus` 404 when syncthing holds no such folder, which is an
- * answer rather than a failure - the caller that acts on absence reads it.
- * @param {string} folder Folder ID.
- * @returns {Promise<object>} The folder status.
- */
-async function getDbStatus(folder) {
-  if (!folder) {
-    throw new Error('folder parameter is mandatory');
-  }
-  return request('get', `/rest/db/status?folder=${folder}`);
 }
 
 /**
@@ -1863,13 +1611,21 @@ async function getDbStatus(folder) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getDbStatusApi(req, res) {
+async function getDbStatus(req, res) {
   try {
-    const data = await getDbStatus(req.params.folder || req.query.folder);
-    res.json(messageHelper.createDataMessage(data));
+    const folder = req?.params?.folder || req?.query?.folder;
+    let apiPath = '/rest/db/status';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
-    res.json(errorEnvelope(error));
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -1894,24 +1650,18 @@ async function postDbIgnores(req, res) {
       if (folder) {
         apiPath += `?folder=${folder}`;
       }
-      // fluxteam, not adminandfluxteam like its siblings. .stignore decides what
-      // LEAVES this node for an app the node operator does not own, and a pattern
-      // dropped here replicates that app's backup and operation staging to every
-      // other node running it - so the blast radius of this one call is the fleet,
-      // not the box. Reading the volume is the operator's already; choosing what
-      // the network carries is not.
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1939,18 +1689,18 @@ async function postDbOverride(req, res) {
       } else {
         throw new Error('folder parameter is mandatory');
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -1984,18 +1734,18 @@ async function postDbPrio(req, res) {
       } else {
         throw new Error('file parameter is mandatory');
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -2023,18 +1773,18 @@ async function postDbRevert(req, res) {
       } else {
         throw new Error('folder parameter is mandatory');
       }
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -2081,18 +1831,18 @@ async function postDbScan(req, res) {
       };
       const qqStr = qs.stringify(qq);
       apiPath += `${qqStr}`;
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
       let response = null;
       if (authorized === true) {
         response = await performRequest(method, apiPath, newConfig);
       } else {
         response = messageHelper.errUnauthorizedMessage();
       }
-      return res.json(response);
+      return res ? res.json(response) : response;
     } catch (error) {
       log.error(error);
       const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-      return res.json(errorResponse);
+      return res ? res.json(errorResponse) : errorResponse;
     }
   });
 }
@@ -2106,14 +1856,14 @@ async function postDbScan(req, res) {
  * @returns {object} Message
  */
 async function debugPeerCompletion(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', '/rest/debug/peerCompletion');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -2123,14 +1873,14 @@ async function debugPeerCompletion(req, res) {
  * @returns {object} Message
  */
 async function debugHttpmetrics(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', '/rest/debug/httpmetrics');
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -2140,7 +1890,7 @@ async function debugHttpmetrics(req, res) {
  * @returns {object} Message
  */
 async function debugCpuprof(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     try {
@@ -2155,12 +1905,12 @@ async function debugCpuprof(req, res) {
       }
       return response.data.pipe(res);
     } catch (error) {
-      return res.json(error);
+      return res ? res.json(error) : JSON.stringify(error);
     }
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -2170,7 +1920,7 @@ async function debugCpuprof(req, res) {
  * @returns {object} Message
  */
 async function debugHeapprof(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     try {
@@ -2185,12 +1935,12 @@ async function debugHeapprof(req, res) {
       }
       return response.data.pipe(res);
     } catch (error) {
-      return res.json(error);
+      return res ? res.json(error) : JSON.stringify(error);
     }
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -2200,14 +1950,14 @@ async function debugHeapprof(req, res) {
  * @returns {object} Message
  */
 async function debugSupport(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   let response = null;
   if (authorized === true) {
     response = await performRequest('get', '/rest/debug/support', undefined, 60000);
   } else {
     response = messageHelper.errUnauthorizedMessage();
   }
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -2233,7 +1983,7 @@ async function debugFile(req, res) {
     } else {
       throw new Error('file parameter is mandatory');
     }
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       try {
@@ -2248,52 +1998,20 @@ async function debugFile(req, res) {
         }
         return response.data.pipe(res);
       } catch (error) {
-        return res.json(error);
+        return res ? res.json(error) : JSON.stringify(error);
       }
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
 // === EVENT ENDPOINTS ===
-
-/**
- * Syncthing's event stream, from `since` onwards.
- *
- * The endpoint long-polls: with a `timeout` hold requested, syncthing keeps the
- * request open up to that many seconds before answering "nothing new", so the
- * client-side abort must come strictly after the server-side hold rather than
- * at the shared instance's 5s default.
- * @param {object} [options] Options.
- * @param {string} [options.events] Comma separated event types to subscribe to.
- * @param {number} [options.since] Last event id already seen.
- * @param {number} [options.limit] Maximum events to return.
- * @param {number} [options.timeout] Seconds syncthing may hold the request open.
- * @param {AbortSignal} [options.signal] Interrupts the long poll on shutdown.
- * @returns {Promise<Array>} The events.
- */
-async function getEvents({
-  events, since, limit, timeout, signal,
-} = {}) {
-  let apiPath = '/rest/events';
-  const query = qs.stringify({
-    events, since, limit, timeout,
-  });
-  if (query) apiPath += `?${query}`;
-  const holdS = Number(timeout);
-  const config = {};
-  if (Number.isFinite(holdS) && holdS > 0) config.timeout = (holdS + 10) * 1000;
-  // axios honours config.signal
-  if (signal) config.signal = signal;
-  // 3rd arg is the request body (none for GET); 4th is the axios config
-  return request('get', apiPath, undefined, config);
-}
 
 /**
  * To receive Syncthing events. takes {events}, {since}, {limit} and {timeout} parameters to filter the result.
@@ -2301,23 +2019,48 @@ async function getEvents({
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getEventsApi(req, res) {
+async function getEvents(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  if (authorized !== true) {
+    const response = messageHelper.errUnauthorizedMessage();
+    return res ? res.json(response) : response;
+  }
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
-    if (authorized !== true) {
-      res.json(messageHelper.errUnauthorizedMessage());
-      return;
-    }
-    const data = await getEvents({
-      events: req.params.events || req.query.events,
-      since: req.params.since || req.query.since,
-      limit: req.params.limit || req.query.limit,
-      timeout: req.params.timeout || req.query.timeout,
-    });
-    res.json(messageHelper.createDataMessage(data));
+    let { events } = req.params;
+    events = events || req.query.events;
+    let { since } = req.params;
+    since = since || req.query.since;
+    let { limit } = req.params;
+    limit = limit || req.query.limit;
+    let { timeout } = req.params;
+    timeout = timeout || req.query.timeout;
+    let apiPath = '/rest/events';
+    if (events || since || limit || timeout) apiPath += '?';
+    const qq = {
+      events,
+      since,
+      limit,
+      timeout,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    // the events endpoint long-polls: with a `timeout` hold requested, syncthing
+    // keeps the request open up to that many seconds before answering "nothing
+    // new" - the client-side abort must come strictly after the server-side hold,
+    // not at the shared instance's 5s default
+    const holdS = Number(timeout);
+    const requestConfig = {};
+    if (Number.isFinite(holdS) && holdS > 0) requestConfig.timeout = (holdS + 10) * 1000;
+    // a caller (e.g. the events consumer) may pass an AbortSignal to interrupt the
+    // long-poll on shutdown; axios honours config.signal
+    if (req.signal) requestConfig.signal = req.signal;
+    // 3rd arg is the request body (none for GET); 4th is the axios config
+    const response = await performRequest('get', apiPath, undefined, requestConfig);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
-    res.json(errorEnvelope(error));
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2328,10 +2071,10 @@ async function getEventsApi(req, res) {
  * @returns {object} Message
  */
 async function getEventsDisk(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
   if (authorized !== true) {
     const response = messageHelper.errUnauthorizedMessage();
-    return res.json(response);
+    return res ? res.json(response) : response;
   }
   try {
     let { since } = req.params;
@@ -2350,11 +2093,11 @@ async function getEventsDisk(req, res) {
     const qqStr = qs.stringify(qq);
     apiPath += `${qqStr}`;
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2377,11 +2120,11 @@ async function getSvcDeviceID(req, res) {
       throw new Error('id parameter is mandatory');
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2399,20 +2142,20 @@ async function getSvcRandomString(req, res) {
     if (length) {
       const parsedLength = Number(length);
       if (!Number.isFinite(parsedLength) || parsedLength < 0 || parsedLength > 10000) {
-        const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+        const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
         if (authorized !== true) {
           const response = messageHelper.errUnauthorizedMessage();
-          return res.json(response);
+          return res ? res.json(response) : response;
         }
       }
       apiPath += `?length=${length}`;
     }
     const response = await performRequest('get', apiPath);
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2443,9 +2186,9 @@ async function getDeviceId() {
   // not sure why this is necessary. If we only want one at a time, should implement a cache too.
   await asyncLock.enable();
 
-  let meta = null;
-  let healthy = null;
-  let pingResponse = null;
+  let meta = {};
+  let healthy = {};
+  let pingResponse = {};
 
   try {
     // if aborted, axios will reject immediately, without any network activity
@@ -2461,9 +2204,9 @@ async function getDeviceId() {
 
   if (stc.aborted) return null;
 
-  if (meta && pingResponse?.ping === 'pong' && healthy?.status === 'OK') {
+  if (meta.status === 'success' && pingResponse.data?.ping === 'pong' && healthy.data?.status === 'OK') {
     syncthingStatusOk = true;
-    const adjustedString = meta.slice(15).slice(0, -2);
+    const adjustedString = meta.data.slice(15).slice(0, -2);
     const deviceObject = JSON.parse(adjustedString);
     const { deviceID } = deviceObject;
     return deviceID;
@@ -2553,10 +2296,8 @@ async function adjustSyncthing() {
   log.info('Adjusting syncthing.');
 
   try {
-    // best effort, as before: a read that fails leaves that block's settings
-    // alone and the next pass retries, rather than abandoning the whole adjust
-    const currentConfigOptions = await getConfigOptions().catch(() => null);
-    const currentDefaultsFolderOptions = await getConfigDefaultsFolder().catch(() => null);
+    const currentConfigOptions = await getConfigOptions();
+    const currentDefaultsFolderOptions = await getConfigDefaultsFolder();
     // use env so can run this module as standalone for testing
     const apiPort = process.env.FLUX_APIPORT || userconfig?.initial.apiport || config.server?.apiport;
     const myPort = +apiPort + 2; // end with 9 eg 16139
@@ -2574,30 +2315,31 @@ async function adjustSyncthing() {
       sendXattrs: true,
       maxConflicts: 0,
     };
-    if (currentConfigOptions) {
-      if (currentConfigOptions.globalAnnounceEnabled !== newConfig.globalAnnounceEnabled
-        || currentConfigOptions.localAnnounceEnabled !== newConfig.localAnnounceEnabled
-        || currentConfigOptions.natEnabled !== newConfig.natEnabled
-        || serviceHelper.ensureString(currentConfigOptions.listenAddresses) !== serviceHelper.ensureString(newConfig.listenAddresses)) {
+    if (currentConfigOptions.status === 'success') {
+      if (currentConfigOptions.data.globalAnnounceEnabled !== newConfig.globalAnnounceEnabled
+        || currentConfigOptions.data.localAnnounceEnabled !== newConfig.localAnnounceEnabled
+        || currentConfigOptions.data.natEnabled !== newConfig.natEnabled
+        || serviceHelper.ensureString(currentConfigOptions.data.listenAddresses) !== serviceHelper.ensureString(newConfig.listenAddresses)) {
         // patch our config
         await adjustConfigOptions('patch', newConfig);
       }
     }
-    if (currentDefaultsFolderOptions) {
-      if (currentDefaultsFolderOptions.syncOwnership !== newConfigDefaultFolders.syncOwnership
-        || currentDefaultsFolderOptions.sendOwnership !== newConfigDefaultFolders.sendOwnership
-        || currentDefaultsFolderOptions.syncXattrs !== newConfigDefaultFolders.syncXattrs
-        || currentDefaultsFolderOptions.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
+    if (currentDefaultsFolderOptions.status === 'success') {
+      if (currentDefaultsFolderOptions.data.syncOwnership !== newConfigDefaultFolders.syncOwnership
+        || currentDefaultsFolderOptions.data.sendOwnership !== newConfigDefaultFolders.sendOwnership
+        || currentDefaultsFolderOptions.data.syncXattrs !== newConfigDefaultFolders.syncXattrs
+        || currentDefaultsFolderOptions.data.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
         // patch our defaults folder config
         await adjustConfigDefaultsFolder('patch', newConfigDefaultFolders);
       }
     }
     // remove default folder
-    // best effort: a configuration that cannot be read leaves the default folder
-    // in place, exactly as an unsuccessful read did before
-    const allFolders = await getConfigFolders().catch(() => []);
-    if (allFolders.find((syncthingFolder) => syncthingFolder.id === 'default')) {
-      await adjustConfigFolders('delete', undefined, 'default');
+    const allFolders = await getConfigFolders();
+    if (allFolders.status === 'success') {
+      const defaultFolderExists = allFolders.data.find((syncthingFolder) => syncthingFolder.id === 'default');
+      if (defaultFolderExists) {
+        await adjustConfigFolders('delete', undefined, 'default');
+      }
     }
     // enable gui debugging for development nodes only
     if (config.development) {
@@ -2612,6 +2354,10 @@ async function adjustSyncthing() {
           log.info('Syncthing GUI in debugging options.');
         }
       }
+    }
+    const restartRequired = await getConfigRestartRequired();
+    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
+      await systemRestart();
     }
   } catch (error) {
     log.error(error);
@@ -3056,19 +2802,6 @@ async function collectSyncthingMetrics() {
                   errors,
                 };
                 metrics.overall.issues.push(`Folder ${folder.label || folderId} has ${errors + pullErrors} error(s)`);
-                // The counts alone cannot be diagnosed from a log dump -
-                // surface the file-level causes, bounded so a sick folder
-                // cannot flood the log.
-                // eslint-disable-next-line no-await-in-loop
-                const folderErrorsResponse = await getFolderIdErrors(folderId);
-                const fileErrors = folderErrorsResponse.status === 'success' ? (folderErrorsResponse.data?.errors ?? []) : [];
-                const shown = fileErrors.slice(0, 5);
-                shown.forEach((fileError) => {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileError.path}: ${fileError.error}`);
-                });
-                if (fileErrors.length > shown.length) {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileErrors.length - shown.length} further file error(s) not shown`);
-                }
               }
             }
           } catch (error) {
@@ -3098,22 +2831,14 @@ async function collectSyncthingMetrics() {
       metrics.overall.issues.push(`Failed to collect folder metrics: ${error.message}`);
     }
 
-    // Drain syncthing's system error buffer. The buffer is cumulative for
-    // the daemon's lifetime and the daemon outlives FluxOS restarts, so each
-    // entry is an occurrence, not a state: log its content, clear the
-    // buffer, and report unhealthy only for the pass the errors arrived in.
+    // Collect system errors
     try {
       const errorsResponse = await performRequest('get', '/rest/system/error');
-      if (errorsResponse.status === 'success' && errorsResponse.data?.errors?.length) {
+      if (errorsResponse.status === 'success' && errorsResponse.data?.errors) {
         metrics.errors.system = errorsResponse.data.errors;
-        metrics.overall.healthy = false;
-        metrics.overall.issues.push(`${metrics.errors.system.length} syncthing system error(s) this pass`);
-        metrics.errors.system.forEach((systemError) => {
-          log.error(`Syncthing system error at ${systemError.when}: ${systemError.message}`);
-        });
-        const clearResponse = await performRequest('post', '/rest/system/error/clear');
-        if (clearResponse.status !== 'success') {
-          log.warn(`Failed to clear syncthing system errors, they will re-log next pass: ${clearResponse.data?.message}`);
+        if (metrics.errors.system.length > 0) {
+          metrics.overall.healthy = false;
+          metrics.overall.issues.push(`${metrics.errors.system.length}`);
         }
       }
     } catch (error) {
@@ -3152,7 +2877,7 @@ function saveMetricsSnapshot(metrics) {
  */
 async function getSyncthingMetrics(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const metrics = await collectSyncthingMetrics();
@@ -3160,11 +2885,11 @@ async function getSyncthingMetrics(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -3176,7 +2901,7 @@ async function getSyncthingMetrics(req, res) {
  */
 async function getSyncthingHealthSummary(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const metrics = await collectSyncthingMetrics();
@@ -3212,11 +2937,11 @@ async function getSyncthingHealthSummary(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -3228,7 +2953,7 @@ async function getSyncthingHealthSummary(req, res) {
  */
 async function getSyncthingMetricsHistory(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       let { limit } = req.params;
@@ -3244,11 +2969,11 @@ async function getSyncthingMetricsHistory(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -3586,7 +3311,7 @@ async function getPeerSyncDiagnostics() {
  */
 async function getPeerSyncDiagnosticsApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const diagnostics = await getPeerSyncDiagnostics();
@@ -3594,11 +3319,11 @@ async function getPeerSyncDiagnosticsApi(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -3608,9 +3333,7 @@ module.exports = {
   getDeviceId,
   getDeviceIdApi,
   getMeta,
-  getMetaApi,
   getHealth,
-  getHealthApi,
   statsDevice,
   statsFolder,
   systemBrowse,
@@ -3624,44 +3347,33 @@ module.exports = {
   systemLogTxt,
   systemPaths,
   systemPause,
-  systemPauseApi,
   systemReset,
   systemResetFolderId,
   systemRestart,
-  systemRestartApi,
   systemResume,
-  systemResumeApi,
   systemShutdown,
   systemStatus,
   systemUpgrade,
   postSystemUpgrade,
   systemVersion,
-  systemVersionApi,
   systemPing,
-  systemPingApi,
   syncthingController,
   // CONFIG
   getConfig,
-  getConfigApi,
   postConfig,
   getConfigRestartRequired,
   getConfigFolders,
-  getConfigFoldersApi,
   getConfigDevices,
-  getConfigDevicesApi,
   postConfigFolders,
   postConfigDevices,
   getConfigDefaultsFolder,
-  getConfigDefaultsFolderApi,
   getConfigDefaultsDevice,
   postConfigDefaultsFolder,
   postConfigDefaultsDevice,
   getConfigDefaultsIgnores,
   postConfigDefaultsIgnores,
   getConfigOptions,
-  getConfigOptionsApi,
   getConfigGui,
-  getConfigGuiApi,
   getConfigLdap,
   postConfigOptions,
   postConfigGui,
@@ -3679,16 +3391,12 @@ module.exports = {
   // DATABASE ENDPOINTS
   getDbBrowse,
   getDbCompletion,
-  getDbCompletionApi,
   getDbFile,
   getDbIgnores,
-  getFolderIgnores,
-  setFolderIgnores,
   getDbLocalchanged,
   getDbNeed,
   getDbRemoteNeed,
   getDbStatus,
-  getDbStatusApi,
   postDbIgnores,
   postDbOverride,
   postDbPrio,
@@ -3697,7 +3405,6 @@ module.exports = {
   postDbScan,
   // EVENTS
   getEvents,
-  getEventsApi,
   getEventsDisk,
   // MISC
   getSvcDeviceID,

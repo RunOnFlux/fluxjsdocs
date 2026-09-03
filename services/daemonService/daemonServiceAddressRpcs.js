@@ -199,7 +199,7 @@ async function getSingleAddressDeltas(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -307,7 +307,7 @@ async function getSingleAddressMempool(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 module.exports = {

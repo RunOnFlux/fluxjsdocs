@@ -50,27 +50,23 @@ const controller = new FluxController();
 // folderId -> { time, errors } from the last FolderErrors event
 const folderErrorsByFolder = new Map();
 
-// Folder ids whose FolderErrors signal has not yet been ACTED on. This is a
-// durable level, not a drained edge: reading it never clears it - an entry
-// resolves only when the monitor's safety action completes (demotion landed,
-// folder verified safe, or no installed app carries the folder any more). A
-// pass that fails mid-action therefore changes nothing and the next pass
-// retries by construction; the guard never depends on the signal re-firing.
-const mountVerifyPending = new Set();
+// folder ids seen in FolderErrors since the last drain - the monitor pass
+// drains this to mount-verify exactly the flagged folders (targeted reaction,
+// never a steady-state sweep)
+const erroredFolderIdsSinceLastDrain = new Set();
 
 /**
  * One long-poll iteration: fetch events after `since`, detect lost-events
  * conditions, surface folder activity to the monitor.
  */
 async function pollOnce() {
-  const events = await syncthingService.getEvents({
-    since,
-    events: SUBSCRIBED_EVENTS,
-    timeout: EVENTS_LONGPOLL_TIMEOUT_S,
+  const response = await syncthingService.getEvents({
+    params: {},
+    query: { since, events: SUBSCRIBED_EVENTS, timeout: EVENTS_LONGPOLL_TIMEOUT_S },
     signal: controller.signal,
-  });
+  }, null);
 
-  if (!Array.isArray(events)) {
+  if (!response || response.status !== 'success' || !Array.isArray(response.data)) {
     throw new Error('syncthing events endpoint unavailable');
   }
 
@@ -81,6 +77,7 @@ async function pollOnce() {
     if (callbacks.onResync) callbacks.onResync();
   }
 
+  const events = response.data;
   if (events.length === 0) return; // long-poll timeout with nothing new
 
   const firstId = events[0].id;
@@ -108,7 +105,7 @@ async function pollOnce() {
     }
     if (event.type === 'FolderErrors') {
       folderErrorsByFolder.set(folder, { time: event.time, errors: event.data.errors || [] });
-      mountVerifyPending.add(folder);
+      erroredFolderIdsSinceLastDrain.add(folder);
       fluxEventBus.publish('syncthing:folderErrors', { folder, time: event.time, errors: event.data.errors || [] });
     }
     if (callbacks.onFolderActivity) callbacks.onFolderActivity(folder, event.type);
@@ -187,26 +184,14 @@ function getFolderErrors(folderId) {
 }
 
 /**
- * Folder ids flagged by FolderErrors and not yet acted on. Non-destructive:
- * the monitor pass reads this to mount-verify exactly the flagged folders
- * (targeted reaction, never a steady-state sweep) and resolves each id only
- * once its safety action actually completed.
+ * Folder ids flagged by FolderErrors since the last drain; draining clears
+ * the accumulator. Consumed by the monitor pass for targeted mount verifies.
  * @returns {string[]} Folder ids
  */
-function mountVerifyPendingIds() {
-  return [...mountVerifyPending];
-}
-
-/**
- * The flagged folder's safety handling completed: demotion landed, the mount
- * verified safe, or no installed app carries the folder. Only these outcomes
- * clear the flag - never the act of reading it. The diagnostic record in
- * folderErrorsByFolder is deliberately untouched: pull errors must survive
- * for diagnosis past the mount question.
- * @param {string} folderId
- */
-function resolveMountVerify(folderId) {
-  mountVerifyPending.delete(folderId);
+function drainErroredFolderIds() {
+  const ids = [...erroredFolderIdsSinceLastDrain];
+  erroredFolderIdsSinceLastDrain.clear();
+  return ids;
 }
 
 module.exports = {
@@ -214,6 +199,5 @@ module.exports = {
   stop,
   isRunning,
   getFolderErrors,
-  mountVerifyPendingIds,
-  resolveMountVerify,
+  drainErroredFolderIds,
 };

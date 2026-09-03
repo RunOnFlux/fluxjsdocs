@@ -2,6 +2,8 @@ const config = require('config');
 const axios = require('axios');
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
+// eslint-disable-next-line no-unused-vars
+const pgpService = require('../pgpService');
 const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const imageVerifier = require('../utils/imageVerifier');
 const dbHelper = require('../dbHelper');
@@ -10,7 +12,6 @@ const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const { supportedArchitectures, globalAppsMessages, globalAppsInformation } = require('../utils/appConstants');
 const fluxCaching = require('../utils/cacheManager').default;
-const { Privilege, authOf } = require('../utils/privileges');
 
 // Cache for blocked repositories
 let cacheUserBlockedRepos = null;
@@ -35,9 +36,11 @@ function classifyVerificationError(error, errorMeta) {
         return { ttlMs: 2 * FluxCacheManager.oneHour, reason: 'Rate limiting (429)' };
       case 'server_error':
         return { ttlMs: 3 * FluxCacheManager.oneHour, reason: 'Server error (5xx)' };
+      case 'whitelist_fetch_error':
       case 'auth_unavailable':
         return { ttlMs: 2 * FluxCacheManager.oneHour, reason: 'Temporary service issue' };
       // Permanent errors - longer cache
+      case 'not_whitelisted':
       case 'invalid_format':
       case 'unsupported_architecture':
       case 'unsupported_media_type':
@@ -179,7 +182,7 @@ async function getBlockedRepositores() {
     if (cachedResponse) {
       return cachedResponse;
     }
-    const resBlockedRepo = await serviceHelper.axiosGet(`${config.policy.baseUrl}/blockedrepositories.json`);
+    const resBlockedRepo = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/blockedrepositories.json`);
     if (resBlockedRepo.data) {
       fluxCaching.blockedRepositoriesCache.set('blockedRepositories', resBlockedRepo.data);
       return resBlockedRepo.data;
@@ -202,7 +205,7 @@ async function getVettedRepositories() {
     if (cachedResponse) {
       return cachedResponse;
     }
-    const resVettedRepo = await serviceHelper.axiosGet(`${config.policy.baseUrl}/vettedrepositories.json`);
+    const resVettedRepo = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/vettedrepositories.json`);
     if (resVettedRepo.data) {
       fluxCaching.blockedRepositoriesCache.set('vettedRepositories', resVettedRepo.data);
       return resVettedRepo.data;
@@ -285,13 +288,13 @@ async function getUserBlockedRepositores() {
       return cacheUserBlockedRepos;
     }
 
-    const { userconfig } = globalThis;
+    const userconfig = globalThis.userconfig;
     const userBlockedRepos = userconfig.initial.blockedRepositories || [];
     if (userBlockedRepos.length === 0) {
       return userBlockedRepos;
     }
     const usableUserBlockedRepos = [];
-    const marketPlaceUrl = `${config.stats.baseUrl}/marketplace/listapps`;
+    const marketPlaceUrl = 'https://stats.runonflux.io/marketplace/listapps';
     const response = await axios.get(marketPlaceUrl);
     console.log(response);
     if (response && response.data && response.data.status === 'success') {
@@ -588,7 +591,7 @@ async function checkDockerAccessibility(req, res) {
   });
   req.on('end', async () => {
     try {
-      const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+      const authorized = await verificationHelper.verifyPrivilege('user', req);
       if (!authorized) {
         const errMessage = messageHelper.errUnauthorizedMessage();
         return res.json(errMessage);
@@ -630,12 +633,8 @@ async function checkApplicationsCompliance(installedApps, removeAppLocally) {
       throw new Error('Failed to get installed Apps');
     }
     // Decrypt enterprise apps (version 8 with encrypted content)
-    const { readable: appsInstalled, unreadable } = await decryptEnterpriseApps(installedAppsRes.data);
-    if (unreadable.length) {
-      // their repotags are inside the blob, so a blocked image in one cannot be
-      // seen here - it is not cleared, it is unexamined
-      log.warn(`Cannot check blocked images for undecryptable apps: ${unreadable.map((app) => app.name).join(', ')}`);
-    }
+    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
+    const appsInstalled = installedAppsRes.data;
     const appsToRemoveNames = [];
     // eslint-disable-next-line no-restricted-syntax
     for (const app of appsInstalled) {

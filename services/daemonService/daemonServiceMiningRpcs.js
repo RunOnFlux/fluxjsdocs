@@ -2,7 +2,6 @@ const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const verificationHelper = require('../verificationHelper');
-const { Privilege, authOf } = require('../utils/privileges');
 
 let response = messageHelper.createErrorMessage();
 
@@ -25,7 +24,7 @@ async function getBlockSubsidy(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -47,7 +46,7 @@ async function getBlockTemplate(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -97,7 +96,7 @@ async function getNetworkHashPs(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -118,7 +117,7 @@ async function getNetworkSolPs(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -132,10 +131,10 @@ async function prioritiseTransaction(req, res) {
   txid = txid || req.query.txid;
   prioritydelta = prioritydelta || req.query.prioritydelta;
   feedelta = feedelta || req.query.feedelta;
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('user', req);
   if (authorized !== true) {
     response = messageHelper.errUnauthorizedMessage();
-    return res.json(response);
+    return res ? res.json(response) : response;
   }
   const rpccall = 'prioritiseTransaction';
   let rpcparameters = [];
@@ -147,7 +146,7 @@ async function prioritiseTransaction(req, res) {
 
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -160,7 +159,7 @@ async function submitBlock(req, res) {
   let { hexdata, jsonparametersobject } = req.params;
   hexdata = hexdata || req.query.hexdata;
   jsonparametersobject = jsonparametersobject || req.query.jsonparametersobject;
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('user', req);
   if (authorized === true) {
     const rpccall = 'submitBlock';
     let rpcparameters = [];
@@ -176,7 +175,7 @@ async function submitBlock(req, res) {
     response = messageHelper.errUnauthorizedMessage();
   }
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -195,7 +194,7 @@ async function submitBlockPost(req, res) {
     const { hexdata } = processedBody;
     let { jsonparametersobject } = processedBody;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('user', req);
     if (authorized === true) {
       const rpccall = 'submitBlock';
       let rpcparameters = [];
