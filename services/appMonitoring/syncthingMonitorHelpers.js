@@ -5,8 +5,6 @@ const path = require('node:path');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
 const volumeService = require('../utils/volumeService');
-const peerIdentityService = require('../peerIdentityService');
-const fluxEventBus = require('../utils/fluxEventBus');
 const {
   DEVICE_ID_REQUEST_TIMEOUT_MS,
   SYNCTHING_RESCAN_INTERVAL_SECONDS,
@@ -44,64 +42,21 @@ async function getDeviceID(fluxIP, retries = 0) {
 }
 
 /**
- * The syncthing device of the node at `name`.
- *
- * A peer that proves it is the node listed at `name` is believed about its
- * device, and what it signs replaces whatever was held for the address. So is a
- * peer that proved it by calling in - its introduction - which is how a node
- * whose own calls are redirected learns its partners: their connections to it
- * arrive intact, and syncthing needs only one direction to sync. A call to
- * `name` that another node answered, with no introduction to go on, yields no
- * device: configuring the answering node's device under this name leaves the
- * folder syncing with a device that holds no copy of it. A peer that cannot
- * prove either way is asked the unsigned way.
- *
- * Every call counts where its answer came from under `syncthing:deviceSource`,
- * keyed by `name`: verified, verifiedNoDevice, introduced, withheld, held or
- * unsigned.
- *
+ * Get device ID with caching
  * @param {string} name - Device name (IP:port)
  * @param {Map} cache - Cache map
  * @returns {Promise<string|null>} Device ID or null
  */
 async function getDeviceIDCached(name, cache) {
-  const { IdentityVerdict } = peerIdentityService;
-  const from = (source, deviceID) => {
-    fluxEventBus.count('syncthing:deviceSource', name, source);
-    return deviceID;
-  };
-  const result = await peerIdentityService.verifyPeer(name);
-
-  if (result.verdict === IdentityVerdict.VERIFIED) {
-    const signedDeviceID = result.identity.deviceId;
-    // Verified with no device: that node's syncthing has not answered it yet.
-    // What was held stands until it has.
-    if (!signedDeviceID) return from('verifiedNoDevice', cache.get(name) ?? null);
-    cache.set(name, signedDeviceID);
-    return from('verified', signedDeviceID);
-  }
-
-  const introduced = peerIdentityService.introducedPeer(name);
-  if (introduced?.deviceId) {
-    cache.set(name, introduced.deviceId);
-    return from('introduced', introduced.deviceId);
-  }
-
-  if (result.verdict === IdentityVerdict.MISROUTED) {
-    cache.delete(name);
-    log.warn(`getDeviceIDCached - ${name} was answered by ${result.answeredAs}; configuring no device for it`);
-    return from('withheld', null);
-  }
-
   if (cache.has(name)) {
-    return from('held', cache.get(name));
+    return cache.get(name);
   }
 
   const deviceID = await getDeviceID(name);
   if (deviceID) {
     cache.set(name, deviceID);
   }
-  return from('unsigned', deviceID);
+  return deviceID;
 }
 
 /**
@@ -142,20 +97,6 @@ function sortRunningAppList(runningAppList) {
 }
 
 /**
- * The addresses a peer's syncthing is reached at: TCP alone. Every node
- * publishes its syncthing port for TCP, and the network's check of a node
- * requires it. Over QUIC, syncthing learns that the peer which dialled a
- * connection has stopped only at QUIC's idle timeout, 30 s, and until then
- * this node reads the peer as running and its own turn as not yet due.
- * @param {string} ip Peer IP
- * @param {number} port Peer API port
- * @returns {string[]}
- */
-function peerSyncthingAddresses(ip, port) {
-  return [`tcp://${ip}:${port + 2}`];
-}
-
-/**
  * Build device configuration from locations
  * @param {Array} locations - App locations
  * @param {string} localSocketAddr - Current node socket address
@@ -163,7 +104,7 @@ function peerSyncthingAddresses(ip, port) {
  * @param {Map} deviceCache - Device ID cache
  * @param {Array} devicesConfiguration - Array to populate with devices
  * @param {Array} devicesIds - Array to populate with device IDs
- * @param {Array} allDevices - Existing syncthing devices
+ * @param {Array} allDevicesResp - Existing syncthing devices
  * @returns {Promise<Array>} Array of device objects for folder configuration
  */
 async function buildDeviceConfiguration(
@@ -173,7 +114,7 @@ async function buildDeviceConfiguration(
   deviceCache,
   devicesConfiguration,
   devicesIds,
-  allDevices,
+  allDevicesResp,
 ) {
   const devices = [{ deviceID: myDeviceId }];
 
@@ -181,7 +122,7 @@ async function buildDeviceConfiguration(
   const devicePromises = locations.map(async (appInstance) => {
     const ip = extractIp(appInstance.ip);
     const port = extractPort(appInstance.ip);
-    const addresses = peerSyncthingAddresses(ip, port);
+    const addresses = [`tcp://${ip}:${port + 2}`, `quic://${ip}:${port + 2}`];
     const name = `${ip}:${port}`;
 
     const deviceID = await getDeviceIDCached(name, deviceCache);
@@ -219,25 +160,16 @@ async function buildDeviceConfiguration(
     // Add to global devices configuration if not already configured
     const deviceExists = devicesConfiguration.find((device) => device.name === name);
     if (!deviceExists) {
-      // Folders are never auto-accepted: FluxOS creates every folder itself,
-      // with its type and its peers. A folder a peer offers before then waits as
-      // pending. Accepted, syncthing would create it with its default type,
-      // sendreceive, and a new standby's empty copy - wiped clean for the
-      // install - would go out as newer than the primary's data, which the
-      // primary would then delete.
       const newDevice = {
         deviceID,
         name,
         addresses,
-        autoAcceptFolders: false,
+        autoAcceptFolders: true,
       };
       devicesIds.push(deviceID);
 
-      // Matched on the id as well as the name: an entry under this name that
-      // holds a different device is not this device. Once this one replaces it
-      // no folder uses it, and it falls to the sweep of unused devices.
       if (deviceID !== myDeviceId) {
-        const syncthingDeviceExists = allDevices.find((device) => device.name === name && device.deviceID === deviceID);
+        const syncthingDeviceExists = allDevicesResp.data.find((device) => device.name === name);
         if (!syncthingDeviceExists) {
           devicesConfiguration.push(newDevice);
         }
@@ -249,37 +181,24 @@ async function buildDeviceConfiguration(
 }
 
 /**
- * The settings every folder FluxOS owns carries, on creation and on every write
- * that changes its type. syncthing re-applies its own defaults to the fields a
- * type or ownership change leaves out of the body, and its default of ten
- * conflict copies puts renamed losers into a single-writer app's data.
- * syncOwnership makes a synced file arrive owned by the uid that wrote it on
- * the primary, so the same image writes it there without a permissions sweep.
- */
-const OWNED_FOLDER_SETTINGS = Object.freeze({
-  rescanIntervalS: SYNCTHING_RESCAN_INTERVAL_SECONDS,
-  maxConflicts: SYNCTHING_MAX_CONFLICTS,
-  syncOwnership: true,
-});
-
-/**
- * The fields of a folder's syncthing configuration the monitor owns. Its type
- * is decided separately: by the monitor for an r: folder, by the primary role
- * for a g: folder.
+ * Create Syncthing folder configuration
  * @param {string} id - Folder ID
  * @param {string} label - Folder label
  * @param {string} path - Folder path
  * @param {Array} devices - Array of device objects
- * @returns {Object} Syncthing folder configuration, without a type
+ * @param {string} type - Folder type (sendreceive, receiveonly)
+ * @returns {Object} Syncthing folder configuration
  */
-function createSyncthingFolderConfig(id, label, path, devices) {
+function createSyncthingFolderConfig(id, label, path, devices, type = 'sendreceive') {
   return {
     id,
     label,
     path,
     devices,
     paused: false,
-    ...OWNED_FOLDER_SETTINGS,
+    type,
+    rescanIntervalS: SYNCTHING_RESCAN_INTERVAL_SECONDS,
+    maxConflicts: SYNCTHING_MAX_CONFLICTS,
   };
 }
 
@@ -358,39 +277,25 @@ function shouldBeRunning(containerDataFlags) {
 }
 
 /**
- * Whether two folder device lists name the same devices. Syncthing returns a
- * folder's devices sorted, once each, with fields FluxOS never sets; the device
- * IDs are what the monitor writes.
- * @param {Array<{deviceID: string}>} [held]
- * @param {Array<{deviceID: string}>} [wanted]
- * @returns {boolean}
- */
-function sameDevices(held = [], wanted = []) {
-  const heldIds = new Set(held.map((device) => device.deviceID));
-  const wantedIds = new Set(wanted.map((device) => device.deviceID));
-  return heldIds.size === wantedIds.size && [...wantedIds].every((id) => heldIds.has(id));
-}
-
-/**
- * Whether syncthing holds a folder differently from the config the monitor
- * built for it: any field of that config that differs, its devices compared as
- * the devices they name and every other field by value. A field the config
- * leaves out - a g: folder's type - is not the monitor's to compare.
- * @param {Object} existingFolder - The folder as syncthing holds it
- * @param {Object} newFolder - The config the monitor built for it
+ * Check if folder configuration needs update
+ * @param {Object} existingFolder - Existing folder config
+ * @param {Object} newFolder - New folder config
  * @returns {boolean} True if update is needed
  */
 function folderNeedsUpdate(existingFolder, newFolder) {
   if (!existingFolder) {
     return true;
   }
-  return Object.entries(newFolder).some(([field, value]) => (field === 'devices'
-    ? !sameDevices(existingFolder.devices, value)
-    : existingFolder[field] !== value));
+
+  return (
+    existingFolder.maxConflicts !== SYNCTHING_MAX_CONFLICTS
+    || existingFolder.paused
+    || existingFolder.type !== newFolder.type
+    || JSON.stringify(existingFolder.devices) !== JSON.stringify(newFolder.devices)
+  );
 }
 
 module.exports = {
-  OWNED_FOLDER_SETTINGS,
   getDeviceID,
   getDeviceIDCached,
   sortAndFilterLocations,

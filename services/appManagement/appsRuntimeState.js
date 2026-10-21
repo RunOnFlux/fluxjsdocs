@@ -20,19 +20,6 @@ const STABLE_RUN_MS = config.fluxapps.crashBackoffStableRunMs ?? 10 * 60 * 1000;
 // only the count (capped by the ladder) and the last timestamp are ever read,
 // so the persisted history never needs to grow beyond the ladder length
 const MAX_HISTORY = BACKOFF_DELAYS_MS.length;
-// The exit code cannot prove a fault: an image whose entrypoint is a wrapper
-// script ending in `exit 0` reports a clean stop for a segfault, and no init we
-// wrap around it can recover a status the image already discarded. So pacing on
-// the code alone would leave such a container restarting without limit. This is
-// the cause-blind backstop - this many automatic restarts ALREADY RECORDED
-// inside the window is evidence of a fault whatever Docker reported, and it
-// disposes into the same ladder rather than into a state a human has to clear.
-//
-// The count is of restarts already behind it, so at 5 the SIXTH restart is the
-// one that earns a rung and the seventh is the first one held back. Six free
-// restarts from a knob that reads as five is worth knowing before tuning it.
-const RESTART_BURST_COUNT = config.fluxapps.restartBurstCount ?? 5;
-const RESTART_BURST_WINDOW_MS = config.fluxapps.restartBurstWindowMs ?? 5 * 60 * 1000;
 
 function collection() {
   const db = dbHelper.databaseConnection();
@@ -70,13 +57,14 @@ function isDuplicateKeyError(err) {
   return err && (err.code === 11000 || /E11000/.test(err.message || ''));
 }
 
-async function upsertState(identifier, update) {
+async function setFields(rawIdentifier, fields) {
+  const identifier = canonical(rawIdentifier);
   const database = collection();
   const write = () => dbHelper.updateOneInDatabase(
     database,
     appsRuntimeState,
     { identifier },
-    update,
+    { $set: { identifier, ...fields, updatedAt: Date.now() } },
     { upsert: true },
   );
   try {
@@ -85,16 +73,10 @@ async function upsertState(identifier, update) {
     // Under the unique index, the loser of a concurrent first upsert THROWS a
     // duplicate-key error instead of converting to an update. The document
     // exists at that point, so one retry takes the update path - without it the
-    // loser's write (possibly the operator stop lock, or a restart request)
-    // would be silently dropped.
+    // loser's write (possibly the operator stop lock) would be silently dropped.
     if (!isDuplicateKeyError(err)) throw err;
     await write();
   }
-}
-
-async function setFields(rawIdentifier, fields) {
-  const identifier = canonical(rawIdentifier);
-  await upsertState(identifier, { $set: { identifier, ...fields, updatedAt: Date.now() } });
 }
 
 /**
@@ -103,198 +85,16 @@ async function setFields(rawIdentifier, fields) {
  * deliberate (re)start (operatorStopped=false, also install/redeploy) clears
  * the crash-recovery backoff so the component gets a fresh start.
  *
- * "Operator" here is the human working the app, not the node operator. The
- * distinction the name draws is a person deciding this component stays down
- * against the reconciler, the master/slave election or crash recovery bringing
- * it back up — so it still reads correctly now that the node operator is not
- * one of the people who can ask for it.
- *
- * The field is persisted and queried by name (`{ operatorStopped: true }`), so
- * renaming it is a migration: without one, that query stops matching on upgrade
- * and every live stop lock releases at once.
- *
- * A lock records whether this node was the component's primary when it was
- * stopped - running it, or committed to running it - and keeps that through a
- * second stop of a component already locked. Only such a lock holds the
- * component on this node; see operatorHeldIdentifiers.
- *
  * @param {string} identifier
  * @param {boolean} stopped
- * @param {object} [opts]
- * @param {boolean} [opts.force] A hard kill, not a graceful stop.
- * @param {boolean} [opts.asPrimary] This node runs the component, or is
- *   committed to running it, as it is stopped.
  */
-async function setOperatorStopped(identifier, stopped, opts = {}) {
+async function setOperatorStopped(identifier, stopped) {
   // No catch: the lock is the contract that the reconciler will not restart the
   // app. Swallowing a write failure would let the API report success while the
   // lock never persisted - the caller must surface the failure instead.
-  // Either way the lock moves, a start waiting on the election is settled: a
-  // stop withdraws it, and a lifted lock has nothing left to wait for.
-  const fields = { operatorStopped: stopped, operatorStartRequested: false };
-  if (stopped) {
-    // A hard kill skips the graceful shutdown window. Durable, so a crash between
-    // the write and the stop cannot quietly downgrade "kill now" to a drain that
-    // waits for the app to finish what it is doing.
-    fields.operatorStopForce = opts.force === true;
-    const held = opts.asPrimary === true ? null : await readLock(canonical(identifier));
-    fields.operatorStoppedAsPrimary = opts.asPrimary === true
-      || (held?.operatorStopped === true && held.operatorStoppedAsPrimary === true);
-  } else {
-    fields.operatorStopForce = false;
-    fields.operatorStoppedAsPrimary = false;
-    fields.restartHistory = [];
-    fields.autoRestartWindow = [];
-  }
+  const fields = { operatorStopped: stopped };
+  if (!stopped) fields.restartHistory = [];
   await setFields(identifier, fields);
-}
-
-// The stop lock and its start request, read without getState's swallow: these
-// readers decide whether to lift the lock, and a read failure answered as "no
-// record" is a lock lifted on no evidence.
-function readLock(identifier) {
-  return dbHelper.findOneInDatabase(
-    collection(),
-    appsRuntimeState,
-    { identifier },
-    { projection: { _id: 0, operatorStopped: 1, operatorStartRequested: 1, operatorStoppedAsPrimary: 1 } },
-  );
-}
-
-/**
- * Whether the operator stop lock is on, read without getState's swallow: for a
- * caller about to commit a component to running, an unread lock is not an
- * absent one.
- *
- * @param {string} rawIdentifier
- * @returns {Promise<boolean>}
- * @throws When the lock cannot be read.
- */
-async function operatorStoppedOrThrow(rawIdentifier) {
-  return (await readLock(canonical(rawIdentifier)))?.operatorStopped === true;
-}
-
-/**
- * Records an operator start of a locked component whose start the primary
- * election decides, leaving the stop lock in place until the election has
- * decided it. A component with no lock has nothing to wait for and is left as
- * it is.
- *
- * The lock is what makes this node hold the component while it is stopped:
- * peers, FDM and the folder monitor all read it as this node's. Lifted at the
- * start, the component would be neither running, nor committed, nor locked until
- * the election next ran, and a standby could take it in between. Held until the
- * election decides, the hold is continuous, and survives a FluxOS restart with
- * the lock. releaseOperatorStart lifts it once the election has decided.
- *
- * Callers write through the reconciler's per-key slot, so the lock read here is
- * the lock this marks. Throws on a failed read or write, for setOperatorStopped's
- * reason: an unread lock answered as none would lift it.
- *
- * @param {string} rawIdentifier
- * @returns {Promise<boolean>} Whether a lock was found and its start recorded.
- */
-async function requestOperatorStart(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const state = await readLock(identifier);
-  if (state?.operatorStopped !== true) return false;
-  await setFields(identifier, { operatorStartRequested: true });
-  return true;
-}
-
-/**
- * Lifts the stop lock of a component the operator has asked to start, once the
- * election has decided who runs it. A lock with no start request - one the
- * operator set again after asking, or never asked to lift - is left as it is.
- *
- * Callers write through the reconciler's per-key slot, which orders this read
- * against the operator's own writes, so a stop that lands after the start was
- * asked for is never lifted by the election acting on the earlier request.
- *
- * Throws on a failed read or write: an unread lock is not a lock to lift.
- *
- * @param {string} rawIdentifier
- * @returns {Promise<boolean>} Whether the lock was lifted.
- */
-async function releaseOperatorStart(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const state = await readLock(identifier);
-  if (state?.operatorStopped !== true || state.operatorStartRequested !== true) return false;
-  await setOperatorStopped(identifier, false);
-  return true;
-}
-
-/**
- * Raises the component's restart generation, which is how an operator restart is
- * expressed as desired state rather than as a docker call from the handler.
- *
- * The reconciler bounces the container when the generation exceeds the one it
- * last actuated, so the request is level-based - replaying it changes nothing -
- * and durable, so it survives a restart of FluxOS itself.
- *
- * No catch, for setOperatorStopped's reason: a request that did not persist must
- * not be reported to the operator as one that did.
- *
- * With a `key` the request is the one restart that key asks for: a repeat of the
- * key raises nothing, decided in the same write, so a caller that cannot tell
- * whether its request landed asks again safely.
- *
- * @param {string} identifier
- * @param {object} [options]
- * @param {string} [options.key] What the restart is for.
- */
-async function requestRestart(rawIdentifier, { key } = {}) {
-  // Incremented by the database, never read and rewritten here. Reading first
-  // asked getState for a number and got null for two different answers - "no
-  // record yet" and "the read failed" - and treating the second as zero wrote a
-  // generation BELOW the one already actuated, which reads as nothing pending: the
-  // restart is reported and never happens. $inc has no such answer to
-  // misread, and creates the field at 1 when there is no record, which is what
-  // the read was for. It also counts two concurrent requests as two, where
-  // read-then-write had both read the same number and one silently overwrite the
-  // other.
-  const identifier = canonical(rawIdentifier);
-  if (key) {
-    await upsertState(identifier, [{
-      $set: {
-        identifier,
-        updatedAt: Date.now(),
-        restartRequestKey: key,
-        restartGeneration: {
-          $cond: [
-            { $eq: ['$restartRequestKey', key] },
-            '$restartGeneration',
-            { $add: [{ $ifNull: ['$restartGeneration', 0] }, 1] },
-          ],
-        },
-      },
-    }]);
-    return;
-  }
-  await upsertState(identifier, {
-    $inc: { restartGeneration: 1 },
-    $set: { identifier, updatedAt: Date.now() },
-  });
-}
-
-/**
- * Marks a restart generation as actuated, so the pass that follows the bounce
- * does not bounce it again.
- *
- * Throws, unlike the recorders either side of it, because this write is not
- * history - it is the only thing that stops the next pass bouncing the container
- * again. Swallowed, a failure here read as "recorded" and the pass that followed
- * found the request still outstanding: on a node whose reads work and whose
- * writes do not, that restarted the app every POST_START_VERIFY_MS forever, on
- * the one path deliberately exempt from the backoff ladder. Losing an exit code
- * (recordExit) costs a log line; losing this one costs the app.
- *
- * @param {string} identifier
- * @param {number} generation
- * @throws when the write fails
- */
-async function recordRestartGeneration(identifier, generation) {
-  await setFields(identifier, { actuatedRestartGeneration: generation });
 }
 
 /**
@@ -310,119 +110,20 @@ async function isOperatorStopped(identifier) {
 }
 
 /**
- * The operator's stop lock and the mode they asked for, from ONE read.
- *
- * They are two fields of one document, and a caller needing both must not ask
- * twice: getState returns null for a read failure exactly as it does for "no
- * record", so a second read that failed reported no force flag and turned the
- * operator's "kill now" into a drain they did not ask for. Answering both from a
- * single read is a window that cannot open - and one round-trip fewer on every
- * stop the reconciler performs.
- *
- * `startRequested` is a start the operator has asked for and the election has
- * not yet decided; the lock stands until it has. `asPrimary` is whether this
- * node was the component's primary when it was stopped.
+ * Appends a restart attempt (wall-clock) and trims the history to the ladder
+ * length so a perpetually crashing container never grows the array unbounded.
  *
  * @param {string} identifier
- * @returns {Promise<{stopped: boolean, force: boolean, startRequested: boolean, asPrimary: boolean}>}
  */
-async function operatorStopState(identifier) {
-  const state = await getState(identifier);
-  return {
-    stopped: state?.operatorStopped === true,
-    startRequested: state?.operatorStopped === true && state.operatorStartRequested === true,
-    force: state?.operatorStopForce === true,
-    asPrimary: state?.operatorStopped === true && state.operatorStoppedAsPrimary === true,
-  };
-}
-
-/**
- * Every component identifier on this node that its operator stop lock holds
- * here: a lock taken while this node was the component's primary.
- *
- * A lock on any other node keeps the component down there and owns nothing.
- * When an owner stops an app on every node and starts it on every node, the
- * starts arrive one node at a time, and the node that was its primary is the
- * only one holding it whichever arrives first: it starts, and the others stand
- * aside for it. A standby's lock held as well would read to the primary as a
- * peer holding the component until that standby's own start arrived.
- *
- * A lock taken before the lock recorded this is held until its start is asked
- * for, as every lock then was.
- *
- * One query rather than a read per component. The caller is the held-components
- * answer, served on an unauthenticated route a peer reads mid-election, so a
- * findOne apiece would scale its cost with the number of components installed
- * here.
- *
- * Throws where getState swallows, and the difference is the point. getState's
- * callers ask about one component and act on this node: a read failure there
- * reads as "no lock", the reconciler leaves the container alone anyway, and the
- * next pass asks again. This answer LEAVES the node - an empty list tells a peer
- * nothing is held here, and the peer acts on that by starting a second writer on
- * the shared volume. There is no safe way to report a lock set we could not
- * read, so the caller has to fail rather than answer.
- *
- * @returns {Promise<string[]>} bare component identifiers, unprefixed
- */
-async function operatorHeldIdentifiers() {
-  const database = collection();
-  const docs = await dbHelper.findInDatabase(
-    database,
-    appsRuntimeState,
-    {
-      operatorStopped: true,
-      $or: [
-        { operatorStoppedAsPrimary: true },
-        { operatorStoppedAsPrimary: { $exists: false }, operatorStartRequested: { $ne: true } },
-      ],
-    },
-    { projection: { _id: 0, identifier: 1 } },
-  );
-  return docs.map((doc) => doc.identifier).filter(Boolean);
-}
-
-/**
- * Whether the restarts already recorded fill the burst window, read before the
- * current attempt is appended - so it answers "have there already been enough",
- * and the restart asking is the one that carries the count over.
- *
- * That restart is counted, not held: restartWaitMs runs ahead of recordRestart
- * and finds an empty ladder, so it goes back immediately and earns the first
- * rung on its way past. The one after it is the first to be made to wait.
- *
- * @param {object|null} state
- * @returns {boolean}
- */
-function burstExceeded(state) {
-  const recent = (state && state.autoRestartWindow) || [];
-  if (recent.length < RESTART_BURST_COUNT) return false;
-  return Date.now() - recent[0] <= RESTART_BURST_WINDOW_MS;
-}
-
-/**
- * Appends a restart attempt (wall-clock). Every automatic restart lands in the
- * burst window; only one with crash evidence - or one that fills the burst
- * window, which is the same conclusion reached without the exit code - also
- * walks the ladder. Both arrays are trimmed to their own bound so a
- * perpetually restarting container never grows the document unbounded.
- *
- * @param {string} identifier
- * @param {boolean} crashed - Docker reported a fault (non-zero exit or OOM kill)
- */
-async function recordRestart(identifier, crashed = true) {
+async function recordRestart(identifier) {
   try {
     const state = await getState(identifier);
-    const fields = {
-      autoRestartWindow: [...((state && state.autoRestartWindow) || []), Date.now()].slice(-RESTART_BURST_COUNT),
-    };
-    // A rung is earned by evidence of a fault - a non-zero exit, or restarts
-    // arriving fast enough to be one whatever the code said - and by a component
-    // that already holds rungs, which is that finding still standing.
-    if (crashed || burstExceeded(state) || ((state && state.restartHistory) || []).length > 0) {
-      fields.restartHistory = [...((state && state.restartHistory) || []), Date.now()].slice(-MAX_HISTORY);
+    const history = (state && state.restartHistory) || [];
+    history.push(Date.now());
+    if (history.length > MAX_HISTORY) {
+      history.splice(0, history.length - MAX_HISTORY);
     }
-    await setFields(identifier, fields);
+    await setFields(identifier, { restartHistory: history });
   } catch (err) {
     log.error(`appsRuntimeState - failed to record restart for ${identifier}: ${err.message}`);
   }
@@ -453,20 +154,9 @@ async function recordRestart(identifier, crashed = true) {
  */
 async function restartWaitMs(identifier, lastFinishedAtMs = null) {
   const state = await getState(identifier);
-  // An empty ladder is a component nothing has found fault with: a clean exit is
-  // the operator's own restart far more often than it is a fault, and pacing that
-  // makes a deliberate restart look like an outage. recordRestart decides what
-  // earns a rung; once a component holds one it is paced until it clears them,
-  // whatever its exit code reads. The burst window empties while a component
-  // sits out a wait, so the ladder is what has to carry the finding across one.
   const history = (state && state.restartHistory) || [];
   if (history.length === 0) return 0;
 
-  // The ladder's last rung IS the component's last start, because a component
-  // holding rungs earns one for every restart. That is what makes this a stable
-  // run and not a wait it just served: if a restart could go unrecorded while
-  // rungs stood, the gap measured here would be the wait itself, and any rung
-  // longer than STABLE_RUN_MS would clear the ladder every time it fired.
   const lastRestart = history[history.length - 1];
   const lastDeath = Math.max(state.lastDiedAt || 0, lastFinishedAtMs || 0);
   if (lastDeath > lastRestart && lastDeath - lastRestart > STABLE_RUN_MS) {
@@ -477,105 +167,6 @@ async function restartWaitMs(identifier, lastFinishedAtMs = null) {
   const sinceLast = Date.now() - lastRestart;
   const index = Math.min(history.length, BACKOFF_DELAYS_MS.length - 1);
   return Math.max(0, BACKOFF_DELAYS_MS[index] - sinceLast);
-}
-
-/**
- * The network-detach heal force-removes a container in order to recreate it with
- * a fresh endpoint. Between those two steps the container is legitimately absent,
- * and that fact MUST be durable: if FluxOS restarts in that window, the next
- * reconcile would otherwise see a missing container with no heal in flight, call
- * it vanished (a false tampering signal) and, on a failed recreate, uninstall the
- * whole app. This flag is the reconciler's memory of "I removed this on purpose";
- * it is set before the remove and cleared once the container is seen running AND
- * attached again (see appReconciler).
- *
- * @param {string} identifier
- * @param {boolean} removed
- */
-async function setNetworkHealRemoval(identifier, removed) {
-  // No catch: the flag is what keeps a failed heal from escalating to an app
-  // uninstall. If it cannot be persisted, the caller must not remove the container.
-  await setFields(identifier, { networkHealRemoval: removed });
-}
-
-/**
- * Whether the reconciler removed this container itself for a network heal.
- *
- * Deliberately does NOT reuse getState: getState swallows a read failure and
- * returns null, which here would read as "not a heal removal" - the DESTRUCTIVE
- * direction (the caller would treat its own removal as a vanished container,
- * record a false tampering event and, on a failed recreate, uninstall the app).
- * A read failure must be a failure, so the caller can defer instead of guess.
- *
- * @param {string} identifier
- * @returns {Promise<boolean>} - throws if the state cannot be read
- */
-async function isNetworkHealRemoval(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const database = collection();
-  const state = await dbHelper.findOneInDatabase(database, appsRuntimeState, { identifier }, { projection: { _id: 0 } });
-  return state?.networkHealRemoval === true;
-}
-
-/**
- * Appends a network-heal attempt to its OWN durable ladder. Kept separate from
- * restartHistory: sharing it would cross-contaminate in both directions - a heal
- * that recreates a g: component (created, not started) would then have the very
- * container it just fixed held down by the crash ladder its own attempts grew,
- * and a crash-looping container could not be healed for up to the 30m cap.
- *
- * @param {string} identifier
- */
-async function recordNetworkHealAttempt(identifier) {
-  // No catch: pacing that silently fails to persist means the next pass sees an
-  // empty ladder, waits 0, and hammers the destructive heal. The caller defers.
-  const state = await getState(identifier);
-  const history = (state && state.networkHealHistory) || [];
-  history.push(Date.now());
-  if (history.length > MAX_HISTORY) {
-    history.splice(0, history.length - MAX_HISTORY);
-  }
-  await setFields(identifier, { networkHealHistory: history });
-}
-
-/**
- * How long (ms) before the next network-heal attempt is allowed - 0 means now.
- * Same ladder shape as the crash backoff (immediate, 30s, 5m, 15m, 30m cap), so
- * a container that keeps coming back detached is retried forever but at a
- * decaying rate. The ladder is reset by clearNetworkHeal once the container is
- * seen healthy, so a later, unrelated episode starts from the bottom again.
- *
- * @param {string} identifier
- * @returns {Promise<number>}
- */
-async function networkHealWaitMs(identifier) {
-  const state = await getState(identifier);
-  const history = (state && state.networkHealHistory) || [];
-  if (history.length === 0) return 0;
-  const last = history[history.length - 1];
-  const index = Math.min(history.length, BACKOFF_DELAYS_MS.length - 1);
-  return Math.max(0, BACKOFF_DELAYS_MS[index] - (Date.now() - last));
-}
-
-/**
- * Drops all network-heal state (the removal flag and the heal ladder) once the
- * container is healthy again. Reads first so the healthy steady state - every
- * reconcile of every attached container - costs a lookup, not a write.
- *
- * @param {string} identifier
- */
-async function clearNetworkHeal(identifier) {
-  try {
-    const state = await getState(identifier);
-    if (!state) return;
-    if (state.networkHealRemoval !== true && !(state.networkHealHistory || []).length) return;
-    await setFields(identifier, { networkHealRemoval: false, networkHealHistory: [] });
-  } catch (err) {
-    // A stale flag only ever makes the reconciler MORE conservative (it keeps
-    // recreating instead of escalating to an uninstall), so a failed clear is safe
-    // to log and move on from - unlike a failed set, which must abort the remove.
-    log.error(`appsRuntimeState - failed to clear network heal state for ${identifier}: ${err.message}`);
-  }
 }
 
 /**
@@ -593,51 +184,6 @@ async function recordExit(identifier, exitCode) {
 }
 
 /**
- * What survives a component being taken down without its volume.
- *
- * Named as what is KEPT rather than what is cleared, so a controller field
- * added later is dropped by a soft removal without anyone remembering to name
- * it here. Everything in this list is the node's account of its own storage,
- * which the removal is not touching.
- */
-const SURVIVES_SOFT_REMOVAL = ['volumeImagePath', 'volumeFsUuid'];
-
-/**
- * Drops the controller state for a component whose volume stays where it is.
- *
- * A soft removal leaves the image on disk and the volume mounted, so the
- * record of which image that is describes something that still exists. Losing
- * it sends the next boot back to searching the disks by filename, and stamps
- * whatever that search turns up as this node's own.
- *
- * THROWS rather than reporting a clear it did not make.
- *
- * @param {string} identifier
- * @throws When the state cannot be read or replaced.
- */
-async function removeControllerState(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const database = collection();
-  // Read without the swallow: a document that could not be READ is not a
-  // document that is absent, and the difference is the operator stop lock.
-  // Answering "nothing here" for a database that would not speak leaves the
-  // lock in place and reports the redeploy done, so the component the operator
-  // asked to run stays down and nothing says why.
-  const state = await dbHelper.findOneInDatabase(
-    database,
-    appsRuntimeState,
-    { identifier },
-    { projection: { _id: 0 } },
-  );
-  if (!state) return;
-  const kept = { identifier, updatedAt: Date.now() };
-  SURVIVES_SOFT_REMOVAL.forEach((field) => {
-    if (state[field] !== undefined) kept[field] = state[field];
-  });
-  await dbHelper.replaceOneInDatabase(database, appsRuntimeState, { identifier }, kept);
-}
-
-/**
  * Drops all runtime state for a component (on uninstall).
  *
  * @param {string} identifier
@@ -650,50 +196,6 @@ async function remove(rawIdentifier) {
   } catch (err) {
     log.error(`appsRuntimeState - failed to remove state for ${identifier}: ${err.message}`);
   }
-}
-
-/**
- * Records where this node put a component's volume image and the filesystem
- * UUID it stamped that image with.
- *
- * The node chooses the path and the UUID, so this is the node's own account of
- * its storage: what it made, and where. It belongs beside the other facts this
- * node observed about the component rather than on the installed-apps row,
- * which is the owner's signed specification.
- *
- * @param {string} identifier Component identifier or docker app id.
- * @param {string} volumeImagePath Absolute path of the image.
- * @param {string|null} volumeFsUuid Filesystem UUID inside the image.
- */
-async function setVolumeImage(identifier, volumeImagePath, volumeFsUuid) {
-  await setFields(identifier, { volumeImagePath, volumeFsUuid: volumeFsUuid || null });
-}
-
-/**
- * The volume image this node recorded for a component, or null when it has
- * none - every component installed before the record existed.
- *
- * THROWS when the record cannot be read. Null is "this node recorded no
- * image", and a caller acts on that by searching the disks and trusting what
- * it finds; a database that would not answer has not established that, and
- * answering null for it hands an unverified image the standing of a recorded
- * one. This does not go through getState for that reason.
- *
- * @param {string} rawIdentifier Component identifier or docker app id.
- * @returns {Promise<{path: string, fsUuid: string|null}|null>}
- * @throws When the state cannot be read.
- */
-async function getVolumeImage(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const database = collection();
-  const state = await dbHelper.findOneInDatabase(
-    database,
-    appsRuntimeState,
-    { identifier },
-    { projection: { _id: 0 } },
-  );
-  if (!state || !state.volumeImagePath) return null;
-  return { path: state.volumeImagePath, fsUuid: state.volumeFsUuid || null };
 }
 
 /**
@@ -721,49 +223,13 @@ async function prepareCollection() {
     // eslint-disable-next-line no-restricted-syntax
     for (const [identifier, twins] of byIdentifier) {
       if (twins.length > 1) {
-        // Oldest first, so every field any twin carries survives and the newest
-        // value of each wins. Fields scatter across twins - that is the whole
-        // reason this merge exists - so taking them from one document would
-        // drop exactly what the scatter put on the other, and a field added to
-        // this document later would be lost without ever being named here.
-        // What follows overrides the ones whose correct value is not simply
-        // "whichever was written last".
-        const oldestFirst = [...twins].sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
-        // The image record is one claim - that the file at this path carries
-        // this UUID - so it moves as a pair. Merged field-wise it could take
-        // the path from one twin and the stamp from another, and a record
-        // saying an image carries a UUID it never carried refuses that volume
-        // for good: the refusal returns before the line that would replace it.
-        const withImage = oldestFirst.filter((t) => t.volumeImagePath);
-        const image = withImage.length ? withImage[withImage.length - 1] : null;
         const merged = {
-          ...Object.assign({}, ...oldestFirst),
-          ...(image ? { volumeImagePath: image.volumeImagePath, volumeFsUuid: image.volumeFsUuid || null } : {}),
           identifier,
           // a lock anywhere is a lock: never auto-start a deliberately stopped app
           operatorStopped: twins.some((t) => t.operatorStopped === true),
-          // a force anywhere is a force: a kill must never be merged down into a
-          // graceful stop the operator did not ask for
-          operatorStopForce: twins.some((t) => t.operatorStopForce === true),
-          // a start waits on the election only if no locked twin withholds it: a
-          // stop without one is the operator's later word
-          operatorStartRequested: twins.some((t) => t.operatorStopped === true)
-            && twins.every((t) => t.operatorStopped !== true || t.operatorStartRequested === true),
-          // the highest request wins and the lowest actuation does, so a restart
-          // asked for on either doc still bounces the container once
-          restartGeneration: Math.max(0, ...twins.map((t) => t.restartGeneration || 0)),
-          actuatedRestartGeneration: Math.min(...twins.map((t) => t.actuatedRestartGeneration || 0)),
-          // likewise, a heal-removal anywhere means a heal may be mid-flight: keep
-          // the reconciler on the recreate path rather than the uninstall path
-          networkHealRemoval: twins.some((t) => t.networkHealRemoval === true),
-          networkHealHistory: [...new Set(twins.flatMap((t) => t.networkHealHistory || []))].sort((a, b) => a - b).slice(-MAX_HISTORY),
           restartHistory: [...new Set(twins.flatMap((t) => t.restartHistory || []))].sort((a, b) => a - b).slice(-MAX_HISTORY),
-          autoRestartWindow: [...new Set(twins.flatMap((t) => t.autoRestartWindow || []))].sort((a, b) => a - b).slice(-RESTART_BURST_COUNT),
           updatedAt: Math.max(...twins.map((t) => t.updatedAt || 0)),
         };
-        // the read projects _id away, but a spread of whatever the documents
-        // carry must not be the thing that reintroduces it into a $set
-        delete merged._id;
         const newestExit = twins.filter((t) => t.lastDiedAt !== undefined).sort((a, b) => b.lastDiedAt - a.lastDiedAt)[0];
         if (newestExit) {
           merged.lastExitCode = newestExit.lastExitCode;
@@ -786,29 +252,12 @@ module.exports = {
   prepareCollection,
   getState,
   setOperatorStopped,
-  requestOperatorStart,
-  releaseOperatorStart,
-  operatorStoppedOrThrow,
   isOperatorStopped,
-  operatorStopState,
-  operatorHeldIdentifiers,
   recordRestart,
-  requestRestart,
-  recordRestartGeneration,
   restartWaitMs,
-  setNetworkHealRemoval,
-  isNetworkHealRemoval,
-  recordNetworkHealAttempt,
-  networkHealWaitMs,
-  clearNetworkHeal,
   recordExit,
-  setVolumeImage,
-  getVolumeImage,
-  removeControllerState,
   remove,
   BACKOFF_DELAYS_MS,
   STABLE_RUN_MS,
   MAX_HISTORY,
-  RESTART_BURST_COUNT,
-  RESTART_BURST_WINDOW_MS,
 };

@@ -1,6 +1,7 @@
 const serviceHelper = require('../serviceHelper');
 const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
+const verificationHelper = require('../verificationHelper');
 const daemonServiceBlockchainRpcs = require('./daemonServiceBlockchainRpcs');
 
 let response = messageHelper.createErrorMessage();
@@ -25,7 +26,7 @@ async function createRawTransaction(req, res) {
   });
   if (!blockcount) {
     // getBlockCount rejected the promise - return error message
-    return res.json(response);
+    return res ? res.json(response) : response;
   }
   const defaultExpiryHeight = blockcount + 20;
   let { expiryheight } = req.params;
@@ -42,7 +43,7 @@ async function createRawTransaction(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -106,7 +107,7 @@ async function decodeRawTransaction(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -152,7 +153,7 @@ async function decodeScript(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -181,7 +182,51 @@ async function decodeScriptPost(req, res) {
   });
 }
 
+/**
+ * To fund raw transaction. Hex string required as parameter for RPC call.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function fundRawTransaction(req, res) {
+  let { hexstring } = req.params;
+  hexstring = hexstring || req.query.hexstring;
 
+  const rpccall = 'fundRawTransaction';
+  let rpcparameters = [];
+  if (hexstring) {
+    rpcparameters = [hexstring];
+  }
+  response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
+
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To fund raw transaction after data is processed. Hex string required as parameter for RPC call.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function fundRawTransactionPost(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    const processedBody = serviceHelper.ensureObject(body);
+    const { hexstring } = processedBody;
+
+    const rpccall = 'fundRawTransaction';
+    let rpcparameters = [];
+    if (hexstring) {
+      rpcparameters = [hexstring];
+    }
+    response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
+
+    return res.json(response);
+  });
+}
 
 /**
  * To get raw transaction. Transaction ID and verbose (defaults to value of 0) required as parameters for RPC call.
@@ -226,7 +271,7 @@ async function sendRawTransaction(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -258,7 +303,92 @@ async function sendRawTransactionPost(req, res) {
   });
 }
 
+/**
+ * To sign raw transaction. Hex string, previous transactions, private keys,
+ * signature hash type (defaults to ALL) and branch ID required as parameters for RPC call. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function signRawTransaction(req, res) {
+  let {
+    hexstring, prevtxs, privatekeys, sighashtype, branchid,
+  } = req.params;
+  hexstring = hexstring || req.query.hexstring;
+  prevtxs = prevtxs || req.query.prevtxs;
+  privatekeys = privatekeys || req.query.privatekeys;
+  sighashtype = sighashtype || req.query.sighashtype || 'ALL';
+  branchid = branchid || req.query.branchid;
 
+  const authorized = await verificationHelper.verifyPrivilege('admin', req);
+  if (authorized !== true) {
+    response = messageHelper.errUnauthorizedMessage();
+    return res ? res.json(response) : response;
+  }
+  const rpccall = 'signRawTransaction';
+  const rpcparameters = [];
+  if (hexstring) {
+    rpcparameters.push(hexstring);
+    if (prevtxs) {
+      prevtxs = serviceHelper.ensureObject(prevtxs);
+      rpcparameters.push(prevtxs);
+      if (privatekeys) {
+        privatekeys = serviceHelper.ensureObject(privatekeys);
+        rpcparameters.push(privatekeys);
+        rpcparameters.push(sighashtype);
+        if (branchid) {
+          rpcparameters.push(branchid);
+        }
+      }
+    }
+  }
+  response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To sign raw transaction after data is processed. Hex string, previous transactions, private keys,
+ *  signature hash type (defaults to all) and branch ID required as parameters for RPC call. Only accessible by admins.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message.
+ */
+async function signRawTransactionPost(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    const processedBody = serviceHelper.ensureObject(body);
+    const { hexstring, branchid } = processedBody;
+    let { prevtxs, privatekeys, sighashtype } = processedBody;
+    sighashtype = sighashtype || 'ALL';
+    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    if (authorized !== true) {
+      response = messageHelper.errUnauthorizedMessage();
+      return res.json(response);
+    }
+    const rpccall = 'signRawTransaction';
+    const rpcparameters = [];
+    if (hexstring) {
+      rpcparameters.push(hexstring);
+      if (prevtxs) {
+        prevtxs = serviceHelper.ensureObject(prevtxs);
+        rpcparameters.push(prevtxs);
+        if (privatekeys) {
+          privatekeys = serviceHelper.ensureObject(privatekeys);
+          rpcparameters.push(privatekeys);
+          rpcparameters.push(sighashtype);
+          if (branchid) {
+            rpcparameters.push(branchid);
+          }
+        }
+      }
+    }
+    response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
+    return res.json(response);
+  });
+}
 
 module.exports = {
   createRawTransaction,
@@ -267,7 +397,11 @@ module.exports = {
   decodeRawTransactionPost,
   decodeScript,
   decodeScriptPost,
+  fundRawTransaction,
+  fundRawTransactionPost,
   getRawTransaction,
   sendRawTransaction,
   sendRawTransactionPost,
+  signRawTransaction,
+  signRawTransactionPost,
 };

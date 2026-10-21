@@ -8,27 +8,22 @@ const messageStore = require('./appMessaging/messageStore');
 const verificationHelper = require('./verificationHelper');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
-const policyStore = require('./policyStore');
 const fluxCommunicationUtils = require('./fluxCommunicationUtils');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const messageHelper = require('./messageHelper');
-const { peerManager, PEER_SOURCE, CLOSE_CODES } = require('./utils/peerState');
-const { RUNNING_EXPIRY_MS } = require('./utils/appConstants');
+const dbHelper = require('./dbHelper');
+const { peerManager, PEER_SOURCE } = require('./utils/peerState');
+const { SIGTERM_EXPIRY_MS } = require('./utils/appConstants');
 const cacheManager = require('./utils/cacheManager').default;
 const networkStateService = require('./networkStateService');
 const nodeConfirmationService = require('./nodeConfirmationService');
-const {
-  extractIp, extractPort, normalizeSocketAddress, parseSocketAddress, socketAddressesMatch,
-} = require('./utils/socketAddressUtils');
+const { extractIp, extractPort, parseSocketAddress, socketAddressesMatch } = require('./utils/socketAddressUtils');
 const registryManager = require('./appDatabase/registryManager');
 const fluxEventBus = require('./utils/fluxEventBus');
 const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('./utils/appSyncEvents');
-const { INTENT } = require('./utils/messageIntent');
-const {
-  ROUTE, register, declaredIntent, handlerFor, isOrdered,
-} = require('./utils/messageRoutes');
+const globalAppsLocations = config.database.appsglobal.collections.appsLocations;
 
-const { announcementSeen, announcementStore, wsPeerCache } = cacheManager;
+const { messageCache, wsPeerCache } = cacheManager;
 
 /* const LRUTest = {
   max: 25000000, // 25M
@@ -42,7 +37,6 @@ const { FluxPeerManager, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES } = require(
 const { NAK_REASON, buildSyncSignatureMessage } = require('./utils/peerCodec');
 const { networkHealthMonitor } = require('./utils/NetworkHealthMonitor');
 const verifyPool = require('./utils/verifyPool');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const DISCOVERY = {
   maxOutbound: 14,
@@ -52,12 +46,6 @@ const DISCOVERY = {
   maxIterations: 100,
   connectionDelayMs: config.fluxapps.discoveryConnectionDelayMs ?? 500,
 };
-
-// How many events of a sync response are carried through verification and
-// storage together. A response holds up to 2500, and each event fans out into a
-// database operation per app it reports, so the whole response is never held at
-// once.
-const SYNC_EVENTS_PER_SLICE = 250;
 
 /**
  * To handle temporary app messages.
@@ -73,7 +61,13 @@ async function handleAppMessages(message, fromIP, port) {
     const rebroadcastToPeers = await messageStore.storeAppTemporaryMessage(message.data);
     if (rebroadcastToPeers === true) {
       fluxEventBus.publish('network:appmessage', { hash: message.data.hash, type: message.data.type, name: message.data.appSpecifications?.name });
-      announceToPeers(message, `${fromIP}:${port}`);
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
@@ -83,38 +77,57 @@ async function handleAppMessages(message, fromIP, port) {
 async function batchVerifyBroadcasts(broadcasts, label) {
   if (broadcasts.length === 0) return [];
 
-  const { VerifyResult } = fluxCommunicationUtils;
-  const verdicts = await fluxCommunicationUtils.verifyBroadcasts(broadcasts, {
-    verifySignatures: (items) => verifyPool.verify(items),
-  });
-  const verified = broadcasts.filter((broadcast, i) => verdicts[i].result === VerifyResult.OK);
-  const signatureFailures = verdicts.filter(({ result }) => result === VerifyResult.BAD_SIGNATURE).length;
-  const nodeCheckFailures = broadcasts.length - verified.length - signatureFailures;
-
-  if (nodeCheckFailures > 0) {
-    log.warn(`${label} - ${nodeCheckFailures} broadcasts failed node lookup`);
+  const items = [];
+  const nodeCheckFailed = new Set();
+  for (let i = 0; i < broadcasts.length; i++) {
+    const b = broadcasts[i];
+    const { pubKey, timestamp, signature, version, data: payload } = b;
+    if (version !== 1 || !pubKey || !timestamp || !signature || !payload) {
+      nodeCheckFailed.add(i);
+      continue;
+    }
+    const { type: msgType } = payload;
+    let target = payload.ip ?? payload.oldIP;
+    if (!target && msgType) {
+      target = await networkStateService.getFluxnodesByPubkey(pubKey);
+    }
+    if (!target) { nodeCheckFailed.add(i); continue; }
+    if (target instanceof Map) {
+      // pubkey lookup — node exists in network
+    } else {
+      const node = await networkStateService.getFluxnodeBySocketAddress(target);
+      if (!node) { nodeCheckFailed.add(i); continue; }
+      if (node.pubkey !== pubKey) { nodeCheckFailed.add(i); continue; }
+    }
+    const message = serviceHelper.ensureString(payload);
+    items.push({ index: i, messageToVerify: String(version) + message + String(timestamp), pubKey, signature });
   }
 
-  log.info(`${label} - Verified ${verified.length}/${broadcasts.length} broadcasts (${nodeCheckFailures} node lookup failures, ${signatureFailures} signature failures)`);
+  if (nodeCheckFailed.size > 0) {
+    log.warn(`${label} - ${nodeCheckFailed.size} broadcasts failed node lookup`);
+  }
+
+  if (items.length === 0) return [];
+
+  const workerItems = items.map((it) => ({ messageToVerify: it.messageToVerify, pubKey: it.pubKey, signature: it.signature }));
+  const cryptoResults = await verifyPool.verify(workerItems);
+
+  const verified = [];
+  for (let i = 0; i < items.length; i++) {
+    if (cryptoResults[i]) {
+      verified.push(broadcasts[items[i].index]);
+    }
+  }
+
+  log.info(`${label} - Verified ${verified.length}/${broadcasts.length} broadcasts (${nodeCheckFailed.size} node lookup failures, ${items.length - verified.length} signature failures)`);
   return verified;
 }
 
-async function handleTempSyncResponse(message, peerSocket) {
+async function handleTempSyncResponse(message, peerKey) {
   try {
-    if (!peerManager.isSyncResponseWanted(peerSocket)) return;
-    const peerKey = peerSocket.key;
+    if (!peerManager.isSyncRequested(peerKey)) return;
     if (!message.data || message.data.type !== 'fluxapptempsync') return;
-    const { messages, done, refused } = message.data;
-    // A peer whose own app state is not authoritative holds an unknown fraction
-    // of the network's pending registrations, and says so rather than sending
-    // the fraction. A refusal is an answer and not a completion - see
-    // handleAppRunningSyncResponse - and a peer refuses all four streams or
-    // none, so whichever refusal arrives first ends the request.
-    if (refused) {
-      log.info(`handleTempSyncResponse - ${peerKey} declined: its app state is not authoritative yet`);
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_REFUSED, 'apptemp', peerKey);
-      return;
-    }
+    const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleTempSyncResponse - Received ${messages.length} temp messages from ${peerKey} (done: ${!!done})`);
     let stored = 0;
@@ -127,142 +140,81 @@ async function handleTempSyncResponse(message, peerSocket) {
       }
     }
     log.info(`handleTempSyncResponse - Processed ${stored} of ${messages.length} messages`);
-    // COUNTED LIKE THE REST. A peer is credited once it has delivered every
-    // stream it was asked for, so the record that admits its responses stays
-    // open until this one has ended too - the three surveys finishing first no
-    // longer cuts off what is still arriving here.
-    if (done) {
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apptemp', peerKey);
-      log.info('handleTempSyncResponse - Sync complete');
-    }
   } catch (error) {
     log.error(error);
   }
 }
 
-async function handleAppRunningSyncResponse(message, peerSocket) {
+async function handleAppRunningSyncResponse(message, peerKey) {
   try {
     if (!message.data || message.data.type !== 'fluxapprunningsync') return;
-    if (!peerManager.isSyncResponseWanted(peerSocket)) return;
-    const peerKey = peerSocket.key;
-    const { messages, done, refused } = message.data;
-    // A peer that says its own app state is not worth surveying has ANSWERED,
-    // and the answer is not a completion. Marking it declined stops it being
-    // offered again on this connection, which opens a deficit in the pool of
-    // outstanding requests and gets another peer asked.
-    if (refused) {
-      log.info(`handleAppRunningSyncResponse - ${peerKey} declined: its app state is not authoritative yet`);
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_REFUSED, 'apprunning', peerKey);
-      return;
-    }
+    if (!peerManager.isSyncRequested(peerKey)) return;
+    const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppRunningSyncResponse - Received ${messages.length} events from ${peerKey} (done: ${!!done})`);
 
-    // A sync response is processed a slice at a time. Verifying and storing the
-    // whole response at once holds the events, their verification copies and the
-    // database encoding of every location update in memory together, which is
-    // what made a single response cost hundreds of megabytes that were never
-    // returned to the OS.
-    // Evictions are applied ahead of the other state events, as they were
-    // before this response was processed in slices.
-    const evictions = [];
-    const stateEvents = [];
-    // Which apps a node still runs is only known from its newest broadcast in
-    // the whole response, so pruning cannot be decided from inside a slice. Only
-    // verified broadcasts count - pruning deletes rows, and an unsigned event
-    // must never be able to do that.
-    const newestByIp = new Map();
-    let locationWriteFailed = false;
-
-    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
-      const appRunningBroadcasts = [];
-      const otherBroadcasts = [];
-      const evictedEvents = [];
-      for (const event of slice) {
-        if (event.envelope && event.type === 'apprunning') {
-          appRunningBroadcasts.push({ ...event.envelope, data: event.data });
-        } else if (event.type === 'evicted') {
-          // Evicted events lack per-event signatures because they are generated
-          // locally by nodeStatusMonitor, which makes non-deterministic HTTP
-          // probe decisions about whether a remote node is alive. The
-          // isSyncResponseWanted check above ensures only solicited responses are
-          // processed, but a compromised confirmed peer we sync from could still
-          // include fake evictions. Impact is limited: only affects this node's
-          // view and self-heals on the next apprunning broadcast (≤60 min).
-          //
-          // The root cause is nodeStatusMonitor itself — it will be replaced by
-          // a peer quorum approach where eviction is determined by consensus of
-          // signed "peer unreachable" events (3 missed pongs on the WebSocket
-          // layer). Once that lands, evicted events will carry verifiable
-          // signatures and this path will verify them like all other event types.
-          evictedEvents.push(event);
-        } else if (event.envelope) {
-          otherBroadcasts.push(event);
-        }
+    const appRunningBroadcasts = [];
+    const otherBroadcasts = [];
+    const evictedEvents = [];
+    for (const event of messages) {
+      if (event.envelope && event.type === 'apprunning') {
+        appRunningBroadcasts.push({ ...event.envelope, data: event.data });
+      } else if (event.type === 'evicted') {
+        // Evicted events lack per-event signatures because they are generated
+        // locally by nodeStatusMonitor, which makes non-deterministic HTTP
+        // probe decisions about whether a remote node is alive. The
+        // isSyncRequested check above ensures only solicited responses are
+        // processed, but a compromised confirmed peer we sync from could still
+        // include fake evictions. Impact is limited: only affects this node's
+        // view and self-heals on the next apprunning broadcast (≤60 min).
+        //
+        // The root cause is nodeStatusMonitor itself — it will be replaced by
+        // a peer quorum approach where eviction is determined by consensus of
+        // signed "peer unreachable" events (3 missed pongs on the WebSocket
+        // layer). Once that lands, evicted events will carry verifiable
+        // signatures and this path will verify them like all other event types.
+        evictedEvents.push(event);
+      } else if (event.envelope) {
+        otherBroadcasts.push(event);
       }
-
-      const verifiedAppRunning = await batchVerifyBroadcasts(appRunningBroadcasts, 'handleAppRunningSyncResponse');
-
-      const otherToVerify = otherBroadcasts.map((e) => ({ ...e.envelope, data: e.data }));
-      const verifiedOther = await batchVerifyBroadcasts(otherToVerify, 'handleAppRunningSyncResponse');
-      const verifiedOtherSet = new Set(verifiedOther);
-      evictions.push(...evictedEvents);
-      for (let i = 0; i < otherBroadcasts.length; i++) {
-        if (verifiedOtherSet.has(otherToVerify[i])) {
-          stateEvents.push(otherBroadcasts[i]);
-        }
-      }
-
-      for (const broadcast of verifiedAppRunning) {
-        const { data } = broadcast;
-        if (!data || data.version !== 2 || !Array.isArray(data.apps) || !data.apps.length) continue;
-        // Skipped for the same reason messageStore skips it when it builds this
-        // map itself: an expired broadcast is not evidence of what an IP is
-        // running now. The prune it feeds only deletes rows at or below the
-        // broadcast's own timestamp, so an expired one could only ever take
-        // already-expired rows - but that is a bound to be read out of another
-        // file, and two builders of one input should not need reconciling.
-        if (data.broadcastedAt + RUNNING_EXPIRY_MS < Date.now()) continue;
-        const seen = newestByIp.get(data.ip);
-        if (!seen || data.broadcastedAt > seen.broadcastedAt) {
-          newestByIp.set(data.ip, { names: data.apps.map((a) => a.name), broadcastedAt: data.broadcastedAt });
-        }
-      }
-
-      if (verifiedAppRunning.length > 0) {
-        const { stored, writeFailed } = await messageStore.storeBatchAppRunningMessages(verifiedAppRunning);
-        if (writeFailed) locationWriteFailed = true;
-        log.info(`handleAppRunningSyncResponse - Stored ${stored} of ${verifiedAppRunning.length} verified apprunning events`);
-        fluxEventBus.publish('sync:chunkVerified', { syncType: 'apprunning', peer: peerKey, verified: verifiedAppRunning.length, stored });
-      }
-    });
-
-    if (locationWriteFailed) {
-      log.warn('handleAppRunningSyncResponse - skipping location pruning, a location write failed');
-    } else {
-      await messageStore.pruneAppRunningLocations(newestByIp);
     }
 
-    // Applied after every slice, once every apprunning row in the response is
-    // stored. Each event removes, shortens or carries only the rows broadcast
-    // before it. An eviction's time is createdAt, when the evicting node made it.
-    for (const event of [...evictions, ...stateEvents]) {
+    const verifiedAppRunning = await batchVerifyBroadcasts(appRunningBroadcasts, 'handleAppRunningSyncResponse');
+
+    const otherToVerify = otherBroadcasts.map((e) => ({ ...e.envelope, data: e.data }));
+    const verifiedOther = await batchVerifyBroadcasts(otherToVerify, 'handleAppRunningSyncResponse');
+    const verifiedOtherSet = new Set(verifiedOther);
+    const otherEvents = [...evictedEvents];
+    for (let i = 0; i < otherBroadcasts.length; i++) {
+      if (verifiedOtherSet.has(otherToVerify[i])) {
+        otherEvents.push(otherBroadcasts[i]);
+      }
+    }
+
+    if (verifiedAppRunning.length > 0) {
+      const { stored } = await messageStore.storeBatchAppRunningMessages(verifiedAppRunning);
+      log.info(`handleAppRunningSyncResponse - Stored ${stored} of ${verifiedAppRunning.length} verified apprunning events`);
+      fluxEventBus.publish('sync:chunkVerified', { syncType: 'apprunning', peer: peerKey, verified: verifiedAppRunning.length, stored });
+    }
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    for (const event of otherEvents) {
       if (event.type === 'sigterm') {
         await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
-        await messageStore.expireLocationsForSigterm(event.data.ip, event.data.broadcastedAt);
+        const newExpireAt = new Date(event.data.broadcastedAt + SIGTERM_EXPIRY_MS);
+        await dbHelper.updateInDatabase(database, globalAppsLocations, { ip: event.data.ip }, { $set: { expireAt: newExpireAt } });
       } else if (event.type === 'appremoved') {
         await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
-        await messageStore.removeLocationForAppRemoved(event.data.ip, event.data.appName, event.data.broadcastedAt);
+        await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, { ip: event.data.ip, name: event.data.appName }, {});
       } else if (event.type === 'evicted') {
-        await messageStore.applyEviction(event.ip, Date.parse(event.createdAt));
+        await messageStore.storeAppStateEvent(event.type, { ip: event.ip });
+        await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, { ip: event.ip });
       } else if (event.type === 'ipchanged') {
         await messageStore.storeAppStateEvent(event.type, { message: event.data, envelope: event.envelope });
-        await messageStore.storeIPChangedMessage(event.data);
       }
     }
-
     if (done) {
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apprunning', peerKey);
+      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apprunning');
       log.info('handleAppRunningSyncResponse - Sync complete');
     }
   } catch (error) {
@@ -270,29 +222,21 @@ async function handleAppRunningSyncResponse(message, peerSocket) {
   }
 }
 
-async function handleAppInstallingSyncResponse(message, peerSocket) {
+async function handleAppInstallingSyncResponse(message, peerKey) {
   try {
-    if (!peerManager.isSyncResponseWanted(peerSocket)) return;
-    const peerKey = peerSocket.key;
+    if (!peerManager.isSyncRequested(peerKey)) return;
     if (!message.data || message.data.type !== 'fluxappinstallingsync') return;
-    const { messages, done, refused } = message.data;
-    // A refusal is an answer and not a completion - see handleAppRunningSyncResponse.
-    if (refused) {
-      log.info(`handleAppInstallingSyncResponse - ${peerKey} declined: its app state is not authoritative yet`);
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_REFUSED, 'appinstalling', peerKey);
-      return;
-    }
+    const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppInstallingSyncResponse - Received ${messages.length} broadcasts from ${peerKey} (done: ${!!done})`);
-    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
-      const verified = await batchVerifyBroadcasts(slice, 'handleAppInstallingSyncResponse');
-      if (verified.length === 0) return;
+    const verified = await batchVerifyBroadcasts(messages, 'handleAppInstallingSyncResponse');
+    if (verified.length > 0) {
       const { stored } = await messageStore.storeBatchAppInstallingMessages(verified);
       log.info(`handleAppInstallingSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
       fluxEventBus.publish('sync:chunkVerified', { syncType: 'appinstalling', peer: peerKey, verified: verified.length, stored });
-    });
+    }
     if (done) {
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'appinstalling', peerKey);
+      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'appinstalling');
       log.info('handleAppInstallingSyncResponse - Sync complete');
     }
   } catch (error) {
@@ -300,29 +244,21 @@ async function handleAppInstallingSyncResponse(message, peerSocket) {
   }
 }
 
-async function handleAppInstallingErrorsSyncResponse(message, peerSocket) {
+async function handleAppInstallingErrorsSyncResponse(message, peerKey) {
   try {
-    if (!peerManager.isSyncResponseWanted(peerSocket)) return;
-    const peerKey = peerSocket.key;
+    if (!peerManager.isSyncRequested(peerKey)) return;
     if (!message.data || message.data.type !== 'fluxappinstallingerrorssync') return;
-    const { messages, done, refused } = message.data;
-    // A refusal is an answer and not a completion - see handleAppRunningSyncResponse.
-    if (refused) {
-      log.info(`handleAppInstallingErrorsSyncResponse - ${peerKey} declined: its app state is not authoritative yet`);
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_REFUSED, 'apperrors', peerKey);
-      return;
-    }
+    const { messages, done } = message.data;
     if (!Array.isArray(messages) || messages.length > 2500) return;
     log.info(`handleAppInstallingErrorsSyncResponse - Received ${messages.length} broadcasts from ${peerKey} (done: ${!!done})`);
-    await serviceHelper.processInSlices(messages, SYNC_EVENTS_PER_SLICE, async (slice) => {
-      const verified = await batchVerifyBroadcasts(slice, 'handleAppInstallingErrorsSyncResponse');
-      if (verified.length === 0) return;
+    const verified = await batchVerifyBroadcasts(messages, 'handleAppInstallingErrorsSyncResponse');
+    if (verified.length > 0) {
       const { stored } = await messageStore.storeBatchAppInstallingErrorMessages(verified);
       log.info(`handleAppInstallingErrorsSyncResponse - Stored ${stored} of ${verified.length} verified broadcasts`);
       fluxEventBus.publish('sync:chunkVerified', { syncType: 'apperrors', peer: peerKey, verified: verified.length, stored });
-    });
+    }
     if (done) {
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apperrors', peerKey);
+      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_COMPLETE, 'apperrors');
       log.info('handleAppInstallingErrorsSyncResponse - Sync complete');
     }
   } catch (error) {
@@ -330,29 +266,9 @@ async function handleAppInstallingErrorsSyncResponse(message, peerSocket) {
   }
 }
 
-/**
- * Tell peers this node holds a message, and keep it for whichever of them asks.
- *
- * The store is written here rather than at dispatch because this is where a message
- * becomes something a peer can ask for: a request follows an announcement, and only a
- * verified message reaches a handler. Nothing this node never announced is ever asked
- * of it, so nothing else needs keeping.
- * @param {object} message The verified signed envelope, as it will be handed over.
- * @param {string} excludeKey The peer it came from, which has it already.
- */
-function announceToPeers(message, excludeKey) {
-  const messageHash = hash(message.data);
-  announcementStore.set(messageHash, message);
-  peerManager.broadcastHash(messageHash, excludeKey);
-}
-
 async function handleCheckMessageHashPresent(messageHash, fromIP, port) {
   try {
-    noteOwnMoveHeardBack(messageHash);
-    // The filter, not the store: the question is whether this node already has the
-    // message, and it has plenty it never announced - anything the database already
-    // held when it arrived. Asking the store would re-request those.
-    if (!announcementSeen.has(messageHash)) {
+    if (!messageCache.has(messageHash)) {
       peerManager.sendHashRequest(`${fromIP}:${port}`, messageHash);
     }
   } catch (error) {
@@ -369,11 +285,8 @@ async function handleCheckMessageHashPresent(messageHash, fromIP, port) {
  */
 async function handleRequestMessageHash(messageHash, fromIP, port) {
   try {
-    // The store, not the filter: this hands the message over, so it needs the message.
-    // A request follows an announcement, so what a peer can ask for is what this node
-    // announced, which is exactly what the store holds.
-    if (announcementStore.has(messageHash)) {
-      const message = announcementStore.get(messageHash);
+    if (messageCache.has(messageHash)) {
+      const message = messageCache.get(messageHash);
       if (message) {
         const messageString = serviceHelper.ensureString(message);
         const peer = peerManager.get(`${fromIP}:${port}`);
@@ -403,7 +316,13 @@ async function handleAppRunningMessage(message, fromIP, port) {
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
     if (result.rebroadcast && timestampOK) {
-      announceToPeers(message, `${fromIP}:${port}`);
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
@@ -420,19 +339,19 @@ async function handleAppInstallingMessage(message, fromIP, port) {
   try {
     const rebroadcastToPeers = await messageStore.storeAppInstallingMessage(message.data);
     if (rebroadcastToPeers === true) {
-      // Version 2 withdraws the sender's claim rather than recording one and
-      // arrives through this handler too, so the event names which it was.
-      fluxEventBus.publish('network:appinstalling', {
-        ip: message.data.ip,
-        name: message.data.name,
-        withdrawn: message.data.withdrawn === true,
-      });
+      fluxEventBus.publish('network:appinstalling', { ip: message.data.ip, name: message.data.name });
     }
     messageStore.storeSignedAppInstallingBroadcast(message);
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp);
     if (rebroadcastToPeers === true && timestampOK) {
-      announceToPeers(message, `${fromIP}:${port}`);
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
@@ -455,212 +374,17 @@ async function handleAppInstallingErrorMessage(message, fromIP, port) {
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp);
     if (rebroadcastToPeers === true && timestampOK) {
-      announceToPeers(message, `${fromIP}:${port}`);
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
   }
-}
-
-/**
- * Record this node's own address move the way its peers record it: the signed
- * ipchanged event, and its location rows carried to the new address. Its own
- * broadcast reaches it only if a peer happens to relay it back, so without this
- * the one node that moved would be the one that cannot follow the move - it
- * would read FDM naming its old IP, for the minute or two FDM takes to catch up,
- * as another node holding its primary. Carrying its rows also keeps the
- * runningSince it announces, and with it its place in every app's order.
- * @param {string} oldIp This node's former socket address.
- * @param {string} newIp Its new socket address.
- * @param {number} broadcastedAt When the move was made (ms).
- */
-async function recordOwnAddressMove(oldIp, newIp, broadcastedAt) {
-  const move = {
-    type: 'fluxipchanged', version: 1, oldIP: oldIp, newIP: newIp, broadcastedAt,
-  };
-  const signed = await fluxCommunicationMessagesSender.serialiseAndSignFluxBroadcast(move);
-  if (!signed) {
-    log.warn(`recordOwnAddressMove - this node cannot sign as itself; its move from ${oldIp} to ${newIp} is not recorded`);
-    return;
-  }
-  const {
-    version, timestamp, pubKey, signature,
-  } = JSON.parse(signed);
-  await messageStore.storeAppStateEvent(messageStore.APP_STATE_EVENT_TYPES.IPCHANGED, {
-    message: move, envelope: { version, timestamp, pubKey, signature },
-  });
-  await messageStore.storeIPChangedMessage(move);
-}
-
-// A signed copy of a move is re-signed once it is this old, so a peer it reaches
-// still has at least half of the relay window (verifyTimestampInFluxBroadcast's
-// 240s in handleIPChangedMessage) to pass it on.
-const OWN_MOVE_RESIGN_MS = 120 * 1000;
-
-// This node's moves still being told to the network: each is sent to every peer
-// as it connects, and dropped once a peer announces it back or it is too old to
-// be applied. A move keeps the time it was made however often it is signed: that
-// time decides which rows it carries and where it falls among the node's moves.
-// `recordedLoaded` is whether the moves recorded before this process started
-// have been read yet.
-const pendingOwnMoves = [];
-let sendingOwnMoves = false;
-let recordedLoaded = true;
-
-/**
- * Sign a move afresh: a new envelope timestamp over the same move.
- * @param {object} move A pending move.
- * @returns {Promise<void>}
- */
-async function signOwnMove(move) {
-  const signed = await fluxCommunicationMessagesSender.serialiseAndSignFluxBroadcast(move.data);
-  if (!signed) return;
-  /* eslint-disable no-param-reassign */
-  move.signed = signed;
-  move.signedAt = Date.now();
-  /* eslint-enable no-param-reassign */
-}
-
-function addPendingOwnMove(oldIp, newIp, broadcastedAt) {
-  const known = pendingOwnMoves.some((move) => socketAddressesMatch(move.oldIp, oldIp) && socketAddressesMatch(move.newIp, newIp));
-  if (!known) {
-    const data = {
-      type: 'fluxipchanged', version: 1, oldIP: oldIp, newIP: newIp, broadcastedAt,
-    };
-    pendingOwnMoves.push({
-      oldIp, newIp, data, hash: hash(data), signed: null, signedAt: 0,
-    });
-  }
-}
-
-/**
- * Drops the pending moves too old for a peer to apply.
- * @returns {void}
- */
-function dropExpiredOwnMoves() {
-  const now = Date.now();
-  for (let i = pendingOwnMoves.length - 1; i >= 0; i -= 1) {
-    const move = pendingOwnMoves[i];
-    if (now - move.data.broadcastedAt >= messageStore.IP_CHANGED_VALIDITY_MS) {
-      pendingOwnMoves.splice(i, 1);
-      log.info(`Address move from ${move.oldIp} to ${move.newIp} is too old to be applied - no longer sent`);
-    }
-  }
-}
-
-/**
- * The moves this node signed to the address it holds now, read once per
- * process: a restart between noticing a move and the network hearing it would
- * otherwise leave the network without it. A move to this address that another
- * key signed is the previous holder's.
- */
-async function loadRecordedOwnMoves() {
-  recordedLoaded = true;
-  try {
-    const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    const ownKey = await fluxNetworkHelper.getFluxNodePublicKey();
-    if (!ownKey) return;
-    const recorded = await registryManager.addressMovesTo(localSocketAddr);
-    // eslint-disable-next-line no-restricted-syntax
-    for (const [oldIp, { to, at, signer }] of recorded) {
-      if (signer === ownKey) addPendingOwnMove(oldIp, to, at);
-    }
-  } catch (error) {
-    log.warn(`loadRecordedOwnMoves - this node's recorded moves cannot be read: ${error.message}`);
-  }
-}
-
-/**
- * Send every pending move to a peer that has just connected.
- * @param {string} peerKey
- */
-async function sendOwnMovesTo(peerKey) {
-  if (!recordedLoaded) await loadRecordedOwnMoves();
-  dropExpiredOwnMoves();
-  const peer = peerManager.get(peerKey);
-  if (!peer) return;
-  // eslint-disable-next-line no-restricted-syntax
-  for (const move of pendingOwnMoves) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      if (!move.signed || Date.now() - move.signedAt > OWN_MOVE_RESIGN_MS) await signOwnMove(move);
-      if (move.signed && peer.send(move.signed)) {
-        log.info(`Address move from ${move.oldIp} to ${move.newIp} sent to ${peerKey}`);
-      }
-    } catch (error) {
-      log.error(`sendOwnMovesTo - the move from ${move.oldIp} to ${move.newIp} could not be sent to ${peerKey}: ${error.message}`);
-    }
-  }
-  if (!pendingOwnMoves.length) stopSendingOwnMoves();
-}
-
-function startSendingOwnMoves() {
-  if (sendingOwnMoves) return;
-  sendingOwnMoves = true;
-  peerManager.on('peerConnected', sendOwnMovesTo);
-}
-
-function stopSendingOwnMoves() {
-  if (!sendingOwnMoves) return;
-  sendingOwnMoves = false;
-  peerManager.off('peerConnected', sendOwnMovesTo);
-}
-
-/**
- * A peer announced, or relayed, a message this node holds the hash of. When it
- * is one of this node's own moves, the move has gone further than the peers
- * this node sent it to - a peer never announces a message back to the one it
- * had it from - and gossip is carrying it: it is no longer sent.
- * @param {string} messageHash
- * @returns {boolean} Whether it was one of this node's moves.
- */
-function noteOwnMoveHeardBack(messageHash) {
-  const index = pendingOwnMoves.findIndex((move) => move.hash === messageHash);
-  if (index === -1) return false;
-  const [move] = pendingOwnMoves.splice(index, 1);
-  log.info(`Address move from ${move.oldIp} to ${move.newIp} heard back from the network - no longer sent`);
-  if (!pendingOwnMoves.length) stopSendingOwnMoves();
-  return true;
-}
-
-/**
- * Tell the network that this node moved. Every connection it holds was made to
- * its old address and carries nothing now, so all of them are dropped; the move
- * goes to each peer as it connects at the new address, until one announces it
- * back.
- * @param {string} oldIp This node's former socket address.
- * @param {string} newIp Its new socket address.
- * @param {number} broadcastedAt When the move was made (ms).
- */
-function announceOwnAddressMove(oldIp, newIp, broadcastedAt) {
-  addPendingOwnMove(oldIp, newIp, broadcastedAt);
-  peerManager.dropAllConnections();
-  startSendingOwnMoves();
-}
-
-/**
- * Record this node's own move and announce it, once: a move already recorded
- * at the time it was made is left as it is, since the network hears it from
- * the pending move or, after a restart, from the moves sent at startup. What
- * serviceManager wires to fluxNetworkHelper's address-moved seam.
- * @param {string} oldIp This node's former socket address.
- * @param {string} newIp Its new socket address.
- * @param {number} broadcastedAt When the move was made (ms).
- */
-async function handleOwnAddressMove(oldIp, newIp, broadcastedAt) {
-  const recorded = (await registryManager.addressMovesFrom([oldIp])).get(normalizeSocketAddress(oldIp));
-  if (recorded && recorded.at === broadcastedAt && socketAddressesMatch(recorded.to, newIp)) return;
-  await recordOwnAddressMove(oldIp, newIp, broadcastedAt);
-  announceOwnAddressMove(oldIp, newIp, broadcastedAt);
-}
-
-/**
- * At startup, send the moves this node recorded to the address it holds now to
- * each peer as it connects, until one announces it back.
- */
-function announceRecordedOwnMovesWhenConnected() {
-  recordedLoaded = false;
-  startSendingOwnMoves();
 }
 
 /**
@@ -671,19 +395,22 @@ function announceRecordedOwnMovesWhenConnected() {
  */
 async function handleIPChangedMessage(message, fromIP, port) {
   try {
-    noteOwnMoveHeardBack(hash(message.data));
     const envelope = { version: message.version, timestamp: message.timestamp, pubKey: message.pubKey, signature: message.signature };
     await messageStore.storeAppStateEvent(messageStore.APP_STATE_EVENT_TYPES.IPCHANGED, { message: message.data, envelope });
-    // storeIPChangedMessage answers true, false for a move too old to apply, or an
-    // Error for one it refused - only true is a move worth passing on
     const rebroadcastToPeers = await messageStore.storeIPChangedMessage(message.data);
-    if (rebroadcastToPeers === true) {
+    if (rebroadcastToPeers) {
       fluxEventBus.publish('network:ipchanged', { oldIP: message.data.oldIP, newIP: message.data.newIP });
     }
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
-    if (rebroadcastToPeers === true && timestampOK) {
-      announceToPeers(message, `${fromIP}:${port}`);
+    if (rebroadcastToPeers && timestampOK) {
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
@@ -702,16 +429,20 @@ async function handleAppRemovedMessage(message, fromIP, port) {
     // rebroadcast message to the network if it's valid
     const envelope = { version: message.version, timestamp: message.timestamp, pubKey: message.pubKey, signature: message.signature };
     await messageStore.storeAppStateEvent(messageStore.APP_STATE_EVENT_TYPES.APPREMOVED, { message: message.data, envelope });
-    // storeAppRemovedMessage answers true, false for a removal too old to apply, or
-    // an Error for one it refused - only true is a removal worth passing on
     const rebroadcastToPeers = await messageStore.storeAppRemovedMessage(message.data);
-    if (rebroadcastToPeers === true) {
+    if (rebroadcastToPeers) {
       fluxEventBus.publish('network:appremoved', { ip: message.data.ip, name: message.data.appName });
     }
     const currentTimeStamp = Date.now();
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(message, currentTimeStamp, 240000);
-    if (rebroadcastToPeers === true && timestampOK) {
-      announceToPeers(message, `${fromIP}:${port}`);
+    if (rebroadcastToPeers && timestampOK) {
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const daemonHeight = syncStatus.data.height || 0;
+      if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+        peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+      } else {
+        fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+      }
     }
   } catch (error) {
     log.error(error);
@@ -750,10 +481,21 @@ async function handleNodeSigtermMessage(message, fromIP, port) {
     await messageStore.storeAppStateEvent(messageStore.APP_STATE_EVENT_TYPES.SIGTERM, { message: message.data, envelope });
     fluxEventBus.publish('network:sigterm', { ip });
 
-    await messageStore.expireLocationsForSigterm(ip, broadcastedAt);
+    const db = dbHelper.databaseConnection();
+    const database = db.db(config.database.appsglobal.database);
+    const newExpireAt = new Date(broadcastedAt + SIGTERM_EXPIRY_MS);
+    const update = { $set: { expireAt: newExpireAt } };
+    const query = { ip };
+    await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
 
     // Rebroadcast to other peers
-    announceToPeers(message, `${fromIP}:${port}`);
+    const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+    const daemonHeight = syncStatus.data.height || 0;
+    if (daemonHeight >= config.messagesBroadcastRefactorStart) {
+      peerManager.broadcastHash(hash(message.data), `${fromIP}:${port}`);
+    } else {
+      fluxCommunicationMessagesSender.relay(serviceHelper.ensureString(message), `${fromIP}:${port}`);
+    }
   } catch (error) {
     log.error(error);
   }
@@ -766,24 +508,8 @@ async function handleNodeSigtermMessage(message, fromIP, port) {
  * @param {object} msgObj Parsed message object.
  * @param {import('./utils/FluxPeerSocket').FluxPeerSocket} peerSocket FluxPeerSocket instance.
  */
-// Only an announcement is a fact whose identity is its payload, so only an announcement
-// is deduplicated. An ask and an answer are about the two nodes exchanging them, and
-// `hash(data)` throws the sender away - see utils/messageIntent for the table.
-//
-// THE FILTER WAS NEVER WHAT BOUNDED THESE. It keys on the payload, which a peer sending a
-// question controls: varying the hash on a fluxapprequest defeats it in one line. What it
-// suppresses is accidental duplicates, which is the job it is for. The per-peer bound is
-// FluxPeerSocket's inbound token bucket - lruRateLimit(ip:port, 120), applied to every
-// frame before dispatch.
-//
-// That bucket counts messages, not bytes, and a ~60-byte fluxpolicyrequest draws a whole
-// bundle back. It is still not a reflection vector: these arrive on an established
-// websocket, so the sender cannot be spoofed and receives every byte it asks for. A peer
-// can make this node serve it quickly; it cannot make this node serve anyone else. If a
-// byte budget is ever wanted it belongs in lruRateLimit, covering every type, not in a
-// second counter here.
-
 async function dispatchFluxMessage(msgObj, peerSocket) {
+  const isOutbound = peerSocket.direction === DIRECTION.OUTBOUND;
   const codes = peerSocket.closeCodes;
   const {
     pubKey, timestamp, signature, version, data,
@@ -830,31 +556,13 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
     return;
   }
 
+  // check if we have the message in cache. If yes, return false. If not, store it and continue
   await serviceHelper.delay(Math.floor(Math.random() * 75 + 1));
-  // Also what a NAK names further down, so it is computed for every message.
   const messageHash = hash(msgObj.data);
-  // THE FILTER IS FOR MESSAGES THAT REACH THIS NODE BY MORE THAN ONE ROUTE, WHICH IS WHAT
-  // MAKES CONTENT THEIR IDENTITY. A relayed announcement arriving three ways is one fact and
-  // acting once is the point. Everything else is point to point, so it reaches this node once
-  // per peer that sends it, and two peers sending the same bytes are two peers rather than
-  // one fact twice. Filtering those on content discards every sender after the first, which
-  // for a message whose whole meaning is "ask me" discards the only thing it carries.
-  //
-  // The TYPE decides, never the message: one that chose for itself could opt out of the
-  // filter by saying so, and a relayed type doing that is a flood every honest node joins in.
-  //
-  // CLAIMED BEFORE VERIFICATION, HELD ONLY BY A MESSAGE THAT EARNED IT. The filter runs first
-  // because that is what bounds the cost of verifying a flood of copies. But a message that
-  // does not go on to verify was never established as anything, and a hash it leaves behind
-  // suppresses the genuine message that hashes the same. So the slot is released on every
-  // path that does not reach a handler, and what remains is the window of one signature check
-  // rather than the cache's whole ttl.
-  const claimedSlot = declaredIntent(msgObj.data.type) === INTENT.ANNOUNCE;
-  if (claimedSlot) {
-    if (announcementSeen.has(messageHash)) return;
-    announcementSeen.set(messageHash, true);
+  if (messageCache.has(messageHash)) {
+    return;
   }
-  const releaseSlot = () => { if (claimedSlot) announcementSeen.delete(messageHash); };
+  messageCache.set(messageHash, msgObj);
 
   // check blocked list
   if (wsPeerCache.has(pubKey)) {
@@ -864,8 +572,6 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
     } catch (e) {
       log.error(e);
     }
-    // Nothing here judged the message; the peer is what was refused.
-    releaseSlot();
     return;
   }
   const currentTimeStamp = Date.now();
@@ -875,35 +581,37 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
   if (verifyResult === VerifyResult.OK) {
     const timestampOK = fluxCommunicationUtils.verifyTimestampInFluxBroadcast(msgObj, currentTimeStamp);
     if (timestampOK === true) {
-      const handler = handlerFor(msgObj.data.type);
-      if (!handler) {
-        log.warn(`Unrecognised message type of ${msgObj.data.type}`);
-      } else if (isOrdered(msgObj.data.type)) {
-        // It reached the wrong pipeline: the socket routes these to the per-peer queue
-        // when they are wanted, so arriving here means nobody asked for it.
-        log.warn(`Unsolicited ${msgObj.data.type} from ${peerSocket.direction} peer ${peerSocket.key}`);
-      } else {
-        setImmediate(() => {
-          try {
-            handler(msgObj, peerSocket);
-          } catch (e) {
-            log.error(e);
-          }
-        });
+      try {
+        if (msgObj.data.type === 'zelappregister' || msgObj.data.type === 'zelappupdate' || msgObj.data.type === 'fluxappregister' || msgObj.data.type === 'fluxappupdate') {
+          setImmediate(() => handleAppMessages(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxapprequest') {
+          setImmediate(() => fluxCommunicationMessagesSender.respondWithAppMessage(msgObj, peerSocket));
+        } else if (msgObj.data.type === 'fluxapprunning') {
+          setImmediate(() => handleAppRunningMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxipchanged') {
+          setImmediate(() => handleIPChangedMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxappremoved') {
+          setImmediate(() => handleAppRemovedMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxappinstalling') {
+          setImmediate(() => handleAppInstallingMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxappinstallingerror') {
+          setImmediate(() => handleAppInstallingErrorMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else if (msgObj.data.type === 'fluxnodesigterm') {
+          setImmediate(() => handleNodeSigtermMessage(msgObj, peerSocket.ip, peerSocket.port));
+        } else {
+          log.warn(`Unrecognised message type of ${msgObj.data.type}`);
+        }
+      } catch (e) {
+        log.error(e);
       }
     } else {
-      // Signed by a real node and outside the window, which is what a replay looks like.
-      releaseSlot();
       peerSocket.sendNak(messageHash, NAK_REASON.STALE);
     }
   } else if (verifyResult === VerifyResult.NODE_NOT_FOUND) {
-    releaseSlot();
     // Originator's node is not in the deterministic list — stale list or node went offline.
     // The relay peer is not at fault. Drop the message, don't punish the relay.
     log.warn(`Dropping message from ${peerSocket.direction} peer ${peerSocket.key}: originator pubkey ${pubKey} not found in node list`);
-    fluxEventBus.publish('network:originatorNotListed', { type: msgObj.data?.type, pubKey, relay: peerSocket.key });
   } else {
-    releaseSlot();
     // BAD_SIGNATURE or MALFORMED — the message is corrupted or forged.
     // Track against this relay peer with a rolling window.
     // If they send 5+ bad messages in 10 minutes, disconnect.
@@ -930,114 +638,49 @@ async function dispatchFluxMessage(msgObj, peerSocket) {
 
 const syncChunkQueues = new Map();
 
-// Verified by dispatchSyncResponse before the chunk was queued, because whether
-// a peer signed what it sent is a statement about the peer and the deadline
-// waiting on it needs the answer at arrival, not at the back of a queue.
-async function processSyncChunk(msgObj, peerSocket) {
-  const handler = handlerFor(msgObj.data.type);
-  if (!handler) {
-    log.warn(`Unknown sync response type: ${msgObj.data.type}`);
+async function processSyncChunk(msgObj, peerKey) {
+  const result = await fluxCommunicationUtils.verifyFluxBroadcast(msgObj);
+  if (result !== fluxCommunicationUtils.VerifyResult.OK) {
+    log.warn(`Sync response from ${peerKey} failed envelope verification: ${result}`);
     return;
   }
-  await handler(msgObj, peerSocket);
-}
 
-/**
- * The envelope check, as a verdict that never rejects.
- *
- * A chunk's verdict is read twice - once by the arrival that queued it and once
- * by whichever arrival is draining - so a rejection would surface in two places
- * and one of them is holding a queue for a peer it does not own. A failure to
- * decide is not a pass: it answers null, which is not OK, and the stream ends
- * on it like any other envelope this node cannot stand behind.
- * @param {object} msgObj
- * @returns {Promise<string|null>}
- */
-async function verifySyncEnvelope(msgObj) {
-  try {
-    return await fluxCommunicationUtils.verifyFluxBroadcast(msgObj);
-  } catch (error) {
-    log.error(error);
-    return null;
+  const { type } = msgObj.data;
+  switch (type) {
+    case 'fluxapptempsync':
+      await handleTempSyncResponse(msgObj, peerKey);
+      break;
+    case 'fluxapprunningsync':
+      await handleAppRunningSyncResponse(msgObj, peerKey);
+      break;
+    case 'fluxappinstallingsync':
+      await handleAppInstallingSyncResponse(msgObj, peerKey);
+      break;
+    case 'fluxappinstallingerrorssync':
+      await handleAppInstallingErrorsSyncResponse(msgObj, peerKey);
+      break;
+    default:
+      log.warn(`Unknown sync response type: ${type}`);
   }
 }
 
 async function dispatchSyncResponse(msgObj, peerSocket) {
   try {
     const peerKey = peerSocket.key;
-    if (!peerManager.isSyncResponseWanted(peerSocket)) return;
+    if (!peerManager.isSyncRequested(peerKey)) return;
 
-    // THE QUEUE IS THE ORDER, so nothing that can reorder may sit in front of
-    // it. Chunks carry meaning by position: the sender sorts by timestamp and
-    // an eviction has none, so evictions land in the FIRST chunk and clear a
-    // node's locations outright - a later chunk processed ahead of them has its
-    // rows deleted by an eviction that came before them. `done` is positional
-    // too, and a stream marked finished early loses whatever was still coming.
-    //
-    // So the chunk takes its place here, in the same synchronous step as its
-    // arrival, and the envelope check is STARTED rather than waited for. Four
-    // chunks arriving together are queued in arrival order and their checks
-    // race each other with no say in it.
     if (!syncChunkQueues.has(peerKey)) {
       syncChunkQueues.set(peerKey, { queue: [], processing: false });
     }
     const state = syncChunkQueues.get(peerKey);
-    const chunk = { msgObj, verdict: verifySyncEnvelope(msgObj) };
-    state.queue.push(chunk);
-    // Decided here for the same reason: read after an await, two arrivals both
-    // find a queue nobody is draining and both start draining it.
-    const drainer = !state.processing;
-    if (drainer) state.processing = true;
+    state.queue.push(msgObj);
 
-    // THE PEER SPOKE, AND IT REALLY WAS THE PEER. Two different questions used
-    // to be split at the wrong seam: arrival on one side, everything else on
-    // the other. The seam that matters is whose statement it is.
-    //
-    // Whether a peer signed what it sent is about the PEER, and it is a
-    // signature check. Storing two thousand messages, or re-verifying every
-    // pending registration, is about US. So the envelope is answered here, as
-    // soon as the check comes back and whatever the queue is doing, and the
-    // payload work stays in the drain below.
-    //
-    // Announced at arrival rather than after that work, because a peer that
-    // answered all four requests correctly and instantly went unheard for as
-    // long as WE took on the first of them - and was recorded as having said
-    // nothing and set aside, with the three answers queued behind it discarded
-    // on the way out.
-    //
-    // And unverifiable bytes are not the peer speaking. Credited as progress
-    // they renewed the deadline that exists to take the slot back, so a peer
-    // streaming rubbish inside every stall window held one of the answers this
-    // node needs for the whole attempt while never answering at all.
-    const verdict = await chunk.verdict;
-    if (verdict === fluxCommunicationUtils.VerifyResult.OK && !msgObj?.data?.refused) {
-      appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_PROGRESS, peerKey);
-    }
-
-    if (!drainer) return;
+    if (state.processing) return;
+    state.processing = true;
 
     while (state.queue.length > 0) {
-      const next = state.queue.shift();
-      const nextVerdict = await next.verdict;
-      // A HOLE IS NOT A SURVEY. Stepping over the chunk and carrying on left
-      // this node counting a peer as having surveyed the network out of an
-      // answer it knows part of is missing - and it cannot know which part,
-      // because the chunk it could not attribute is the one it cannot read.
-      // The stream ends the way every other failure in this design ends: the
-      // request is over, and another peer is asked.
-      if (nextVerdict !== fluxCommunicationUtils.VerifyResult.OK) {
-        log.warn(`Sync response from ${peerKey} failed envelope verification: ${nextVerdict}, ending its request`);
-        syncChunkQueues.delete(peerKey);
-        // Only about the connection this drain serves. A backlog left by a
-        // connection that has since been replaced still drains, and ending a
-        // request on its behalf would close the one belonging to the peer that
-        // dialled back in - which has answered nothing wrong.
-        if (peerManager.isSyncResponseWanted(peerSocket)) {
-          appSyncEvents.emit(SYNC_EVENTS.EPHEMERAL_SYNC_UNVERIFIED, peerKey);
-        }
-        return;
-      }
-      await processSyncChunk(next.msgObj, peerSocket);
+      const chunk = state.queue.shift();
+      await processSyncChunk(chunk, peerKey);
     }
 
     state.processing = false;
@@ -1049,39 +692,6 @@ async function dispatchSyncResponse(msgObj, peerSocket) {
 }
 
 // Register message dispatchers on the peerManager singleton
-// Every wire type this node answers.
-// Everything a node tells the network about itself or about an app it saw. One fact
-// reaching us by many routes is one fact, and a relayed type must be deduplicated.
-register(['zelappregister', 'zelappupdate', 'fluxappregister', 'fluxappupdate'],
-  (msg, peer) => handleAppMessages(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxapprunning', (msg, peer) => handleAppRunningMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxipchanged', (msg, peer) => handleIPChangedMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxappremoved', (msg, peer) => handleAppRemovedMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxappinstalling', (msg, peer) => handleAppInstallingMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxappinstallingerror', (msg, peer) => handleAppInstallingErrorMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-register('fluxnodesigterm', (msg, peer) => handleNodeSigtermMessage(msg, peer.ip, peer.port), ROUTE.GOSSIP, INTENT.ANNOUNCE);
-// An ask delivered by broadcast. Delivery is not the classifier: it goes to every peer,
-// and it is still a question from one node that each of them answers separately.
-register('fluxapprequest', (msg, peer) => fluxCommunicationMessagesSender.respondWithAppMessage(msg, peer), ROUTE.GOSSIP, INTENT.ASK);
-register('fluxpolicyrequest', (msg, peer) => fluxCommunicationMessagesSender.respondWithPolicy(msg, peer), ROUTE.GOSSIP, INTENT.ASK);
-// The one type sent both ways: news when a node announces what it adopted, an answer when
-// it settles a peer's ask. Nothing relays it, which is what makes the marker safe to trust.
-// A claim rather than an answer: a number cannot be checked, so it is a prompt to ask.
-register('fluxpolicyseq', (msg, peer) => policyStore.notePeerSeq(
-  msg.data.seq, peer.key, msg.data.correlationId,
-), ROUTE.GOSSIP, INTENT.VARIES);
-// Checked against the pinned keys before adoption, so an unsolicited bundle is no more
-// dangerous than one this node asked for - and peers announce what they adopt.
-register('fluxpolicy', (msg, peer) => policyStore.offerBundle(
-  msg.data.bundle, peer.key, msg.data.correlationId,
-), ROUTE.GOSSIP, INTENT.ANSWER);
-
-// Answers to a sync this node asked for, which is why they are ordered.
-register('fluxapptempsync', handleTempSyncResponse, ROUTE.ORDERED, INTENT.ANSWER);
-register('fluxapprunningsync', handleAppRunningSyncResponse, ROUTE.ORDERED, INTENT.ANSWER);
-register('fluxappinstallingsync', handleAppInstallingSyncResponse, ROUTE.ORDERED, INTENT.ANSWER);
-register('fluxappinstallingerrorssync', handleAppInstallingErrorsSyncResponse, ROUTE.ORDERED, INTENT.ANSWER);
-
 peerManager.messageDispatcher = dispatchFluxMessage;
 peerManager.syncResponseDispatcher = dispatchSyncResponse;
 async function verifySyncRequest(peer, decoded) {
@@ -1186,35 +796,6 @@ function connectedPeersInfo(req, res) {
 }
 
 /**
- * How many peers answered our most recent ping, out of how many we hold.
- *
- * The freshest liveness signal this node has about the network, and the one that
- * tells it whether IT is the thing that has gone quiet. Peer COUNT alone cannot: a
- * socket survives wsMaxMissedPongs rounds before it is dropped, so a node that has
- * just been cut off keeps a full peer list for ~45s and reads as perfectly healthy
- * throughout - after the point a decision gated on two 30s monitor passes could
- * already have been made. missedPongs moves on the first missed round instead
- * (~15s), which lands before that.
- *
- * Reported as a ratio rather than a bare count because the useful question is
- * proportional: one silent peer among many is that peer's problem, while all of
- * them going quiet at once is this node's. An absolute floor would also be a fleet
- * size in disguise - a node configured with two peers can never reach a threshold
- * written for a node with twelve.
- *
- * @returns {{responding: number, total: number}} Peers with no missed pong, and all peers
- */
-function peerResponsiveness() {
-  let responding = 0;
-  let total = 0;
-  for (const peer of peerManager.allValues()) {
-    total += 1;
-    if (peer.missedPongs === 0) responding += 1;
-  }
-  return { responding, total };
-}
-
-/**
  * To keep connections alive by pinging all outgoing and incoming peers.
  */
 function keepConnectionsAlive() {
@@ -1236,7 +817,7 @@ async function removePeer(req, res) {
     let { ip } = req.params;
     ip = ip || req.query.ip;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
     if (authorized !== true) {
       const message = messageHelper.errUnauthorizedMessage();
@@ -1280,7 +861,7 @@ async function removeIncomingPeer(req, res) {
     let { ip } = req.params;
     ip = ip || req.query.ip;
 
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
 
     if (authorized !== true) {
       const message = messageHelper.errUnauthorizedMessage();
@@ -1332,18 +913,6 @@ function onOutboundError(error) {
 function onOutboundOpen() {
   const meta = wsMetadata.get(this);
   if (!meta) return;
-  const key = `${meta.ip}:${meta.port}`;
-  const existing = peerManager.get(key);
-  // A connection to this peer is already held: a live one in the same
-  // direction stays, and when both ends dialed at once the pair keeps the
-  // connection dialed by the lower address (peerManager.resolveCrossing), the
-  // same choice the far end makes. Otherwise add() replaces the held one.
-  const replaces = !existing || peerManager.resolveCrossing(existing, DIRECTION.OUTBOUND);
-  if (!replaces) {
-    peerManager.clearPending(key);
-    try { this.close(CLOSE_CODES.DUPLICATE_PEER, 'Peer already connected'); } catch (_e) { /* noop */ }
-    return;
-  }
   peerManager.add(this, meta.ip, meta.port, {
     source: meta.source,
     remoteCapabilities: meta.remoteCapabilities,
@@ -1378,48 +947,13 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
     const key = `${ip}:${port}`;
     if (peerManager.has(key) || peerManager.isPending(key)) return;
     peerManager.markPending(key);
-
-    // This node's own address, asked of the peer manager rather than of
-    // benchmark. That is where the fact lives - fluxNetworkHelper pushes every
-    // refresh into it from the one place the node learns what it is - and the
-    // peer manager already answers this exact question for the sync draw.
-    // Asking benchmark is an uncached RPC (executeCall), and this runs on every
-    // dial: discovery's deterministic loop, the reconnect queue, the random
-    // draw, the manual add and /flux/addpeer. It also made all five hard
-    // dependent on benchd answering, which only discovery already was.
-    //
-    // Fresh enough by construction: fluxDiscovery refreshes it once per cycle
-    // before it dials anything, and so do the availability checker and the
-    // address-change handler. That is a bound the form this replaces did not
-    // have - it read the port once per process and never again, so after an
-    // address change a node announced a stale one for as long as it ran.
-    let localSocketAddr = peerManager.getOwnSocketAddress?.() || null;
-
-    if (!localSocketAddr) {
-      // Never been told, which a dial arriving before the first refresh
-      // genuinely is. Ask once - the answer fills the peer manager's copy on its
-      // way through, so this costs one call rather than one per dial.
-      localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
-    }
-
-    if (!localSocketAddr) {
-      peerManager.clearPending(key);
-      return;
-    }
-    myPort = extractPort(localSocketAddr);
-
-    // Never ourselves, and refused HERE rather than by each caller. fluxDiscovery
-    // filters its own address before dialling, but it is one of four ways in -
-    // manual, deterministic, reconnect and random all arrive through this
-    // function, and the reconnect queue in particular re-dials whatever it holds
-    // without asking whose address it is. A self-connection is not merely a
-    // wasted socket: it occupies a peer slot, is offered back as a peer to
-    // gossip and to sync from, and answers every question with what this node
-    // already knows.
-    if (socketAddressesMatch(key, localSocketAddr)) {
-      log.warn(`initiateAndHandleConnection - refusing to connect to ourselves at ${key} (source ${source})`);
-      peerManager.clearPending(key);
-      return;
+    if (!myPort) {
+      const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
+      if (!localSocketAddr) {
+        peerManager.clearPending(key);
+        return;
+      }
+      myPort = extractPort(localSocketAddr);
     }
     const options = {
       handshakeTimeout: config.fluxapps.wsHandshakeTimeoutMs ?? 10000,
@@ -1427,11 +961,7 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
         zlibDeflateOptions: {
         // See zlib defaults.
           chunkSize: 1024,
-          // No-context-takeover resets the stream after every message, so the
-          // window only ever matches within one. Gossip messages are a few KB
-          // and compress to the same bytes on an 8KB window as on a 32KB one,
-          // for a third of the memory - and a context is held per peer socket.
-          memLevel: 8,
+          memLevel: 9,
           level: 9,
         },
         zlibInflateOptions: {
@@ -1440,10 +970,8 @@ async function initiateAndHandleConnection(connection, source = PEER_SOURCE.RAND
         // Other options settable:
         clientNoContextTakeover: true, // Defaults to negotiated value.
         serverNoContextTakeover: true, // Defaults to negotiated value.
-        // This socket only ever talks to another node, so both directions size
-        // down; a peer on an older build negotiates back up to 15.
-        serverMaxWindowBits: 13,
-        clientMaxWindowBits: 13,
+        serverMaxWindowBits: 15, // Defaults to negotiated value.
+        clientMaxWindowBits: 15, // Defaults to negotiated value.
         // Below options specified as default values.
         concurrencyLimit: 2, // Limits zlib concurrency for perf.
         threshold: 128, // Size (in bytes) below which messages
@@ -1571,8 +1099,8 @@ async function addPeer(req, res) {
     ip = ip || req.query.ip;
 
     const authorized = await verificationHelper.verifyPrivilege(
-      Privilege.NODE_OPERATOR_OR_FLUX_TEAM,
-      authOf(req),
+      'adminandfluxteam',
+      req,
     );
 
     if (authorized !== true) {
@@ -1653,10 +1181,7 @@ async function addOutgoingPeer(req, res) {
     }
 
     const nodeList = await fluxCommunicationUtils.deterministicFluxList();
-    // A listed node that has moved asks from the address its move leads to, which
-    // the list names only once the move is confirmed on chain.
-    const fluxNode = nodeList.find((node) => socketAddressesMatch(node.ip, ip))
-      ?? await registryManager.listedNodeMovedTo(ip, nodeList);
+    const fluxNode = nodeList.find((node) => socketAddressesMatch(node.ip, ip));
     if (!fluxNode) {
       const errMessage = messageHelper.createErrorMessage(`FluxNode ${peerIp}:${peerPort} is not confirmed on the network.`);
       return res.json(errMessage);
@@ -1679,17 +1204,12 @@ async function addOutgoingPeer(req, res) {
 function startDiscovery() {
   if (discoveryRunning) return;
   discoveryRunning = true;
-  fluxEventBus.publish('discovery:started', {});
-  // Driven by the node list arriving rather than by a retry that happens to
-  // land after it. A peer holds one socket in either direction, so peers that
-  // dial us while we are waiting take the very sockets we would have dialled
-  // them on, and a late first pass then has nothing left to connect to.
-  networkStateService.onReady(fluxDiscovery);
+  fluxDiscovery();
 }
 
 async function startDiscoveryApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('fluxteam', req);
     if (authorized !== true) {
       return res.json(messageHelper.errUnauthorizedMessage());
     }
@@ -1719,13 +1239,6 @@ async function fluxDiscovery() {
 
     if (!localSocketAddr) {
       throw new Error('Flux IP not detected. Flux discovery is awaiting.');
-    }
-
-    // An unknown node list and an empty one are the same value below, and acting
-    // on the second when it is really the first sizes both deterministic loops
-    // to zero - the node then connects to nobody and reports no error.
-    if (!networkStateService.isReady()) {
-      throw new Error('Network state not yet known. Flux discovery is awaiting.');
     }
 
     const sortedNodeList = await fluxCommunicationUtils.deterministicFluxList({
@@ -1881,29 +1394,12 @@ async function fluxDiscovery() {
 
 function initializeDiscovery() {
   nodeConfirmationService.onConfirmationChange((confirmed) => {
-    if (!confirmed) {
+    if (confirmed) {
+      peerManager.allowConnections();
+    } else {
       log.info('fluxDiscovery - Confirmation lost, disconnecting all peers');
       peerManager.disconnectAll();
-      return;
     }
-
-    // Confirmed is not the same as ready to peer. Every message an inbound peer
-    // sends is checked against the node list, so a peer that arrives before the
-    // list does is refused however legitimate it is - there is nothing to
-    // validate it against. The two facts come from different calls to the same
-    // daemon, one carrying a single record and one carrying every node, so the
-    // list lands well after the confirmation and that gap is the whole of the
-    // window peers were being turned away in.
-    //
-    // Only the first open waits: once the list is here isReady() is true and
-    // this runs inline, so regaining confirmation reconnects immediately.
-    networkStateService.onReady(() => {
-      // The wait is not instant, and confirmation can be lost inside it. Without
-      // this the callback would re-open the door straight after disconnectAll().
-      if (!nodeConfirmationService.isConfirmed()) return;
-
-      peerManager.allowConnections();
-    });
   });
 }
 
@@ -2007,7 +1503,7 @@ function getUnstableNodes(req, res) {
  * @param {object} res Response.
  */
 async function getPeerHistory(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
   if (authorized !== true) {
     return res.json(messageHelper.errUnauthorizedMessage());
   }
@@ -2094,7 +1590,6 @@ module.exports = {
   removePeer,
   removeIncomingPeer,
   connectedPeersInfo,
-  peerResponsiveness,
   keepConnectionsAlive,
   fluxDiscovery,
   startDiscovery,
@@ -2104,17 +1599,7 @@ module.exports = {
   addPeer,
   logSocketsEvery,
   handleAppRunningMessage,
-  handleAppInstallingMessage,
-  handleTempSyncResponse,
-  handleAppRunningSyncResponse,
-  handleAppInstallingSyncResponse,
-  handleAppInstallingErrorsSyncResponse,
   handleIPChangedMessage,
-  recordOwnAddressMove,
-  announceOwnAddressMove,
-  handleOwnAddressMove,
-  announceRecordedOwnMovesWhenConnected,
-  noteOwnMoveHeardBack,
   handleAppRemovedMessage,
   handleNodeSigtermMessage,
   initiateAndHandleConnection,

@@ -35,10 +35,6 @@ async function getHostInfo(req, res) {
         hostInfo.ip = extractIp(localSocketAddr);
         const nodeGeo = await geolocationService.getNodeGeolocation();
         if (nodeGeo) {
-          // One address per reply, from the source that cannot be stale:
-          // hostInfo.ip above is live from bench, this record's copy is as fresh
-          // as the last ip-api pass. Neither field is withheld - the address is
-          // above and /flux/geolocation serves the whole record unauthenticated.
           delete nodeGeo.ip;
           delete nodeGeo.org;
           hostInfo.geo = nodeGeo;
@@ -137,5 +133,4 @@ function stop() {
 module.exports = {
   start,
   stop,
-  getHostInfo,
 };

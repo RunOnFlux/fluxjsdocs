@@ -41,6 +41,9 @@ class FluxRpc {
       ['getinfo', null],
       ['help', null],
       ['stop', null],
+      // == Disclosure ==
+      ['z_getpaymentdisclosure', null],
+      ['z_validatepaymentdisclosure', null],
       // == Fluxnode ==
       ['createconfirmationtransaction', null],
       ['createfluxnodekey', null],
@@ -100,8 +103,10 @@ class FluxRpc {
       ['decoderawblock', null],
       ['decoderawtransaction', null],
       ['decodescript', null],
+      ['fundrawtransaction', null],
       ['getrawtransaction', null],
       ['sendrawtransaction', null],
+      ['signrawtransaction', null],
       // == Util ==
       ['createmultisig', null],
       ['estimatefee', null],
@@ -110,6 +115,70 @@ class FluxRpc {
       ['validateaddress', null],
       ['verifymessage', null],
       ['z_validateaddress', null],
+      // == Wallet ==
+      ['addmultisigaddress', null],
+      ['backupwallet', null],
+      ['consolidateutxos', null],
+      ['dumpprivkey', null],
+      ['dumpwallet', null],
+      ['encryptwallet', null],
+      ['getaccount', null],
+      ['getaccountaddress', null],
+      ['getaddressesbyaccount', null],
+      ['getbalance', null],
+      ['getnewaddress', null],
+      ['getrawchangeaddress', null],
+      ['getreceivedbyaccount', null],
+      ['getreceivedbyaddress', null],
+      ['gettransaction', null],
+      ['getunconfirmedbalance', null],
+      ['getwalletinfo', null],
+      ['importaddress', null],
+      ['importprivkey', null],
+      ['importwallet', null],
+      ['keypoolrefill', null],
+      ['listaccounts', null],
+      ['listaddressgroupings', null],
+      ['listlockunspent', null],
+      ['listreceivedbyaccount', null],
+      ['listreceivedbyaddress', null],
+      ['listsinceblock', null],
+      ['listtransactions', null],
+      ['listunspent', null],
+      ['lockunspent', null],
+      ['move', null],
+      ['rescanblockchain', null],
+      ['sendfrom', null],
+      ['sendmany', null],
+      ['sendtoaddress', null],
+      ['setaccount', null],
+      ['settxfee', null],
+      ['signmessage', null],
+      ['z_exportkey', null],
+      ['z_exportviewingkey', null],
+      ['z_exportwallet', null],
+      ['z_getbalance', null],
+      ['z_getmigrationstatus', null],
+      ['z_getnewaddress', null],
+      ['z_getoperationresult', null],
+      ['z_getoperationstatus', null],
+      ['z_gettotalbalance', null],
+      ['z_importkey', null],
+      ['z_importviewingkey', null],
+      ['z_importwallet', null],
+      ['z_listaddresses', null],
+      ['z_listoperationids', null],
+      ['z_listreceivedbyaddress', null],
+      ['z_listunspent', null],
+      ['z_mergetoaddress', null],
+      ['z_sendmany', null],
+      ['z_setmigration', null],
+      ['z_shieldcoinbase', null],
+      ['zcbenchmark', null],
+      ['zcrawjoinsplit', null],
+      ['zcrawkeygen', null],
+      ['zcrawreceive', null],
+      ['zcsamplejoinsplit', null],
     ]),
     fluxbenchd: new Map([
       ['getstatus', null],
@@ -139,11 +208,6 @@ class FluxRpc {
 
     this.auth = options.auth || null;
     this.mode = options.mode || 'fluxd';
-    // A unix socket the daemon serves on instead of TCP. When given, every
-    // request goes over it with no credentials: the socket's own permissions
-    // authorize the caller, and the uri only names the Host header. Otherwise
-    // every request goes to the uri with `auth`.
-    this.socketPath = options.socketPath || null;
     // Originally, this timeout was 60s. However, it got lowered to 10s. Which,
     // due to the chaintips call, is too low. On a Stratus (with average CPU) this
     // call was about 14s. Now we set it to defauolt 60s here, and the callee can
@@ -157,14 +221,9 @@ class FluxRpc {
     this.controller = options.controller || new fluxController.FluxController();
 
     // we don't use the serviceHelper methods here to avoid adding these calls to debug
-    this.#instance = axios.create({ baseURL: this.url, timeout });
+    this.#instance = axios.create({ baseURL: this.url, auth: this.auth, timeout });
 
     this.methods = FluxRpc.#methodMap[this.mode];
-  }
-
-  #post(body, signal) {
-    const transport = this.socketPath ? { socketPath: this.socketPath } : { auth: this.auth };
-    return this.#instance.post('/', body, { signal, ...transport });
   }
 
   #createPayload(method, params) {
@@ -190,7 +249,7 @@ class FluxRpc {
     const { signal } = this.controller;
 
     // by default, axios throws for any non 2XX response code
-    const res = await this.#post(payload, signal).catch((err) => {
+    const res = await this.#instance.post('/', payload, { signal }).catch((err) => {
       const { response: { data } = {} } = err;
 
       let errorMessage;
@@ -246,7 +305,7 @@ class FluxRpc {
 
     const { signal } = this.controller;
 
-    const res = await this.#post(payloads, signal).catch((err) => {
+    const res = await this.#instance.post('/', payloads, { signal }).catch((err) => {
       const { response: { data } = {} } = err;
 
       let errorMessage;

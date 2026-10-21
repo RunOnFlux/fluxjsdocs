@@ -11,14 +11,12 @@
  * - Primary: [flags]:<path>  (e.g., r:/data, g:/primary, /config)
  * - Component ref: <number>:<path>  (e.g., 0:/shared)
  * - Directory mount: m:<subdir>:<path>  (e.g., m:logs:/var/log)
- * - Local directory mount: ml:<subdir>:<path>  (e.g., ml:cache:/var/cache) - never replicated
  * - File mount: f:<filename>:<path>  (e.g., f:config.yaml:/etc/config.yaml)
  * - Component dir: c:<number>:<subdir>:<path>  (e.g., c:0:backups:/backups)
  * - Component file: cf:<number>:<filename>:<path>  (e.g., cf:0:cert.pem:/etc/ssl/cert.pem)
  */
 
 const log = require('../../lib/log');
-const { isReservedName, isLiteralIgnoreName } = require('../appSystem/volumeReservedNames');
 
 /**
  * Mount type enumeration
@@ -26,7 +24,6 @@ const { isReservedName, isLiteralIgnoreName } = require('../appSystem/volumeRese
 const MountType = {
   PRIMARY: 'primary',
   DIRECTORY: 'directory',
-  LOCAL_DIRECTORY: 'local_directory',
   FILE: 'file',
   COMPONENT_PRIMARY: 'component_primary',
   COMPONENT_DIRECTORY: 'component_directory',
@@ -108,17 +105,6 @@ function validateSubdirOrFilename(name) {
     throw new Error(`Subdirectory/filename cannot be a reserved name: ${reserved.join(', ')}`);
   }
 
-  // The volume root also holds entries that are not the owner's, and a mount is
-  // the one way an app reaches them: `.stignore` decides what leaves the node,
-  // `.stfolder` is how syncthing knows the folder is mounted at all, and an
-  // operation's staging is deleted underneath whoever holds it by the boot
-  // sweep. Refused through the same predicate the file browser refuses them by,
-  // so the two doors into that root cannot drift apart - which also means a name
-  // that merely resembles a staging directory stays the owner's to use.
-  if (isReservedName(name)) {
-    throw new Error(`Subdirectory/filename cannot be a reserved name: ${name}`);
-  }
-
   // Check for special characters that might cause issues
   const invalidChars = /[<>:"|?*\0]/;
   if (invalidChars.test(name)) {
@@ -129,21 +115,6 @@ function validateSubdirOrFilename(name) {
   if (name.length > 255) {
     throw new Error('Subdirectory/filename too long (max 255 characters)');
   }
-}
-
-/**
- * Whether a mount is backed by this component's OWN volume, as opposed to another
- * component's. Stated once because every caller that creates, names or excludes a
- * path on this volume has to agree on the set, and a mount form added to one list
- * but not the others is invisible until an app uses it.
- * @param {object} mount - A parsed mount
- * @returns {boolean}
- */
-function isLocalMount(mount) {
-  return mount.type === MountType.PRIMARY
-    || mount.type === MountType.DIRECTORY
-    || mount.type === MountType.LOCAL_DIRECTORY
-    || mount.type === MountType.FILE;
 }
 
 /**
@@ -226,41 +197,6 @@ function parseMountDefinition(mountDef, index) {
 
     return {
       type: MountType.DIRECTORY,
-      subdir,
-      containerPath,
-      flags: [],
-      isFile: false,
-    };
-  }
-
-  // ml:<subdir>:<path> - a directory on this component's own volume that syncthing
-  // never replicates. The volume root IS the syncthing folder, so every other mount
-  // form is synced whether or not that helps: a game's Steam content, a build cache,
-  // anything a container can obtain again for free costs the cluster a full copy per
-  // instance and a fresh copy on every change. The exclusion is asserted through
-  // .stignore, which is derived from this spec and therefore identical on every node.
-  //
-  // Only ever a non-primary mount. The primary carries the component's sync mode, so
-  // a local primary would be a component with no synced storage at all - which is
-  // what a flagless primary already is.
-  if (firstPart === 'ml') {
-    if (parts.length !== 3) {
-      throw new Error(`Invalid local directory mount syntax: ${mountDef}. Expected ml:<subdir>:<path>`);
-    }
-
-    const subdir = parts[1];
-    const containerPath = parts[2];
-
-    validateSubdirOrFilename(subdir);
-    // This name is asserted as a syncthing ignore pattern, where the name has to stand
-    // for itself - see isLiteralIgnoreName for what a pattern character does to it.
-    if (!isLiteralIgnoreName(subdir)) {
-      throw new Error(`Invalid local directory mount: ${mountDef}. A local directory's name may not contain * ? [ ] { } or \\, or begin or end with whitespace`);
-    }
-    validateMountPath(containerPath);
-
-    return {
-      type: MountType.LOCAL_DIRECTORY,
       subdir,
       containerPath,
       flags: [],
@@ -394,7 +330,7 @@ function parseContainerData(containerData) {
 
   // Validate no duplicate subdirs/filenames (for non-component mounts)
   const localSubdirs = parsedMounts
-    .filter(isLocalMount)
+    .filter((m) => m.type === MountType.PRIMARY || m.type === MountType.DIRECTORY || m.type === MountType.FILE)
     .map((m) => m.subdir);
   const duplicateSubdirs = localSubdirs.filter((subdir, index) => localSubdirs.indexOf(subdir) !== index);
   if (duplicateSubdirs.length > 0) {
@@ -435,7 +371,7 @@ function getRequiredLocalPaths(parsedMounts) {
   // eslint-disable-next-line no-restricted-syntax
   for (const mount of parsedMounts.allMounts) {
     // Only include local mounts (not component references)
-    if (isLocalMount(mount)) {
+    if (mount.type === MountType.PRIMARY || mount.type === MountType.DIRECTORY || mount.type === MountType.FILE) {
       paths.push({
         name: mount.subdir,
         isFile: mount.isFile,
@@ -486,77 +422,9 @@ function getComponentSyncMode(containerData) {
   return null;
 }
 
-/**
- * The subdirectory names a component has declared it does not want replicated.
- *
- * These become .stignore patterns, so every node must compute the same set from the
- * same spec - which is why the answer comes from the parsed mounts and never from
- * what happens to be on this node's disk.
- *
- * Takes mounts already parsed, so a caller holding them does not parse twice and the
- * throw stays where the spec is read. getUnsyncedSubdirs is the form for a caller
- * that holds only the containerData.
- *
- * @param {object} parsedMounts - result of parseContainerData
- * @returns {string[]} subdirectory names, relative to the volume root
- */
-function unsyncedSubdirsOf(parsedMounts) {
-  return parsedMounts.allMounts
-    .filter((mount) => mount.type === MountType.LOCAL_DIRECTORY)
-    .map((mount) => mount.subdir);
-}
-
-/**
- * The same answer for a caller holding only the containerData.
- *
- * Returns [] for an unparseable spec rather than throwing: the callers are the
- * .stignore writers, and refusing to write ignores is worse than writing the base
- * set. An invalid spec is surfaced by the install path, which parses explicitly.
- *
- * @param {string} containerData
- * @returns {string[]} subdirectory names, relative to the volume root
- */
-function getUnsyncedSubdirs(containerData) {
-  try {
-    return unsyncedSubdirsOf(parseContainerData(containerData));
-  } catch (e) {
-    return [];
-  }
-}
-
 /** True iff the component's primary mount is a g: (masterSlave) sync mount. */
 function isGComponent(containerData) {
   return getComponentSyncMode(containerData) === 'g';
-}
-
-/**
- * The components of an app whose start the primary election decides: every g:
- * component, in compose order, as `<component>_<app>` (the app name for a v1-3
- * app). Empty when it has none. The election decides the app, and its primary
- * runs all of them.
- * @param {object} appSpec - Installed app specification, decrypted.
- * @returns {string[]}
- */
-function gComponentIdentifiers(appSpec) {
-  if (!appSpec) return [];
-  if (appSpec.version <= 3) return isGComponent(appSpec.containerData) ? [appSpec.name] : [];
-  return (appSpec.compose || [])
-    .filter((comp) => isGComponent(comp.containerData))
-    .map((comp) => `${comp.name}_${appSpec.name}`);
-}
-
-/**
- * An app's anchor: its first g: component, or null when it has none.
- *
- * A FluxOS release that predates electing every g: component knows only this
- * one, and asks a peer whether it holds the app by asking about it - so a node
- * holding any g: component of the app reports holding the anchor
- * (appQueryService.heldComponents).
- * @param {object} appSpec - Installed app specification, decrypted.
- * @returns {string|null}
- */
-function anchorComponentIdentifier(appSpec) {
-  return gComponentIdentifiers(appSpec)[0] ?? null;
 }
 
 /** True iff the component's primary mount is any sync mount (g:/r:/s:). */
@@ -583,15 +451,10 @@ module.exports = {
   parseContainerData,
   parseMountDefinition,
   getRequiredLocalPaths,
-  getUnsyncedSubdirs,
-  unsyncedSubdirsOf,
-  isLocalMount,
   getPrimaryFlags,
   hasFlag,
   getComponentSyncMode,
   isGComponent,
-  gComponentIdentifiers,
-  anchorComponentIdentifier,
   isSyncedComponent,
   validateMountPath,
   validateSubdirOrFilename,

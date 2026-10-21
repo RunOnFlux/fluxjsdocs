@@ -8,6 +8,7 @@
 const log = require('../../lib/log');
 const { MountType } = require('./mountParser');
 const { appsFolder } = require('./appConstants');
+const config = require('../../../config/default');
 
 /**
  * Get app identifier with proper flux prefix
@@ -156,10 +157,7 @@ function constructVolumes(parsedMounts, identifier, appName, fullAppSpecs, appSp
     switch (mount.type) {
       case MountType.PRIMARY:
       case MountType.DIRECTORY:
-      case MountType.LOCAL_DIRECTORY:
-        // Local mounts (current component). A LOCAL_DIRECTORY binds exactly like a
-        // DIRECTORY - what makes it local is the .stignore pattern derived from the
-        // spec, not where the bind points.
+        // Local mounts (current component)
         hostPath = constructLocalHostPath(identifier, mount.subdir);
         break;
 

@@ -20,14 +20,10 @@ const { CLOSE_CODES } = require('../utils/FluxPeerSocket');
 const { appSyncEvents, EVENTS } = require('../utils/appSyncEvents');
 const { HASH_EXPIRY_BLOCKS, HASH_RETRY_BACKOFF } = require('../utils/appConstants');
 const log = require('../../lib/log');
-const fluxEventBus = require('../utils/fluxEventBus');
-const { isBefore, messagesThatCount } = require('../utils/appMessageChain');
 const { invalidMessages } = require('../invalidMessages');
-const { Privilege, authOf } = require('../utils/privileges');
 
 const appsHashesCollection = config.database.daemon.collections.appsHashes;
 const globalAppsMessages = config.database.appsglobal.collections.appsMessages;
-const globalAppsTempMessages = config.database.appsglobal.collections.appsTemporaryMessages;
 
 const SETTLE_TIME_MS = config.fluxapps.hashSyncSettleMs ?? 4000;
 const RESPONSE_TIME_PER_HASH_MS = config.fluxapps.hashSyncResponseTimePerHashMs ?? 150;
@@ -38,16 +34,12 @@ const EPHEMERAL_PEERS_COUNT = config.fluxapps.hashSyncEphemeralPeers ?? 5;
 
 let syncRunning = false;
 
-// The message right before one in the log, in (height, timestamp) order - the order
-// getPreviousAppSpecifications and appMessageChain use, so a registration and an update paid in
-// one block are in the same order for a bulk-synced node as for a live one. specs is sorted by
-// (height, timestamp).
-function findPrevSpec(specs, height, timestamp = -Infinity) {
+function findPrevSpec(specs, height) {
   let lo = 0;
   let hi = specs.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (isBefore(specs[mid], height, timestamp)) lo = mid + 1;
+    if (specs[mid].height < height) lo = mid + 1;
     else hi = mid;
   }
   return lo > 0 ? specs[lo - 1] : null;
@@ -57,8 +49,7 @@ async function getMissingHashes(options = {}) {
   const { force = false, currentHeight = 0 } = options;
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.daemon.database);
-  // A payment whose transaction is not on the chain (notOnChain) has no message to fetch.
-  const query = { message: false, notOnChain: { $ne: true } };
+  const query = { message: false };
   if (!force) {
     query.messageNotFound = { $ne: true };
     query.$or = [
@@ -139,15 +130,7 @@ function createJsonArrayExtractor(onObject) {
 
 const BULK_FETCH_BATCH_SIZE = 500;
 
-/**
- * Streams a peer's permanent messages and stores the ones this node is missing.
- * @param {string} peerIp
- * @param {string|number} peerPort
- * @param {Map<string, {txid: string, height: number, value: number}>} missing this node's own
- *   payment record of each hash it is missing, keyed by hash
- * @param {Function} [onProgress]
- */
-async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) {
+async function bulkFetchStreamAndProcess(peerIp, peerPort, missingSet, onProgress) {
   log.info(`syncMissingHashes - Checking explorer sync on ${peerIp}:${peerPort}`);
   const syncResponse = await serviceHelper.axiosGet(
     `http://${peerIp}:${peerPort}/explorer/issynced`,
@@ -157,7 +140,7 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) 
     return { processed: 0, skipped: 0, streamed: 0 };
   }
 
-  log.info(`syncMissingHashes - Streaming permanent messages from ${peerIp}:${peerPort} (${missing.size} missing)`);
+  log.info(`syncMissingHashes - Streaming permanent messages from ${peerIp}:${peerPort} (${missingSet.size} missing)`);
   const response = await serviceHelper.axiosGet(
     `http://${peerIp}:${peerPort}/apps/permanentmessages`,
     { responseType: 'stream', timeout: 120000, headers: { 'Accept-Encoding': 'gzip' }, decompress: false },
@@ -183,7 +166,7 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) 
 
   const extractor = createJsonArrayExtractor((obj) => {
     totalSeen += 1;
-    if (obj.hash && missing.has(obj.hash)) {
+    if (obj.hash && missingSet.has(obj.hash)) {
       batch.push(obj);
       if (batch.length >= BULK_FETCH_BATCH_SIZE) {
         dataStream.pause();
@@ -210,12 +193,12 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) 
 
       const currentBatch = batch.splice(0, BULK_FETCH_BATCH_SIZE);
       // eslint-disable-next-line no-await-in-loop
-      const stats = await processMessages(currentBatch, missing, onProgress);
+      const stats = await processMessages(currentBatch, onProgress);
       totalProcessed += stats.processed;
       totalSkipped += stats.skipped;
-      for (const msg of currentBatch) missing.delete(msg.hash);
+      for (const msg of currentBatch) missingSet.delete(msg.hash);
 
-      if (missing.size === 0) {
+      if (missingSet.size === 0) {
         log.info(`syncMissingHashes - All missing hashes resolved after streaming ${totalSeen} messages`);
         stopped = true;
         break;
@@ -226,10 +209,10 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) 
     }
 
     if (batch.length > 0) {
-      const stats = await processMessages(batch, missing, onProgress);
+      const stats = await processMessages(batch, onProgress);
       totalProcessed += stats.processed;
       totalSkipped += stats.skipped;
-      for (const msg of batch) missing.delete(msg.hash);
+      for (const msg of batch) missingSet.delete(msg.hash);
     }
   } finally {
     dataStream.destroy();
@@ -237,39 +220,10 @@ async function bulkFetchStreamAndProcess(peerIp, peerPort, missing, onProgress) 
   }
 
   log.info(`syncMissingHashes - Streamed ${totalSeen} messages from ${peerIp}:${peerPort}: ${totalProcessed} processed, ${totalSkipped} skipped`);
-  fluxEventBus.publish('hashSync:bulkFetched', {
-    peer: `${peerIp}:${peerPort}`, streamed: totalSeen, processed: totalProcessed, skipped: totalSkipped,
-  });
   return { processed: totalProcessed, skipped: totalSkipped, streamed: totalSeen };
 }
 
-/**
- * A peer's message with this node's chain facts for it: the txid, block height and payment its
- * own scan recorded for the hash. The peer's copy carries its own values for these, which are
- * never taken: they place the message on chain, and so decide which message is in force and when
- * its app expires.
- * @param {object} message as the peer sent it
- * @param {{txid: string, height: number, value: number}} record this node's payment record
- * @returns {object}
- */
-function withOwnChainRecord(message, record) {
-  if (message.txid !== record.txid || message.height !== record.height || message.valueSat !== record.value) {
-    log.warn(`processMessages - ${message.hash}: peer sent txid ${message.txid} height ${message.height} valueSat ${message.valueSat}, `
-      + `this node recorded txid ${record.txid} height ${record.height} value ${record.value}; storing this node's`);
-  }
-  return {
-    ...message, txid: record.txid, height: record.height, valueSat: record.value,
-  };
-}
-
-/**
- * Verifies and stores messages streamed from a peer.
- * @param {object[]} messages as the peer sent them
- * @param {Map<string, {txid: string, height: number, value: number}>} records this node's
- *   payment record of each hash, keyed by hash
- * @param {Function} [onProgress]
- */
-async function processMessages(messages, records, onProgress) {
+async function processMessages(messages, onProgress) {
   const db = dbHelper.databaseConnection();
   const appsGlobalDb = db.db(config.database.appsglobal.database);
   const daemonDb = db.db(config.database.daemon.database);
@@ -277,12 +231,8 @@ async function processMessages(messages, records, onProgress) {
   let skipped = 0;
   let failed = 0;
 
-  const placed = messages
-    .filter((message) => records.has(message.hash))
-    .map((message) => withOwnChainRecord(message, records.get(message.hash)));
-  // (height, timestamp): the order findPrevSpec searches, and the one a same-block pair confirmed in
-  placed.sort((a, b) => (a.height - b.height) || ((a.timestamp || 0) - (b.timestamp || 0)));
-  const filtered = placed.filter((app) => app.valueSat !== null);
+  messages.sort((a, b) => a.height - b.height);
+  const filtered = messages.filter((app) => app.valueSat !== null);
 
   const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
   const daemonHeight = syncStatus.data.height || 0;
@@ -299,10 +249,8 @@ async function processMessages(messages, records, onProgress) {
     );
     const existingSet = new Set(existingDocs.map((d) => d.hash));
 
-    // 2. Batch mark existing hashes as message:true, the stored message following this node's
-    // payment record
+    // 2. Batch mark existing hashes as message:true
     if (existingSet.size > 0) {
-      await messageVerifier.alignStoredMessagesWithPayments([...existingSet].map((hash) => ({ hash, ...records.get(hash) })));
       const hashOps = [...existingSet].map((hash) => ({
         updateOne: { filter: { hash }, update: { $set: { message: true, messageNotFound: false } } },
       }));
@@ -331,8 +279,7 @@ async function processMessages(messages, records, onProgress) {
       const prevDocs = await appsGlobalDb.collection(globalAppsMessages)
         .find({ 'appSpecifications.name': { $in: [...updateNames] } })
         .project({ _id: 0 })
-        // a same-block tie in the order getPreviousAppSpecifications and appMessageChain use
-        .sort({ height: 1, timestamp: 1 })
+        .sort({ height: 1 })
         .toArray();
       for (const doc of prevDocs) {
         const name = doc.appSpecifications?.name;
@@ -341,17 +288,6 @@ async function processMessages(messages, records, onProgress) {
         prevSpecsMap.get(name).push(doc);
       }
     }
-
-    // Who holds a name is decided by the chain (appMessageChain): an update is verified against
-    // the message before it among those that count, from this node's payment records.
-    const paymentFacts = await dbHelper.appPaymentFacts(
-      daemonDb,
-      [...[...prevSpecsMap.values()].flat(), ...newMessages].map((message) => message.hash),
-    );
-    const countedBefore = (list) => messagesThatCount(
-      list.filter((message) => !paymentFacts.notOnChain.has(message.hash)),
-      paymentFacts.positions,
-    );
 
     // 4. Verify each message and collect for batch insert
     const permInserts = [];
@@ -404,7 +340,7 @@ async function processMessages(messages, records, onProgress) {
           );
         } else {
           const prevSpecsList = prevSpecsMap.get(appSpecFormatted.name);
-          const prevMsg = prevSpecsList ? findPrevSpec(countedBefore(prevSpecsList), height, messageTimestamp) : null;
+          const prevMsg = prevSpecsList ? findPrevSpec(prevSpecsList, height) : null;
           if (!prevMsg) {
             failed += 1;
             continue;
@@ -450,10 +386,7 @@ async function processMessages(messages, records, onProgress) {
         // Verified — add to batch and update map for subsequent messages
         permInserts.push(permMsg);
         if (!prevSpecsMap.has(appSpecFormatted.name)) prevSpecsMap.set(appSpecFormatted.name, []);
-        // kept sorted, as findPrevSpec searches it: a gap filled late lands mid-list, not at its end
-        const prevList = prevSpecsMap.get(appSpecFormatted.name);
-        const at = prevList.indexOf(findPrevSpec(prevList, height, messageTimestamp)) + 1;
-        prevList.splice(at, 0, permMsg);
+        prevSpecsMap.get(appSpecFormatted.name).push(permMsg);
 
         hashMarkOps.push({
           updateOne: { filter: { hash: appMessage.hash }, update: { $set: { message: true, messageNotFound: false } } },
@@ -554,7 +487,6 @@ async function broadcastHashRequest(hashes, peers) {
     hashes,
   };
   const signed = await serialiseAndSignFluxBroadcast(message);
-  if (!signed) return;
   for (const peer of peers) {
     peer.send(signed);
   }
@@ -660,33 +592,14 @@ async function syncMissingHashes(options = {}) {
       // eslint-disable-next-line no-await-in-loop
       const found = await dbHelper.findInDatabase(appsGlobalDb, globalAppsMessages, { hash: { $in: hashValues } }, { projection: { _id: 0, hash: 1 } });
       if (found.length > 0) {
-        // The stored message follows this node's payment record.
-        const foundHashes = new Set(found.map((m) => m.hash));
-        // eslint-disable-next-line no-await-in-loop
-        await messageVerifier.alignStoredMessagesWithPayments(chunk.filter((record) => foundHashes.has(record.hash)));
         const ops = found.map((m) => ({ updateOne: { filter: { hash: m.hash }, update: { $set: { message: true, messageNotFound: false } } } }));
         // eslint-disable-next-line no-await-in-loop
         await daemonDb.collection(appsHashesCollection).bulkWrite(ops, { ordered: false });
         localResolved += found.length;
       }
     }
-    // A message this node holds unpromoted is promoted from that copy, as a block's scan
-    // promotes it; a peer's copy of a message already held is not taken (messageStore).
-    let poolResolved = 0;
-    for (let i = 0; i < missingHashes.length; i += CHUNK_SIZE) {
-      const chunk = missingHashes.slice(i, i + CHUNK_SIZE);
-      // eslint-disable-next-line no-await-in-loop
-      const held = await dbHelper.findInDatabase(appsGlobalDb, globalAppsTempMessages, { hash: { $in: chunk.map((h) => h.hash) } }, { projection: { _id: 0, hash: 1 } });
-      const heldHashes = new Set(held.map((m) => m.hash));
-      // eslint-disable-next-line no-restricted-syntax
-      for (const record of chunk.filter((r) => heldHashes.has(r.hash))) {
-        // eslint-disable-next-line no-await-in-loop
-        if (await messageVerifier.checkAndRequestApp(record.hash, record.txid, record.height, record.value, 2)) poolResolved += 1;
-      }
-    }
-    if (localResolved > 0 || poolResolved > 0) {
-      log.info(`syncMissingHashes - Resolved ${localResolved} hashes from local permanent messages, ${poolResolved} from unpromoted ones`);
-      localResolved += poolResolved;
+    if (localResolved > 0) {
+      log.info(`syncMissingHashes - Resolved ${localResolved} hashes from local permanent messages`);
       missingHashes = await getMissingHashes({ force, currentHeight });
     }
 
@@ -703,15 +616,11 @@ async function syncMissingHashes(options = {}) {
       const peerKeys = peers.map((p) => p.key).join(', ');
       log.info(`syncMissingHashes - ${missingHashes.length} missing, using streaming bulk fetch from ${peers.length} peers: ${peerKeys}`);
 
-      // A hash paid more than once is placed by its first payment, as the scan records it first.
-      const missing = new Map();
-      for (const record of missingHashes) {
-        if (!missing.has(record.hash)) missing.set(record.hash, record);
-      }
+      const missingSet = new Set(missingHashes.map((h) => h.hash));
       for (const peer of peers) {
-        if (missing.size === 0) break;
+        if (missingSet.size === 0) break;
         // eslint-disable-next-line no-await-in-loop
-        const stats = await bulkFetchStreamAndProcess(peer.ip, peer.port, missing, onProgress);
+        const stats = await bulkFetchStreamAndProcess(peer.ip, peer.port, missingSet, onProgress);
         resolved += stats.processed;
       }
 
@@ -811,7 +720,7 @@ async function syncMissingHashes(options = {}) {
 
 async function triggerAppHashesCheckAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
+    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
     if (!authorized) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -847,7 +756,6 @@ async function resetHashSyncForUpgrade(currentHeight) {
 }
 
 module.exports = {
-  findPrevSpec,
   syncMissingHashes,
   getMissingHashes,
   resetHashSyncForUpgrade,

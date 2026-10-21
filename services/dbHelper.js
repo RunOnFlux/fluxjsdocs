@@ -8,8 +8,6 @@ const mongodb = require('mongodb');
 const config = require('config');
 
 const serviceHelper = require('./serviceHelper');
-const { withRegistryWrite } = require('./appDatabase/registryWriteLock');
-const appMessageChain = require('./utils/appMessageChain');
 
 const { MongoClient } = mongodb;
 const mongoUrl = `mongodb://${config.database.url}:${config.database.port}/`;
@@ -238,12 +236,11 @@ async function findOneAndUpdateInDatabase(database, collection, query, update, o
  * @param {string} database
  * @param {string} collection
  * @param {object} query
- * @param {object} [options] countDocuments options, such as an index `hint`
  *
  * @returns count of documents
  */
-async function countInDatabase(database, collection, query, options = {}) {
-  const result = await database.collection(collection).countDocuments(query, options);
+async function countInDatabase(database, collection, query) {
+  const result = await database.collection(collection).countDocuments(query);
   return result;
 }
 
@@ -593,114 +590,11 @@ function expireHeightExpr(heightField, expireField) {
 }
 
 /**
- * Each app's messages newest first: by block, a same-block tie by timestamp. The first message
- * per name in this order is the one in force (appMessageChain).
- */
-const NEWEST_APP_MESSAGE_SORT = { 'appSpecifications.name': 1, height: -1, timestamp: -1 };
-const NEWEST_APP_MESSAGE_INDEX = 'newestAppMessageByName';
-
-/**
- * Ensures the index NEWEST_APP_MESSAGE_SORT reads from, and drops the name+height index it
- * covers.
- * @param {mongodb.Collection} appsMessagesCollection
- * @returns {Promise<void>}
- */
-async function ensureNewestAppMessageIndex(appsMessagesCollection) {
-  await appsMessagesCollection.createIndex(NEWEST_APP_MESSAGE_SORT, { name: NEWEST_APP_MESSAGE_INDEX });
-  await appsMessagesCollection.dropIndex('sortAppMessagesForGroupBy').catch(() => {});
-}
-
-/**
- * This node's payment facts for app messages, from its payment records: each hash's position in
- * its block, and the hashes whose transaction is not on the chain.
- * @param {mongodb.Db} daemonDb
- * @param {string[]} hashes
- * @returns {Promise<{positions: Map<string, number>, notOnChain: Set<string>}>}
- */
-async function appPaymentFacts(daemonDb, hashes) {
-  const records = await findInDatabase(
-    daemonDb,
-    config.database.daemon.collections.appsHashes,
-    { hash: { $in: hashes } },
-    { projection: { _id: 0, hash: 1, txIndex: 1, notOnChain: 1 } },
-  );
-  const positions = new Map();
-  const notOnChain = new Set();
-  records.forEach((record) => {
-    if (record.notOnChain === true) notOnChain.add(record.hash);
-    else if (Number.isInteger(record.txIndex)) positions.set(record.hash, record.txIndex);
-  });
-  return { positions, notOnChain };
-}
-
-/**
- * The messages of one app name that count (appMessageChain.messagesThatCount), leaving out a
- * message whose payment is not on the chain.
- * @param {mongodb.Db} daemonDb
- * @param {object[]} messages the name's permanent messages
- * @returns {Promise<object[]>} oldest first
- */
-async function appMessagesThatCount(daemonDb, messages) {
-  const { positions, notOnChain } = await appPaymentFacts(daemonDb, messages.map((message) => message.hash));
-  return appMessageChain.messagesThatCount(messages.filter((message) => !notOnChain.has(message.hash)), positions);
-}
-
-/**
- * The app names whose message in force can differ from their newest message: a name registered
- * by more than one owner, and a name with a message whose payment is not on the chain.
- * @param {mongodb.Db} appsGlobalDb
- * @param {string} appsMessagesCol
- * @param {mongodb.Db} daemonDb
- * @returns {Promise<string[]>}
- */
-async function appNamesTheNameRuleDecides(appsGlobalDb, appsMessagesCol, daemonDb) {
-  const contested = await aggregateInDatabase(appsGlobalDb, appsMessagesCol, [
-    { $match: { type: { $in: ['fluxappregister', 'zelappregister'] } } },
-    { $group: { _id: '$appSpecifications.name', owners: { $addToSet: '$appSpecifications.owner' } } },
-    { $match: { 'owners.1': { $exists: true } } },
-  ]);
-  const notOnChainHashes = (await findInDatabase(
-    daemonDb,
-    config.database.daemon.collections.appsHashes,
-    { notOnChain: true },
-    { projection: { _id: 0, hash: 1 } },
-  )).map((record) => record.hash);
-  const unpaid = notOnChainHashes.length ? await findInDatabase(
-    appsGlobalDb,
-    appsMessagesCol,
-    { hash: { $in: notOnChainHashes } },
-    { projection: { _id: 0, 'appSpecifications.name': 1 } },
-  ) : [];
-  return [...new Set([...contested.map((group) => group._id), ...unpaid.map((message) => message.appSpecifications.name)])];
-}
-
-/**
- * The registry row for one app name under appMessageChain: its message in force while that
- * message's term runs at the height, or null.
- * @param {mongodb.Db} appsGlobalDb
- * @param {string} appsMessagesCol
- * @param {mongodb.Db} daemonDb
- * @param {string} name
- * @param {number} scannedHeight
- * @returns {Promise<object|null>}
- */
-async function liveAppRow(appsGlobalDb, appsMessagesCol, daemonDb, name, scannedHeight) {
-  const messages = await findInDatabase(appsGlobalDb, appsMessagesCol, { 'appSpecifications.name': name }, { projection: { _id: 0 } });
-  const counted = await appMessagesThatCount(daemonDb, messages);
-  const governing = counted[counted.length - 1];
-  if (!governing || !appMessageChain.isInForce(governing.height, governing.appSpecifications.expire, scannedHeight)) return null;
-  return { ...governing.appSpecifications, hash: governing.hash, height: governing.height };
-}
-
-/**
- * Whether the registry holds a different number of live apps than the messages give: each name's
- * newest message, and for a name the name rule decides (appNamesTheNameRuleDecides), its message
- * in force (liveAppRow), as the rebuild takes them.
+ *
  * @param {mongodb.Db} appsGlobalDb
  * @param {string} appsMessagesCol mongo collection name
  * @param {string} appsInformationCol mongo collection name
  * @param {number} scannedHeight
- * @param {mongodb.Db} daemonDb the payment records' database
  * @returns {Promise<boolean>}
  */
 async function isReindexAppsInformationRequired(
@@ -708,25 +602,15 @@ async function isReindexAppsInformationRequired(
   appsMessagesCol,
   appsInformationCol,
   scannedHeight,
-  daemonDb,
 ) {
-  const decided = await appNamesTheNameRuleDecides(appsGlobalDb, appsMessagesCol, daemonDb);
-  let decidedLive = 0;
-  // eslint-disable-next-line no-restricted-syntax
-  for (const name of decided) {
-    // eslint-disable-next-line no-await-in-loop
-    if (await liveAppRow(appsGlobalDb, appsMessagesCol, daemonDb, name, scannedHeight)) decidedLive += 1;
-  }
-
   const appsMessagesPipeline = [
-    { $sort: NEWEST_APP_MESSAGE_SORT },
+    { $sort: { 'appSpecifications.name': 1, height: -1 } },
     {
       $group: {
         _id: '$appSpecifications.name',
         maxHeightMsg: { $first: '$$ROOT' },
       },
     },
-    { $match: { _id: { $nin: decided } } },
     {
       $match: {
         $expr: {
@@ -762,7 +646,15 @@ async function isReindexAppsInformationRequired(
   ];
 
   try {
-    await ensureNewestAppMessageIndex(appsGlobalDb.collection(appsMessagesCol));
+    await appsGlobalDb
+      .collection(appsMessagesCol)
+      .createIndex(
+        {
+          'appSpecifications.name': 1,
+          height: -1,
+        },
+        { name: 'sortAppMessagesForGroupBy' },
+      );
 
     const messagesCursor = await aggregateInDatabase(
       appsGlobalDb,
@@ -777,11 +669,10 @@ async function isReindexAppsInformationRequired(
       { returnArray: false },
     );
 
-    const newestLive = await messagesCursor.next();
+    const appsFromMessages = await messagesCursor.next();
     const appsFromInformation = await informationCursor.next();
-    const appsFromMessagesCount = (newestLive?.count ?? 0) + decidedLive;
 
-    if (!appsFromMessagesCount) {
+    if (!appsFromMessages) {
       log.warn('No apps from apps messages found, unable to validate apps information');
       return false;
     }
@@ -792,11 +683,11 @@ async function isReindexAppsInformationRequired(
     }
 
     log.info(
-      `Apps reindex validation. Found ${appsFromMessagesCount} apps from appsMessages.`
+      `Apps reindex validation. Found ${appsFromMessages.count} apps from appsMessages.`
       + ` Found ${appsFromInformation.count} apps from appsInformation`,
     );
 
-    if (appsFromMessagesCount !== appsFromInformation.count) {
+    if (appsFromMessages.count !== appsFromInformation.count) {
       return true;
     }
 
@@ -870,29 +761,22 @@ async function syncAppsInformationCollection(
 }
 
 /**
- * Rebuilds the appsInformation collection from appsMessages in a single mongo
- * aggregation and chunked bulk inserts.
+ * Drops the appsInformation collection and rebuilds it from appsMessages in a
+ * single mongo aggregation + chunked bulk inserts. Also clears the install
+ * errors collection (1-hour TTL anyway, no useful state to preserve through
+ * a full rebuild).
  *
- * The new registry is built in a staging collection and renamed over the live
- * one in one step, so a reader sees the old registry or the new one and never an
- * empty or partial one. The rebuild holds the registry write lock throughout: a
- * promotion or expiry arriving meanwhile waits and writes to the collection this
- * produced.
- *
- * The aggregation takes each name's newest message. A name whose message in
- * force can differ from it (appNamesTheNameRuleDecides) is then decided by
- * appMessageChain from its full history. Filtering for currently-alive apps
- * happens inside the aggregation via expireHeightExpr (full PON fork rate
- * adjustment), and by appMessageChain.isInForce for the names decided after it,
- * so there is no separate expire pass.
+ * Filtering for currently-alive apps happens inside the aggregation via
+ * expireHeightExpr (full PON fork rate adjustment), so there is no separate
+ * expire pass.
  *
  * @param {mongodb.Db} appsGlobalDb
  * @param {mongodb.Db} appsLocalDb
  * @param {string} globalAppsMessagesCol
  * @param {string} globalAppsInformationCol
+ * @param {string} globalAppsInstallingErrorsLocationsCol
  * @param {string} localAppsInformationCol
  * @param {number} scannedHeight
- * @param {mongodb.Db} daemonDb the payment records' database
  * @returns {Promise<Array<string>>} installed app names that are no longer in
  *   the live spec set (caller is responsible for removing them locally)
  */
@@ -903,102 +787,77 @@ async function reindexGlobalAppsInformation(
   globalAppsInformationCol,
   localAppsInformationCol,
   scannedHeight,
-  daemonDb,
 ) {
-  return withRegistryWrite(async () => {
-    const stagingCol = `${globalAppsInformationCol}_rebuild`;
-    // A staging collection left by a rebuild that did not finish is discarded;
-    // the live registry was never touched by it.
-    await dropCollection(appsGlobalDb, stagingCol).catch((error) => {
-      if (error.message !== 'ns not found') throw error;
-    });
+  try {
+    await appsGlobalDb.collection(globalAppsInformationCol).deleteMany({});
+  } catch (error) {
+    log.error(`reindexGlobalAppsInformation - Unable to clear collection. Error: ${error}`);
+    return [];
+  }
 
-    const infoCol = appsGlobalDb.collection(stagingCol);
-    await infoCol.createIndexes([
-      { key: { name: 1 }, name: 'query for getting zelapp based on zelapp specs name' },
-      { key: { owner: 1 }, name: 'query for getting zelapp based on zelapp specs owner' },
-      { key: { repotag: 1 }, name: 'query for getting zelapp based on image' },
-      { key: { height: 1 }, name: 'query for getting zelapp based on last height update' },
-      { key: { hash: 1 }, name: 'query for getting zelapp based on last hash' },
-    ]);
-    await ensureNewestAppMessageIndex(appsGlobalDb.collection(globalAppsMessagesCol));
+  const infoCol = appsGlobalDb.collection(globalAppsInformationCol);
+  await infoCol.createIndexes([
+    { key: { name: 1 }, name: 'query for getting zelapp based on zelapp specs name' },
+    { key: { owner: 1 }, name: 'query for getting zelapp based on zelapp specs owner' },
+    { key: { repotag: 1 }, name: 'query for getting zelapp based on image' },
+    { key: { height: 1 }, name: 'query for getting zelapp based on last height update' },
+    { key: { hash: 1 }, name: 'query for getting zelapp based on last hash' },
+  ]);
 
-    const pipeline = [
-      { $sort: NEWEST_APP_MESSAGE_SORT },
-      {
-        $group: {
-          _id: '$appSpecifications.name',
-          maxHeightMsg: { $first: '$$ROOT' },
-        },
+  const pipeline = [
+    { $sort: { 'appSpecifications.name': 1, height: -1 } },
+    {
+      $group: {
+        _id: '$appSpecifications.name',
+        maxHeightMsg: { $first: '$$ROOT' },
       },
-      {
-        $match: {
-          $expr: {
-            $gt: [
-              expireHeightExpr(
-                '$maxHeightMsg.height',
-                '$maxHeightMsg.appSpecifications.expire',
-              ),
-              scannedHeight,
-            ],
-          },
-        },
-      },
-      {
-        $replaceWith: {
-          $mergeObjects: [
-            '$maxHeightMsg.appSpecifications',
-            {
-              hash: '$maxHeightMsg.hash',
-              height: '$maxHeightMsg.height',
-            },
+    },
+    {
+      $match: {
+        $expr: {
+          $gt: [
+            expireHeightExpr(
+              '$maxHeightMsg.height',
+              '$maxHeightMsg.appSpecifications.expire',
+            ),
+            scannedHeight,
           ],
         },
       },
-    ];
+    },
+    {
+      $replaceWith: {
+        $mergeObjects: [
+          '$maxHeightMsg.appSpecifications',
+          {
+            hash: '$maxHeightMsg.hash',
+            height: '$maxHeightMsg.height',
+          },
+        ],
+      },
+    },
+  ];
 
-    const resultCursor = await aggregateInDatabase(
-      appsGlobalDb,
-      globalAppsMessagesCol,
-      pipeline,
-      { returnArray: false },
-    );
+  const resultCursor = await aggregateInDatabase(
+    appsGlobalDb,
+    globalAppsMessagesCol,
+    pipeline,
+    { returnArray: false },
+  );
 
-    const appsToRemove = await syncAppsInformationCollection(
-      resultCursor,
-      appsGlobalDb,
-      appsLocalDb,
-      stagingCol,
-      localAppsInformationCol,
-    );
+  const appsToRemove = await syncAppsInformationCollection(
+    resultCursor,
+    appsGlobalDb,
+    appsLocalDb,
+    globalAppsInformationCol,
+    localAppsInformationCol,
+  );
 
-    const decided = await appNamesTheNameRuleDecides(appsGlobalDb, globalAppsMessagesCol, daemonDb);
-    // eslint-disable-next-line no-restricted-syntax
-    for (const name of decided) {
-      // eslint-disable-next-line no-await-in-loop
-      const row = await liveAppRow(appsGlobalDb, globalAppsMessagesCol, daemonDb, name, scannedHeight);
-      const removalAt = appsToRemove.indexOf(name);
-      if (row) {
-        // eslint-disable-next-line no-await-in-loop
-        await infoCol.replaceOne({ name }, row, { upsert: true });
-        if (removalAt !== -1) appsToRemove.splice(removalAt, 1);
-      } else {
-        // eslint-disable-next-line no-await-in-loop
-        await infoCol.deleteOne({ name });
-        // eslint-disable-next-line no-await-in-loop
-        const installed = await findOneInDatabase(appsLocalDb, localAppsInformationCol, { name }, { projection: { _id: 0, name: 1 } });
-        if (installed && removalAt === -1) appsToRemove.push(name);
-      }
-    }
+  log.info(
+    `Reindexing of global applications finished. Local apps to be removed: ${JSON.stringify(appsToRemove)}`,
+  );
 
-    await infoCol.rename(globalAppsInformationCol, { dropTarget: true });
-
-    log.info(
-      `Reindexing of global applications finished. Local apps to be removed: ${JSON.stringify(appsToRemove)}`,
-    );
-
-    return appsToRemove;
-  });
+  return appsToRemove;
 }
 
 /**
@@ -1057,7 +916,6 @@ async function validateAppsInformation() {
       globalAppsMessagesCol,
       globalAppsInformationCol,
       scannedHeight,
-      daemonDb,
     );
 
     log.info(`validateAppsInformation reindexRequired: ${reindexRequired}`);
@@ -1074,7 +932,6 @@ async function validateAppsInformation() {
       globalAppsInformationCol,
       localAppsInformationCol,
       scannedHeight,
-      daemonDb,
     );
 
     response.reindexed = true;
@@ -1127,8 +984,6 @@ if (require.main === module) {
 
 module.exports = {
   aggregateInDatabase,
-  appMessagesThatCount,
-  appPaymentFacts,
   bulkWriteInDatabase,
   closeDbConnection,
   collectionStats,
@@ -1137,7 +992,6 @@ module.exports = {
   databaseConnection,
   distinctDatabase,
   dropCollection,
-  ensureNewestAppMessageIndex,
   findInDatabase,
   findOneAndDeleteInDatabase,
   findOneAndUpdateInDatabase,
@@ -1146,7 +1000,6 @@ module.exports = {
   initiateDB,
   insertManyToDatabase,
   insertOneToDatabase,
-  isReindexAppsInformationRequired,
   reindexGlobalAppsInformation,
   removeDocumentsFromCollection,
   repairNanInAppsMessagesDb,
@@ -1155,5 +1008,4 @@ module.exports = {
   updateOneInDatabase,
   validateAppsInformation,
   waitForMongo,
-  NEWEST_APP_MESSAGE_SORT,
 };

@@ -176,7 +176,7 @@ function analyticsMiddleware(req, res, next) {
     return;
   }
 
-  const { zelidauth } = req.headers;
+  const zelidauth = req.headers.zelidauth;
   if (!zelidauth) {
     next();
     return;

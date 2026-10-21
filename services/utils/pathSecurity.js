@@ -29,37 +29,15 @@ function rejectBackslashes(inputPath) {
 }
 
 /**
- * Characters that cannot appear in a path component this code will handle.
+ * Validate a single path component (directory or filename) against allowlist.
+ * This is the STRICT mode validation - only allows known-safe characters.
  *
- * A path separator, because components are what a path splits INTO; a backslash,
- * which on Linux is a legal filename character but only ever appears here by
- * mistake or by attempt; and the control characters.
- *
- * Control characters are the interesting one. They are legal in a Linux
- * filename, but a newline in particular corrupts anything line-oriented that
- * later handles the name - /proc/self/mountinfo escapes them for exactly this
- * reason, and a name reaches a log line, a mount table and a container's own
- * output before anyone reads it. Rejecting them keeps a filename from being
- * able to forge a record about itself.
- */
-// eslint-disable-next-line no-control-regex
-const UNSAFE_PATH_COMPONENT = /[\u0000-\u001F\u007F-\u009F\\/]/;
-
-/**
- * Validate a single path component (directory or filename).
- *
- * This rejects what cannot be handled rather than permitting a known-safe list.
- * It previously allowed only `[a-zA-Z0-9_\-. @#+=()[\]{}]`, which excludes the
- * comma, the apostrophe, the ampersand and every non-ASCII character - so
- * `café.jpg`, `Mary's photo.png` and `report,final.pdf` could be UPLOADED (the
- * upload path applies no character rule) and then never renamed, moved,
- * downloaded or deleted. The system accepted names it could not address.
- *
- * Widening is safe because nothing in the containment argument rests on the
- * character set: traversal is caught by the `..` component check and by
- * resolving against the base, symlink escape by verifyRealPath, and anything
- * that slips past both lands inside a container with only that volume mounted.
- * An allowlist of punctuation was never what made a path safe.
+ * Allowed characters:
+ * - Alphanumeric (a-z, A-Z, 0-9)
+ * - Dash (-), underscore (_)
+ * - Dot (.) - but not as sole character or double dots
+ * - Space ( ) - common in filenames
+ * - Additional safe chars: @, #, +, =, (), [], {}
  *
  * @param {string} component - Single path component (no slashes)
  * @returns {boolean} True if component is safe
@@ -79,9 +57,16 @@ function isValidPathComponent(component) {
     return false;
   }
 
-  // Consecutive dots WITHIN a name ("file..backup.txt") are not traversal; only
-  // the component being exactly '..' is, and that is checked above.
-  return !UNSAFE_PATH_COMPONENT.test(component);
+  // Allowlist pattern: alphanumeric, dash, underscore, dot, space, and common safe chars
+  // Note: We allow consecutive dots in FILENAMES (e.g., "file..backup.txt") since they're not traversal
+  // The traversal check is done by checking if component === '..'
+  const safePattern = /^[a-zA-Z0-9_\-. @#+=()[\]{}]+$/;
+
+  if (!safePattern.test(component)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -246,13 +231,6 @@ function sanitizePath(userPath, basePath, options = {}) {
  * This prevents symlink escape attacks where a symlink inside the allowed directory
  * points to a location outside it.
  *
- * A path that cannot be resolved is returned unchanged rather than refused, so
- * this answers "does this resolve outside" and not "is this contained": a leaf
- * that does not exist yet passes even when a directory above it is a link out.
- * Callers guarding containment want verifyRealPathOfExistingPath, which walks
- * to the deepest part that does exist. This one is for comparing where two
- * paths land, and is what that function is built on.
- *
  * @param {string} targetPath - The path to verify (should already be sanitized)
  * @param {string} basePath - The allowed base directory
  * @returns {Promise<string>} The real path if safe
@@ -296,57 +274,6 @@ async function verifyRealPath(targetPath, basePath) {
 }
 
 /**
- * Where a path will land once written, including when it does not exist yet.
- *
- * verifyRealPath returns a path it cannot resolve unchanged, so a name below a
- * link that has no target yet - `backup/in/new` with `backup/in -> ../appdata`
- * - compares as itself, while `mkdir -p` then creates `appdata/new`. This
- * resolves the deepest part that does exist and appends the rest, which is
- * exactly where a create lands.
- *
- * A name that is there but does not resolve is a dangling link, and where a
- * write through it would land cannot be known: null, which a caller deciding
- * whether to allow the write must read as no.
- *
- * Bounded by the base like verifyRealPathOfExistingPath: a path spelled
- * outside it is refused rather than walked.
- *
- * @param {string} targetPath - The path to place (should already be sanitized)
- * @param {string} basePath - The allowed base directory, where the walk stops
- * @returns {Promise<string|null>} the real path the target lands at, or null
- */
-async function realLandingPath(targetPath, basePath) {
-  const normalizedBase = path.resolve(basePath);
-  let existing = path.resolve(targetPath);
-  const below = [];
-  // Every iteration either returns or moves one level towards the base.
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const relativePath = path.relative(normalizedBase, existing);
-    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
-      throw new Error('Invalid path: access outside allowed directory denied');
-    }
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const real = await fs.promises.realpath(existing);
-      return path.join(real, ...below);
-    } catch (error) {
-      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    const present = await fs.promises.lstat(existing).then(() => true, (error) => {
-      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false;
-      throw error;
-    });
-    if (present) return null;
-    // A base that is not there at all is taken as itself, as verifyRealPath does.
-    if (existing === normalizedBase) return path.join(existing, ...below);
-    below.unshift(path.basename(existing));
-    existing = path.dirname(existing);
-  }
-}
-
-/**
  * Verify that the deepest existing portion of a (sanitized) path resolves within the allowed base.
  *
  * This is intended for operations that may CREATE files/folders, where `targetPath`
@@ -363,12 +290,8 @@ async function realLandingPath(targetPath, basePath) {
 async function verifyRealPathOfExistingPath(targetPath, basePath) {
   const normalizedBase = path.resolve(basePath);
   let currentPath = path.resolve(targetPath);
-  let ancestorStats = null;
 
-  // Walk up until we find an existing ancestor (or reach the base). Bounded by
-  // the walk itself: every iteration either breaks or moves one level towards
-  // the base, and reaching the base breaks.
-  // eslint-disable-next-line no-constant-condition
+  // Walk up until we find an existing ancestor (or reach the base)
   while (true) {
     const relativePath = path.relative(normalizedBase, currentPath);
     if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
@@ -376,7 +299,7 @@ async function verifyRealPathOfExistingPath(targetPath, basePath) {
     }
 
     try {
-      ancestorStats = await fs.promises.lstat(currentPath);
+      await fs.promises.lstat(currentPath);
       break;
     } catch (error) {
       if (error.code !== 'ENOENT') {
@@ -395,22 +318,42 @@ async function verifyRealPathOfExistingPath(targetPath, basePath) {
     }
   }
 
-  // A symlink in the path whose target does not resolve on the host is
-  // unverifiable, and unverifiable is not safe. The checks run in the host
-  // namespace, but the operation runs in the container where /work IS this
-  // volume - so a link the host sees as dangling (ln -s /work ..., or a
-  // relative climb to it) can resolve to the volume root in the container and
-  // reach a reserved name the guard would otherwise refuse. lstat succeeds on a
-  // dangling link and realpath then fails with ENOENT, which the ENOENT branch
-  // below would pass through as "cannot resolve, therefore safe". Refuse it.
-  if (ancestorStats && ancestorStats.isSymbolicLink()) {
-    const resolvedTarget = await fs.promises.realpath(currentPath).catch(() => null);
-    if (resolvedTarget === null) {
-      throw new Error('Invalid path: a symlink in the path does not resolve on the host');
+  return verifyRealPath(currentPath, basePath);
+}
+
+/**
+ * Synchronous version of verifyRealPath.
+ *
+ * @param {string} targetPath - The path to verify
+ * @param {string} basePath - The allowed base directory
+ * @returns {string} The real path if safe
+ * @throws {Error} If the real path escapes the base directory
+ */
+function verifyRealPathSync(targetPath, basePath) {
+  const normalizedBase = path.resolve(basePath);
+  let realBasePath = normalizedBase;
+  try {
+    realBasePath = fs.realpathSync(normalizedBase);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
     }
   }
 
-  return verifyRealPath(currentPath, basePath);
+  try {
+    const realPath = fs.realpathSync(targetPath);
+
+    if (realPath !== realBasePath && !realPath.startsWith(realBasePath + path.sep)) {
+      throw new Error('Symlink escape: real path is outside allowed directory');
+    }
+
+    return realPath;
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return targetPath;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -432,12 +375,14 @@ function validateFilename(name) {
     throw new Error('Filename must be a non-empty string');
   }
 
-  // Named separately from the control-character rule that would also catch it:
-  // a null byte in a filename is a specific, well-known attempt to truncate a
-  // path in a downstream C string, and saying so is more use than a general
-  // message.
+  // Check for null bytes
   if (name.includes('\0')) {
     throw new Error('Invalid filename: null bytes not allowed');
+  }
+
+  // Check for path separators (both / and \)
+  if (name.includes('/') || name.includes('\\')) {
+    throw new Error('Invalid filename: path separators not allowed');
   }
 
   // Check for reserved traversal names
@@ -445,92 +390,29 @@ function validateFilename(name) {
     throw new Error('Invalid filename: reserved name');
   }
 
-  // The same rule the rest of the module applies to a path component. Upload
-  // used to have its own, looser one - no character check at all - which is how
-  // a name could be accepted here and then be unaddressable by every other
-  // endpoint. One rule, so what can be created can be managed.
-  if (!isValidPathComponent(name)) {
-    throw new Error('Invalid filename: path separators and control characters are not allowed');
-  }
-
   return name;
 }
 
 /**
- * Open a regular file without following a link at its final component, and
- * without waiting for one.
+ * Sanitize a path and verify it doesn't escape via symlinks.
+ * This is the most secure option - combines lexical checks with symlink verification.
  *
- * The one way to read a path an application owns. A checked name is only ever a
- * claim about the moment it was checked - the owner keeps running and can
- * replace what it refers to, and this process is root, so following a link
- * there reads a file the owner could not open themselves. Everything after this
- * is decided from the descriptor rather than from the name.
- *
- * O_NONBLOCK because opening a FIFO for reading WAITS for a writer, and the
- * application owns the directory. A named pipe left where a file is expected
- * blocks the open for as long as the pipe exists - and the boot sweep awaits
- * its read, so one pipe planted in one app's own volume stops everything after
- * it in startup: the app network reclaim, syncthing, the PGP identity. It
- * survives the reboot, because the pipe is still there. The flag does nothing
- * to a regular file.
- *
- * The type is then checked from the DESCRIPTOR, which is the same reason
- * everything else here is. With the flag above a pipe or a device opens rather
- * than hanging, so a caller would otherwise go on to read one as if it were a
- * file. Callers get a regular file or an error, and never have to ask.
- *
- * The stats are handed back with the handle because they were taken to make
- * that check, and every caller needs the size. Asking again would be a second
- * answer to a settled question - and a later one: the application is writing to
- * this file throughout, so a size measured a turn afterwards can already be
- * larger than the one a download has announced.
- *
- * The caller closes the handle. Swapping a PARENT directory stays expressible
- * and is what the containment checks in this module cover; this closes the half
- * of it that a check cannot.
- * @param {string} filePath - already checked for containment
- * @returns {Promise<{handle: import('node:fs/promises').FileHandle,
- *   stats: import('node:fs').Stats}>} An open handle and what it is.
- * @throws {Error} if the path is not a regular file
+ * @param {string} userPath - User-provided relative path
+ * @param {string} basePath - The allowed base directory
+ * @param {object} options - Optional configuration
+ * @param {boolean} options.strict - If true, enforce strict allowlist (default: true)
+ * @returns {Promise<string>} The verified real path
+ * @throws {Error} If path is invalid or escapes base directory
  */
-async function openNoFollow(filePath) {
-  let handle;
-  try {
-    handle = await fs.promises.open(
-      filePath,
-      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
-    );
-  } catch (error) {
-    // A symlink at the final component fails with ELOOP because O_NOFOLLOW
-    // refuses to follow it - the download reads on the host, not in the
-    // container, so following a link could hand back a file outside the volume.
-    // Answer the app owner with what to do instead of an opaque errno: a link
-    // an app legitimately keeps (latest.log -> dated.log) is served by naming
-    // its target. The advice names only that, because this serves callers on
-    // both the app volume browser and the FluxShare routes, and compressing a
-    // folder is a route only the first of them has.
-    if (error.code === 'ELOOP') {
-      throw new Error('A symbolic link cannot be downloaded directly; name the file it points to instead');
-    }
-    throw error;
-  }
+async function sanitizeAndVerifyPath(userPath, basePath, options = {}) {
+  // First, sanitize the path lexically
+  const sanitizedPath = sanitizePath(userPath, basePath, options);
 
-  try {
-    const stats = await handle.stat();
-    if (!stats.isFile()) {
-      // No path in the message: this reaches an API caller, and the host path
-      // is not theirs to learn.
-      throw new Error('Only a regular file can be read');
-    }
-    return { handle, stats };
-  } catch (error) {
-    await handle.close().catch(() => {});
-    throw error;
-  }
+  // Then verify the real path (after symlink resolution)
+  return verifyRealPath(sanitizedPath, basePath);
 }
 
 module.exports = {
-  openNoFollow,
   sanitizePath,
   validateFilename,
   validatePathAllowlist,
@@ -538,6 +420,7 @@ module.exports = {
   isValidPathComponent,
   verifyRealPath,
   verifyRealPathOfExistingPath,
-  realLandingPath,
+  verifyRealPathSync,
+  sanitizeAndVerifyPath,
   rejectBackslashes,
 };

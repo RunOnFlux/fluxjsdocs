@@ -12,35 +12,8 @@ const dbHelper = require('./dbHelper');
 
 const scannedHeightCollection = config.database.daemon.collections.scannedHeight;
 
-/**
- * Every collateral a Flux node can hold, keyed by its amount: the tier it makes
- * the node (`tier`, and `nodeTier` as /flux/nodetier names it), and the
- * hardware a node must have to serve as that tier.
- */
-const COLLATERAL_TIERS = Object.freeze({
-  10000: Object.freeze({
-    tier: 'basic', nodeTier: 'cumulus', label: 'Cumulus', minRamGb: 3, minCpuThreads: 2,
-  }),
-  25000: Object.freeze({
-    tier: 'super', nodeTier: 'nimbus', label: 'Nimbus', minRamGb: 7, minCpuThreads: 4,
-  }),
-  100000: Object.freeze({
-    tier: 'bamf', nodeTier: 'stratus', label: 'Stratus', minRamGb: 30, minCpuThreads: 8,
-  }),
-  1000: Object.freeze({
-    tier: 'basic', nodeTier: 'cumulus_new', label: 'new Cumulus', minRamGb: 3, minCpuThreads: 4,
-  }),
-  12500: Object.freeze({
-    tier: 'super', nodeTier: 'nimbus_new', label: 'new Nimbus', minRamGb: 30, minCpuThreads: 8,
-  }),
-  40000: Object.freeze({
-    tier: 'bamf', nodeTier: 'stratus_new', label: 'new Stratus', minRamGb: 61, minCpuThreads: 16,
-  }),
-});
-
-// This node's collateral and its tier, held once known: neither changes while
-// FluxOS runs.
-let storedCollateralTier = null;
+let storedTier = null;
+let storedCollateral = null;
 
 /**
  * To return a transaction hash and index.
@@ -74,45 +47,49 @@ async function obtainNodeCollateralInformation() {
 }
 
 /**
- * This node's collateral and the tier it makes the node, as the daemon reports
- * them. Throws only when the daemon cannot say: `collateral` is null when the
- * node holds none, or when the collateral's transaction has no output at its
- * index, and `tier` is null when its collateral is not one of COLLATERAL_TIERS.
- * @returns {Promise<{collateral: (number|null), tier: (object|null), missingOutput: (string|undefined)}>}
- *   tier is the node's COLLATERAL_TIERS entry; missingOutput names, as
- *   `txhash:index`, a collateral output its transaction does not have.
+ * To return the tier of a node in old naming scheme
+ * @returns {string} Name of the node tier in old naming scheme
  */
-async function nodeCollateralTier() {
-  if (storedCollateralTier) return storedCollateralTier;
-
+async function nodeTier() {
+  if (storedTier) {
+    return storedTier; // node tier is not changing. We can use globally cached value.
+  }
+  // get our collateral information to decide if app specifications are basic, super, bamf
+  // getzlenodestatus.collateral
   const nodeStatus = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
   if (nodeStatus.status === 'error') {
     throw nodeStatus.data;
   }
-  if (!nodeStatus.data.collateral) return { collateral: null, tier: null };
-
-  const { txhash, txindex } = getCollateralInfo(nodeStatus.data.collateral);
-  const txInformation = await daemonServiceTransactionRpcs.getRawTransaction({ params: { txid: txhash, verbose: 1 } });
+  const collateralInformation = getCollateralInfo(nodeStatus.data.collateral);
+  // get transaction information about collateralInformation.txhash
+  const request = {
+    params: {
+      txid: collateralInformation.txhash,
+      verbose: 1,
+    },
+  };
+  const txInformation = await daemonServiceTransactionRpcs.getRawTransaction(request);
   if (txInformation.status === 'error') {
     throw txInformation.data;
   }
-  const output = txInformation.data.vout[txindex];
-  if (!output) return { collateral: null, tier: null, missingOutput: `${txhash}:${txindex}` };
-
-  const collateralTier = { collateral: output.value, tier: COLLATERAL_TIERS[output.value] || null };
-  if (collateralTier.tier) storedCollateralTier = collateralTier;
-  return collateralTier;
-}
-
-/**
- * To return the tier of a node in old naming scheme
- * @returns {Promise<string>} basic, super or bamf. Throws when the node's
- *   collateral makes it no tier.
- */
-async function nodeTier() {
-  const { tier } = await nodeCollateralTier();
-  if (!tier) throw new Error('Unrecognised Flux Node tier');
-  return tier.tier;
+  // get collateralInformation.txindex vout
+  const { value } = txInformation.data.vout[collateralInformation.txindex];
+  if (value === 10000 || value === 1000) {
+    storedTier = 'basic';
+    storedCollateral = value;
+    return storedTier;
+  }
+  if (value === 25000 || value === 12500) {
+    storedTier = 'super';
+    storedCollateral = value;
+    return storedTier;
+  }
+  if (value === 100000 || value === 40000) {
+    storedTier = 'bamf';
+    storedCollateral = value;
+    return storedTier;
+  }
+  throw new Error('Unrecognised Flux Node tier');
 }
 
 /**
@@ -132,13 +109,48 @@ async function getNewNodeTier() {
 
 /**
  * To return the quantity of collateral stored and determine what type of node it can be used for.
- * @returns {Promise<number>} The quantity of collateral. Throws when the node's
- *   collateral makes it no tier.
+ * @returns {number} The quantity of collateral.
  */
 async function nodeCollateral() {
-  const { collateral, tier } = await nodeCollateralTier();
-  if (!tier) throw new Error('Unrecognised Flux Node Collateral');
-  return collateral;
+  if (storedCollateral) {
+    return storedCollateral; // node collateral is not changing. We can use globally cached value.
+  }
+  // get our collateral information to decide if app specifications are basic, super, bamf
+  // getzlenodestatus.collateral
+  const nodeStatus = await daemonServiceFluxnodeRpcs.getFluxNodeStatus();
+  if (nodeStatus.status === 'error') {
+    throw nodeStatus.data;
+  }
+  const collateralInformation = getCollateralInfo(nodeStatus.data.collateral);
+  // get transaction information about collateralInformation.txhash
+  const request = {
+    params: {
+      txid: collateralInformation.txhash,
+      verbose: 1,
+    },
+  };
+  const txInformation = await daemonServiceTransactionRpcs.getRawTransaction(request);
+  if (txInformation.status === 'error') {
+    throw txInformation.data;
+  }
+  // get collateralInformation.txindex vout
+  const { value } = txInformation.data.vout[collateralInformation.txindex];
+  if (value === 10000 || value === 1000) {
+    storedTier = 'basic';
+    storedCollateral = value;
+    return storedCollateral;
+  }
+  if (value === 100000 || value === 40000) {
+    storedTier = 'bamf';
+    storedCollateral = value;
+    return storedCollateral;
+  }
+  if (value === 25000 || value === 12500) {
+    storedTier = 'super';
+    storedCollateral = value;
+    return storedCollateral;
+  }
+  throw new Error('Unrecognised Flux Node Collateral');
 }
 
 /**
@@ -201,16 +213,20 @@ async function checkSynced() {
 }
 
 /**
- * @deprecated The image whitelist is retired - nothing has enforced it since
- * July 2024 and the network accepts any image (the blocklist still governs).
- * Kept returning an empty list so existing callers get a valid answer instead
- * of a 404. Remove once no supported release could still call it.
+ * To create a JSON response showing a list of whitelisted Github repositories.
  * @param {object} req Request.
  * @param {object} res Response.
  */
 async function whitelistedRepositories(req, res) {
-  const resultsResponse = messageHelper.createDataMessage([]);
-  res.json(resultsResponse);
+  try {
+    const whitelisted = await serviceHelper.axiosGet(`${config.github.rawBaseUrl}/helpers/repositories.json`);
+    const resultsResponse = messageHelper.createDataMessage(whitelisted.data);
+    res.json(resultsResponse);
+  } catch (error) {
+    log.error(error);
+    const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    res.json(errMessage);
+  }
 }
 
 /**
@@ -226,29 +242,33 @@ async function messageHash(message) {
 }
 
 /**
- * Set the held collateral by its amount, or clear it with null - created for testing purposes
- * @param {(number|null)} collateral Collateral amount.
+ * Set nodeTier - created for testing purposes
  */
-function setStoredCollateral(collateral) {
-  storedCollateralTier = collateral === null
-    ? null
-    : { collateral, tier: COLLATERAL_TIERS[collateral] || null };
+function setStoredTier(newValue) {
+  storedTier = newValue;
 }
 
 /**
- * Returns the held collateral amount - created for testing purposes
- * @returns {(number|null)} Collateral amount.
- */
-function getStoredCollateral() {
-  return storedCollateralTier ? storedCollateralTier.collateral : null;
-}
-
-/**
- * Returns the held tier in old naming scheme - created for testing purposes
- * @returns {(string|null)} basic, super or bamf.
+ * Returns storedTier - created for testing purposes
+ * @returns {string} storedTier
  */
 function getStoredTier() {
-  return storedCollateralTier && storedCollateralTier.tier ? storedCollateralTier.tier.tier : null;
+  return storedTier;
+}
+
+/**
+ * Set storedCollateral - created for testing purposes
+ */
+function setStoredCollateral(newValue) {
+  storedCollateral = newValue;
+}
+
+/**
+ * Returns storedCollateral - created for testing purposes
+ * @returns {number} storedTier
+ */
+function getStoredCollateral() {
+  return storedCollateral;
 }
 
 module.exports = {
@@ -260,11 +280,10 @@ module.exports = {
   whitelistedRepositories,
   messageHash,
   nodeCollateral,
-  nodeCollateralTier,
   obtainNodeCollateralInformation,
-  COLLATERAL_TIERS,
 
   // exported for testing purposes
+  setStoredTier,
   setStoredCollateral,
   getStoredCollateral,
   getStoredTier,

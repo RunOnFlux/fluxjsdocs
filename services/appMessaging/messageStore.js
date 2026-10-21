@@ -6,7 +6,6 @@ const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const messageVerifier = require('./messageVerifier');
 const appValidator = require('../appRequirements/appValidator');
 const registryManager = require('../appDatabase/registryManager');
-const { socketAddressesMatch } = require('../utils/socketAddressUtils');
 // const advancedWorkflows = require('../appLifecycle/advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const globalState = require('../utils/globalState');
@@ -20,10 +19,9 @@ const {
   globalAppStateEvents,
   appsHashesCollection,
 } = require('../utils/appConstants');
-const { appsInstallingBroadcasts } = config.database.appsglobal.collections;
+const appsInstallingBroadcasts = config.database.appsglobal.collections.appsInstallingBroadcasts;
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
-const { addressMoveEvents, EVENTS: ADDRESS_MOVE_EVENTS } = require('../utils/addressMoveEvents');
 
 const {
   GOSSIP_VALIDITY_MS,
@@ -31,13 +29,7 @@ const {
   INSTALLING_EXPIRY_MS,
   INSTALLING_ERRORS_EXPIRY_MS,
   EVICTED_EXPIRY_MS,
-  SIGTERM_EXPIRY_MS,
 } = require('../utils/appConstants');
-
-// Cap on how many location operations are handed to one bulk write. The driver
-// encodes the whole batch before sending it, and that encoding is what a large
-// sync response leaves behind in memory.
-const LOCATION_OPS_PER_WRITE = 500;
 
 const APP_STATE_EVENT_TYPES = Object.freeze({
   APPRUNNING: 'apprunning',
@@ -146,13 +138,7 @@ async function storeAppTemporaryMessage(message, options = {}) {
     // For updates, fetch previous app specs first - if registration doesn't exist yet, queue the update
     let previousAppSpecs = null;
     if (!appRegistration) {
-      // a message fetched from peers is already on chain at block: check it against what was
-      // below it there. A live one builds on the newest message.
-      previousAppSpecs = await registryManager.getPreviousAppSpecifications(
-        appSpecFormatted,
-        isAppRequested ? block : undefined,
-        isAppRequested ? messageTimestamp : undefined,
-      );
+      previousAppSpecs = await registryManager.getPreviousAppSpecifications(appSpecFormatted, messageTimestamp);
       if (!previousAppSpecs) {
         // Registration doesn't exist yet - queue this update for later processing
         const appName = appSpecFormatted.name;
@@ -275,20 +261,6 @@ async function storeAppPermanentMessage(message) {
 }
 
 /**
- * The runningSince a location write sets. A report written at the address its
- * node moved to meets the row the move carried there, which is the same
- * instance: the earlier of the two is kept, as storeIPChangedMessage keeps it.
- * @param {object} isNewer Expression: the report is newer than the row.
- * @param {Date} runningSince The report's.
- * @param {boolean} moved Whether the report was made at an address its node has since left.
- * @returns {object} Aggregation expression.
- */
-function runningSinceOf(isNewer, runningSince, moved) {
-  if (moved) return { $min: [{ $ifNull: ['$runningSince', runningSince] }, runningSince] };
-  return { $cond: [isNewer, runningSince, { $ifNull: ['$runningSince', runningSince] }] };
-}
-
-/**
  * Store app running message
  * @param {object} message - Message to store
  * @returns {Promise<boolean|Error>} Whether message should be rebroadcast or Error if invalid
@@ -351,7 +323,6 @@ async function storeAppRunningMessage(message) {
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
   const expireAt = new Date(message.broadcastedAt + RUNNING_EXPIRY_MS);
-  const [ip] = await registryManager.currentAddressesOf([{ ip: message.ip, at: message.broadcastedAt }]);
 
   let anyStored = false;
   const incomingDate = new Date(message.broadcastedAt);
@@ -363,21 +334,21 @@ async function storeAppRunningMessage(message) {
     const incoming = {
       name: app.name,
       hash: app.hash,
-      ip,
+      ip: message.ip,
       broadcastedAt: incomingDate,
       expireAt,
       osUptime: message.osUptime,
       staticIp: message.staticIp,
+      runningSince,
     };
     const conditionalSet = Object.fromEntries(
       Object.entries(incoming).map(([k, v]) => [k, { $cond: [isNewer, v, { $ifNull: [`$${k}`, v] }] }]),
     );
-    conditionalSet.runningSince = runningSinceOf(isNewer, runningSince, ip !== message.ip);
 
     // eslint-disable-next-line no-await-in-loop
     const result = await dbHelper.updateOneInDatabase(
       database, globalAppsLocations,
-      { name: app.name, ip },
+      { name: app.name, ip: message.ip },
       [{ $set: conditionalSet }],
       { upsert: true },
     );
@@ -387,10 +358,10 @@ async function storeAppRunningMessage(message) {
   }
 
   if (message.version === 2 && appsMessages.length === 0) {
-    const result = await dbHelper.findInDatabase(database, globalAppsLocations, { ip }, { projection: { _id: 0, runningSince: 1 } });
+    const result = await dbHelper.findInDatabase(database, globalAppsLocations, { ip: message.ip }, { projection: { _id: 0, runningSince: 1 } });
     if (result.length > 0) {
       const broadcastDate = new Date(message.broadcastedAt);
-      const olderThanBroadcast = { ip, broadcastedAt: { $lte: broadcastDate } };
+      const olderThanBroadcast = { ip: message.ip, broadcastedAt: { $lte: broadcastDate } };
       await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, olderThanBroadcast);
       await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingLocations, { ip: message.ip });
       await dbHelper.removeDocumentsFromCollection(database, appsInstallingBroadcasts, { 'data.ip': message.ip });
@@ -412,22 +383,7 @@ async function storeAppRunningMessage(message) {
 }
 
 /**
- * Store app installing message, or apply a version 2 withdrawal of one.
- *
- * A node claims an app before it knows whether it is needed - the claim is what
- * lets every contender see the contention - so losing that race is ordinary and
- * has to be retractable. Version 2 is that retraction: it carries
- * `withdrawn: true` and removes the sender's claim instead of recording one.
- *
- * A claim stays at version 1 on purpose. Moving claims to 2 would have nodes
- * that do not know the version reject them, and they would stop seeing
- * contention at all - so the retraction is what carries the new version, and a
- * node that rejects it simply lets the claim expire as it does today.
- *
- * Never an installing ERROR. That message means an install was attempted and
- * failed, it is counted as such, and a node standing aside has attempted
- * nothing - counting it would turn the apps most in demand, whose races have
- * the most losers, into the apps that look most broken.
+ * Store app installing message
  * @param {object} message - Message to store
  * @returns {Promise<boolean|Error>} Whether message should be rebroadcast or Error if invalid
  */
@@ -438,21 +394,14 @@ async function storeAppInstallingMessage(message) {
   * @param broadcastedAt number
   * @param name string
   * @param ip string
-  * @param withdrawn boolean - version 2 only, always true
   */
   if (!message || typeof message !== 'object' || typeof message.type !== 'string' || typeof message.version !== 'number'
     || typeof message.broadcastedAt !== 'number' || typeof message.ip !== 'string' || typeof message.name !== 'string') {
     return new Error('Invalid Flux App Installing message for storing');
   }
 
-  if (message.version !== 1 && message.version !== 2) {
+  if (message.version !== 1) {
     return new Error(`Invalid Flux App Installing message for storing version ${message.version} not supported`);
-  }
-
-  // version 2 exists only to withdraw; anything else at that version is not
-  // something this protocol emits
-  if (message.version === 2 && message.withdrawn !== true) {
-    return new Error('Invalid Flux App Installing message for storing version 2 must be a withdrawal');
   }
 
   if (message.broadcastedAt + GOSSIP_VALIDITY_MS < Date.now()) {
@@ -479,30 +428,6 @@ async function storeAppInstallingMessage(message) {
   if (result && result.broadcastedAt && result.broadcastedAt >= newAppInstallingMessage.broadcastedAt) {
     // found a message that was already stored/probably from duplicated message processsed
     return false;
-  }
-
-  if (message.version === 2) {
-    // The comparison above is what makes a withdrawal safe to apply late: a node
-    // may claim, stand aside, and claim again on a later pass, and a withdrawal
-    // that arrives after the newer claim must not erase it. Reaching here means
-    // the stored claim is older than this withdrawal, so it is the one being
-    // retracted. Nothing is recorded in its place - the sender holds no claim.
-    // Carried on both deletes rather than rested on the read above. The read
-    // proves the stored claim was older a moment ago; the guard proves it at the
-    // moment of deletion, which is what the batch path does and what closes the
-    // window where a newer claim lands in between. The broadcast row needs it in
-    // its own right too - it is a separate collection written by a separate path,
-    // so a claim newer than this withdrawal can exist there while the location
-    // the read consulted is still the old one.
-    const olderThanWithdrawal = { broadcastedAt: { $lt: newAppInstallingMessage.broadcastedAt } };
-    await dbHelper.removeDocumentsFromCollection(
-      database, globalAppsInstallingLocations, { ...queryFind, ...olderThanWithdrawal },
-    );
-    await dbHelper.removeDocumentsFromCollection(
-      database, appsInstallingBroadcasts,
-      { 'data.name': message.name, 'data.ip': message.ip, ...olderThanWithdrawal },
-    );
-    return true;
   }
 
   const queryUpdate = { name: newAppInstallingMessage.name, ip: newAppInstallingMessage.ip };
@@ -556,62 +481,14 @@ async function storeAppRemovedMessage(message) {
     return false;
   }
 
-  await removeLocationForAppRemoved(message.ip, message.appName, message.broadcastedAt);
+  const db = dbHelper.databaseConnection();
+  const database = db.db(config.database.appsglobal.database);
+  const query = { ip: message.ip, name: message.appName };
+  const projection = {};
+  await dbHelper.findOneAndDeleteInDatabase(database, globalAppsLocations, query, projection);
 
   // all stored, rebroadcast
   return true;
-}
-
-/**
- * Shortens the location rows a node's shutdown speaks for.
- *
- * A sigterm covers only what its node broadcast before it: a row from a later
- * apprunning broadcast is the node running again and keeps its own expiry, which
- * is the same rule the event-derived view applies. A sigterm may arrive long
- * after it was sent (a peer sync replays every unexpired event), so the new
- * expiry can already be in the past and must never be applied to a newer row.
- * It applies where its node is now, which differs from where it was signed when
- * the node has moved since.
- *
- * @param {string} signedAt - The node's socket address when it signed it
- * @param {number} broadcastedAt - The sigterm's broadcast time, ms
- * @returns {Promise<void>}
- */
-async function expireLocationsForSigterm(signedAt, broadcastedAt) {
-  const [ip] = await registryManager.currentAddressesOf([{ ip: signedAt, at: broadcastedAt }]);
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  await dbHelper.updateInDatabase(
-    database,
-    globalAppsLocations,
-    { ip, broadcastedAt: { $lt: new Date(broadcastedAt) } },
-    { $min: { expireAt: new Date(broadcastedAt + SIGTERM_EXPIRY_MS) } },
-  );
-}
-
-/**
- * Removes the location row an appremoved broadcast speaks for: the app's row on
- * that node, when it was broadcast no later than the removal. A row from a later
- * apprunning broadcast is the app installed again and stays. The same rule as
- * the event-derived view, which keeps a report only when it is newer than the
- * node's removal of that app. It applies where its node is now, which differs
- * from where it was signed when the node has moved since.
- *
- * @param {string} signedAt - The node's socket address when it signed it
- * @param {string} appName - The removed app
- * @param {number} broadcastedAt - The removal's broadcast time, ms
- * @returns {Promise<void>}
- */
-async function removeLocationForAppRemoved(signedAt, appName, broadcastedAt) {
-  const [ip] = await registryManager.currentAddressesOf([{ ip: signedAt, at: broadcastedAt }]);
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  await dbHelper.findOneAndDeleteInDatabase(
-    database,
-    globalAppsLocations,
-    { ip, name: appName, broadcastedAt: { $lte: new Date(broadcastedAt) } },
-    {},
-  );
 }
 
 /**
@@ -673,18 +550,10 @@ async function storeAppInstallingErrorMessage(message) {
   return true;
 }
 
-// How long after it was made a move is applied: as long as a row it carries can
-// stand. One older is refused.
-const IP_CHANGED_VALIDITY_MS = RUNNING_EXPIRY_MS;
-
 /**
- * Applies a move to the location table: the rows reported at the old address
- * before the move are carried to where the node is now, and addressMoveEvents
- * is told. Every path a move arrives by - gossip, sync, this node's own - applies
- * it here.
- * @param {object} message - The move
- * @returns {Promise<boolean|Error>} true when applied, false when too old to
- *   apply, an Error when refused
+ * Store IP changed message
+ * @param {object} message - Message to store
+ * @returns {Promise<boolean>} Whether message should be rebroadcast
  */
 async function storeIPChangedMessage(message) {
   /* message object
@@ -714,7 +583,7 @@ async function storeIPChangedMessage(message) {
   log.info('New Flux IP Changed message received.');
   log.info(message);
 
-  const validTill = message.broadcastedAt + IP_CHANGED_VALIDITY_MS;
+  const validTill = message.broadcastedAt + (65 * 60 * 1000); // 3900 seconds
   if (validTill < Date.now()) {
     // reject old message
     return false;
@@ -722,87 +591,43 @@ async function storeIPChangedMessage(message) {
 
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
-  // The rows the move speaks for are the ones reported before it: a later row at
-  // the old address is whoever holds it now. They go where the node is now, which
-  // is further on when it has moved again since, and keep their own report time.
-  const reportedBefore = { ip: message.oldIP, broadcastedAt: { $lt: new Date(message.broadcastedAt) } };
-  const [newIp] = await registryManager.currentAddressesOf([{ ip: message.newIP, at: message.broadcastedAt }]);
-  // the node has since moved back: its rows are where they belong
-  if (socketAddressesMatch(newIp, message.oldIP)) return true;
-  // A row the node has already announced at its new address is the same instance
-  // as its row at the old one: it keeps the earlier runningSince and the old row
-  // goes, so the move leaves one row per app rather than two.
-  const moving = await dbHelper.findInDatabase(database, globalAppsLocations, reportedBefore, { projection: { _id: 0, name: 1, runningSince: 1 } });
-  if (moving.length) {
-    const present = await dbHelper.findInDatabase(
-      database,
-      globalAppsLocations,
-      { ip: newIp, name: { $in: moving.map((row) => row.name) } },
-      { projection: { _id: 0, name: 1 } },
-    );
-    // eslint-disable-next-line no-restricted-syntax
-    for (const { name } of present) {
-      const { runningSince } = moving.find((row) => row.name === name);
-      if (runningSince) {
-        // eslint-disable-next-line no-await-in-loop
-        await dbHelper.updateOneInDatabase(database, globalAppsLocations, { ip: newIp, name }, [
-          { $set: { runningSince: { $min: ['$runningSince', runningSince] } } },
-        ]);
-      }
-    }
-    if (present.length) {
-      await dbHelper.removeDocumentsFromCollection(database, globalAppsLocations, { ...reportedBefore, name: { $in: present.map((row) => row.name) } });
-    }
-  }
-  await dbHelper.updateInDatabase(database, globalAppsLocations, reportedBefore, { $set: { ip: newIp } });
-  addressMoveEvents.emit(ADDRESS_MOVE_EVENTS.APPLIED, { from: message.oldIP, to: newIp, broadcastedAt: message.broadcastedAt });
+  const query = { ip: message.oldIP };
+  const update = { $set: { ip: message.newIP, broadcastedAt: new Date(message.broadcastedAt) } };
+  await dbHelper.updateInDatabase(database, globalAppsLocations, query, update);
 
   // all stored, rebroadcast
   return true;
 }
 
 async function storeBatchAppRunningMessages(verifiedBroadcasts) {
-  if (verifiedBroadcasts.length === 0) return { stored: 0, writeFailed: false };
+  if (verifiedBroadcasts.length === 0) return { stored: 0 };
   const db = dbHelper.databaseConnection();
   const database = db.db(config.database.appsglobal.database);
 
   const { stored } = await storeBatchAppRunningEvents(verifiedBroadcasts);
 
-  // One operation is built per app per broadcast and each carries a merge
-  // pipeline, so a sync response of a few thousand broadcasts expands into tens
-  // of thousands of them. Writing in bounded batches keeps both this array and
-  // the driver's encoding of it small; the operations are independent of one
-  // another, which is what makes the unordered write safe to split.
   const locationOps = [];
-  let writeFailed = false;
-  const flushLocationOps = async () => {
-    if (!locationOps.length) return;
-    const batch = locationOps.splice(0, locationOps.length);
-    await database.collection(globalAppsLocations).bulkWrite(batch, { ordered: false })
-      .catch((err) => {
-        writeFailed = true;
-        log.error(`storeBatchAppRunningMessages locations: ${err.message}`);
-      });
-  };
+  const v2AppsByIp = new Map();
 
-  const addresses = await registryManager.currentAddressesOf(
-    verifiedBroadcasts.map(({ data }) => ({ ip: data.ip, at: data.broadcastedAt })),
-  );
-
-  for (const [index, broadcast] of verifiedBroadcasts.entries()) {
+  for (const broadcast of verifiedBroadcasts) {
     const { data } = broadcast;
     const validTill = data.broadcastedAt + RUNNING_EXPIRY_MS;
     if (validTill < Date.now()) continue;
-    const ip = addresses[index];
 
     const apps = data.version === 2 ? (data.apps || []) : [{ name: data.name, hash: data.hash }];
+    if (data.version === 2 && apps.length > 0) {
+      const existing = v2AppsByIp.get(data.ip);
+      if (!existing || data.broadcastedAt > existing.broadcastedAt) {
+        v2AppsByIp.set(data.ip, { names: apps.map((a) => a.name), broadcastedAt: data.broadcastedAt });
+      }
+    }
     const incomingDate = new Date(data.broadcastedAt);
     const incomingExpiry = new Date(validTill);
     const isNewer = { $gt: [incomingDate, { $ifNull: ['$broadcastedAt', new Date(0)] }] };
     for (const app of apps) {
       const setFields = {
         name: app.name,
-        ip,
+        ip: data.ip,
         hash: { $cond: [isNewer, app.hash, { $ifNull: ['$hash', app.hash] }] },
         broadcastedAt: { $cond: [isNewer, incomingDate, '$broadcastedAt'] },
         expireAt: { $cond: [isNewer, incomingExpiry, '$expireAt'] },
@@ -811,73 +636,33 @@ async function storeBatchAppRunningMessages(verifiedBroadcasts) {
       };
       const runningSince = data.runningSince ? new Date(data.runningSince) : (app.runningSince ? new Date(app.runningSince) : null);
       if (runningSince) {
-        setFields.runningSince = runningSinceOf(isNewer, runningSince, ip !== data.ip);
+        setFields.runningSince = { $cond: [isNewer, runningSince, { $ifNull: ['$runningSince', runningSince] }] };
       }
       locationOps.push({
         updateOne: {
-          filter: { name: app.name, ip },
+          filter: { name: app.name, ip: data.ip },
           update: [{ $set: setFields }],
           upsert: true,
         },
       });
-
-      if (locationOps.length >= LOCATION_OPS_PER_WRITE) {
-        // eslint-disable-next-line no-await-in-loop
-        await flushLocationOps();
-      }
     }
   }
 
-  await flushLocationOps();
-
-  // Upserts only. Removing the rows a node no longer reports belongs to
-  // pruneAppRunningLocations, which is driven from the newest broadcast per node
-  // rather than from whatever happened to arrive in this batch.
-  return { stored, writeFailed };
-}
-
-/**
- * Drop location rows a node no longer reports.
- *
- * Only the newest broadcast from a node says which apps it still runs, so this
- * cannot be done from part of a sync response - a slice holding an older
- * broadcast would prune against a stale app list, and one holding a newer
- * broadcast would leave rows an earlier slice had already written. The caller
- * passes the newest broadcast seen per node across the whole response.
- *
- * @param {Map<string, {names: Array<string>, broadcastedAt: number}>} newestByIp Newest broadcast per node.
- * @returns {Promise<void>}
- */
-async function pruneAppRunningLocations(newestByIp) {
-  if (!newestByIp || newestByIp.size === 0) return;
-
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  const ops = [];
-
-  const flush = async () => {
-    if (!ops.length) return;
-    const batch = ops.splice(0, ops.length);
-    await database.collection(globalAppsLocations).bulkWrite(batch, { ordered: false })
-      .catch((err) => log.error(`pruneAppRunningLocations: ${err.message}`));
-  };
-
-  const newest = [...newestByIp];
-  const addresses = await registryManager.currentAddressesOf(newest.map(([ip, { broadcastedAt }]) => ({ ip, at: broadcastedAt })));
-  for (const [index, [, { names, broadcastedAt }]] of newest.entries()) {
-    const ip = addresses[index];
-    ops.push({
+  for (const [ip, { names, broadcastedAt }] of v2AppsByIp) {
+    const cutoff = new Date(broadcastedAt);
+    locationOps.push({
       deleteMany: {
-        filter: { ip, name: { $nin: names }, broadcastedAt: { $lte: new Date(broadcastedAt) } },
+        filter: { ip, name: { $nin: names }, broadcastedAt: { $lte: cutoff } },
       },
     });
-    if (ops.length >= LOCATION_OPS_PER_WRITE) {
-      // eslint-disable-next-line no-await-in-loop
-      await flush();
-    }
   }
 
-  await flush();
+  if (locationOps.length > 0) {
+    await database.collection(globalAppsLocations).bulkWrite(locationOps, { ordered: false })
+      .catch((err) => log.error(`storeBatchAppRunningMessages locations: ${err.message}`));
+  }
+
+  return { stored };
 }
 
 // --- Event Log Functions ---
@@ -955,74 +740,20 @@ async function handleAppRemovedStateEvent({ message, envelope }) {
   }
 }
 
-/**
- * The time an eviction speaks from: when the evicting node made it, never later
- * than now. Evictions are unsigned, so a time in the future is taken as now
- * rather than trusted to outrank broadcasts that have not happened yet, and an
- * unreadable one is taken as now.
- *
- * @param {number} evictedAt - The eviction's time, ms
- * @returns {number}
- */
-function evictionTime(evictedAt) {
-  const now = Date.now();
-  return Number.isFinite(evictedAt) ? Math.min(evictedAt, now) : now;
-}
-
-/**
- * Records a node's eviction under the time it was made. The record keeps that
- * time wherever a peer sync carries it, so it expires one location lifetime
- * after the eviction however often it is passed on, and it is dated before any
- * broadcast the node makes on its return. Of two evictions of one node the
- * newer is kept.
- *
- * @param {object} payload
- * @param {string} payload.ip - The evicted node's socket address
- * @param {number} [payload.evictedAt] - When the eviction was made, ms; now when absent
- * @returns {Promise<void>}
- */
-async function handleEvictedEvent({ ip, evictedAt }) {
+async function handleEvictedEvent({ ip }) {
   if (!ip) return;
-  const at = evictionTime(evictedAt);
   try {
+    const now = new Date();
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.appsglobal.database);
     await database.collection(globalAppStateEvents).updateOne(
       { ip, type: APP_STATE_EVENT_TYPES.EVICTED, dedupKey: 'evicted' },
-      {
-        $set: { receivedAt: new Date() },
-        $max: { createdAt: new Date(at), expireAt: new Date(at + EVICTED_EXPIRY_MS) },
-      },
+      { $set: { ip, type: APP_STATE_EVENT_TYPES.EVICTED, dedupKey: 'evicted', createdAt: now, expireAt: new Date(now.getTime() + EVICTED_EXPIRY_MS), receivedAt: now } },
       { upsert: true },
     );
   } catch (err) {
     log.error(`storeAppStateEvent(evicted): ${err.message}`);
   }
-}
-
-/**
- * Applies a node's eviction: records it, and removes the node's location rows
- * broadcast before it. A row from a broadcast after the eviction is the node
- * back on the network and stays. An eviction older than a location lifetime
- * changes nothing.
- *
- * @param {string} ip - The evicted node's socket address
- * @param {number} [evictedAt] - When the eviction was made, ms; now when absent
- * @returns {Promise<void>}
- */
-async function applyEviction(ip, evictedAt) {
-  if (!ip) return;
-  const at = evictionTime(evictedAt);
-  if (at + EVICTED_EXPIRY_MS <= Date.now()) return;
-  await handleEvictedEvent({ ip, evictedAt: at });
-  const [evicted] = await registryManager.currentAddressesOf([{ ip, at }]);
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-  await dbHelper.removeDocumentsFromCollection(
-    database,
-    globalAppsLocations,
-    { ip: evicted, broadcastedAt: { $lt: new Date(at) } },
-  );
 }
 
 async function handleIPChangedEvent({ message, envelope }) {
@@ -1127,29 +858,10 @@ async function storeBatchAppInstallingMessages(verifiedBroadcasts) {
   const signedOps = [];
   const locationOps = [];
 
-  const withdrawalOps = [];
-
   for (const broadcast of verifiedBroadcasts) {
     const { data } = broadcast;
     const validTill = data.broadcastedAt + INSTALLING_EXPIRY_MS;
     if (validTill < Date.now()) continue;
-
-    // A version 2 message withdraws its sender's claim. Reaching the claim path
-    // with one would store the very claim it retracts, so it is deleted here
-    // instead - and only where the stored claim is older, so a withdrawal that
-    // arrives after the sender has claimed again cannot erase the newer claim.
-    if (data.version === 2) {
-      // version 2 exists only to withdraw; anything else at that version is
-      // not something this protocol emits. The single-message path refuses
-      // it, and this path must not read it as a withdrawal.
-      if (data.withdrawn !== true) continue;
-      withdrawalOps.push({
-        deleteOne: {
-          filter: { name: data.name, ip: data.ip, broadcastedAt: { $lt: new Date(data.broadcastedAt) } },
-        },
-      });
-      continue;
-    }
 
     signedOps.push({
       updateOne: {
@@ -1195,29 +907,7 @@ async function storeBatchAppInstallingMessages(verifiedBroadcasts) {
     await database.collection(globalAppsInstallingLocations).bulkWrite(locationOps, { ordered: false })
       .catch((err) => log.error(`storeBatchAppInstallingMessages locations: ${err.message}`));
   }
-  // after the claims, so a claim and its withdrawal arriving in one batch settle
-  // in the order they were sent rather than the order they were read
-  if (withdrawalOps.length > 0) {
-    await database.collection(globalAppsInstallingLocations).bulkWrite(withdrawalOps, { ordered: false })
-      .catch((err) => log.error(`storeBatchAppInstallingMessages withdrawals: ${err.message}`));
-    await database.collection(appsInstallingBroadcasts).bulkWrite(
-      // The location's own guard, carried over rather than restated: the
-      // broadcast is what proves the location, so deleting one without the
-      // other leaves a claim nothing can serve during sync. Same object, so
-      // the two cannot come apart.
-      withdrawalOps.map((op) => ({
-        deleteOne: {
-          filter: {
-            'data.name': op.deleteOne.filter.name,
-            'data.ip': op.deleteOne.filter.ip,
-            broadcastedAt: op.deleteOne.filter.broadcastedAt,
-          },
-        },
-      })),
-      { ordered: false },
-    ).catch((err) => log.error(`storeBatchAppInstallingMessages withdrawal broadcasts: ${err.message}`));
-  }
-  return { stored: signedOps.length + withdrawalOps.length };
+  return { stored: signedOps.length };
 }
 
 function storeSignedAppInstallingErrorBroadcast(signedBroadcast) {
@@ -1312,18 +1002,13 @@ module.exports = {
   storeAppPermanentMessage,
   storeAppRunningMessage,
   storeBatchAppRunningMessages,
-  pruneAppRunningLocations,
   storeAppStateEvent,
   storeBatchAppRunningEvents,
   APP_STATE_EVENT_TYPES,
-  IP_CHANGED_VALIDITY_MS,
   storeAppInstallingMessage,
   storeSignedAppInstallingBroadcast,
   storeBatchAppInstallingMessages,
   storeAppRemovedMessage,
-  expireLocationsForSigterm,
-  removeLocationForAppRemoved,
-  applyEviction,
   storeAppInstallingErrorMessage,
   storeSignedAppInstallingErrorBroadcast,
   storeBatchAppInstallingErrorMessages,

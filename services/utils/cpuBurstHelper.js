@@ -4,20 +4,16 @@ const path = require('path');
 const config = require('config');
 const log = require('../../lib/log');
 const enterpriseConfig = require('./enterpriseConfig');
-const signatureVerifier = require('../signatureVerifier');
 
 let burstSupportCache = null;
 
 /**
- * Checks if an app owner is in the enterprise app owners whitelist. An unknown policy
- * answers false: burst is a privilege, and one that cannot be verified is not granted.
+ * Checks if an app owner is in the enterprise app owners whitelist.
  * @param {string} owner - The app owner address
  * @returns {boolean}
  */
 function isEnterpriseOwner(owner) {
-  const owners = enterpriseConfig.getEnterpriseAppOwners();
-  if (owners === null) return false;
-  return signatureVerifier.includesSigningIdentity(owners, owner);
+  return enterpriseConfig.getEnterpriseAppOwners().includes(owner);
 }
 
 /**

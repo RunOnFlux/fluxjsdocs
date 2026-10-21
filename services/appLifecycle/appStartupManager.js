@@ -16,7 +16,6 @@ const registryManager = require('../appDatabase/registryManager');
 const appReconciler = require('../appMonitoring/appReconciler');
 const appUninstaller = require('./appUninstaller');
 const appNetworkLinker = require('./appNetworkLinker');
-const portManager = require('../appNetwork/portManager');
 const globalState = require('../utils/globalState');
 const fluxEventBus = require('../utils/fluxEventBus');
 const nodeConfirmationService = require('../nodeConfirmationService');
@@ -24,28 +23,6 @@ const { localAppsInformation, SIGTERM_EXPIRY_MS, RUNNING_EXPIRY_MS } = require('
 const { getNonGComponentIdentifiers, parseContainerName, appHasValidLocationOnNode } = require('../utils/appUtilities');
 
 const SYNC_TIMEOUT_MS = config.system.bootSyncTimeoutMs ?? 300000;
-
-/**
- * Await a promise, giving up after a deadline. The timer is cleared however the
- * race ends, so work that finishes early leaves nothing pending behind it.
- * @param {Promise<any>} work What to wait for.
- * @param {number} timeoutMs How long to wait.
- * @param {string} reason Message of the error thrown when the deadline passes.
- * @returns {Promise<any>} Whatever `work` resolved to.
- */
-async function awaitWithin(work, timeoutMs, reason) {
-  let timer;
-  try {
-    return await Promise.race([
-      work,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(reason)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * Get all installed apps from local database
@@ -94,27 +71,6 @@ async function getStoppedFluxContainers() {
   } catch (error) {
     log.error(`appStartupManager - Error getting stopped containers: ${error.message}`);
     return [];
-  }
-}
-
-/**
- * Opens every installed app's ports in the firewall, in one ufw batch, before
- * the apps start. ufw keeps the rules across restarts and skips one it already
- * holds, so this changes nothing unless the rules were lost, as a ufw reset
- * loses them. An app whose specification cannot be read is left out and
- * logged; a failure is logged and the apps still start.
- */
-async function openInstalledAppPorts() {
-  try {
-    const { apps, unreadable } = await portManager.appsWithPorts(await getInstalledAppsFromDb());
-    if (unreadable.length) log.warn(`appStartupManager - ports of ${unreadable.length} installed app(s) not opened in the firewall: specification unreadable`);
-    const ports = apps.flatMap((app) => app.ports).map((port) => serviceHelper.ensureNumber(port));
-    if (!ports.length) return;
-    const { failed, locked } = await fluxNetworkHelper.allowAppPorts(ports);
-    if (locked) log.warn('appStartupManager - app ports not opened in the firewall: ufw is locked by another ufw command');
-    failed.forEach(({ rule, error }) => log.warn(`appStartupManager - app port not opened in the firewall: ufw ${rule}: ${error}`));
-  } catch (error) {
-    log.error(`appStartupManager - app ports not opened in the firewall: ${error.message}`);
   }
 }
 
@@ -320,7 +276,10 @@ async function manageAppsOnBoot(bootContext) {
     // Locations still valid — wait for daemon + sync then reconcile.
     const DAEMON_TIMEOUT_MS = config.system.bootDaemonTimeoutMs ?? 300000;
     try {
-      await awaitWithin(globalState.waitForDaemonReady(), DAEMON_TIMEOUT_MS, 'daemon_timeout');
+      await Promise.race([
+        globalState.waitForDaemonReady(),
+        new Promise((_, reject) => { setTimeout(() => reject(new Error('daemon_timeout')), DAEMON_TIMEOUT_MS); }),
+      ]);
     } catch (error) {
       if (error.message === 'daemon_timeout') {
         log.error(`appStartupManager - Daemon not ready after ${DAEMON_TIMEOUT_MS / 1000}s, removing all apps`);
@@ -344,7 +303,10 @@ async function manageAppsOnBoot(bootContext) {
     }
 
     try {
-      await awaitWithin(globalState.waitForDbReady(), SYNC_TIMEOUT_MS, 'sync_timeout');
+      await Promise.race([
+        globalState.waitForDbReady(),
+        new Promise((_, reject) => { setTimeout(() => reject(new Error('sync_timeout')), SYNC_TIMEOUT_MS); }),
+      ]);
     } catch (error) {
       if (error.message === 'sync_timeout') {
         log.error(`appStartupManager - DB not ready after ${SYNC_TIMEOUT_MS / 1000}s, removing all apps`);
@@ -355,7 +317,6 @@ async function manageAppsOnBoot(bootContext) {
     }
 
     log.info('appStartupManager - Daemon, DB, and node confirmed, reconciling apps');
-    await openInstalledAppPorts();
     await reconcileAppsOnBoot();
   } finally {
     globalState.bootContainerStateSettled = true;
@@ -366,7 +327,6 @@ async function manageAppsOnBoot(bootContext) {
 
 module.exports = {
   manageAppsOnBoot,
-  openInstalledAppPorts,
   reconcileAppsOnBoot,
   getStoppedFluxContainers,
   getInstalledAppsFromDb,

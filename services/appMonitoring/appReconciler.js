@@ -4,6 +4,7 @@ const fluxEventBus = require('../utils/fluxEventBus');
 const dbHelper = require('../dbHelper');
 const serviceHelper = require('../serviceHelper');
 const dockerService = require('../dockerService');
+const dockerOperations = require('../appManagement/dockerOperations');
 const volumeService = require('../utils/volumeService');
 const mountParser = require('../utils/mountParser');
 const globalState = require('../utils/globalState');
@@ -20,9 +21,7 @@ const { AsyncGate } = require('../utils/asyncGate');
 // die event, stream reconnect, hourly tick, boot, post-install, and the
 // masterSlave/syncthing deciders) just enqueues a component identifier; one
 // reconcile per identifier drives the actual Docker state toward the desired
-// state. This is the ONLY place that calls appDockerStart/appDockerStop. It also
-// force-removes and recreates a container that came up detached from its own
-// docker network (a stale libnetwork endpoint), which a start alone cannot fix.
+// state. This is the ONLY place that calls appDockerStart/appDockerStop.
 //
 // Desired state inputs:
 //   operatorStopped (durable, appsRuntimeState) - user lock, wins over all.
@@ -33,27 +32,7 @@ const { AsyncGate } = require('../utils/asyncGate');
 // id -> 'running' | 'stopped'. In-memory: re-derived from live truth (FDM
 // election + real syncthing sync state) by the deciders each cycle, so it is
 // intentionally NOT persisted (a stale election after a reboot must not act).
-//
-// Every set and delete counts in `writes`, which is never reset. Some writers
-// write at once and some await first (a lock read, docker); one that awaits
-// compares the count it read before its awaits with the count after, and writes
-// nothing when another writer spoke meanwhile (writeIfUnchanged).
-const opinions = new Map();
-const opinionWrites = new Map();
-const controllerDesired = {
-  get: (identifier) => opinions.get(identifier),
-  has: (identifier) => opinions.has(identifier),
-  forEach: (fn) => opinions.forEach(fn),
-  writes: (identifier) => opinionWrites.get(identifier) ?? 0,
-  set(identifier, state) {
-    opinions.set(identifier, state);
-    opinionWrites.set(identifier, this.writes(identifier) + 1);
-  },
-  delete(identifier) {
-    opinions.delete(identifier);
-    opinionWrites.set(identifier, this.writes(identifier) + 1);
-  },
-};
+const controllerDesired = new Map();
 
 // id -> 'clear'. In-memory peer of controllerDesired: a pending request from the
 // sync layer to wipe the component's local appdata before it next runs (the
@@ -63,19 +42,14 @@ const controllerDesired = {
 // a start can never race it.
 const dataDesired = new Map();
 
-
 // brief settle between the stop and the rm -rf so the container has fully released
 // its appdata mount before the wipe (mirrors the sync layer's prior 500ms delay).
 const DATA_CLEAR_SETTLE_MS = 500;
 
-// id -> promise of the pass (or intent write) currently holding this key. A Map
-// rather than a Set so a caller can WAIT for the holder: applyIntent below needs
-// to know when a pass has finished, not merely that one is running.
-const inFlight = new Map(); // per-key single-flight
+const inFlight = new Set(); // ids currently reconciling (per-key single-flight)
 const dirty = new Set(); // ids re-requested while in flight -> reconcile again
 const bootPending = new Set(); // ids enqueued before the boot gate opened
 const backoffTimers = new Map(); // id -> scheduled retry timeout
-const unhandledFailures = new Map(); // id -> consecutive passes that threw
 
 // The boot-drain gate: opens once every boot-held component has completed ONE
 // reconcile pass (started, backoff-deferred, awaiting-controller, or failed
@@ -99,22 +73,30 @@ function settleBootDrain(reason) {
   log.info(`appReconciler - boot drain settled (${reason})`);
 }
 
+// A container start is information the network wants immediately: a backoff
+// straggler that starts minutes after boot must refresh its appsLocations row
+// inside the sigterm TTL window, not at the next hourly broadcast.
+// serviceManager wires this to the peer broadcast (which coalesces bursts),
+// mirroring appInstaller.setOnInstallComplete.
+let onContainerStarted = null;
+
+function setOnContainerStarted(callback) {
+  onContainerStarted = callback;
+}
+
+function notifyContainerStarted(identifier) {
+  if (!onContainerStarted) return;
+  try {
+    onContainerStarted(identifier);
+  } catch (err) {
+    log.error(`appReconciler - onContainerStarted callback failed for ${identifier}: ${err.message}`);
+  }
+}
+
 // while an install/remove/redeploy/backup/restore or a deliberate stop owns a
 // container, defer and re-check shortly (the operation also re-enqueues on
 // completion, so this is just a backstop)
 const MANAGED_RETRY_MS = 5000;
-
-// How many consecutive passes may throw before the component is left to the
-// hourly sweep. A pass that throws is by definition one whose failure nobody
-// anticipated: every failure this file expects returns after deciding either to
-// pace a retry (a transient fault) or deliberately not to (an invalid spec, which
-// no retry can fix). An unhandled throw made neither decision, so it reached the
-// sweep - and with the operator's stop now actuated here rather than inline, a
-// container could keep running for an hour after a stop reported success.
-// Retrying is safe because a pass is level-based: it re-derives desired against
-// actual rather than resuming half-finished work. The bound is what keeps a
-// permanent fault from becoming a five-second log loop forever.
-const UNHANDLED_FAILURE_RETRIES = 3;
 
 // an unmountable volume usually means its host filesystem is still coming up
 // (e.g. the encrypted data partition after a reboot) - retry on a pace that
@@ -123,75 +105,7 @@ const VOLUME_MOUNT_RETRY_MS = 30 * 1000;
 
 // identifiers whose missing backing image was already recorded as a tampering
 // event, so the paced retries don't re-record it every cycle
-// The volume fault already recorded for a component, so a retry every few
-// seconds does not re-record one a minute. Keyed by fault as well as
-// component: an image that goes missing and an image that is replaced are
-// different events, and noting one must not swallow the other.
-const volumeFaultNoted = new Map();
-
-// A running container attached to NO network (a stale libnetwork endpoint left
-// by an earlier failed start) is healed by recreating it (force-remove + fresh
-// create; a plain start reuses the broken endpoint, and `network connect` does
-// not restore published host ports). The remove is destructive, so it is guarded:
-//
-//   - Confirmed in-pass: on first sight of the detached state we settle, then
-//     re-inspect, and only act if it is still detached. Counting observations
-//     across reconciles would not do this - two reconciles can run back-to-back
-//     (a die event lands while the sweep's pass is in flight, and the workqueue
-//     re-runs the id immediately), so both "observations" can come from the same
-//     instant. A settle + re-read guarantees the time separation the confirmation
-//     is for: a transient inspect (dockerd mid-restart, the brief pre-IP window)
-//     never destroys a healthy container.
-//   - Paced, not capped: heal attempts walk their own durable ladder in
-//     appsRuntimeState (same shape as the crash backoff, up to a 30m cap, but a
-//     SEPARATE history - sharing one would let a heal's attempts hold down the
-//     very container it just recreated, and would block the heal of a container
-//     that happens to be crash-looping). A hard attempt cap would park the heal in
-//     a terminal state until the FluxOS process restarts, which is not level-based
-//     - a reconciler keeps trying at a bounded rate.
-//     The app stays placed here while that runs. apprunning states which apps this
-//     node holds, and a container that is broken or absent does not change that, so
-//     the heal is this node's only route back to a working instance - nowhere else
-//     picks the app up. Which is why the pacing is the bound and a cap is not: the
-//     retries cost a paced recreate each, and stopping them strands the app on a
-//     node that is still claiming it, with its bind-mounted data.
-//   - Never uninstalls: unlike the vanished path, a failed heal recreate does not
-//     escalate to removeAppLocally. The spec and image are fine; only the host
-//     networking hit a conflict.
-//
-// The one fact that must survive a FluxOS restart is "I removed this container on
-// purpose" (otherwise a restart between the remove and the recreate makes the next
-// reconcile read the absence as tampering and, on a failed recreate, uninstall the
-// app). That lives in appsRuntimeState.networkHealRemoval, not here.
-const NETWORK_DETACH_CONFIRM_MS = 3000;
-// ...and the detach must ALSO have persisted for this long since we first saw it.
-// A dockerd restart with live-restore can answer an inspect before libnetwork has
-// re-populated endpoint IPs on running containers - and the event-stream reconnect
-// sweep enqueues every component at exactly that moment, so a short confirm alone
-// would rebuild every container on the node. This is wall-clock since the first
-// sighting, NOT a count of reconcile passes (two passes can land in the same
-// instant), so it is a real settle window whatever the trigger cadence.
-const DETACHED_PERSIST_MS = 60 * 1000;
-// id -> ms epoch of the first detached sighting of the current episode
-const detachedSince = new Map();
-// One container detached is a stale endpoint. Several at once is the daemon, not
-// the containers - refuse to force-remove the whole node's workload on that read.
-const DETACH_STORM_THRESHOLD = 3;
-// a pruned network cannot be repaired by recreating the container - re-check on a
-// slow pace so a restored network is picked up without an hour's wait
-const NETWORK_PRUNED_RETRY_MS = 5 * 60 * 1000;
-// a container is normally verified attached only on the reconcile after its start,
-// i.e. the hourly sweep. But this pathology is BORN at start time, so re-check
-// shortly after every start/recreate we perform: detached-at-boot then heals in
-// under a minute, with the sweep as the backstop. (Docker network events cannot
-// cover this: a container born detached never emits a disconnect.)
-const POST_START_VERIFY_MS = 30 * 1000;
-
-// identifiers whose detach/prune was already recorded as a tampering event, so the
-// paced retries record it once per episode rather than once per attempt (the count
-// feeds a node-level signal). Cleared once the container is seen attached.
-const networkDetachedNoted = new Set();
-const networkPrunedNoted = new Set();
+const volumeMissingNoted = new Set();
 
 // The reconciler's canonical id is the bare component identifier
 // (`{component}_{app}`). Deciders disagree on the form they pass — masterSlave
@@ -244,18 +158,17 @@ async function getLocalComponentSpec(identifier) {
     throw error;
   }
   if (!appSpec) return null;
-  const { readable: [decryptedSpec] } = await appQueryService
-    .decryptEnterpriseApps([appSpec], { formatSpecs: false });
-  if (!decryptedSpec) {
+  try {
+    [appSpec] = await appQueryService.decryptEnterpriseApps([appSpec], { formatSpecs: false, throwOnError: true });
+  } catch (err) {
     // Decryption failed (e.g. the enterprise key isn't loaded yet at boot). Never
     // proceed on still-encrypted data: containerData would be unreadable, so we'd
     // misclassify g:/r: or start a container on garbage. Treat as transient like a
     // DB read failure so reconcile defers and retries once the key is available.
-    const error = new Error(`failed to decrypt enterprise spec for ${identifier}`);
+    const error = new Error(`failed to decrypt enterprise spec for ${identifier}: ${err.message}`);
     error.transient = true;
     throw error;
   }
-  appSpec = decryptedSpec;
 
   let comp;
   if (appSpec.version >= 4 && Array.isArray(appSpec.compose)) {
@@ -319,27 +232,9 @@ async function dockerActual(identifier) {
     return {
       reachable: true,
       exists: true,
-      // A PAUSED container reports Running: true - docker freezes the processes
-      // and leaves the record saying they are up. Reading that as running is how
-      // a frozen container became invisible to everything: this function said
-      // "healthy, nothing to do", the sampler skipped it so its charts flatlined
-      // with no explanation, and FDM went on routing traffic to something that
-      // would never answer.
-      //
-      // It also put this function at odds with appStartupManager, which
-      // enumerates boot candidates from the LISTING's State (where paused is not
-      // 'running'). Boot handed the container over saying it needed starting and
-      // this said it was already up - every boot, forever. The two now agree.
-      running: !!(info.State && info.State.Running) && !info.State.Paused,
-      paused: !!(info.State && info.State.Paused),
+      running: !!(info.State && info.State.Running),
       exitCode: everRan ? (info.State.ExitCode ?? null) : null,
-      // the kernel's verdict, not the entrypoint's: an image that swallows its
-      // payload's status still cannot hide this one
-      oomKilled: !!(info.State && info.State.OOMKilled),
       finishedAt,
-      // classified from THIS inspect so the running-branch network check needs no
-      // second docker call (and no TOCTOU between two inspects).
-      attachment: dockerService.classifyContainerNetworkAttachment(info),
     };
   } catch (err) {
     let containers;
@@ -378,26 +273,8 @@ function isManagedElsewhere(identifier) {
   return false;
 }
 
-/**
- * What this component should be doing, why, and - when the answer is an operator
- * stop - whether that operator asked for a hard kill.
- *
- * The lock and the force flag are fields of one document, so they come from one
- * read. The stop branch used to re-read the same document for the flag alone,
- * and getState returns null for a read failure exactly as it does for "no
- * record" - so a second read that failed turned "kill now" into a drain. One
- * read is a window that cannot open, and one round-trip fewer on every stop.
- *
- * @returns {Promise<{desired: boolean|null, reason: string, force: boolean}>}
- */
 async function effectiveDesiredRunning(identifier, spec, exitCode) {
-  const operatorStop = await appsRuntimeState.operatorStopState(identifier);
-  if (operatorStop.stopped) {
-    // A start the election has yet to decide keeps the lock, and is reported as
-    // what it is waiting for.
-    const reason = operatorStop.startRequested ? 'startAwaitsElection' : 'operatorStopped';
-    return { desired: false, reason, force: operatorStop.force };
-  }
+  if (await appsRuntimeState.isOperatorStopped(identifier)) return { desired: false, reason: 'operatorStopped' };
   if (spec.isG || spec.isR) {
     const cd = controllerDesired.get(identifier) ?? null;
     // No controller opinion yet. controllerDesired is in-memory, so a FluxOS
@@ -405,36 +282,11 @@ async function effectiveDesiredRunning(identifier, spec, exitCode) {
     // the FluxOS process). Take no action - leave the container as-is until the
     // masterSlave/syncthing decider re-derives intent. Treating "unset" as "stop"
     // here would bounce every running syncthing app on every FluxOS restart.
-    if (cd === null) return { desired: null, reason: 'awaitingController', force: false };
-    if (cd !== 'running') return { desired: false, reason: 'controllerDesired', force: false };
+    if (cd === null) return { desired: null, reason: 'awaitingController' };
+    if (cd !== 'running') return { desired: false, reason: 'controllerDesired' };
   }
   const desired = policyAllowsRun(getRestartPolicy(spec), exitCode);
-  // Only an operator asks for a hard kill; every other stop reason is a drain.
-  return { desired, reason: desired ? 'running' : 'policy', force: false };
-}
-
-/**
- * The run state the reconciler would converge this component to right now, and
- * why — the same spec read, docker probe and policy a reconcile pass uses, so a
- * caller reporting on an operator command never re-derives the decision.
- *
- * `desired` is null for a g:/r: component whose decider has not spoken: the
- * reconciler takes no action, which is neither running nor stopped.
- *
- * Throws what getLocalComponentSpec throws — a transient spec read is not an
- * answer, and reporting one as "not running" would tell an operator their app
- * is held when nothing has decided anything.
- *
- * @param {string} rawIdentifier
- * @returns {Promise<{desired: boolean|null, reason: string, force: boolean}>}
- */
-async function desiredRunState(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  const spec = await getLocalComponentSpec(identifier);
-  if (!spec) return { desired: false, reason: 'notInstalled', force: false };
-  if (spec.invalidSpec) return { desired: false, reason: 'invalidSpec', force: false };
-  const actual = await dockerActual(identifier);
-  return effectiveDesiredRunning(identifier, spec, actual.exitCode);
+  return { desired, reason: desired ? 'running' : 'policy' };
 }
 
 /**
@@ -445,32 +297,13 @@ async function desiredRunState(rawIdentifier) {
 async function recreateMissing(identifier) {
   const mainAppName = identifier.split('_')[1] || identifier;
 
-  // `container_vanished` is the heaviest tampering signal this node emits and it
-  // asserts one thing: a container went away and FluxOS did not take it. FluxOS's
-  // own removals are in globalState.fluxRemovedContainers, and an absence FluxOS
-  // caused is evidence of nothing. Either way the container is recreated below -
-  // only the accusation is withheld.
-  //
-  // The entry is dropped by appDockerCreate succeeding, not by being read here.
-  // A recreate that fails therefore keeps it, which is what the next pass needs:
-  // the container is still absent and that absence is still FluxOS's, so reading
-  // the entry away would have this node accuse itself on the following pass -
-  // an image pull spans several of them.
-  const removedByFluxOs = globalState.fluxRemovedContainers.has(dockerService.getAppIdentifier(identifier));
-  if (removedByFluxOs) {
-    log.info(`appReconciler - ${identifier} is missing because FluxOS removed it; recreating without recording a tampering event`);
-  } else {
-    await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
-  }
+  await appTamperingDetectionService.recordEvent(mainAppName, 'container_vanished', `Container ${identifier} missing, not found in Docker`);
   try {
-    // Created, not started: the pass this enqueues starts it against the desired
-    // state as it is then, which a recreate of minutes may have changed.
-    await containerHealthMonitor.recreateMissingContainers(identifier, { start: false });
-    appInspector.startAppMonitoring(identifier);
+    await containerHealthMonitor.recreateMissingContainers(identifier);
+    appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
     log.info(`appReconciler - recreated missing container ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated' });
-    enqueue(identifier);
-    scheduleRetry(identifier, POST_START_VERIFY_MS); // verify it came up attached
+    notifyContainerStarted(identifier);
   } catch (err) {
     // Removal must be justified by the state of the world NOW, not at
     // classification time: a whole recreate attempt (image pull - up to
@@ -496,244 +329,6 @@ async function recreateMissing(identifier) {
   }
 }
 
-/**
- * Recreate a container that was removed to clear a detached network endpoint.
- * Deliberately NOT recreateMissing: a failure here must not escalate to
- * uninstalling the whole app (the trigger is a transient host-networking
- * conflict, not tampering). On failure we just re-arm a retry; the next pass
- * paces it on the heal ladder. The container is created, not started: the pass
- * this enqueues starts it against the desired state. The durable heal-removal flag is NOT cleared here: only seeing the
- * container back proves the heal worked.
- */
-async function recreateForNetworkHeal(identifier) {
-  const mainAppName = identifier.split('_')[1] || identifier;
-  try {
-    // softOnly: a hard install would REFORMAT the app's data volume (createAppVolume
-    // fallocates + mke2fs). We removed a live container whose data was intact, so a
-    // recreate that cannot verify the volume must fail and be retried - never wipe it.
-    await containerHealthMonitor.recreateMissingContainers(identifier, { softOnly: true, start: false });
-    appInspector.startAppMonitoring(identifier);
-    log.info(`appReconciler - recreated ${identifier} to clear a detached network endpoint`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'recreated', reason: 'networkDetached' });
-    enqueue(identifier);
-    scheduleRetry(identifier, POST_START_VERIFY_MS); // verify it came up attached
-  } catch (err) {
-    // Same diagnostics the vanished path emits - minus the uninstall escalation.
-    // Without these a heal-removed container whose recreate keeps failing (e.g. its
-    // network was pruned in the meantime) would loop with no operator-visible signal.
-    log.error(`appReconciler - failed to recreate ${identifier} after network detach: ${err.message}; will retry (app NOT uninstalled)`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'networkHealRecreateFailed', reason: err.message });
-    await appTamperingDetectionService.recordEvent(mainAppName, 'recreation_failed', `Container recreation failure after network detach: ${err.message}`).catch(() => {});
-    if (appTamperingDetectionService.isNetworkMissingError(err.message) && !networkPrunedNoted.has(identifier)) {
-      networkPrunedNoted.add(identifier);
-      await appTamperingDetectionService.recordEvent(mainAppName, 'network_pruned', `Docker network missing while recreating ${identifier}: ${err.message}`).catch(() => {});
-    }
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-  }
-}
-
-/**
- * Drops all bookkeeping for a healthy container: the in-memory episode markers and
- * the durable heal state (the "I removed this on purpose" flag and the heal ladder).
- * Called whenever the container is seen to EXIST and not be detached - existing is
- * what makes the removal flag stale, so this must not be gated on `running`, or the
- * flag would leak on every path that leaves the container stopped (a g: component
- * awaiting its controller, an operator stop) and would then divert a later, genuine
- * disappearance away from the vanished path forever.
- */
-async function clearNetworkHealState(identifier) {
-  networkDetachedNoted.delete(identifier);
-  networkPrunedNoted.delete(identifier);
-  detachedSince.delete(identifier);
-  await appsRuntimeState.clearNetworkHeal(identifier);
-}
-
-/**
- * Whether a detached container can actually be recreated after we destroy it.
- * The heal removes FIRST and recreates second, so every precondition of the
- * recreate must hold BEFORE the remove - otherwise we turn a partially-alive
- * container into a permanently gone one. Returns null when it is safe to proceed,
- * or a reason string.
- */
-async function networkHealBlocker(identifier, spec) {
-  // recreateMissingContainers throws unconditionally on a spec with no compose
-  // array (v1-3 apps, which getLocalComponentSpec explicitly supports). Removing
-  // such a container destroys it forever: the recreate can never succeed, and the
-  // heal - by design - never escalates to an uninstall that would re-place the app.
-  if (!(spec.appSpec.version >= 4 && Array.isArray(spec.appSpec.compose) && spec.appSpec.compose.length)) {
-    return 'the app has no compose spec, so its container cannot be recreated';
-  }
-  // The recreate refuses to reformat (softOnly), so an unverifiable volume means it
-  // would fail AFTER we destroyed the container. Check the same thing the recreate
-  // checks, before committing.
-  const mainAppName = identifier.split('_')[1] || identifier;
-  const componentName = identifier.split('_')[0];
-  const isComponent = identifier.includes('_');
-  const volumeMounted = await volumeService
-    .verifyAppVolumeMount(mainAppName, true, isComponent ? componentName : spec.comp.name)
-    .catch(() => false);
-  if (!volumeMounted) {
-    return 'its data volume cannot be verified as mounted, so the recreate would fail';
-  }
-  return null;
-}
-
-/**
- * Heals a container that looks running-but-detached from its own docker network:
- * confirm it (settle + re-inspect), require its network to still exist, then
- * force-remove (keeping bind-mounted data) and recreate with a fresh endpoint.
- * Force-remove is required because the recreate path (appDockerCreate) 409s on an
- * existing container name; `docker network connect` on a live container does not
- * restore published host ports, so only a recreate fully heals it.
- */
-async function healDetachedNetwork(identifier, mainAppName, spec) {
-  // Confirm in-pass: a detached read can be transient (dockerd mid-restart, the
-  // brief window before an endpoint gets its IP). Settle, then look again, and
-  // only destroy on a state that survived the gap.
-  log.warn(`appReconciler - ${identifier} appears detached from its docker network; confirming before acting`);
-  await serviceHelper.delay(NETWORK_DETACH_CONFIRM_MS);
-  const confirmed = await dockerActual(identifier);
-  if (!confirmed.reachable || confirmed.indeterminate || !confirmed.exists || !confirmed.running) {
-    // docker went unhappy, or the container is no longer running: nothing here can
-    // be justified on this read. The next pass reconciles whatever it actually is.
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-  if (!dockerService.isContainerDetachedFromNetwork(confirmed.attachment)) {
-    log.info(`appReconciler - ${identifier} is attached after all; no heal needed`);
-    await clearNetworkHealState(identifier);
-    return;
-  }
-  const { networkMode } = confirmed.attachment;
-
-  // The detach must also have PERSISTED. A dockerd restart (live-restore) can serve
-  // a successful inspect before libnetwork has re-populated endpoint IPs, and the
-  // reconnect sweep enqueues everything at that moment - without a real settle
-  // window we would rebuild every container on the node.
-  if (!detachedSince.has(identifier)) {
-    detachedSince.set(identifier, Date.now());
-    log.warn(`appReconciler - ${identifier} detached; waiting for it to persist before healing`);
-    scheduleRetry(identifier, DETACHED_PERSIST_MS);
-    return;
-  }
-  const detachedFor = Date.now() - detachedSince.get(identifier);
-  if (detachedFor < DETACHED_PERSIST_MS) {
-    scheduleRetry(identifier, DETACHED_PERSIST_MS - detachedFor);
-    return;
-  }
-
-  // Several containers detached at once is a daemon-level fault, not N stale
-  // endpoints. Force-removing the node's whole workload on that read is never the
-  // right answer - say so loudly and wait for the daemon to settle instead.
-  if (detachedSince.size >= DETACH_STORM_THRESHOLD) {
-    log.error(`appReconciler - ${detachedSince.size} containers look detached at once; treating this as a docker-level fault and NOT recreating any of them (including ${identifier})`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'networkDetachStorm', count: detachedSince.size });
-    scheduleRetry(identifier, NETWORK_PRUNED_RETRY_MS);
-    return;
-  }
-
-  // Only a stale endpoint (network present, container not attached) is heal-able.
-  // If the network itself is gone the recreate would fail on a missing NetworkMode,
-  // so removing the container would only take it from partially-alive to removed-
-  // and-unrecreatable. And absence must be PROVEN: a failed network read is not
-  // evidence of a missing network, and acting on it destroys a container we then
-  // cannot bring back.
-  const networkState = await dockerService.dockerNetworkState(networkMode);
-  if (networkState === 'unknown') {
-    log.warn(`appReconciler - cannot determine whether ${networkMode} exists; deferring the heal of ${identifier}`);
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-  if (networkState === 'absent') {
-    if (!networkPrunedNoted.has(identifier)) {
-      networkPrunedNoted.add(identifier);
-      log.error(`appReconciler - ${identifier} detached because its network ${networkMode} is missing; not recreating (needs network restore, app NOT touched)`);
-      await appTamperingDetectionService.recordEvent(mainAppName, 'network_pruned', `Network ${networkMode} missing while ${identifier} runs detached`);
-      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'networkPruned' });
-    }
-    scheduleRetry(identifier, NETWORK_PRUNED_RETRY_MS); // keep watching for a restored network
-    return;
-  }
-  networkPrunedNoted.delete(identifier);
-
-  // Never destroy what we cannot rebuild: every precondition of the recreate must
-  // hold BEFORE the remove, or the heal turns a half-alive container into a gone one.
-  const blocker = await networkHealBlocker(identifier, spec);
-  if (blocker) {
-    log.error(`appReconciler - ${identifier} runs detached but must NOT be recreated: ${blocker}; leaving the container in place (app NOT touched)`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'networkHealBlocked', reason: blocker });
-    scheduleRetry(identifier, NETWORK_PRUNED_RETRY_MS);
-    return;
-  }
-
-  // Paced on its OWN durable ladder (0, 30s, 5m, 15m, 30m cap), not the crash one:
-  // a container that keeps coming back detached is retried forever but at a decaying
-  // rate, without holding down (or being held down by) the restart backoff.
-  const wait = await appsRuntimeState.networkHealWaitMs(identifier);
-  if (wait > 0) {
-    log.warn(`appReconciler - ${identifier} still detached, backing off ${Math.round(wait / 1000)}s before the next heal attempt`);
-    scheduleRetry(identifier, wait);
-    return;
-  }
-
-  // The ONLY ownership sample was at reconcile entry, and everything above this
-  // point - the settle, two inspects, the network probe, the volume check - has
-  // taken seconds. A redeploy/backup/uninstall may have taken the container over in
-  // the meantime, and force-removing it from under them is exactly what
-  // isManagedElsewhere exists to prevent. Re-check at actuation time (the same
-  // re-read-before-acting discipline the controller verdict and recreateMissing use).
-  if (isManagedElsewhere(identifier)) {
-    log.info(`appReconciler - ${identifier} was taken over by another operation during the heal confirmation; aborting the recreate`);
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-
-  log.warn(`appReconciler - ${identifier} running but not attached to its docker network; clearing the stale endpoint`);
-  fluxEventBus.publish('reconciler:actuated', { identifier, action: 'networkDetached' });
-
-  try {
-    // Record the anomaly (once per episode) and the durable "I removed this on
-    // purpose" flag BEFORE the remove: if FluxOS restarts in the window between the
-    // remove and the recreate, the flag is the only thing that tells the next process
-    // the absence was ours - without it, the vanished path records a false tampering
-    // event and can uninstall the whole app on a failed recreate. The marker is only
-    // set AFTER a successful record, so a failed write does not suppress the event.
-    if (!networkDetachedNoted.has(identifier)) {
-      await appTamperingDetectionService.recordEvent(mainAppName, 'network_detached', `Container ${identifier} running with no network endpoint on its own network`);
-      networkDetachedNoted.add(identifier);
-    }
-    await appsRuntimeState.recordNetworkHealAttempt(identifier);
-    await appsRuntimeState.setNetworkHealRemoval(identifier, true);
-  } catch (err) {
-    // These writes are what make the remove safe and paced, so a failure must abort
-    // it - and must re-arm a retry, or the container stays broken until the hourly
-    // sweep (every other failure path here paces its own retry).
-    log.error(`appReconciler - cannot record the network heal of ${identifier} (${err.message}); not removing the container, will retry`);
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-
-  // Stop the per-minute stats monitor before removing the container (mirrors the
-  // uninstaller). Otherwise its interval runs against a gone container, leaking and
-  // error-spamming. The recreate re-establishes it via startAppMonitoring.
-  appInspector.stopAppMonitoring(identifier, true);
-  try {
-    // v=false: Flux data lives on bind mounts; the recreate reuses them via a soft
-    // install (enforced: recreateForNetworkHeal passes softOnly).
-    await dockerService.appDockerForceRemove(identifier, false);
-  } catch (err) {
-    // The container is still there (or partially removed): put monitoring back so a
-    // container we did NOT manage to remove is not left unmonitored. The heal flag
-    // stays set on purpose - the remove may have partially succeeded, and a stale
-    // flag only keeps us on the recreate path (never the uninstall one).
-    appInspector.startAppMonitoring(identifier);
-    log.error(`appReconciler - failed to remove detached ${identifier}: ${err.message}; will retry`);
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-  await recreateForNetworkHeal(identifier);
-}
-
 // --- the reconcile -------------------------------------------------------
 
 async function reconcile(rawIdentifier) {
@@ -753,14 +348,7 @@ async function reconcile(rawIdentifier) {
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
-  if (!spec) { // not installed here - nothing to enforce
-    // drop the in-memory heal markers for a gone app (its durable runtime-state doc
-    // is dropped by the uninstaller via appsRuntimeState.remove)
-    networkDetachedNoted.delete(identifier);
-    networkPrunedNoted.delete(identifier);
-    detachedSince.delete(identifier);
-    return;
-  }
+  if (!spec) return; // not installed here - nothing to enforce
 
   // Invalid containerData (e.g. a sync flag on a non-primary mount, or an index-ref
   // primary): the spec can never be actuated — volume construction would throw — so
@@ -788,38 +376,13 @@ async function reconcile(rawIdentifier) {
     // container running over a missing volume with the mount-safety hold
     // unenforceable - the incident's app kept running through the gutted
     // window exactly this way. Honor a pending stop; defer everything else.
-    //
-    // Paused counts: dockerActual reports a paused container as not running,
-    // and this branch returns before the paused normalisation below is ever
-    // reached - skipping the stop here would leave a frozen container over the
-    // missing volume with nothing left to release it. docker stop works on a
-    // paused container.
-    // The operator's stop counts here for the same reason the controller's does,
-    // and is the more urgent of the two: a volume that will not mount is the state
-    // support reaches for a stop IN, so a stop that waits for the mount to come
-    // back is a stop that never arrives when it is wanted. It outranks the
-    // controller everywhere else in this pass (see effectiveDesiredRunning) and
-    // reading only the controller here was the one place it did not.
-    const operatorStop = await appsRuntimeState.operatorStopState(identifier);
-    if (operatorStop.stopped || controllerDesired.get(identifier) === 'stopped') {
+    if (controllerDesired.get(identifier) === 'stopped') {
       try {
         const actualNow = await dockerActual(identifier);
-        if (actualNow.reachable && !actualNow.indeterminate && (actualNow.running || actualNow.paused)) {
-          // Only an operator asks for a hard kill; every other stop reason is a
-          // drain. Carried through here too, or an appkill against an unmounted
-          // volume quietly becomes a graceful stop.
-          const forceKill = operatorStop.stopped && operatorStop.force === true;
-          const reason = operatorStop.stopped ? 'operatorStopped' : 'controllerDesired';
-          log.info(`appReconciler - ${identifier} data volume unavailable but a stop is desired; ${forceKill ? 'killing' : 'stopping'} the container`);
-          if (forceKill) {
-            await dockerService.appDockerKill(identifier);
-          } else {
-            await dockerService.appDockerStop(identifier);
-          }
-          appInspector.stopAppMonitoring(identifier, false);
-          fluxEventBus.publish('reconciler:actuated', {
-            identifier, action: 'stopped', reason, forced: forceKill,
-          });
+        if (actualNow.reachable && !actualNow.indeterminate && actualNow.running) {
+          log.info(`appReconciler - ${identifier} data volume unavailable but a stop is desired; stopping the container`);
+          await dockerService.appDockerStop(identifier);
+          fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'controllerDesired' });
         }
       } catch (err) {
         log.error(`appReconciler - ${identifier} stop under unavailable volume failed: ${err.message}`);
@@ -827,25 +390,14 @@ async function reconcile(rawIdentifier) {
     }
     log.error(`appReconciler - ${identifier} data volume not mounted (${volumeMount.reason}); deferring all actuation`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'volumeUnavailable', reason: volumeMount.reason });
-    // A mount fault is recorded under the same name the boot sweep uses, so a
-    // fleet query for an event sees a node whether the fault was there at boot
-    // or arose mid-run. Once per distinct reason per component, not every retry.
-    const faultKey = String(volumeMount.reason).split(':')[0];
-    if (volumeFaultNoted.get(identifier) !== faultKey) {
-      volumeFaultNoted.set(identifier, faultKey);
-      await appTamperingDetectionService.recordEvent(
-        mainAppName,
-        appTamperingDetectionService.classifyVolumeFault(volumeMount.reason),
-        `Volume for ${identifier} not mountable: ${volumeMount.reason}`,
-      );
+    if (volumeMount.reason === 'volume_file_missing' && !volumeMissingNoted.has(identifier)) {
+      volumeMissingNoted.add(identifier);
+      await appTamperingDetectionService.recordEvent(mainAppName, 'volume_missing', `Backing volume image for ${identifier} not found on disk`);
     }
     scheduleRetry(identifier, VOLUME_MOUNT_RETRY_MS);
     return;
   }
-  volumeFaultNoted.delete(identifier);
-  if (volumeMount.imageMoved) {
-    await appTamperingDetectionService.recordEvent(mainAppName, 'volume_image_moved', `Volume image for ${identifier} was found somewhere other than where this node recorded it`);
-  }
+  volumeMissingNoted.delete(identifier);
   if (!volumeMount.alreadyMounted) {
     log.info(`appReconciler - mounted data volume for ${identifier}`);
     fluxEventBus.publish('reconciler:actuated', { identifier, action: 'volumeMounted' });
@@ -871,54 +423,6 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  // NORMALISE A PAUSED CONTAINER BEFORE DECIDING ANYTHING ELSE.
-  //
-  // Paused is a state nothing downstream can act on. It is not startable -
-  // docker refuses with "cannot start a paused container, try unpause instead" -
-  // and appDockerUnpause was retired with the rest of pause, so no primitive
-  // remains that releases one directly. Left alone it is invisible and permanent.
-  //
-  // Stopping it converts an unrecognised state into a known one: docker stop
-  // works on a paused container and leaves it exited. From there this function
-  // needs no special case at all - the branches below start it on the normal path
-  // (with the backoff pacing, the mount-path recreation, the controller re-read
-  // and the CFS burst reapplication that appDockerStart owns), or leave it
-  // stopped if that is what is wanted. Handled ahead of the desired-state branch
-  // deliberately, so it is correct in both directions rather than only when the
-  // component is meant to be running.
-  //
-  // Nothing can create a paused container from here on - pause is retired - so
-  // this exists for the ones that already are, and for those a node that has not
-  // upgraded yet can still make during the rollout. A daemon or host restart
-  // clears them too (they come back exited), but a FluxOS restart does not, and
-  // that is the one an upgrade performs.
-  if (actual.paused) {
-    log.warn(`appReconciler - ${identifier} is paused, which nothing can act on; stopping it so it can be reconciled normally`);
-    try {
-      await dockerService.appDockerStop(identifier);
-      appInspector.stopAppMonitoring(identifier, false);
-      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'unpaused' });
-    } catch (err) {
-      log.error(`appReconciler - failed to stop the paused ${identifier}: ${err.message}; retrying. No FluxOS primitive releases a paused container - manual remedy on the node: docker unpause ${dockerService.getAppIdentifier(identifier)}`);
-      scheduleRetry(identifier, MANAGED_RETRY_MS);
-      return;
-    }
-    // The container is exited now, so what was sampled at entry is stale in the
-    // one field the branches below read. Re-enqueue rather than reason from it.
-    scheduleRetry(identifier, MANAGED_RETRY_MS);
-    return;
-  }
-
-  // The heal state says "this container is absent because I removed it". The moment
-  // the container exists and is not detached, that is stale - whatever its run state,
-  // and whatever the desired state below turns out to be. Clearing here (rather than
-  // only on the running+attached path) is what stops the flag leaking on every branch
-  // that leaves a container stopped (awaiting-controller g:, operator stop), which
-  // would otherwise divert a later, genuine disappearance away from the vanished path.
-  if (actual.exists && !dockerService.isContainerDetachedFromNetwork(actual.attachment)) {
-    await clearNetworkHealState(identifier);
-  }
-
   // Pending data wipe: the sync layer flagged this component's local appdata as
   // stale/to-be-reset and to be cleared before it runs again. This is the highest-
   // priority data action and is resolved here, inside the per-key single-flight and
@@ -931,11 +435,10 @@ async function reconcile(rawIdentifier) {
       if (actual.running) {
         log.info(`appReconciler - ${identifier} stopping before local appdata clear`);
         await dockerService.appDockerStop(identifier);
-        appInspector.stopAppMonitoring(identifier, false);
         fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason: 'dataClear' });
       }
       await serviceHelper.delay(DATA_CLEAR_SETTLE_MS);
-      await volumeService.clearAppVolumeData(identifier);
+      await dockerOperations.appDeleteDataInMountPoint(dockerService.getAppIdentifier(identifier));
     } catch (err) {
       // A failed stop/wipe is the only actuation path here that would otherwise drop
       // to the hourly sweep (~1h down). Leave dataDesired 'clear' - so the retried
@@ -956,10 +459,7 @@ async function reconcile(rawIdentifier) {
     return;
   }
 
-  // what this pass decides from: a start is carried out only while no opinion has
-  // been written since (writeIfUnchanged's rule)
-  const opinionWrites = controllerDesired.writes(identifier);
-  const { desired, reason, force } = await effectiveDesiredRunning(identifier, spec, actual.exitCode);
+  const { desired, reason } = await effectiveDesiredRunning(identifier, spec, actual.exitCode);
 
   // null = no controller opinion yet for a g:/r: component: neither start nor stop,
   // leave the container in its current state until the decider speaks.
@@ -967,151 +467,26 @@ async function reconcile(rawIdentifier) {
 
   if (!desired) {
     if (actual.running) {
-      // A hard kill skips the graceful shutdown window, and only an operator asks
-      // for one - every other stop reason is a drain. The flag arrives with the
-      // decision that read it, from the same document and the same read as the
-      // lock itself, so there is no second read here to disagree with the first.
-      const forceKill = force === true;
-      log.info(`appReconciler - ${identifier} desired stopped, ${forceKill ? 'killing' : 'stopping'}`);
-      if (forceKill) {
-        await dockerService.appDockerKill(identifier);
-      } else {
-        await dockerService.appDockerStop(identifier);
-      }
-      // Monitoring follows the container. The per-minute sampler otherwise runs
-      // against a stopped container, logging an error a minute until something
-      // else happens to stop it.
-      appInspector.stopAppMonitoring(identifier, false);
-      fluxEventBus.publish('reconciler:actuated', {
-        identifier, action: 'stopped', reason, forced: forceKill,
-      });
+      log.info(`appReconciler - ${identifier} desired stopped, stopping`);
+      await dockerService.appDockerStop(identifier);
+      fluxEventBus.publish('reconciler:actuated', { identifier, action: 'stopped', reason });
     }
     return;
   }
 
-  if (actual.running) {
-    // A running container is normally "already where we want it" - but a start
-    // can succeed while leaving the container attached to NO network when
-    // libnetwork holds a stale endpoint from an earlier failed "programming
-    // external connectivity" (e.g. a host-port bind conflict on a restart after
-    // an unclean reboot). It then runs with no IP, no embedded DNS (cannot
-    // resolve sibling components by name) and no published ports, and no future
-    // `docker start` repairs it - only a recreate clears the stale endpoint.
-    // Verify the attachment (from the inspect dockerActual already did) before
-    // trusting "running"; heal by recreating, confirmed in-pass and paced.
-    if (!dockerService.isContainerDetachedFromNetwork(actual.attachment)) {
-      // An operator restart is a level, not an action: it raises a generation and
-      // this bounces the container once the generation passes the one already
-      // actuated. Not paced by the backoff ladder - a deliberate bounce is not
-      // crash recovery, and pacing it is what made six restarts look like an app
-      // that could not stay up.
-      const restartState = await appsRuntimeState.getState(identifier);
-      const desiredGeneration = (restartState && restartState.restartGeneration) || 0;
-      const actuatedGeneration = (restartState && restartState.actuatedRestartGeneration) || 0;
-      if (desiredGeneration > actuatedGeneration) {
-        log.info(`appReconciler - ${identifier} restart requested (generation ${desiredGeneration}); restarting`);
-        try {
-          await dockerService.appDockerRestart(identifier);
-        } catch (err) {
-          log.error(`appReconciler - failed to restart ${identifier} on request: ${err.message}; retrying`);
-          fluxEventBus.publish('reconciler:actuated', { identifier, action: 'restartRequestFailed', reason: err.message });
-          scheduleRetry(identifier, MANAGED_RETRY_MS);
-          return;
-        }
-        fluxEventBus.publish('reconciler:actuated', { identifier, action: 'restarted', reason: 'operatorRequested' });
-        // A restart is a start, so it can come up on a stale endpoint the same way.
-        scheduleRetry(identifier, POST_START_VERIFY_MS);
-        // Last, because it throws. The bounce above already happened, so a write
-        // failure must not also cost the event and the attachment check a
-        // successful restart is owed - it is the record that failed, not the
-        // restart.
-        //
-        // The throw reaches the pass-level retry, which PACES it - a rate, not a
-        // bound, and the difference matters. UNHANDLED_FAILURE_RETRIES clears only
-        // on a pass that succeeds, so a database that reads but cannot write never
-        // records the generation: four bounces over fifteen seconds, then one per
-        // hourly sweep for as long as the condition holds. Bounding it needs that
-        // condition to be something the node observes centrally rather than each
-        // write site discovering it alone, which is its own change.
-        await appsRuntimeState.recordRestartGeneration(identifier, desiredGeneration);
-        return;
-      }
-      // The container is where it should be; monitoring may not be. A stop turns
-      // it off, and a stop docker never carried out leaves a running container
-      // unmonitored with no later pass to notice.
-      appInspector.ensureAppMonitoring(identifier);
-      return; // running and properly attached (heal state was cleared above)
-    }
-    await healDetachedNetwork(identifier, mainAppName, spec);
-    return;
-  }
+  if (actual.running) return; // already where we want it
 
   if (!actual.exists) {
-    // Durable, so it survives a FluxOS restart mid-heal: if WE removed this
-    // container to clear a stale endpoint, its absence is not tampering. Keep
-    // recreating it - paced on the heal ladder, never escalating to the vanished
-    // path's uninstall-on-failure. Only a container that vanished by other means
-    // takes that path.
-    let healRemoved;
-    try {
-      healRemoved = await appsRuntimeState.isNetworkHealRemoval(identifier);
-    } catch (err) {
-      // We cannot tell whether we removed this container ourselves. Guessing "no" is
-      // the destructive guess: it records a false tampering event and can uninstall
-      // the whole app on a failed recreate. Defer until the state is readable.
-      log.warn(`appReconciler - cannot read the heal state of the missing ${identifier} (${err.message}); deferring rather than treating it as vanished`);
-      scheduleRetry(identifier, MANAGED_RETRY_MS);
-      return;
-    }
-    if (healRemoved) {
-      const wait = await appsRuntimeState.networkHealWaitMs(identifier);
-      if (wait > 0) {
-        log.warn(`appReconciler - ${identifier} awaiting recreation after a network heal, backing off ${Math.round(wait / 1000)}s`);
-        scheduleRetry(identifier, wait);
-        return;
-      }
-      try {
-        await appsRuntimeState.recordNetworkHealAttempt(identifier);
-      } catch (err) {
-        // unpaced retries would hammer the recreate; defer instead
-        log.error(`appReconciler - cannot pace the heal recreate of ${identifier} (${err.message}); will retry`);
-        scheduleRetry(identifier, MANAGED_RETRY_MS);
-        return;
-      }
-      await recreateForNetworkHeal(identifier);
-      return;
-    }
     await recreateMissing(identifier);
     return;
   }
 
-  // exists but stopped, should run -> restart, paced by the ladder only when the
-  // stop carries evidence of a fault (no sleeping; the worker re-enqueues when
-  // the backoff window elapses). A clean exit goes back immediately: it is an
-  // operator restarting their own app far more often than it is a crash, and
-  // pacing that turns a deliberate restart into what looks like an outage.
-  // exitCode null is a container that has never run - an initial start, not a death.
-  const crashed = !!actual.oomKilled || (actual.exitCode !== null && actual.exitCode !== 0);
+  // exists but stopped, should run -> backoff-paced restart (no sleeping; the
+  // worker re-enqueues when the backoff window elapses)
   const wait = await appsRuntimeState.restartWaitMs(identifier, actual.finishedAt);
   if (wait > 0) {
-    // name which of the two put it here: a reported fault, or restarts arriving
-    // fast enough to be one whatever the exit code said. Support cannot tell
-    // these apart from the outside, and the difference decides what they do next.
-    const cause = crashed
-      ? `exit ${actual.exitCode}${actual.oomKilled ? ' (OOM-killed)' : ''}`
-      : 'restarting too fast to be healthy';
-    // How far up the ladder this is. waitMs alone cannot say: it is what REMAINS
-    // of the rung, and the worker re-enqueues during a wait, so one rung reports
-    // several times, each smaller than the last. Two backoffs cannot be compared
-    // without it - which is how far a component has escalated, and whether it
-    // ever went backwards. Read on the backoff path only, which is a paced
-    // restart and therefore cold.
-    const backoffState = await appsRuntimeState.getState(identifier);
-    const rung = ((backoffState && backoffState.restartHistory) || []).length;
-    log.warn(`appReconciler - ${identifier} stopped, ${cause}; backing off ${Math.round(wait / 1000)}s before restart (rung ${rung})`);
-    fluxEventBus.publish('reconciler:actuated', {
-      identifier, action: 'backoff', waitMs: wait, rung, crashed,
-    });
+    log.warn(`appReconciler - ${identifier} stopped, backing off ${Math.round(wait / 1000)}s before restart`);
+    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'backoff', waitMs: wait });
     scheduleRetry(identifier, wait);
     return;
   }
@@ -1122,58 +497,33 @@ async function reconcile(rawIdentifier) {
   const isComponent = spec.appSpec.version >= 4 && Array.isArray(spec.appSpec.compose);
   await volumeService.ensureMountPathsExist(spec.comp, mainAppName, isComponent, isComponent ? spec.appSpec : null);
 
-  await fluxEventBus.checkpoint(fluxEventBus.Checkpoint.RECONCILER_BEFORE_START, identifier);
-  // A decider writes its opinion outside this single-flight, so one may have been
-  // written during the awaits above; starting on what this pass read would undo it
-  // (a folder a decider has just stopped, or wiped). The writer's own enqueue
-  // drives the next pass, so not starting here needs no retry. Nothing awaits
-  // between this check and the start.
-  if ((spec.isG || spec.isR) && controllerDesired.writes(identifier) !== opinionWrites) {
-    log.info(`appReconciler - ${identifier}: a controller opinion was written during this pass, not starting it`);
+  // The controller verdict was sampled at reconcile entry, but the syncthing
+  // decider's stop wrapper runs OUTSIDE this single-flight and may have flipped
+  // it (stop + data wipe) during the awaits above. Re-read at actuation time:
+  // starting onto a folder mid-wipe corrupts the fresh sync. The decider's own
+  // enqueue drives the follow-up reconcile, so aborting here needs no retry.
+  if ((spec.isG || spec.isR) && controllerDesired.get(identifier) !== 'running') {
+    log.info(`appReconciler - ${identifier} controller verdict changed during reconcile, aborting start`);
     return;
   }
-  // The attempt is recorded once it is made, whatever it came to: a pass that
-  // does not start the component walks no ladder.
-  let startError = null;
+
+  await appsRuntimeState.recordRestart(identifier);
   try {
     await dockerService.appDockerStart(identifier);
   } catch (err) {
-    startError = err;
-  }
-  await appsRuntimeState.recordRestart(identifier, crashed);
-  if (startError) {
     // No die event fires for a failed start (the container never ran), so a
     // dropped throw here leaves the component down until the hourly sweep.
-    // Schedule our own retry. A start that never ran carries no exit code, so it
-    // is not a fault and does not walk the ladder directly - it reaches the
-    // ladder by filling the burst window, which these retries do comfortably
-    // (restartBurstCount x MANAGED_RETRY_MS against restartBurstWindowMs). That
-    // relationship is what bounds a permanently failing start, and the config
-    // comment on the window is where it is stated.
-    log.error(`appReconciler - failed to start ${identifier}: ${startError.message}; retrying`);
-    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'startFailed', reason: startError.message });
+    // Schedule our own retry; pacing is free - the attempt was recorded above,
+    // so a persistent failure walks the backoff ladder instead of hammering.
+    log.error(`appReconciler - failed to start ${identifier}: ${err.message}; retrying`);
+    fluxEventBus.publish('reconciler:actuated', { identifier, action: 'startFailed', reason: err.message });
     scheduleRetry(identifier, MANAGED_RETRY_MS);
     return;
   }
-  appInspector.startAppMonitoring(identifier);
-  // A restart of a container that was already stopped IS this start, so the
-  // request is satisfied here. Left pending, the pass that next finds it running
-  // would bounce a container the operator has just watched come up.
-  const startedState = await appsRuntimeState.getState(identifier);
-  const pendingGeneration = (startedState && startedState.restartGeneration) || 0;
-  const satisfiesRestart = pendingGeneration > ((startedState && startedState.actuatedRestartGeneration) || 0);
+  appInspector.startAppMonitoring(identifier, globalState.appsMonitored);
   log.info(`appReconciler - ${identifier} restarted`);
   fluxEventBus.publish('reconciler:actuated', { identifier, action: 'started', exitCode: actual.exitCode });
-  // A start is exactly when a container can come up attached to no network (a stale
-  // endpoint left by an earlier failed start). The attachment we hold was sampled
-  // BEFORE this start, so verify the new one shortly - otherwise a detached-at-boot
-  // container waits for the hourly sweep.
-  scheduleRetry(identifier, POST_START_VERIFY_MS);
-  // Last, because it throws - the start above already happened, and the record
-  // failing must not cost the bookkeeping that start is owed.
-  if (satisfiesRestart) {
-    await appsRuntimeState.recordRestartGeneration(identifier, pendingGeneration);
-  }
+  notifyContainerStarted(identifier);
 }
 
 // --- workqueue (per-key single-flight, boot-gated) -----------------------
@@ -1189,29 +539,8 @@ function scheduleRetry(identifier, delayMs) {
 }
 
 function runReconcile(identifier) {
-  const pass = reconcile(identifier)
-    .then(() => {
-      // A pass that got through is the only evidence the fault has cleared.
-      unhandledFailures.delete(identifier);
-    })
-    .catch((err) => {
-      const attempt = (unhandledFailures.get(identifier) || 0) + 1;
-      unhandledFailures.set(identifier, attempt);
-      const retrying = attempt <= UNHANDLED_FAILURE_RETRIES;
-      log.error(
-        `appReconciler - reconcile ${identifier} failed: ${err.message}`
-        + (retrying
-          ? `; retrying (${attempt}/${UNHANDLED_FAILURE_RETRIES})`
-          : `; ${attempt} consecutive failures, leaving it to the hourly sweep`),
-      );
-      // Published for every unhandled failure rather than at each throw site: the
-      // sites that can throw are the ones nobody thought to guard, so an event
-      // added per site would miss exactly the same ones the retry did.
-      fluxEventBus.publish('reconciler:actuated', {
-        identifier, action: 'reconcileFailed', reason: err.message, attempt, retrying,
-      });
-      if (retrying) scheduleRetry(identifier, MANAGED_RETRY_MS);
-    })
+  reconcile(identifier)
+    .catch((err) => log.error(`appReconciler - reconcile ${identifier} failed: ${err.message}`))
     .finally(() => {
       inFlight.delete(identifier);
       // one completed pass (actuated or deferred) is all the boot drain needs
@@ -1223,10 +552,6 @@ function runReconcile(identifier) {
         setImmediate(() => enqueue(identifier));
       }
     });
-  // Registered synchronously: promise callbacks are microtasks, so the finally
-  // above cannot run before this line and clear an entry that is not there yet.
-  inFlight.set(identifier, pass);
-  return pass;
 }
 
 /**
@@ -1238,196 +563,62 @@ function enqueue(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   if (!globalState.bootContainerStateSettled) {
     bootPending.add(identifier);
-    return null;
+    return;
   }
   if (inFlight.has(identifier)) {
     dirty.add(identifier);
-    // The pass already running was started against state older than whatever
-    // just changed, so it is NOT the pass a caller wanting actuation should
-    // wait on. The re-run this marks dirty is, and it has no promise yet.
-    return null;
+    return;
   }
-  return runReconcile(identifier);
-}
-
-/**
- * Change what a component is supposed to be doing, without racing a pass that is
- * deciding what to do about it.
- *
- * A reconcile reads the desired state, then acts on that answer some
- * milliseconds later once docker has answered. An intent written in that gap is
- * not seen: the pass starts a container an operator has just stopped, and the
- * next pass stops it again. The lock is written correctly and early - the
- * problem is that the check and the action are not atomic against a concurrent
- * writer, so narrowing the gap with a second check before acting would leave the
- * same defect with a smaller window.
- *
- * Instead the write takes the same per-key slot a pass takes. It waits out a
- * pass already deciding, holds the key while it writes so `enqueue` marks the
- * key dirty rather than starting one, and enqueues on release so the next pass
- * reads the intent it just wrote. The two can no longer interleave because they
- * are mutually exclusive by construction.
- *
- * The wait is one pass of ONE component - a docker probe and at most one action -
- * so an operator's command is never behind unrelated work. That is a BOUND only
- * while passes terminate, and the docker calls a pass makes carry no timeout of
- * their own: a daemon that HANGS rather than fails leaves the pass unfinished and
- * this wait with nothing to wake it.
- *
- * What that costs is durability, not correctness: nothing wrong is recorded, and
- * the caller's request hangs on a wedged daemon regardless. What is lost is a
- * FluxOS restart during the hang - the write has not landed, so the intent does
- * not survive one.
- *
- * Bounding THIS wait is not the repair - giving up on it and writing anyway
- * restores the interleave described above, which is the defect this exists to
- * fix. Bounding the docker calls is, and that is fleet-wide work rather than
- * something this function can do alone.
- * @param {string} rawIdentifier Component identifier.
- * @param {Function} mutate Writes the new intent. Awaited while the key is held.
- * @param {object} [opts]
- * @param {boolean} [opts.awaitPass] Wait for the reconcile that follows, so a
- *   caller can report what was DONE rather than what was asked for. The pass is
- *   awaited to completion, actuated or deferred - it never throws here, since
- *   runReconcile absorbs its own failures.
- * @returns {Promise<boolean>} True when a pass ran to completion. False when the
- *   intent is durable but nothing has acted on it yet - the boot gate is shut,
- *   or another pass is mid-flight and the re-run has not started. Callers that
- *   report to a user must not present false as success.
- */
-async function applyIntent(rawIdentifier, mutate, { awaitPass = false } = {}) {
-  const identifier = canonical(rawIdentifier);
-
-  // A loop, not a single await: releasing the key lets a queued pass start
-  // before this continues, and that pass would be reading the state we are
-  // about to replace.
-  // eslint-disable-next-line no-await-in-loop
-  while (inFlight.has(identifier)) await inFlight.get(identifier).catch(() => {});
-
-  let release;
-  const held = new Promise((resolve) => { release = resolve; });
-  inFlight.set(identifier, held);
-  try {
-    await mutate();
-  } finally {
-    inFlight.delete(identifier);
-    release();
-  }
-
-  const pass = enqueue(identifier);
-  if (!awaitPass) return Boolean(pass);
-  if (!pass) return false;
-  await pass;
-  return true;
-}
-
-/**
- * The component identifiers of a set of installed apps.
- *
- * Enterprise specs are stored encrypted (compose: []) and the component names
- * live INSIDE the blob, so the set is decrypted first - leniently: one app
- * failing to decrypt must not cost the rest their components. An app that stays
- * encrypted is enumerated from the containers docker is already holding for it,
- * matched on the `_<appname>` suffix, so it is never silently skipped. That
- * source can only see components that EXIST, which is the most that can be known
- * about such an app anyway: a vanished component of one cannot be recreated
- * either, because recreating it needs the spec.
- *
- * The listing is taken once for the whole set, and only if something failed to
- * decrypt.
- *
- * @param {Array<object>} installed Records from appQueryService.installedApps().
- * @returns {Promise<string[]>} Bare component identifiers (`<component>_<app>`,
- *   or `<app>` for v1-3) across every app given - one spelling whichever source
- *   they came from.
- */
-async function componentIdsOf(installed) {
-  const { readable, unreadable } = await appQueryService.decryptEnterpriseApps(installed, { formatSpecs: false });
-  const ids = [];
-
-  readable.forEach((app) => {
-    if (app.version >= 4 && Array.isArray(app.compose)) {
-      app.compose.forEach((c) => ids.push(`${c.name}_${app.name}`));
-    } else {
-      ids.push(app.name);
-    }
-  });
-
-  if (!unreadable.length) return ids;
-
-  let dockerNames;
-  try {
-    const containers = await dockerService.dockerListContainers(true);
-    dockerNames = containers.map((c) => (c.Names && c.Names[0] ? c.Names[0].slice(1) : ''));
-  } catch (err) {
-    // The list is returned short rather than refused, so one app's failure
-    // cannot cost the readable apps their sweep. Named at error level because a
-    // short list is indistinguishable from a complete one at every call site:
-    // the app is simply absent from what the caller acts on.
-    log.error(`appReconciler - cannot list containers, dropping undecryptable apps [${unreadable.map((app) => app.name).join(', ')}]: ${err.message}`);
-    return ids;
-  }
-  unreadable.forEach((app) => {
-    const suffix = `_${app.name}`;
-    // Docker holds the namespaced name (`flux<component>_<app>`); the readable
-    // branch above produces the bare one. One list carries one spelling, so a
-    // consumer that compares it against a component name an operator typed
-    // matches it, rather than refusing every component of an app whose spec
-    // will not decrypt. The consumers that canonicalise on ingest cannot tell
-    // the two apart, which is why they coexisted unnoticed.
-    dockerNames.filter((name) => name.endsWith(suffix)).forEach((name) => ids.push(canonical(name)));
-  });
-  return ids;
+  inFlight.add(identifier);
+  runReconcile(identifier);
 }
 
 /**
  * Enqueue every installed component (hourly tick / reconnect / boot drift).
+ * Enterprise specs are stored encrypted (compose: []), so the sweep decrypts
+ * to enumerate components — leniently: one app failing to decrypt must not
+ * abort the sweep for the rest. An app that stays encrypted is still covered
+ * via its existing docker containers (see below); never silently skipped.
  */
 async function enqueueAll(reason = 'resync') {
   const res = await appQueryService.installedApps();
   if (!res || res.status !== 'success') return;
-  const ids = await componentIdsOf(res.data);
-  // canonicalised to the bare component identifier by enqueue
-  ids.forEach((id) => enqueue(id));
-  fluxEventBus.publish('reconciler:swept', { reason, count: ids.length });
-}
-
-/**
- * Ask every component of these apps to restart, and let the normal machinery
- * carry it out.
- *
- * For a caller that knows the node has changed underneath its apps - the address
- * moved, so the containers have to come up on the new one - and knows nothing
- * else about them. Everything an app is made of is worked out here rather than by
- * the caller: which components it has, whether its specs can be read, and what a
- * restart request even is.
- *
- * Durable and paced, deliberately. A generation survives a FluxOS restart part
- * way through, where a docker call issued from the caller is simply lost, and it
- * queues behind the same slot as every other intent instead of racing it. Each
- * request is independent: one component that cannot be recorded must not cost the
- * others theirs.
- *
- * @param {Array<object>} installed Records from appQueryService.installedApps().
- * @param {string} reason Why, for the log.
- * @param {string} [key] What the restart is for: a repeat of the key restarts
- *   nothing again (appsRuntimeState.requestRestart).
- * @returns {Promise<{asked: number, components: number}>} How many components
- *   were asked, of how many.
- */
-async function requestRestartOf(installed, reason, key) {
-  const ids = await componentIdsOf(installed);
-  let asked = 0;
-  // eslint-disable-next-line no-restricted-syntax
-  for (const id of ids) {
-    // eslint-disable-next-line no-await-in-loop
-    await applyIntent(id, async () => {
-      await appsRuntimeState.requestRestart(id, { key });
-    }).then(() => { asked += 1; })
-      .catch((err) => log.error(`appReconciler - could not request restart of ${id} (${reason}): ${err.message}`));
+  const apps = await appQueryService.decryptEnterpriseApps(res.data, { formatSpecs: false });
+  let count = 0;
+  let dockerNames = null; // fetched once, only if some app failed to decrypt
+  for (const app of apps) {
+    const stillEncrypted = app.version >= 8 && app.enterprise
+      && (!Array.isArray(app.compose) || app.compose.length === 0);
+    if (stillEncrypted) {
+      // Decryption failed (already logged by decryptEnterpriseApps). The component
+      // names live inside the blob, so enumerate the app's EXISTING docker
+      // containers instead: their reconciles defer on the same decrypt failure
+      // and converge the moment fluxbenchd answers again. A vanished container of
+      // an undecryptable app cannot be recovered anyway (recreation needs the
+      // spec); the next sweep retries, so coverage resumes with decryption.
+      if (dockerNames === null) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const containers = await dockerService.dockerListContainers(true);
+          dockerNames = containers.map((c) => (c.Names && c.Names[0] ? c.Names[0].slice(1) : ''));
+        } catch (err) {
+          log.warn(`appReconciler - enqueueAll cannot list containers for undecryptable apps: ${err.message}`);
+          dockerNames = [];
+        }
+      }
+      const suffix = `_${app.name}`;
+      dockerNames.filter((name) => name.endsWith(suffix)).forEach((name) => {
+        enqueue(name); // canonicalised to the bare component identifier by enqueue
+        count += 1;
+      });
+    } else if (app.version >= 4 && Array.isArray(app.compose)) {
+      app.compose.forEach((c) => { enqueue(`${c.name}_${app.name}`); count += 1; });
+    } else {
+      enqueue(app.name);
+      count += 1;
+    }
   }
-  log.info(`appReconciler - restart requested for ${asked}/${ids.length} components (${reason})`);
-  return { asked, components: ids.length };
+  fluxEventBus.publish('reconciler:swept', { reason, count });
 }
 
 // --- controllerDesired seam (written by masterSlave/syncthing deciders) ---
@@ -1444,94 +635,6 @@ function setControllerDesired(rawIdentifier, state, reason) {
   log.info(`appReconciler - controllerDesired[${identifier}] = ${state} (${reason})`);
   fluxEventBus.publish('reconciler:desiredChanged', { identifier, state, reason });
   enqueue(identifier);
-}
-
-/**
- * setControllerDesired, returning once the reconcile it causes has run, so the
- * caller can act on what was done rather than on what was asked for.
- * @param {string} rawIdentifier Component identifier.
- * @param {string} state 'running' | 'stopped'
- * @param {string} reason Why, for the log and the event.
- * @returns {Promise<boolean>} False when nothing has acted on it yet - see applyIntent.
- */
-async function setControllerDesiredAndWait(rawIdentifier, state, reason) {
-  const identifier = canonical(rawIdentifier);
-  return applyIntent(identifier, () => {
-    controllerDesired.set(identifier, state);
-    log.info(`appReconciler - controllerDesired[${identifier}] = ${state} (${reason})`);
-    fluxEventBus.publish('reconciler:desiredChanged', { identifier, state, reason });
-  }, { awaitPass: true });
-}
-
-/** What a request to run a component came to (setRunningUnlessOperatorStopped). */
-const RunRequest = Object.freeze({
-  WRITTEN: 'written',
-  // the operator has it stopped, and the lock holds it
-  OPERATOR_STOPPED: 'operatorStopped',
-  // the caller's `unless` answered true
-  STOOD_DOWN: 'stoodDown',
-  // another writer decided while this awaited, or a data clear is pending
-  SUPERSEDED: 'superseded',
-});
-
-/**
- * Writes a controller opinion decided across awaits, if nothing else decided in
- * the meantime: `writes` is the opinion's write count read before the awaits.
- * @param {string} identifier canonical
- * @param {number} writes
- * @param {'running'|'stopped'} state
- * @returns {boolean} whether it was written
- */
-function writeIfUnchanged(identifier, writes, state) {
-  if (controllerDesired.writes(identifier) !== writes) return false;
-  controllerDesired.set(identifier, state);
-  return true;
-}
-
-/**
- * Asks for a component to run unless its operator has it stopped, decided in
- * the per-key slot the operator's own writes go through. A desire to run is
- * never written behind the stop lock: an operator stop clears the desire, and a
- * desire written after it would start the component the moment the lock lifted
- * by any route, with no election pass. In the slot, either this lands first and
- * the stop clears it, or the stop lands first and this writes nothing.
- *
- * A pending data clear, or another writer's opinion written while the lock was
- * read, supersedes it: the clear has to run on a stopped component, and the
- * other writer decided last.
- * @param {string} rawIdentifier Component identifier.
- * @param {string} reason Why, for the log and the event.
- * @param {object} [options]
- * @param {() => boolean} [options.unless] Asked once the slot is held and again
- *   after the lock is read; true at either writes nothing.
- * @returns {Promise<string>} A RunRequest.
- * @throws When the lock cannot be read: an unread lock is not an absent one.
- */
-async function setRunningUnlessOperatorStopped(rawIdentifier, reason, { unless = () => false } = {}) {
-  const identifier = canonical(rawIdentifier);
-  let outcome = RunRequest.SUPERSEDED;
-  await applyIntent(identifier, async () => {
-    const writes = controllerDesired.writes(identifier);
-    if (unless()) {
-      outcome = RunRequest.STOOD_DOWN;
-      return;
-    }
-    if (dataDesired.has(identifier)) return;
-    if (await appsRuntimeState.operatorStoppedOrThrow(identifier)) {
-      outcome = RunRequest.OPERATOR_STOPPED;
-      return;
-    }
-    // `unless` is set from outside the slot, so it is asked again after the read
-    if (unless()) {
-      outcome = RunRequest.STOOD_DOWN;
-      return;
-    }
-    if (!writeIfUnchanged(identifier, writes, 'running')) return;
-    log.info(`appReconciler - controllerDesired[${identifier}] = running (${reason})`);
-    fluxEventBus.publish('reconciler:desiredChanged', { identifier, state: 'running', reason });
-    outcome = RunRequest.WRITTEN;
-  });
-  return outcome;
 }
 
 /**
@@ -1552,123 +655,10 @@ function requestStopAndClearData(rawIdentifier, reason) {
   enqueue(identifier);
 }
 
-/**
- * Retract the controller's opinion about whether this component should run,
- * leaving every other desired input standing.
- *
- * A pending data clear is NOT an opinion about running - it is the sync layer's
- * finding that the local appdata must not be trusted - so it survives. It has
- * to: the sync layer marks a component processed BEFORE asking, so a request
- * dropped here is never made again and the component eventually starts on the
- * data the clear existed to remove. The reconciler resolves a pending clear
- * ahead of any run decision, so one left standing on a stopped component simply
- * waits.
- */
 function clearControllerDesired(rawIdentifier) {
   const identifier = canonical(rawIdentifier);
   controllerDesired.delete(identifier);
-}
-
-/**
- * Whether this process holds a controller opinion for the component. False is
- * "unknown": no decider has spoken since this process started, or an operator
- * stop retracted what one said.
- */
-function hasControllerOpinion(rawIdentifier) {
-  return controllerDesired.has(canonical(rawIdentifier));
-}
-
-/**
- * Record a decider's verdict for a component this process holds no opinion on,
- * where the container already matches it.
- *
- * The opinion is in-memory and the container is not: a FluxOS restart leaves a
- * component running (or stopped) where the previous process's decision put it,
- * with no opinion recorded. A decider whose verdict agrees with the container
- * has nothing to actuate, so it never reaches setControllerDesired, which is
- * how a decider changes what the container does. This is how it records the
- * verdict instead. Until one is recorded, every pass takes no action on the
- * component, including a restart the operator asked for.
- *
- * Resolves an unknown opinion only: an existing one is a decision, and only a
- * decision changes it. Checked inside the component's intent slot, against the
- * operator lock and the container as they are now rather than as the decider
- * sampled them - an operator stop that lands mid-pass must not be followed by
- * an adoption that outlives its lock, and a verdict is adopted only while the
- * container still shows it. An opinion written by any writer while those are
- * read decided last, so nothing is adopted (writeIfUnchanged), and nothing is
- * adopted while a data clear is pending. The slot enqueues a pass on release,
- * which carries out anything that was held for want of an opinion: a pending
- * operator restart.
- *
- * @param {string} rawIdentifier
- * @param {'running'|'stopped'} state
- * @param {string} reason
- * @returns {Promise<boolean>} true if the verdict was recorded.
- */
-async function adoptControllerDesired(rawIdentifier, state, reason) {
-  const identifier = canonical(rawIdentifier);
-  let adopted = false;
-  await applyIntent(identifier, async () => {
-    const writes = controllerDesired.writes(identifier);
-    if (controllerDesired.has(identifier)) return;
-    // a pending data clear runs on a stopped component, whatever it shows now
-    if (dataDesired.has(identifier)) return;
-    await fluxEventBus.checkpoint(fluxEventBus.Checkpoint.RECONCILER_BEFORE_ADOPT, identifier);
-    try {
-      if (await appsRuntimeState.operatorStoppedOrThrow(identifier)) return;
-    } catch (error) {
-      // an unread lock is not an absent one
-      log.warn(`appReconciler - ${identifier}: not adopting ${state}, the operator lock could not be read: ${error.message}`);
-      return;
-    }
-    const actual = await dockerActual(identifier);
-    // An unreachable daemon reports the container absent.
-    if (!actual.exists || actual.indeterminate) return;
-    if (actual.running !== (state === 'running')) return;
-    // a writer that decided while this read the lock and docker decided last
-    if (!writeIfUnchanged(identifier, writes, state)) return;
-    adopted = true;
-    log.info(`appReconciler - controllerDesired[${identifier}] = ${state} (adopted: ${reason})`);
-    fluxEventBus.publish('reconciler:desiredChanged', {
-      identifier, state, reason, adopted: true,
-    });
-  });
-  return adopted;
-}
-
-/**
- * Forget every desired input for a component - it is gone, and nothing about it
- * is worth acting on. Removal only: for anything short of that, retract the
- * specific opinion.
- */
-function forgetDesiredState(rawIdentifier) {
-  const identifier = canonical(rawIdentifier);
-  controllerDesired.delete(identifier);
   dataDesired.delete(identifier);
-  // A removed component keeps no failure history: these are keyed by identifier
-  // and a reinstall under the same name would otherwise start part-way up the
-  // count and reach the sweep sooner than a first failure should - or, for the
-  // noted maps, have a new fault swallowed as one already recorded.
-  unhandledFailures.delete(identifier);
-  volumeFaultNoted.delete(identifier);
-  networkDetachedNoted.delete(identifier);
-  networkPrunedNoted.delete(identifier);
-  detachedSince.delete(identifier);
-}
-
-/**
- * Component identifiers this node is committed to running, from its own state
- * alone. The running containers are the caller's to add - this is the part Docker
- * cannot answer.
- * @returns {string[]}
- */
-function committedIdentifiers() {
-  const ids = new Set();
-  controllerDesired.forEach((state, identifier) => {
-    if (state === 'running') ids.add(identifier);
-  });
-  return [...ids];
 }
 
 // --- lifecycle -----------------------------------------------------------
@@ -1699,7 +689,6 @@ function stop() {
   started = false;
   backoffTimers.forEach((t) => clearTimeout(t));
   backoffTimers.clear();
-  unhandledFailures.clear();
   if (bootDrainCapTimer) {
     clearTimeout(bootDrainCapTimer);
     bootDrainCapTimer = null;
@@ -1711,36 +700,15 @@ function stop() {
 }
 
 module.exports = {
-  RunRequest,
   enqueue,
-  applyIntent,
   enqueueAll,
-  requestRestartOf,
   setControllerDesired,
   clearControllerDesired,
-  hasControllerOpinion,
-  adoptControllerDesired,
-  forgetDesiredState,
-  setControllerDesiredAndWait,
-  setRunningUnlessOperatorStopped,
-  committedIdentifiers,
   requestStopAndClearData,
+  setOnContainerStarted,
   waitForBootDrainSettled: () => bootDrainGate.wait(),
   start,
   stop,
-  // The one answer to "what is this container actually doing" - it probes the
-  // daemon rather than pattern-matching an inspect error, so it can tell docker
-  // being unreachable from the container being gone. Anything that acts on a
-  // container's run state needs that distinction, not just the reconciler.
-  dockerActual,
-  // What the reconciler would do with this component now, for a caller that has
-  // to report an operator command's outcome truthfully.
-  desiredRunState,
-  // What an app is actually made of. Enterprise specs keep their component names
-  // inside an encrypted blob, so reading `compose` off a stored spec yields an
-  // empty list and silently addresses nothing - which is why every caller that
-  // needs an app's components asks here rather than working it out again.
-  componentIdsOf,
   // exposed for tests
   reconcile,
   policyAllowsRun,

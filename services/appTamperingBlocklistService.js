@@ -1,61 +1,49 @@
 const config = require('config');
 const log = require('../lib/log');
-const policyStore = require('./policyStore');
+const serviceHelper = require('./serviceHelper');
 const dbHelper = require('./dbHelper');
 const fluxNetworkHelper = require('./fluxNetworkHelper');
 const generalService = require('./generalService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const benchmarkService = require('./benchmarkService');
 
+const BLOCKLIST_URL = `${config.github.rawBaseUrl}/helpers/tamperingblockednodes.json`;
 const CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const SYNC_POLL_MS = 60 * 1000; // 60s while waiting for daemon sync
-const TAMPER_SCORE_THRESHOLD = 10;
+const TAMPERING_EVENT_THRESHOLD = 10;
 const DOS_MESSAGE_PREFIX = 'Node flagged via tampering blocklist';
-const OWNER = fluxNetworkHelper.StickyDosOwner.APP_TAMPERING;
 
 const tamperingEventsCollection = config.database.local.collections.appTamperingEvents;
 
 let intervalHandle = null;
+let ourDosActive = false;
 let stopping = false;
 let syncWaitTimer = null;
 let syncWaitResolver = null;
 
 /**
- * True while this service's own verdict holds the node out of service.
- * @returns {boolean}
+ * True when the current sticky DOS message was set by this service.
+ * Identified by the DOS_MESSAGE_PREFIX we always prepend when we set it.
  */
-function isOurDosHeld() {
-  return fluxNetworkHelper.isStickyDosHeldBy(OWNER);
+function isOurStickyDos() {
+  const msg = fluxNetworkHelper.getStickyDosMessage();
+  return typeof msg === 'string' && msg.startsWith(DOS_MESSAGE_PREFIX);
 }
 
 /**
- * Give up the DOS this service is holding. Every other owner's verdict stands.
- * @param {string} reason Logged context for the release.
+ * Fetch the manually-curated txhash blocklist from the RunOnFlux repo.
+ * Returns [] on any failure so the caller never crashes the enforcer loop.
  */
-function releaseOurDos(reason) {
-  if (!isOurDosHeld()) return;
-  log.info(`appTamperingBlocklist - clearing sticky DOS (${reason})`);
-  fluxNetworkHelper.clearStickyDos(OWNER);
-}
-
-/**
- * Fetch the manually-curated txhash blocklist from the policy repo.
- * Returns null on any failure - could-not-fetch is not an empty list, and the
- * enforcer must distinguish them or an outage clears an active DOS.
- */
-function fetchBlocklist() {
-  // Read from the signed bundle rather than fetched here. Null still means "could not read
-  // it", which the caller already treats as a reason to skip the tick rather than as an
-  // empty list -- an unreadable blocklist releasing a node the network deliberately DOSed is
-  // the bug this contract was written for.
-  const blocklist = policyStore.getDocument('tamperingblockednodes');
-  if (blocklist === null) return null;
-  // A signature says who published a document, not that it is the shape this code expects.
-  if (!Array.isArray(blocklist)) {
-    log.warn('appTamperingBlocklist - tamperingblockednodes in the signed bundle is not an array');
-    return null;
+async function fetchBlocklist() {
+  try {
+    const res = await serviceHelper.axiosGet(BLOCKLIST_URL);
+    if (res && Array.isArray(res.data)) return res.data;
+    log.warn('appTamperingBlocklist - unexpected response shape from blocklist URL');
+    return [];
+  } catch (error) {
+    log.warn(`appTamperingBlocklist - failed to fetch blocklist: ${error.message}`);
+    return [];
   }
-  return blocklist;
 }
 
 /**
@@ -84,32 +72,18 @@ async function isArcaneOs() {
 }
 
 /**
- * Tamper score over incident documents (30-day TTL bounds the window).
- * Each schemaVersion>=1 document already IS one deduplicated incident with a
- * severity stamped at write time, so scoring is a plain sum of severities.
- * Pre-schema rows are excluded on purpose: they are row-per-observation noise
- * with no severity, exactly the data a raw countDocuments({}) once let cross
- * the enforcement gate on honest nodes. The startup purge removes them; the
- * filter here covers anything written before that purge has run.
+ * Count documents in the tampering events collection (all types, all apps).
+ * The 30-day TTL on detectedAt already scopes this.
  */
-async function computeTamperScore() {
+async function countTamperingEvents() {
   try {
     const db = dbHelper.databaseConnection();
-    // null, never 0: a score this node could not read is not a score of zero,
-    // and returning zero would take the clear branch and release a node this
-    // service had deliberately DOSed - the same distinction the blocklist
-    // fetch makes between could-not-ask and nothing-listed
-    if (!db) return null;
+    if (!db) return 0;
     const database = db.db(config.database.local.database);
-    const pipeline = [
-      { $match: { schemaVersion: { $gte: 1 } } },
-      { $project: { _id: 0, severity: 1 } },
-    ];
-    const incidents = await dbHelper.aggregateInDatabase(database, tamperingEventsCollection, pipeline);
-    return incidents.reduce((score, incident) => score + (incident.severity ?? 0), 0);
+    return await database.collection(tamperingEventsCollection).countDocuments({});
   } catch (error) {
-    log.warn(`appTamperingBlocklist - failed to compute tamper score: ${error.message}`);
-    return null;
+    log.warn(`appTamperingBlocklist - failed to count events: ${error.message}`);
+    return 0;
   }
 }
 
@@ -147,8 +121,8 @@ async function waitForDaemonSynced() {
 }
 
 /**
- * Core check: if our txhash is in the blocklist AND the weighted tamper score
- * exceeds TAMPER_SCORE_THRESHOLD, DOS the node. Otherwise, if we previously
+ * Core check: if our txhash is in the blocklist AND we have more than
+ * TAMPERING_EVENT_THRESHOLD events, DOS the node. Otherwise, if we previously
  * DOSed it, clear the DOS. This service owns the DOS message it sets and only
  * clears it when its own condition is no longer true.
  */
@@ -169,10 +143,10 @@ async function enforceBlocklist() {
     return;
   }
 
-  const [myTxhash, blocklist, tamperScore] = await Promise.all([
+  const [myTxhash, blocklist, eventCount] = await Promise.all([
     getMyTxhash(),
     fetchBlocklist(),
-    computeTamperScore(),
+    countTamperingEvents(),
   ]);
 
   if (!myTxhash) {
@@ -180,34 +154,26 @@ async function enforceBlocklist() {
     return;
   }
 
-  // An unreadable blocklist is not an empty one. Falling through on null would
-  // take the clear branch below and release a node this service had already
-  // DOSed - an outage would undo enforcement rather than postpone it.
-  if (blocklist === null) {
-    log.warn('appTamperingBlocklist - blocklist unavailable, skipping this tick');
-    return;
-  }
-
-  // Same rule for the other input to the decision: an unreadable score cannot
-  // clear an active DOS.
-  if (tamperScore === null) {
-    log.warn('appTamperingBlocklist - tamper score unavailable, skipping this tick');
-    return;
-  }
-
-  const listed = blocklist.includes(myTxhash);
-  const exceedsThreshold = tamperScore > TAMPER_SCORE_THRESHOLD;
+  const listed = Array.isArray(blocklist) && blocklist.includes(myTxhash);
+  const exceedsThreshold = eventCount > TAMPERING_EVENT_THRESHOLD;
   const shouldDos = listed && exceedsThreshold;
 
-  log.info(`appTamperingBlocklist - txhash=${myTxhash} listed=${listed} score=${tamperScore} shouldDos=${shouldDos}`);
+  log.info(`appTamperingBlocklist - txhash=${myTxhash} listed=${listed} events=${eventCount} shouldDos=${shouldDos}`);
 
   if (shouldDos) {
-    const message = `${DOS_MESSAGE_PREFIX}: tamper score ${tamperScore}, txhash ${myTxhash}`;
-    fluxNetworkHelper.setStickyDos(OWNER, message);
+    const message = `${DOS_MESSAGE_PREFIX}: ${eventCount} events, txhash ${myTxhash}`;
+    fluxNetworkHelper.setStickyDosMessage(message);
+    fluxNetworkHelper.setStickyDosStateValue(100);
+    ourDosActive = true;
+    log.error(message);
     return;
   }
 
-  releaseOurDos(`listed=${listed}, score=${tamperScore}`);
+  if (ourDosActive || isOurStickyDos()) {
+    log.info(`appTamperingBlocklist - clearing sticky DOS (listed=${listed}, events=${eventCount})`);
+    fluxNetworkHelper.clearStickyDosMessage();
+    ourDosActive = false;
+  }
 }
 
 /**
@@ -264,7 +230,7 @@ function stop() {
 }
 
 function isDosActive() {
-  return isOurDosHeld();
+  return ourDosActive;
 }
 
 module.exports = {
@@ -272,9 +238,9 @@ module.exports = {
   stop,
   enforceBlocklist,
   fetchBlocklist,
-  computeTamperScore,
+  countTamperingEvents,
   getMyTxhash,
   isDosActive,
-  TAMPER_SCORE_THRESHOLD,
+  TAMPERING_EVENT_THRESHOLD,
   DOS_MESSAGE_PREFIX,
 };

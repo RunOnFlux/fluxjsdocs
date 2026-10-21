@@ -8,26 +8,7 @@ const { localAppsInformation } = require('../utils/appConstants');
 const { verifyAppVolumeMount } = require('../utils/volumeService');
 
 
-/**
- * Recreates the container(s) for an app/component from its local spec.
- *
- * softOnly: refuse the installApplicationHard fallback. A hard install runs
- * createAppVolume, which fallocates and mke2fs's the app's volume file - i.e. it
- * REFORMATS the app's data. That is acceptable when recreating a container whose
- * volume could not be verified and which is gone anyway, but it is catastrophic
- * for a caller that deliberately removed a live container whose data was intact
- * (the network-detach heal): a transient verifyAppVolumeMount failure would wipe
- * the user's data. Such callers pass softOnly and get a throw instead, so they
- * can retry rather than reformat.
- *
- * start: false creates a soft-installed container without starting it, for the
- * reconciler, whose next pass starts it against the component's desired state.
- *
- * @param {string} componentIdentifier
- * @param {{softOnly?: boolean, start?: boolean}} [options]
- */
-async function recreateMissingContainers(componentIdentifier, options = {}) {
-  const { softOnly = false, start = true } = options;
+async function recreateMissingContainers(componentIdentifier) {
   const mainAppName = componentIdentifier.split('_')[1] || componentIdentifier;
   const dbopen = dbHelper.databaseConnection();
   const appsDatabase = dbopen.db(config.database.appslocal.database);
@@ -40,24 +21,13 @@ async function recreateMissingContainers(componentIdentifier, options = {}) {
     throw new Error(`App ${mainAppName} not found in local database`);
   }
 
-  const { readable: [decryptedSpec] } = await decryptEnterpriseApps([appSpec], { formatSpecs: false });
-  if (!decryptedSpec) {
-    // its components are inside the blob, so there is nothing to recreate from
-    throw new Error(`App ${mainAppName} could not be decrypted`);
-  }
-  appSpec = decryptedSpec;
+  appSpec = await decryptEnterpriseApps([appSpec], { formatSpecs: false });
+  // eslint-disable-next-line prefer-destructuring
+  appSpec = appSpec[0];
 
   if (!appSpec.compose || appSpec.compose.length === 0) {
     throw new Error(`App ${mainAppName} has no components to install`);
   }
-
-  // A container can only be (re)created onto an existing docker network, but the
-  // per-app network (fluxDockerNetwork_<app>) is otherwise created only at install
-  // time (registerAppLocally). If it was pruned - docker prune, daemon restart -
-  // every recreate below would loop forever on "network not found". Recreate it
-  // first; ensureAppDockerNetwork returns early (no create, no firewall work) when
-  // the network already exists, so the common intact-network recreate stays cheap.
-  await appInstaller.ensureAppDockerNetwork(mainAppName);
 
   const tier = await generalService.nodeTier();
   const isComponent = componentIdentifier.includes('_');
@@ -81,11 +51,8 @@ async function recreateMissingContainers(componentIdentifier, options = {}) {
       // volume not mounted
     }
     if (volumeMounted) {
-      await appInstaller.installApplicationSoft(componentSpec, mainAppName, true, null, appSpec, { start });
+      await appInstaller.installApplicationSoft(componentSpec, mainAppName, true, null, appSpec);
     } else {
-      if (softOnly) {
-        throw new Error(`Cannot recreate ${componentIdentifier} without reformatting its volume: the data volume for ${mainAppName} could not be verified as mounted`);
-      }
       await appInstaller.installApplicationHard(componentSpec, mainAppName, true, null, appSpec);
     }
   } else {
@@ -105,11 +72,8 @@ async function recreateMissingContainers(componentIdentifier, options = {}) {
       }
       if (volumeMounted) {
         // eslint-disable-next-line no-await-in-loop
-        await appInstaller.installApplicationSoft(componentSpec, mainAppName, true, null, appSpec, { start });
+        await appInstaller.installApplicationSoft(componentSpec, mainAppName, true, null, appSpec);
       } else {
-        if (softOnly) {
-          throw new Error(`Cannot recreate ${componentIdentifier} without reformatting its volume: the data volume for ${mainAppName} could not be verified as mounted`);
-        }
         // eslint-disable-next-line no-await-in-loop
         await appInstaller.installApplicationHard(componentSpec, mainAppName, true, null, appSpec);
       }

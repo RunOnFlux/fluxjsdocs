@@ -13,7 +13,6 @@ const fluxNetworkHelper = require('./fluxNetworkHelper');
 // App modular services - replacing appsService
 const appInstaller = require('./appLifecycle/appInstaller');
 const appUninstaller = require('./appLifecycle/appUninstaller');
-const localRemovalQueue = require('./appLifecycle/localRemovalQueue');
 const appController = require('./appManagement/appController');
 const monitoringOrchestrator = require('./appMonitoring/monitoringOrchestrator');
 const portManager = require('./appNetwork/portManager');
@@ -31,41 +30,28 @@ const appSpawner = require('./appLifecycle/appSpawner');
 const { AppSyncOrchestrator } = require('./appMessaging/appSyncOrchestrator');
 const crontabAndMountsCleanup = require('./appLifecycle/crontabAndMountsCleanup');
 const containerMountRecovery = require('./appLifecycle/containerMountRecovery');
-const fileOperationRecovery = require('./appSystem/fileOperationRecovery');
-const networkRecovery = require('./appSystem/networkRecovery');
-const volumeExecutor = require('./appSystem/volumeExecutor');
 const appStartupManager = require('./appLifecycle/appStartupManager');
 const hardwareValidationService = require('./appLifecycle/hardwareValidationService');
 const globalState = require('./utils/globalState');
 const { peerManager } = require('./utils/peerState');
 const enterpriseNetwork = require('./utils/enterpriseNetwork');
-const ufwHelper = require('./utils/ufwHelper');
-const policyStore = require('./policyStore');
-const fluxCommunicationMessagesSender = require('./fluxCommunicationMessagesSender');
+const enterpriseConfig = require('./utils/enterpriseConfig');
 const appQueryService = require('./appQuery/appQueryService');
 const daemonServiceMiscRpcs = require('./daemonService/daemonServiceMiscRpcs');
 const daemonServiceUtils = require('./daemonService/daemonServiceUtils');
-const paymentPositions = require('./migrations/paymentPositions');
 const fluxService = require('./fluxService');
 const geolocationService = require('./geolocationService');
-const ipLocationSync = require('./appPlacement/ipLocationSync');
 const upnpService = require('./upnpService');
 const syncthingService = require('./syncthingService');
 const pgpService = require('./pgpService');
 const dockerService = require('./dockerService');
 const backupRestoreService = require('./backupRestoreService');
 const systemService = require('./systemService');
-const systemdNotify = require('./utils/systemdNotify');
-const fluxadmService = require('./fluxadmService');
 const fluxNodeService = require('./fluxNodeService');
 const volumeValidationService = require('./volumeValidationService');
 const watchdogService = require('./watchdogService');
 const cloudUIUpdateService = require('./cloudUIUpdateService');
 const appTamperingBlocklistService = require('./appTamperingBlocklistService');
-const residentialNodeDosService = require('./residentialNodeDosService');
-const peerSetStabilityService = require('./peerSetStabilityService');
-const outboundPathService = require('./outboundPathService');
-const uplinkService = require('./uplinkService');
 const nodeConfirmationService = require('./nodeConfirmationService');
 const appTamperingDetectionService = require('./appTamperingDetectionService');
 const appsRuntimeState = require('./appManagement/appsRuntimeState');
@@ -86,213 +72,68 @@ function bootDelay(ms) { return Math.round(ms * bootDelayMultiplier); }
 const {
   portRestoreIntervalMs,
   cpuCheckIntervalMs,
+  imageComplianceIntervalMs,
   forceRemovalIntervalMs,
   tempMsgTtlS,
 } = config.fluxapps;
 
 // State objects for monitoring services
 const dosState = {
-  get dosMessage() { return fluxNetworkHelper.getDosMessage(); },
-  set dosMessage(value) { fluxNetworkHelper.setDosMessage(value); },
+  dosMessage: null,
+  dosMountMessage: null,
+  dosDuplicateAppMessage: null,
   get dosStateValue() { return fluxNetworkHelper.getDosStateValue(); },
   set dosStateValue(value) { fluxNetworkHelper.setDosStateValue(value); },
   testingPort: null,
   nextTestingPort: null,
   originalPortFailed: null,
-  routerRefusalsSeen: 0,
+  lastUPNPMapFailed: false,
 };
 const portsNotWorking = new Set();
 const appsStorageViolations = [];
 
 /**
- * Remove rows that duplicate a would-be-unique key, keeping the newest of each.
- *
- * A recovery strategy for ensureIndex: when a unique build fails because the
- * collection already holds rows that violate it, this makes the data conform to
- * the invariant the index DECLARES - it deletes duplicates on the key the index
- * says must be unique, which is enforcing a contract rather than losing data.
- * Only safe where the key IS the row's identity, so it is passed in per build by
- * the caller that knows the collection, never applied by default. A rollup whose
- * duplicates must be summed rather than dropped (the tampering incident count)
- * belongs to its owning service instead - see the note on ensureIndex.
- *
- * Keeps the newest per group (rows sort by _id, which is time-ordered), honours
- * the index's partialFilterExpression so it only touches rows the index covers,
- * and returns how many it removed.
- *
- * @param {object} collection - a mongo collection handle
- * @param {object} spec - the index key, e.g. { hash: 1 }
- * @param {object} options - the index options (read for partialFilterExpression)
- * @returns {Promise<number>} rows removed
+ * createIndex that tolerates a pre-existing index with conflicting options
+ * (IndexOptionsConflict / IndexKeySpecsConflict) by finding the conflicting
+ * index via listIndexes, dropping it by its actual name, and recreating.
+ * Every other error bubbles up.
  */
-async function dedupeByKey(collection, spec, options = {}) {
-  const groupId = {};
-  Object.keys(spec).forEach((key, i) => { groupId[`k${i}`] = `$${key}`; });
-  // Held in memory deliberately, and measured rather than assumed: run against a
-  // live node's collection unioned with itself until every key appeared 16 times
-  // - 1,030,208 rows, the duplicate state this exists to repair - it finished in
-  // under 2s without spilling. The $sort adds nothing on top while it stays an
-  // index walk on _id, which it is for a spec with no partialFilterExpression;
-  // the first partial index to use this wants re-measuring, because the $match
-  // ahead of the sort is what would make the sort blocking. allowDiskUse is not
-  // set: it would take a mongo below 6.0, where the cap errors instead of
-  // spilling, and the network floor is moving past that.
-  //
-  // ids[0] rather than $max: $group does not document that it carries a
-  // preceding sort into an accumulator, and that non-guarantee is about results
-  // merged from several sources - this is one standalone mongod. Checked against
-  // 64,388 real duplicate groups, ids[0] was the newest in all 64,388.
-  const pipeline = [
-    ...(options.partialFilterExpression ? [{ $match: options.partialFilterExpression }] : []),
-    { $sort: { _id: -1 } },
-    { $group: { _id: groupId, ids: { $push: '$_id' } } },
-    { $match: { 'ids.1': { $exists: true } } },
-  ];
-  const groups = await collection.aggregate(pipeline).toArray();
-  const toRemove = groups.flatMap((group) => group.ids.slice(1));
-  if (!toRemove.length) return 0;
-  await collection.deleteMany({ _id: { $in: toRemove } });
-  return toRemove.length;
-}
-
-/**
- * Assert one index, healing the failures that are recoverable.
- *
- *   - a pre-existing index with conflicting OPTIONS (IndexOptionsConflict /
- *     IndexKeySpecsConflict) is dropped by its real name and recreated;
- *   - a unique build blocked by DUPLICATE ROWS runs the caller's `recover`
- *     strategy (see dedupeByKey) and rebuilds, so the node ends up WITH the
- *     index rather than running degraded without it;
- *   - anything else rethrows.
- *
- * The rethrow is deliberate and is NOT the blanket swallow it replaced. Index
- * setup runs before any service or interval starts, so the 15s startFluxFunctions
- * retry re-runs it safely: a TRANSIENT failure (mongo mid-election, a slow-disk
- * blip) heals on the next pass instead of being skipped until the next reboot,
- * and a genuinely UNRECOVERABLE database wedges loudly - which is correct, since
- * a node whose DB cannot hold its schema cannot serve apps and appremove would
- * not rescue it. The realistic wedge that finding motivated - a unique index
- * over rows that already violate it - is repaired above, not hidden.
- *
- * TRUE NORTH: eventually every collection owns its own schema-prepare - its
- * index spec plus whatever dedupe or merge its data needs - the way
- * appsRuntimeState.prepareCollection and appTamperingDetectionService already
- * do, and boot just invokes those prepare functions. That turns this ~40-call
- * imperative block into a set of owned, individually testable units. This
- * function is the increment toward it, not the destination; a full move of the
- * remaining builds is a separate refactor, out of scope for the PR that added it.
- *
- * @param {object} collection - a mongo collection handle
- * @param {object} spec - the index key
- * @param {object} [options] - the index options
- * @param {(collection: object, spec: object, options: object) => Promise<number>} [recover]
- *   run when a unique build is blocked by existing duplicate rows
- */
-async function ensureIndex(collection, spec, options = {}, recover = null) {
+async function ensureIndex(collection, spec, options = {}) {
   try {
     await collection.createIndex(spec, options);
   } catch (err) {
     const conflict = err && (err.codeName === 'IndexOptionsConflict' || err.codeName === 'IndexKeySpecsConflict');
-    if (conflict) {
-      const specKeys = JSON.stringify(spec);
-      const indexes = await collection.listIndexes().toArray();
-      const match = indexes.find((idx) => JSON.stringify(idx.key) === specKeys);
-      if (match?.name) {
-        log.warn(`ensureIndex - conflicting index '${match.name}' on ${collection.collectionName} (key: ${specKeys}), dropping and recreating`);
-        await collection.dropIndex(match.name);
-      }
-      await collection.createIndex(spec, options);
-      return;
+    if (!conflict) throw err;
+    const specKeys = JSON.stringify(spec);
+    const indexes = await collection.listIndexes().toArray();
+    const match = indexes.find((idx) => JSON.stringify(idx.key) === specKeys);
+    const dropName = match?.name;
+    if (dropName) {
+      log.warn(`ensureIndex - conflicting index '${dropName}' on ${collection.collectionName} (key: ${specKeys}), dropping and recreating`);
+      await collection.dropIndex(dropName);
     }
-    const duplicate = err && (err.code === 11000 || err.codeName === 'DuplicateKey');
-    if (duplicate && recover) {
-      const removed = await recover(collection, spec, options);
-      log.warn(`ensureIndex - ${collection.collectionName} (key: ${JSON.stringify(spec)}) held ${removed} row(s) violating a unique index; removed and rebuilding`);
-      await collection.createIndex(spec, options);
-      return;
-    }
-    throw err;
-  }
-}
-
-/**
- * Assert every index one collection needs, in a single command.
- *
- * mongo's index build protocol has a fixed cost per BUILD - register, start,
- * scan, wait for commit quorum, commit, log - and it does not care that the
- * collection is empty. A node asserting its schema one index at a time pays
- * that cost 34 times over 14 collections; createIndexes pays it once per
- * collection. A node boots faster for it, and the integration harness, where
- * ten nodes share one mongod and every database is new, feels it ten times over
- * (measured: 938 concurrent builds per ten-node fleet).
- *
- * The batch is the fast path, not the only one. ensureIndex heals two failures
- * that need to be attributed to a single index - an options conflict it drops
- * and rebuilds, and a unique build blocked by duplicate rows it repairs through
- * the caller's strategy - and a batch rejection does not say which member
- * failed. So any error falls back to asserting them one at a time, which is
- * exactly the behaviour that existed before this function.
- *
- * @param {object} collection - a mongo collection handle
- * @param {Array<object>} specs - `{ key, ...indexOptions, recover }` per index,
- *   where `recover` is ours and never reaches mongo
- */
-async function ensureIndexes(collection, specs) {
-  try {
-    await collection.createIndexes(specs.map((spec) => {
-      // `recover` is a FluxOS concern; mongo is handed the index model alone
-      const model = { ...spec };
-      delete model.recover;
-      return model;
-    }));
-    return;
-  } catch (error) {
-    log.warn(`ensureIndexes - batch of ${specs.length} on ${collection.collectionName} failed (${error.codeName || error.message}); asserting one at a time`);
-  }
-  // eslint-disable-next-line no-restricted-syntax
-  for (const { key, recover = null, ...options } of specs) {
-    // eslint-disable-next-line no-await-in-loop
-    await ensureIndex(collection, key, options, recover);
+    await collection.createIndex(spec, options);
   }
 }
 
 /**
  * To start FluxOS. A series of checks are performed on port and UPnP (Universal Plug and Play) support and mapping. Database connections are established. The other relevant functions required to start FluxOS services are called.
- *
- * Not unit-testable: every step acts on the machine, and a throw re-runs the
- * whole boot 15 s later with whatever is stubbed by then. Unit-test the steps
- * it calls; the integration harness covers the sequence.
  */
 async function startFluxFunctions() {
   try {
     if (!config.server.allowedPorts.includes(+apiPort)) {
       log.error(`Flux port ${apiPort} is not supported. Shutting down.`);
-      process.exit(systemdNotify.EXIT_CONFIG);
+      process.exit();
     }
-    // Ahead of anything that might call a runtime API this NodeJS lacks. A
-    // below-floor node stays up holding a sticky DOS, so /flux/info names the
-    // version found and the version required.
-    fluxNetworkHelper.checkNodeJsVersionAllowed();
+    // Seed the enterprise node->owners map from helpers/enterprisenodes.json on disk
+    // and sync it from github (every 6h thereafter). Awaited so consumers (identity
+    // resolution, the spawn loop, app-spec validation) have data before they run; the
+    // disk read and github fetch are both bounded (10s fetch timeout) so boot is never
+    // stuck on this. A failed/invalid sync keeps the last-good value.
+    await enterpriseConfig.startSync().catch((err) => log.error(`enterpriseConfig sync start error: ${err.message}`));
     // Hard dependencies — nothing starts until these are confirmed.
     await dbHelper.waitForMongo();
     await dockerService.waitForDocker();
-    // As soon as Docker answers, before the container firewall is applied: a
-    // below-floor node stays up holding a sticky DOS, so /flux/info names the
-    // version found and the version required.
-    fluxNetworkHelper.checkDockerVersionAllowed(await dockerService.dockerVersion().then((version) => version.Version, () => null));
-    // Before any work that a restart would cut short: a registration that
-    // needs its kill timeout raised restarts FluxOS, and this waits for it.
-    await fluxService.ensurePm2KillTimeout();
-    // Before anything runs the ufw helper: the copy root runs is installed once
-    // per start.
-    await ufwHelper.path();
-    // Before anything reads or changes the firewall: a node whose ufw defaults
-    // file is broken has no firewall until this repairs it.
-    await fluxNetworkHelper.ensureUfwDefaults().catch((error) => log.error(error));
-    // The node's own firewall rules, before any other code writes to the
-    // firewall and before any app starts.
-    await fluxNetworkHelper.adjustFirewall();
-    log.info('Firewalls checked');
 
     // Check and update CloudUI if needed (for legacy nodes without watchdog)
     log.info('Checking CloudUI installation...');
@@ -320,58 +161,41 @@ async function startFluxFunctions() {
     await systemService.mongoDBConfig();
     systemService.monitorSystem();
     log.info('System service initiated');
-    fluxadmService.start();
-    log.info('Fluxadm access service initiated');
     log.info('Preparing local database...');
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.local.database);
-    // Logins survive a restart: every request re-verifies its signature and
-    // re-checks its privilege against the node's current config, and each
-    // session collection's TTL index expires its rows. A login row never holds
-    // the session's signature (loginSignatures does, for a minute); one that
-    // does loses it here.
-    await dbHelper.updateInDatabase(database, config.database.local.collections.loggedUsers, { signature: { $exists: true } }, { $unset: { signature: '' } }).catch((error) => {
-      log.error(error);
+    await dbHelper.dropCollection(database, config.database.local.collections.loggedUsers).catch((error) => { // drop currently logged users
+      if (error.message !== 'ns not found') {
+        log.error(error);
+      }
     });
-    // Named literally because they are no longer part of the schema: the payment
-    // request and receipt collections outlived the endpoint that wrote them, and
-    // a node's word was never the payment record - the chain is. Dropping is
-    // idempotent, so this costs one 'ns not found' per boot once they are gone.
-    await Promise.all(['activepaymentrequests', 'completedpayments'].map((orphan) => dbHelper
-      .dropCollection(database, orphan).catch((error) => {
-        if (error.message !== 'ns not found') {
-          log.error(error);
-        }
-      })));
-    await ensureIndexes(database.collection(config.database.local.collections.loggedUsers), [
-      { key: { createdAt: 1 }, expireAfterSeconds: 14 * 24 * 60 * 60 },
-    ]);
-    await ensureIndexes(database.collection(config.database.local.collections.activeLoginPhrases), [
-      { key: { createdAt: 1 }, expireAfterSeconds: 900 },
-    ]);
-    await ensureIndexes(database.collection(config.database.local.collections.activeSignatures), [
-      { key: { createdAt: 1 }, expireAfterSeconds: 900 },
-    ]);
-    await ensureIndexes(database.collection(config.database.local.collections.loginSignatures), [
-      { key: { createdAt: 1 }, expireAfterSeconds: 60 },
-      { key: { loginPhrase: 1 } },
-    ]);
-    // legacy pre-incident-schema rows expire via detectedAt; current incident
-    // documents expire via lastSeen. The tamper service purges pre-schema
-    // rows at startup, so the detectedAt pair only matters where old code
-    // still writes; drop it once the fleet is past the incident schema.
-    await ensureIndexes(database.collection(config.database.local.collections.appTamperingEvents), [
-      { key: { detectedAt: 1 }, expireAfterSeconds: 30 * 24 * 60 * 60, name: 'detectedAt_ttl' }, // 30 days
-      { key: { appName: 1, detectedAt: -1 }, name: 'appName_detectedAt' },
-      { key: { lastSeen: 1 }, expireAfterSeconds: 30 * 24 * 60 * 60, name: 'lastSeen_ttl' }, // 30 days
-      { key: { appName: 1, eventType: 1, lastSeen: -1 }, name: 'appName_eventType_lastSeen' },
-    ]);
-    // The unique incident-rollup index lives with its owner: duplicate rollups
-    // must have their counts SUMMED, not one dropped, so the merge needs the
-    // collection's own knowledge rather than a generic dedupe. See
-    // prepareIncidentRollup.
-    await appTamperingDetectionService.prepareIncidentRollup();
-    await appTamperingDetectionService.checkNodeReboot();
+    await dbHelper.dropCollection(database, config.database.local.collections.activeLoginPhrases).catch((error) => {
+      if (error.message !== 'ns not found') {
+        log.error(error);
+      }
+    });
+    await dbHelper.dropCollection(database, config.database.local.collections.activeSignatures).catch((error) => {
+      if (error.message !== 'ns not found') {
+        log.error(error);
+      }
+    });
+    await ensureIndex(database.collection(config.database.local.collections.loggedUsers), { createdAt: 1 }, { expireAfterSeconds: 14 * 24 * 60 * 60 });
+    await ensureIndex(database.collection(config.database.local.collections.activeLoginPhrases), { createdAt: 1 }, { expireAfterSeconds: 900 });
+    await ensureIndex(database.collection(config.database.local.collections.activeSignatures), { createdAt: 1 }, { expireAfterSeconds: 900 });
+    await ensureIndex(database.collection(config.database.local.collections.activePaymentRequests), { createdAt: 1 }, { expireAfterSeconds: 3600 });
+    await ensureIndex(database.collection(config.database.local.collections.completedPayments), { paymentId: 1 });
+    await ensureIndex(database.collection(config.database.local.collections.completedPayments), { createdAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
+    await ensureIndex(
+      database.collection(config.database.local.collections.appTamperingEvents),
+      { detectedAt: 1 },
+      { expireAfterSeconds: 30 * 24 * 60 * 60, name: 'detectedAt_ttl' }, // 30 days
+    );
+    await ensureIndex(
+      database.collection(config.database.local.collections.appTamperingEvents),
+      { appName: 1, detectedAt: -1 },
+      { name: 'appName_detectedAt' },
+    );
+    await appTamperingDetectionService.checkFrequentRestart();
     // appsRuntimeState (localzelapps): merge any pre-unique-index duplicate docs,
     // then enforce one doc per component identifier
     await appsRuntimeState.prepareCollection();
@@ -379,9 +203,7 @@ async function startFluxFunctions() {
     log.info('Preparing temporary database...');
     // no need to drop temporary messages
     const databaseTemp = db.db(config.database.appsglobal.database);
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsTemporaryMessages), [
-      { key: { receivedAt: 1 }, expireAfterSeconds: tempMsgTtlS },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsTemporaryMessages), { receivedAt: 1 }, { expireAfterSeconds: tempMsgTtlS });
     log.info('Temporary database prepared');
     log.info('Preparing Flux Apps locations');
 
@@ -395,85 +217,51 @@ async function startFluxFunctions() {
 
     // we have to create this index again here, as we need it to repair the db. As we were deleting this on every reboot (and it was only created when scannedHeight was 0)
     // Creating an index that already exists is a no-op
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsMessages), [
-      { key: { hash: 1 }, name: 'query for getting zelapp message based on hash', unique: true, recover: dedupeByKey },
-      { key: { 'appSpecifications.version': 1 }, name: 'query for getting app message based on version' },
-      { key: { 'appSpecifications.nodes': 1 }, name: 'query for getting app message based on nodes' },
-    ]);
-    await dbHelper.ensureNewestAppMessageIndex(databaseTemp.collection(config.database.appsglobal.collections.appsMessages));
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsMessages), { hash: 1 }, { name: 'query for getting zelapp message based on hash', unique: true });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsMessages), { 'appSpecifications.version': 1 }, { name: 'query for getting app message based on version' });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsMessages), { 'appSpecifications.nodes': 1 }, { name: 'query for getting app message based on nodes' });
     // TTL is driven by expireAt (set per-document by store functions). Migrate from old broadcastedAt-based TTL.
     await databaseTemp.collection(config.database.appsglobal.collections.appsLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsLocations), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { name: 1 }, name: 'query for getting zelapp location based on zelapp specs name' },
-      { key: { ip: 1, name: 1 } },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsLocations), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsLocations), { name: 1 }, { name: 'query for getting zelapp location based on zelapp specs name' });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsLocations), { ip: 1, name: 1 });
     log.info('Flux Apps locations prepared');
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appStateEvents), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { ip: 1, type: 1, dedupKey: 1 }, unique: true, recover: dedupeByKey },
-      { key: { broadcastedAt: 1 } },
-      { key: { createdAt: 1 } },
-      // the events of one type still standing, every move among them
-      { key: { type: 1, expireAt: 1 }, name: 'events by type and expiry' },
-      // the moves that lead to an address
-      { key: { 'data.newIP': 1 }, name: 'moves by the address they lead to', partialFilterExpression: { type: 'ipchanged' } },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appStateEvents), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appStateEvents), { ip: 1, type: 1, dedupKey: 1 }, { unique: true });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appStateEvents), { broadcastedAt: 1 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appStateEvents), { createdAt: 1 });
     log.info('App state events collection prepared');
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { broadcastedAt: 1 } },
-      { key: { 'data.name': 1, 'data.ip': 1 }, unique: true, recover: dedupeByKey },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts), { broadcastedAt: 1 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingBroadcasts), { 'data.name': 1, 'data.ip': 1 }, { unique: true });
     log.info('Signed appinstalling broadcasts collection prepared');
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { name: 1 }, name: 'query for getting flux app install location based on specs name' },
-      { key: { name: 1, ip: 1 }, name: 'query for getting flux app install location based on specs name and node ip' },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations), { name: 1 }, { name: 'query for getting flux app install location based on specs name' });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingLocations), { name: 1, ip: 1 }, { name: 'query for getting flux app install location based on specs name and node ip' });
     log.info('Flux Apps installing locations prepared');
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('cachedAt_1').catch(() => {});
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations).dropIndex('broadcastedAt_1').catch(() => {});
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { name: 1 }, name: 'query for getting flux app install errors location based on specs name' },
-      { key: { name: 1, hash: 1 }, name: 'query for getting flux app install errors location based on specs name and hash' },
-      { key: { name: 1, hash: 1, ip: 1 }, name: 'query for getting flux app install errors location based on specs name and hash and node ip' },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations), { name: 1 }, { name: 'query for getting flux app install errors location based on specs name' });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations), { name: 1, hash: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash' });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsLocations), { name: 1, hash: 1, ip: 1 }, { name: 'query for getting flux app install errors location based on specs name and hash and node ip' });
     log.info('App installing errors locations prepared');
     await databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts).dropIndex('broadcastedAt_1').catch(() => {});
-    await ensureIndexes(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts), [
-      { key: { expireAt: 1 }, expireAfterSeconds: 0 },
-      { key: { broadcastedAt: 1 } },
-      { key: { 'data.name': 1, 'data.hash': 1, 'data.ip': 1 }, unique: true, recover: dedupeByKey },
-    ]);
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts), { expireAt: 1 }, { expireAfterSeconds: 0 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts), { broadcastedAt: 1 });
+    await ensureIndex(databaseTemp.collection(config.database.appsglobal.collections.appsInstallingErrorsBroadcasts), { 'data.name': 1, 'data.hash': 1, 'data.ip': 1 }, { unique: true });
     log.info('Signed app installing errors broadcasts collection prepared');
 
     // This fixes an issue where the appsMessage db has NaN for valueSat. Once db is repaired on all nodes,
     // we can remove this.
     await dbHelper.repairNanInAppsMessagesDb();
 
-    // The location table this node already holds, brought back as soon as the
-    // database is up. Detached and best-effort - every consumer degrades safely
-    // without it. On a node that has run before this is a single marker read
-    // against rows already in mongo, so the residential verdict and placement's
-    // fault domains hold their table within milliseconds of boot rather than
-    // behind the app-database rebuild, which neither depends on. Fetching a NEW
-    // baseline is the expensive half and stays in startDbDependentServices,
-    // where its two-million-row ingest cannot land on top of that rebuild.
-    ipLocationSync.restoreCachedTable().catch((err) => log.error(`ipLocationSync restore error: ${err.message}`));
-
     // Check for apps with incorrect volume mounts (containing /flux/ path)
     log.info('Checking for apps with incorrect volume mounts...');
-    // BOTH CONDITIONS, because neither implies the other. The delay is for the host
-    // settling - docker, mounts, crontab - and the gate is for the policy the hard
-    // redeploy it performs needs to pull an image again. This pass runs ONCE per
-    // boot and has nothing that retries it, so firing it into a closed gate loses
-    // the fix until the node next restarts.
     setTimeout(() => {
-      globalState.waitForPolicyReady().then(() => volumeValidationService.checkAndFixIncorrectVolumeMounts()).catch((error) => {
+      volumeValidationService.checkAndFixIncorrectVolumeMounts().catch((error) => {
         log.error(`Volume validation service error: ${error.message}`);
       });
     }, bootDelay(45 * 1000)); // Run after 45 seconds to allow system to stabilize
@@ -502,26 +290,11 @@ async function startFluxFunctions() {
     // Read boot context early — determines startup behavior for container management.
     const bootContext = await AppSyncOrchestrator.readBootContext();
 
-    // The rules that keep app containers off private networks and off each
-    // other's networks, applied before any app container starts. A failure is
-    // logged and apps still start. Rechecked so a removed chain returns; each
-    // network FluxOS creates or removes re-applies them as it goes.
-    await dockerService.applyContainerFirewall();
-    setInterval(() => dockerService.applyContainerFirewall(), 10 * 60 * 1000);
-
     // App startup manager owns all boot-time container lifecycle decisions:
     // Locations expired → remove all. Otherwise wait for daemon/DB, then reconcile.
     appStartupManager.manageAppsOnBoot(bootContext).catch((error) => {
       log.error(`App startup manager error: ${error.message}`);
     });
-
-    // Above the daemon wait, because syncthing has nothing to do with the
-    // daemon: the sentinel talks to syncthing's own API and reads userconfig,
-    // and the webserver is already answering. Below it, a node whose fluxd is
-    // slow or dead never starts measuring syncthing at all, and a check nobody
-    // is making cannot report a fault - see syncthingService's health stamps.
-    syncthingService.startSyncthingSentinel();
-    log.info('Syncthing service started');
 
     // Wait for daemon RPC — manageAppsOnBoot (above) is fire-and-forget and gates
     // on waitForDaemonReady() internally with a 5-min timeout. It must be running
@@ -532,132 +305,35 @@ async function startFluxFunctions() {
     await daemonServiceMiscRpcs.daemonBlockchainInfoService();
     globalState.daemonReady = true;
 
-    // App payments are placed in chain order from the daemon's address index: it
-    // positions the payments recorded before the scan recorded positions, and a
-    // node with no app history yet fetches its payments through it.
-    if (!daemonServiceMiscRpcs.isAddressIndex()) {
-      log.error('fluxd is running without addressindex=1. FluxOS needs the address index to order app messages. Set addressindex=1 in flux.conf and reindex the daemon, or reinstall the node. FluxOS is stopping.');
-      process.exit(1);
-    }
-    await paymentPositions.backfillPaymentPositions();
-
     // Initialize app sync orchestrator and spawner
     const orchestrator = new AppSyncOrchestrator({
       blockEmitter: explorerService.getBlockEmitter(),
-      getEligibleSyncPeers: () => peerManager.getEligibleSyncPeers()
-        .map((p) => ({ key: p.key, connectionId: p.connectionId, send: (msg) => p.send(msg) })),
+      getEligibleSyncPeers: (minUptime) => peerManager.getEligibleSyncPeers(minUptime)
+        .map((p) => ({ key: p.key, send: (msg) => p.send(msg) })),
       onPeerEvent: (event, cb) => peerManager.on(event, cb),
       offPeerEvent: (event, cb) => peerManager.removeListener(event, cb),
-      isAboveThreshold: () => peerManager.isAboveThreshold(),
+      peerCountIfAboveThreshold: () => peerManager.peerCountIfAboveThreshold(),
+      markSyncRequested: (key) => peerManager.markSyncRequested(key),
+      clearSyncRequested: () => peerManager.clearSyncRequested(),
+      isEnterprise: () => enterpriseNetwork.getCachedEnterpriseIdentity(),
       networkStateReady: () => networkStateService.waitStarted(),
       fluxVersion,
     });
-    // The orchestrator issues the sync requests and holds their deadlines, so
-    // it is the only thing that knows whether an arriving answer is still
-    // wanted. The peer manager asks rather than keeping its own copy.
-    peerManager.syncResponseWanted = (peerSocket) => orchestrator.isSyncResponseWanted(peerSocket);
-
-    // The other half of the peer-gated fallback. The orchestrator stops a node
-    // whose peer set keeps collapsing from ever reaching READY, which is silent;
-    // this says so, and puts a node that does it repeatedly out of service. Same
-    // two edges, read for a different purpose, so it subscribes for itself
-    // rather than being another of the orchestrator's jobs.
-    peerSetStabilityService.start({
-      onPeerEvent: (event, cb) => peerManager.on(event, cb),
-      offPeerEvent: (event, cb) => peerManager.removeListener(event, cb),
-      isAboveThreshold: () => peerManager.isAboveThreshold(),
-    });
-
-    // Whether this node's calls to other nodes reach them. Started beside the
-    // peer-set watch because it draws its observer from the same network state,
-    // and like it the check says why a node is out rather than leaving it silent.
-    outboundPathService.start();
-
-    // Network policy, started here rather than at the top of boot because it needs both of
-    // the things that only exist by now: mongo, to restore and re-verify the bundle this
-    // node last held, and peers, to ask for anything newer. Its old position could reach
-    // neither, which is why it could only ever fetch from github.
-    //
-    // Not awaited. Boot does not wait on policy and never did: the node comes up, serves its
-    // API and keeps its containers running regardless. What waits is acquisition, through
-    // globalState.policyReady, which is the one decision that must not be made on a guess.
-    policyStore.setPeerTransport({
-      // The peers worth asking. One that does not advertise the capability has no handler
-      // for the ask, so including it would buy a deadline's wait and an unrecognised-type
-      // warning in its log.
-      capableKeys: () => peerManager.getPolicyCapablePeers().map((peer) => peer.key),
-      // The only ask. A key that no longer resolves is a peer that left between connecting
-      // and being asked, which is not an error.
-      requestFrom: (key, seq, correlationId) => {
-        const peer = peerManager.get(key);
-        if (!peer) return Promise.resolve();
-        return fluxCommunicationMessagesSender.requestPolicyFromPeer(peer, seq, correlationId);
-      },
-      announce: (seq) => fluxCommunicationMessagesSender.announcePolicySeq(seq),
-      // The latched level: peerManager already defines "enough peers to gossip with" with
-      // hysteresis (appSyncPeerThreshold 12 up, appSyncDegradedThreshold 4 down). A late
-      // subscriber cannot see the edge it missed, which is what this accessor exists for -
-      // and reading the level rather than keeping an edge of our own is why nothing here
-      // needs re-arming when a peer set collapses and rebuilds.
-      aboveThreshold: () => peerManager.isAboveThreshold(),
-    });
-    // Discovery has not started yet - it is fifty lines below - so the peer set is empty at
-    // this point on every node, always. Nothing here asks peers or the source; both are
-    // driven by the two subscriptions that follow, which is what makes peers-first true at
-    // boot rather than only at the 24-hour tick. It is the whole difference between a node
-    // that boots while github is down getting policy from the neighbour beside it and
-    // getting none for a day.
-    //
-    // PER JOIN for the ASK. peerThresholdReached fires when the count first crosses
-    // appSyncPeerThreshold and then never again unless the set has since fallen below
-    // appSyncDegradedThreshold, so as a prompt to ask peers it is the wrong signal: a node
-    // asks once, its peers have nothing either, and when one of them later obtains a bundle
-    // nothing tells this node to ask again - its peer set never collapsed, so the edge never
-    // re-arms. Measured on a three-node fleet: node 1 asked at 08:16:09, node 0 adopted at
-    // 08:16:54, and node 1 held nothing thereafter. Every join re-arms the ask, and the join
-    // that crosses the threshold is one of them.
-    //
-    // The key is the whole point: notePeerAvailable asks THAT peer and never the source.
-    // A broadcast would have to be rationed, and a rationed ask cannot serve a node that is
-    // merely behind.
-    //
-    // The orchestrator next door draws the same distinction for its sync pool, and for the
-    // same reason: a latched edge says nothing about a pool that has changed since it fired.
-    peerManager.on('peerConnected', (key) => policyStore.notePeerAvailable(key));
-    // Both edges, because the store's decision is about the peer SET. A peer leaving takes
-    // its answer with it, and a node waiting on one that has gone waits out a deadline for an
-    // answer that cannot come.
-    peerManager.on('peerDisconnected', (key) => policyStore.notePeerGone(key));
-    // AND the threshold itself, which is written one line after the arrival that crosses it.
-    // Without this the crossing arrival decides while the level still reads false, and a set
-    // that stops exactly at the threshold has nothing left to re-trigger the decision.
-    peerManager.on('peerThresholdReached', () => policyStore.noteThresholdReached());
-    policyStore.start().catch((err) => log.error(`policyStore start error: ${err.message}`));
     nodeConfirmationService.onMessageCapabilityChange((capable) => orchestrator.onMessageCapabilityChange(capable));
     peerNotification.initialize();
     appSpawner.initialize();
     appInstaller.setOnInstallComplete(() => peerNotification.checkAndNotifyPeersOfRunningApps());
+    // a reconciler start (incl. a backoff straggler after boot) must refresh the
+    // app's network presence inside the sigterm TTL window, not at the hourly tick;
+    // checkAndNotifyPeersOfRunningApps coalesces bursts
+    appReconciler.setOnContainerStarted(() => peerNotification.checkAndNotifyPeersOfRunningApps());
     // a removed component's in-memory controller verdict dies with it - a
     // reinstalled g:/r: app must await a fresh election, not inherit a stale one
-    appUninstaller.setOnComponentRemoved((id) => appReconciler.forgetDesiredState(id));
-    // an app the registry stops listing is removed here and its removal told to peers
-    localRemovalQueue.setRemover((appName) => appUninstaller.removeAppLocally(appName, null, true, false, true));
-    // the node's address moved, so every app that survived it has to come up on
-    // the new one - asked for durably here rather than driven from the network
-    // layer, which sits underneath the reconciler and cannot require it
-    fluxNetworkHelper.setOnAddressChanged((apps, reason, key) => appReconciler.requestRestartOf(apps, reason, key));
-    // this node's own address moved: it records the move as its peers will, so
-    // it knows FDM naming its old IP means itself, and tells them once it has
-    // peers at the new address
-    fluxNetworkHelper.setOnOwnAddressMoved((oldIp, newIp, movedAt) => fluxCommunication.handleOwnAddressMove(oldIp, newIp, movedAt));
-    // whether this node ran apps at an address it has no record of leaving
-    fluxNetworkHelper.setInstalledAppsListedAt((socketAddress) => appQueryService.installedAppsListedAt(socketAddress));
-    fluxCommunication.announceRecordedOwnMovesWhenConnected();
-    // every address benchmark reports as this node's own, from boot on: one that
-    // differs from the address it last adopted is its move
-    fluxNetworkHelper.startOwnAddressWatch();
+    appUninstaller.setOnComponentRemoved((id) => appReconciler.clearControllerDesired(id));
     log.info('App Spawner initialized');
 
+    fluxNetworkHelper.adjustFirewall();
+    log.info('Firewalls checked');
     fluxNetworkHelper.allowNodeToBindPrivilegedPorts();
     log.info('Node allowed to bind privileged ports');
     fluxCommunication.keepConnectionsAlive();
@@ -667,45 +343,14 @@ async function startFluxFunctions() {
     // Remove existing watchtower container (replaced by native image update service)
     imageUpdateService.removeWatchtowerContainer();
     // Start native image update service (delayed start)
-    // A check that lands before the policy gate opens refuses, and the next one is
-    // six hours away - so the app runs on the image it has for that long over a
-    // window measured in minutes. The interval is the fallback; the gate is when
-    // the first check is actually able to do its work.
     setTimeout(() => {
-      globalState.waitForPolicyReady().then(() => {
-        imageUpdateService.startImageUpdateService();
-        log.info('Native image update service started');
-      }).catch((error) => log.error(`Image update service start error: ${error.message}`));
+      imageUpdateService.startImageUpdateService();
+      log.info('Native image update service started');
     }, bootDelay(10 * 60 * 1000)); // 10 minutes after startup
-    // this node's own standing on the network - collisions, reachability, its
-    // own address - judged as each thing it depends on changes
-    fluxNetworkHelper.startOwnStandingWatch();
-    syncthingService.onListenerStateKnown(fluxNetworkHelper.noteSyncthingListenerKnown);
-    // STARTED ON THE POLICY, NOT ON BOOT. The blocklist this enforces is a document in the
-    // signed bundle, and the bundle is not resolved by the time this line runs. Started
-    // here, its first tick reads nothing - and reading nothing is correctly refused rather
-    // than taken for an empty list, because an unreadable blocklist releasing a node the
-    // network deliberately DOSed is the failure that contract was written for. What it
-    // costs is the interval: the next tick is twelve hours away and nothing brings it
-    // forward, so a node on the blocklist goes unenforced for twelve hours per restart.
-    globalState.waitForPolicyReady()
-      .then(() => appTamperingBlocklistService.start())
-      .catch((err) => log.error(`appTamperingBlocklist start error: ${err.message}`));
-    // Not awaited, and started ahead of setNodeGeolocation below on purpose: the
-    // first tick reads geolocation from the db when there is one, and otherwise
-    // decides nothing and retries until the lookup this boot has landed.
-    //
-    // Injected the same way nodeStatusMonitor is, and for the same reason: the
-    // app list is read from a query service deep enough in the lifecycle graph
-    // that requiring it here would put geolocation and the network helper on
-    // that load path. Removing the app is not this service's job - the single
-    // give-up-an-app pass in advancedWorkflows does that.
-    residentialNodeDosService.start({
-      installedAppsFn: appQueryService.installedApps,
-    }).catch((err) => {
-      log.error(`residentialNodeDos start error: ${err.message}`);
+    fluxNetworkHelper.checkDeterministicNodesCollisions();
+    appTamperingBlocklistService.start().catch((err) => {
+      log.error(`appTamperingBlocklist start error: ${err.message}`);
     });
-    uplinkService.start();
     log.info('Flux checks operational');
     fluxCommunication.initializeDiscovery();
     await nodeConfirmationService.start();
@@ -724,41 +369,8 @@ async function startFluxFunctions() {
     await containerMountRecovery.performContainerMountRecovery().catch((error) => {
       log.error(`Container mount recovery service error: ${error.message}`);
     });
-    // A file operation's container is detached from the process that started
-    // it, so a FluxOS restart leaves one running with nobody waiting for its
-    // result, and its staging directory on the volume. The recovery below
-    // reclaims both, after the volumes above are mounted, since it reads them.
-    //
-    // The fetch starts early so the image is in hand before the first file
-    // operation arrives, rather than being pulled while an owner waits on a
-    // request. The recovery does not depend on it: that is a host rm over names
-    // readdir returned, and runs on a node that can reach nothing.
-    //
-    // Not awaited: the node takes the image at its own place in a window, so
-    // the fleet ends up holding it without every node fetching at the same
-    // moment. A node that cannot reach the registry takes it from one that did,
-    // which only works if they have it.
-    volumeExecutor.startImagePrefetch();
-
-    log.info('Reclaiming interrupted file operations...');
-    await fileOperationRecovery.recoverInterruptedFileOperations().catch((error) => {
-      log.error(`File operation recovery error: ${error.message}`);
-    });
-
-    // At boot, before anything installs: an app network is created per app and
-    // removed only by the uninstaller, so an uninstall interrupted between the
-    // container going and the network going leaves one behind for ever. Each
-    // holds an octet that getFreeFluxAppNetworkOctet cannot hand out again, and
-    // when the last of 255 is gone nothing can be installed on the node.
-    //
-    // Here rather than on a schedule because a sweep must not meet an install
-    // in progress: at boot the expected names are simply what the database
-    // holds, with no window in which an app has a network and no record yet.
-    await networkRecovery.reclaimOrphanedAppNetworks();
-    // Awaited: generating an identity rewrites config/userconfig.js, and that
-    // write is not atomic - a reload landing inside it leaves the process with
-    // no userconfig.initial at all. A node that already has an identity returns
-    // from here immediately, so this costs the fleet nothing.
+    syncthingService.startSyncthingSentinel();
+    log.info('Syncthing service started');
     await pgpService.generateIdentity();
     log.info('PGP service initiated');
     // Ensure watchdog is installed and running on legacy OS (non-ArcaneOS) nodes
@@ -791,55 +403,39 @@ async function startFluxFunctions() {
     // await throughput.start();
 
     setTimeout(async () => {
+      const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
+      await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
       log.info('Rechecking firewall app rules');
       await fluxNetworkHelper.purgeUFW();
+      advancedWorkflows.testAppMount(); // test if our node can mount a volume
     }, bootDelay(30 * 1000));
     setTimeout(() => {
       appController.stopAllNonFluxRunningApps();
-      // Best effort during boot — the reconciler starts monitoring per app as it settles.
-      monitoringOrchestrator.startMonitoringOfApps(null).catch((error) => log.error(error));
+      monitoringOrchestrator.startMonitoringOfApps(null, globalState.appsMonitored, appQueryService.installedApps);
       portManager.restoreAppsPortsSupport();
     }, bootDelay(1 * 60 * 1000));
-    // Resolve this node's enterprise identity once, up front. The key comes off disk and
-    // policy arrives on an event, so this settles at boot rather than on a timer; the
-    // interval is the fallback for a config that cannot be read at all. Once cached, hot
-    // paths (spawn loop) read it synchronously via getCachedEnterpriseIdentity() with no
-    // network call and no throws.
-    enterpriseNetwork.scheduleIdentityResolution();
+    // Resolve this node's enterprise identity once, up front. Self-reschedules
+    // every 5 minutes until the pubkey resolves (daemon/benchmark may still be
+    // coming up). Once cached, hot paths (spawn loop) read it synchronously
+    // via getCachedEnterpriseIdentity() with no network call and no throws.
+    const identityReady = enterpriseNetwork.scheduleIdentityResolution();
 
     // Services that read from zelappsinformation wait for the orchestrator
     // to finish rebuilding it rather than guessing a setTimeout delay.
     const startDbDependentServices = async () => {
       await globalState.waitForDbReady();
       log.info('DB ready - starting db-dependent services');
-      // Interim until policyStore supersedes it at the userconfig rebase (see the
-      // module header): keep the iplocation table fresh. The cached copy is
-      // already back - restoreCachedTable ran with the schema prep above - so
-      // what starts here is the fetch loop, whose ingest is the half worth
-      // keeping clear of the rebuild that just finished. Detached; placement
-      // degrades to /16 arithmetic without a table.
-      ipLocationSync.startSync().catch((err) => log.error(`ipLocationSync start error: ${err.message}`));
       advancedWorkflows.checkAndRemoveEnterpriseAppsOnNonArcane();
-      // Detached. The sweep uninstalls apps, so it waits for policy this node has confirmed
-      // is the network's, and everything below here starts whether or not that ever arrives.
-      enterpriseNetwork.startOwnershipSweeps();
-      // STARTED ON THE POLICY, NOT ON A CLOCK. What this removes is decided by the
-      // blocklist in the signed bundle, so it runs when that changes and when the gate
-      // opens on it. An application arriving afterwards is judged by the installer
-      // before it is written, and what has neither - a specification that did not
-      // decrypt, a removal the node was too busy to take, a pass that stopped part way
-      // - is held by name and asked again on its own timer.
-      //
-      // Here rather than beside the other app services: the first thing a pass does is
-      // read the local app table, so it waits on the same db the sweep beside it waits
-      // on.
-      imageManager.startComplianceSweeps(appQueryService.installedApps, appUninstaller.removeAppLocally);
+      await identityReady;
+      try {
+        await enterpriseNetwork.cleanupOwnershipViolations();
+        log.info('Enterprise network cleanup completed');
+      } catch (error) {
+        log.error(`Enterprise network cleanup failed: ${error.message || error}`);
+      }
       setInterval(() => {
         portManager.restorePortsSupport();
       }, portRestoreIntervalMs);
-      // Detached: one pass per start, once the boot gate has settled and in
-      // this node's own slot. Nothing waits on it.
-      portManager.removeStaleUpnpMappings();
     };
     startDbDependentServices();
     log.info('Starting setting Node Geolocation');
@@ -892,15 +488,13 @@ async function startFluxFunctions() {
       // masterSlave self-gates on syncthingAppsFirstRun (the syncthing monitor's
       // first-run mount-safety must complete before any g: election), so it starts
       // concurrently rather than after a timed offset.
-      // The election reads the busy lists and the receive-only cache off
-      // globalState itself at each decision; they are not parameters. The
-      // getters return snapshots and masterSlaveApps re-invokes itself forever,
-      // so anything captured at this call is frozen at boot and goes quietly
-      // stale - which is exactly how the backup/restore guard once died.
       advancedWorkflows.masterSlaveApps(
         globalState,
         appQueryService.installedApps,
         appQueryService.listRunningApps,
+        globalState.receiveOnlySyncthingAppsCache,
+        globalState.backupInProgress,
+        globalState.restoreInProgress,
         https,
       ); // stops and starts g: syncthing apps when a new master is required or changed.
       setTimeout(() => {
@@ -910,6 +504,9 @@ async function startFluxFunctions() {
     // Hash sync and spawner startup are now managed by the AppSyncOrchestrator (event-driven)
     orchestrator.start(bootContext);
     log.info('AppSyncOrchestrator started');
+    setInterval(() => {
+      imageManager.checkApplicationsCompliance(appQueryService.installedApps, appUninstaller.removeAppLocally);
+    }, imageComplianceIntervalMs);
     setTimeout(() => {
       advancedWorkflows.forceAppRemovals();
       setInterval(() => {
@@ -923,17 +520,13 @@ async function startFluxFunctions() {
         daemonHealthMonitor.checkDaemonHealthAndCleanup();
       }, bootDelay(15 * 60 * 1000));
     }, bootDelay(5 * 60 * 1000));
-    // Gated for the same reason as the image updater: this pass redeploys on a
-    // storage violation, and one that runs before policy refuses and re-arms
-    // thirty minutes out. It re-arms itself from then on, so only the first run
-    // needs the gate.
     setTimeout(() => {
-      globalState.waitForPolicyReady().then(() => appInspector.checkStorageSpaceForApps(
+      appInspector.checkStorageSpaceForApps(
         appQueryService.installedApps,
         appUninstaller.removeAppLocally,
         advancedWorkflows.softRedeploy,
         appsStorageViolations,
-      )).catch((error) => log.error(`Storage space check error: ${error.message}`));
+      );
     }, bootDelay(20 * 60 * 1000));
     setInterval(() => {
       backupRestoreService.cleanLocalBackup();
@@ -958,9 +551,4 @@ async function startFluxFunctions() {
 
 module.exports = {
   startFluxFunctions,
-  ensureIndex,
-  ensureIndexes,
-  dedupeByKey,
-  // testing exports
-  dosState,
 };

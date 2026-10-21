@@ -1,12 +1,10 @@
 const config = require('config');
-const { performance } = require('perf_hooks');
 const WebSocket = require('ws');
 const log = require('../../lib/log');
 const serviceHelper = require('../serviceHelper');
 const { version: FLUX_VERSION } = require('../../../../package.json');
 const peerCodec = require('./peerCodec');
 const rateLimit = require('./rateLimit');
-const { isOrdered } = require('./messageRoutes');
 
 let _fluxNetworkHelper;
 function getFluxNetworkHelper() {
@@ -14,25 +12,6 @@ function getFluxNetworkHelper() {
   return _fluxNetworkHelper;
 }
 
-/**
- * Milliseconds from a clock that only moves forward.
- *
- * Every elapsed measurement below uses this rather than Date.now(). Wall clock is adjusted by NTP
- * and by hand, and a backward step makes an elapsed time negative while a forward one makes a peer
- * look silent for however far the clock jumped — either can terminate a healthy connection.
- * Timestamps that are REPORTED stay on the wall clock, because a caller reading connectedAt or
- * lastPongTime wants a date, not milliseconds since this process started.
- *
- * @returns {number}
- */
-function monotonicMs() {
-  return performance.now();
-}
-
-// These number the PEER sockets. The browser routes on the same server carry
-// their own meanings for the same numbers - the payment relay answers a
-// browser with 4012 when a transaction id arrives - so a code read off a
-// socket means what that socket's route says it means.
 const CLOSE_CODES = Object.freeze({
   // Inbound validation (FluxPeerManager.validateAndAddInbound)
   MAX_CONNECTIONS: 4000,
@@ -56,7 +35,7 @@ const CLOSE_CODES = Object.freeze({
   // Dead connection (keepalive failure)
   DEAD_CONNECTION: 4011,
 
-  // Auth failures (idService)
+  // Auth failures (paymentService, idService)
   AUTH_FAILURE_1: 4012,
   AUTH_FAILURE_2: 4013,
   AUTH_FAILURE_3: 4014,
@@ -89,16 +68,6 @@ const DIRECTION = Object.freeze({
 
 class FluxPeerSocket {
   /**
-   * Distinguishes one connection to an address from the next one to it.
-   *
-   * `ip:port` names a NODE, and a node that reconnects is the same key over a
-   * different socket. Anything recorded against a connection - a request whose
-   * answer is still expected, and what that peer said about it - needs an
-   * identity the address alone does not give it.
-   */
-  static #nextConnectionId = 1;
-
-  /**
    * @param {WebSocket} ws - raw WebSocket
    * @param {string} ip
    * @param {string} port
@@ -109,47 +78,13 @@ class FluxPeerSocket {
     this.ip = ip;
     this.port = String(port);
     this.key = `${ip}:${this.port}`;
-    this.connectionId = FluxPeerSocket.#nextConnectionId;
-    FluxPeerSocket.#nextConnectionId += 1;
     this.manager = manager;
 
     this.latency = null;
-    // Reported, so wall clock. The elapsed maths uses the monotonic pair below.
     this.lastPingTime = null;
     this.lastPongTime = null;
-    this.lastPingMono = null;
     this.missedPongs = 0;
-    /**
-     * Whether a ping has gone out that this peer has not yet answered.
-     *
-     * A ping in flight is not a missed pong, and the two used to be the same
-     * number: missedPongs was incremented at SEND, so it read 1 on a healthy
-     * peer for the whole round trip after every ping. Anything asking "has this
-     * peer missed a pong" got yes, once per ping interval, about a peer that
-     * was answering perfectly.
-     */
-    this.pingOutstanding = false;
     this.maxMissedPongs = config.peers.wsMaxMissedPongs ?? 3;
-    /**
-     * When anything was last heard from this peer, on the monotonic clock.
-     *
-     * A peer mid-conversation is the one case the heartbeat should never fire on, and crediting
-     * only pongs makes it fire there first: a pong is an ordinary frame that queues behind
-     * whatever else that peer sent, so the busiest connections look the most silent.
-     *
-     * Null until something actually arrives. Seeding it with the connection time would credit a
-     * peer for existing and give every new connection a free window in which no missed pong can
-     * terminate it.
-     */
-    this.lastMessageMono = null;
-    /**
-     * How long a peer may go completely quiet before a missed-pong count can terminate it.
-     *
-     * Derived, not a new tunable: it is exactly the window the pong count already allows, so a
-     * genuinely silent peer is dropped on the same schedule as before and only a talking one is
-     * treated differently.
-     */
-    this.livenessWindowMs = (config.peers.wsPingIntervalMs ?? 15000) * this.maxMissedPongs;
     this.connectedAt = Date.now();
     this.nakCount = 0;
     this.nakWindowStart = Date.now();
@@ -189,15 +124,8 @@ class FluxPeerSocket {
       };
   }
 
-  /** Anything received from this peer within the window the pong count allows. */
-  get heardFromRecently() {
-    return this.lastMessageMono !== null
-      && monotonicMs() - this.lastMessageMono < this.livenessWindowMs;
-  }
-
   get isAlive() {
-    return this.ws.readyState === WebSocket.OPEN
-      && (this.missedPongs < this.maxMissedPongs || this.heardFromRecently);
+    return this.missedPongs < this.maxMissedPongs && this.ws.readyState === WebSocket.OPEN;
   }
 
   get reconnects() {
@@ -205,36 +133,19 @@ class FluxPeerSocket {
   }
 
   onPingSent() {
-    // The ping going out now is IN FLIGHT, and nothing is yet known about it.
-    // What this moment decides is the fate of the PREVIOUS one: its pong has had
-    // a full interval to arrive, so if the peer still owes us one, that is a
-    // pong genuinely missed. Counting at send instead made the number a count of
-    // pings sent since the last pong, which is not what it is named, not what
-    // isAlive means by it, and not what the peers that read it assume.
-    //
-    // So a peer answering normally now sits at 0 always, and one that has gone
-    // silent reaches maxMissedPongs after that many intervals rather than one
-    // early - the ~45s that peerResponsiveness already documents.
-    if (this.pingOutstanding) this.missedPongs += 1;
-    this.pingOutstanding = true;
     this.lastPingTime = Date.now();
-    this.lastPingMono = monotonicMs();
-    // Unanswered pings only terminate a peer we have heard NOTHING else from. Three unanswered
-    // pings from a peer that is streaming messages at us means our own reader has not reached the
-    // pong yet, not that the peer is gone.
-    if (this.missedPongs >= this.maxMissedPongs && !this.heardFromRecently) {
-      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs and sent nothing else, terminating`);
+    this.missedPongs += 1;
+    if (this.missedPongs >= this.maxMissedPongs) {
+      log.info(`Peer ${this.key} missed ${this.missedPongs} pongs, terminating`);
       this.terminate();
     }
   }
 
   onPongReceived() {
-    this.pingOutstanding = false;
     this.missedPongs = 0;
     this.lastPongTime = Date.now();
-    this.lastMessageMono = monotonicMs();
-    if (this.lastPingMono !== null) {
-      this.latency = Math.ceil((monotonicMs() - this.lastPingMono) / 2);
+    if (this.lastPingTime) {
+      this.latency = Math.ceil((this.lastPongTime - this.lastPingTime) / 2);
     }
   }
 
@@ -320,20 +231,6 @@ class FluxPeerSocket {
 
   terminate() {
     this.ws.terminate();
-  }
-
-  /**
-   * Drop every handler on the underlying socket.
-   *
-   * Used when the manager has already accounted for this peer's departure. onclose is the
-   * only caller of FluxPeerManager.remove(), so a socket that completes its handshake
-   * afterwards would remove an entry that has since been replaced or already retired, and
-   * a frame arriving in the meantime would be processed for a peer no longer held.
-   */
-  detachHandlers() {
-    this.ws.onclose = null;
-    this.ws.onerror = null;
-    this.ws.onmessage = null;
   }
 
   /**
@@ -423,10 +320,6 @@ class FluxPeerSocket {
     ws.onmessage = (evt) => {
       if (!evt) return;
 
-      // Before the rate limit: a frame we decline to process still proves the peer is there, and
-      // liveness is a question about the peer rather than about how much work we accept from it.
-      this.lastMessageMono = monotonicMs();
-
       const rateOK = rateLimit.lruRateLimit(`${this.ip}:${this.port}`, 120);
       if (!rateOK) return;
 
@@ -485,9 +378,13 @@ class FluxPeerSocket {
         return;
       }
 
-      // Around the gossip pipeline: these keep their arrival order.
-      if (isOrdered(msgObj.data?.type)) {
-        if (manager.syncResponseDispatcher && manager.isSyncResponseWanted(this)) {
+      // Route sync responses directly — bypass the gossip pipeline
+      const syncType = msgObj.data?.type;
+      if (syncType === 'fluxapptempsync'
+        || syncType === 'fluxapprunningsync'
+        || syncType === 'fluxappinstallingsync'
+        || syncType === 'fluxappinstallingerrorssync') {
+        if (manager.syncResponseDispatcher && manager.isSyncRequested(this.key)) {
           setImmediate(() => manager.syncResponseDispatcher(msgObj, this));
           return;
         }
@@ -506,16 +403,6 @@ const FLUX_CAPABILITIES = Object.freeze([
   'peerExchange',
   'binaryMessages',
   'appStateSync',
-  // This build answers a state-sync request it cannot usefully serve with a
-  // refusal, instead of an empty batch that reads as a completed survey. A peer
-  // that does not claim it cannot tell us it knows nothing, so it is still held
-  // to the uptime proxy - see getEligibleSyncPeers.
-  'appStateSyncRefusal',
-  // This build speaks the policy bundle protocol - it answers fluxpolicyrequest and
-  // understands an adoption announcement. A peer that does not claim it is not a quiet
-  // participant, it is not a participant: asking it spends a window waiting for a reply
-  // that cannot come, and announcing to it logs an unrecognised type on its side.
-  'policyBundle',
 ]);
 
 module.exports = { FluxPeerSocket, CLOSE_CODES, PEER_SOURCE, DIRECTION, FLUX_VERSION, FLUX_CAPABILITIES };

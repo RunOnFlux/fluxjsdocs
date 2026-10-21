@@ -10,15 +10,14 @@
  * This matches the authentication pattern used by AWS ECR and Google GAR providers.
  */
 
-const workerRunner = require('../../utils/workerRunner');
+// eslint-disable-next-line import/no-unresolved
+const { ClientSecretCredential } = require('@azure/identity');
 const { RegistryAuthProvider } = require('./base/registryAuthProvider');
-
-const AAD_SCOPES = ['https://containerregistry.azure.net/.default'];
 
 class AzureAcrAuthProvider extends RegistryAuthProvider {
   constructor(config, appName) {
     super(config, appName);
-    this.clientInitialized = false;
+    this.azureCredential = null;
 
     // Extract registry name from config if provided
     // Config can have: registryName (explicit) or registry (URL to parse)
@@ -30,8 +29,7 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
   }
 
   /**
-   * Confirm the service principal is complete enough to authenticate with.
-   * The Azure client itself is built inside the worker that uses it.
+   * Initialize the Azure Identity client with service principal credentials
    */
   initializeClient() {
     try {
@@ -39,7 +37,12 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
         throw new Error('Service principal credentials (clientId, clientSecret, tenantId) are required');
       }
 
-      this.clientInitialized = true;
+      // Create Azure ClientSecretCredential with service principal
+      this.azureCredential = new ClientSecretCredential(
+        this.config.tenantId,
+        this.config.clientId,
+        this.config.clientSecret,
+      );
     } catch (error) {
       const wrappedError = new Error(`Failed to initialize Azure ACR client: ${error.message}`);
       // Only record error if provider name is set (avoid error in tests)
@@ -48,20 +51,6 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
       }
       throw wrappedError;
     }
-  }
-
-  /**
-   * Obtain an Azure AD access token scoped to container registry access.
-   *
-   * @returns {Promise<{token: string, expiresOnTimestamp: number}|null>} Token response, or null if Azure returned none.
-   */
-  async fetchAadToken() {
-    return workerRunner.runInWorker('azureAcrAuthWorker', {
-      tenantId: this.config.tenantId,
-      clientId: this.config.clientId,
-      clientSecret: this.config.clientSecret,
-      scopes: AAD_SCOPES,
-    });
   }
 
   /**
@@ -210,7 +199,7 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
    * @returns {Promise<object>} Fresh ACR credentials
    */
   async refreshCredentials() {
-    if (!this.clientInitialized) {
+    if (!this.azureCredential) {
       const error = new Error('Azure credential not initialized');
       this.recordError(error);
       throw error;
@@ -219,7 +208,9 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
     try {
       // Step 1: Get Azure AD access token with correct scope for container registry
       // This is the CORRECT scope - not management.azure.com!
-      const tokenResponse = await this.fetchAadToken();
+      const tokenResponse = await this.azureCredential.getToken([
+        'https://containerregistry.azure.net/.default',
+      ]);
 
       if (!tokenResponse || !tokenResponse.token) {
         throw new Error('No access token received from Azure Identity');
@@ -405,7 +396,7 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
       tenantId: this.config.tenantId,
       clientId: this.config.clientId,
       registryName: this.registryName,
-      azureCredentialInitialized: Boolean(this.clientInitialized),
+      azureCredentialInitialized: Boolean(this.azureCredential),
       configurationValid: this.validateConfiguration(),
       credentialSources: {
         hasClientId: Boolean(this.config.clientId),
@@ -428,7 +419,9 @@ class AzureAcrAuthProvider extends RegistryAuthProvider {
 
     try {
       // Test by attempting to get an access token with correct scope
-      const tokenResponse = await this.fetchAadToken();
+      const tokenResponse = await this.azureCredential.getToken([
+        'https://containerregistry.azure.net/.default',
+      ]);
       return Boolean(tokenResponse && tokenResponse.token);
     } catch (error) {
       this.recordError(error);

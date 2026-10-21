@@ -22,21 +22,6 @@ const myShortCache = cacheManager.fluxRatesCache;
 const myLongCache = cacheManager.appPriceBlockedRepoCache;
 
 /**
- * Round a USD price up to the next price ending in .49 or .99 (1.12 -> 1.49, 1.50 -> 1.99).
- * A price already ending in .49 or .99 is kept.
- * @param {number|string} usdPrice - Price in USD
- * @returns {string} Rounded price with two decimals
- */
-function roundUpToCharmPrice(usdPrice) {
-  // Whole cents first, so float noise (4.49 * 100 = 449.00000000000006) cannot push a price
-  // that already ends in .49 up to .99.
-  const cents = Math.round(Number(usdPrice) * 100);
-  const dollars = Math.floor(cents / 100);
-  const charmCents = cents % 100 <= 49 ? 49 : 99;
-  return ((dollars * 100 + charmCents) / 100).toFixed(2);
-}
-
-/**
  * Get app Flux on-chain price
  * @param {object} appSpecification - Application specification
  * @returns {Promise<string>} Price in Flux
@@ -116,6 +101,15 @@ async function getAppFluxOnChainPrice(appSpecification) {
       actualPriceToPay *= 0.8;
     } else if (appHWrequirements.cpu < 7 && appHWrequirements.ram < 29000 && appHWrequirements.hdd < 370) {
       actualPriceToPay *= 0.9;
+    }
+    let gSyncthgApp = false;
+    if (appSpecFormatted.version <= 3) {
+      gSyncthgApp = appSpecFormatted.containerData.includes('g:');
+    } else {
+      gSyncthgApp = appSpecFormatted.compose.find((comp) => comp.containerData.includes('g:'));
+    }
+    if (gSyncthgApp) {
+      actualPriceToPay *= 0.8;
     }
     actualPriceToPay = Number(Math.ceil(actualPriceToPay * 100) / 100);
     if (actualPriceToPay < priceSpecifications.minPrice) {
@@ -358,7 +352,7 @@ async function getAppFiatAndFluxPrice(req, res) {
       if (myLongCache.has('appPrices')) {
         appPrices.push(myLongCache.get('appPrices'));
       } else {
-        let response = await axios.get(`${config.stats.baseUrl}/apps/getappspecsusdprice`, axiosConfig).catch((error) => log.error(error));
+        let response = await axios.get('https://stats.runonflux.io/apps/getappspecsusdprice', axiosConfig).catch((error) => log.error(error));
         if (response && response.data && response.data.status === 'success') {
           myLongCache.set('appPrices', response.data.data);
           appPrices.push(response.data.data);
@@ -438,7 +432,16 @@ async function getAppFiatAndFluxPrice(req, res) {
           actualPriceToPay *= 0.9;
         }
       }
-      const marketplaceResponse = await axios.get(`${config.stats.baseUrl}/marketplace/listapps`).catch((error) => log.error(error));
+      let gSyncthgApp = false;
+      if (appSpecFormatted.version <= 3) {
+        gSyncthgApp = appSpecFormatted.containerData.includes('g:');
+      } else {
+        gSyncthgApp = appSpecFormatted.compose.find((comp) => comp.containerData.includes('g:'));
+      }
+      if (gSyncthgApp) {
+        actualPriceToPay *= 0.8;
+      }
+      const marketplaceResponse = await axios.get('https://stats.runonflux.io/marketplace/listapps').catch((error) => log.error(error));
       let marketPlaceApps = [];
       if (marketplaceResponse && marketplaceResponse.data && marketplaceResponse.data.status === 'success') {
         marketPlaceApps = marketplaceResponse.data.data;
@@ -482,20 +485,12 @@ async function getAppFiatAndFluxPrice(req, res) {
         actualPriceToPay = Number(appPrices[0].minUSDPrice).toFixed(2);
       }
 
-      // Last step on purpose: anything applied after it would move the price off .49/.99.
-      // The Flux price below is derived from this, so it follows the rounded figure.
-      // A caller's own priceUSD is left alone: it has always come back exactly as sent, and a
-      // caller that charges that amount would otherwise be quoted up to $0.50 more than it took.
-      if (!appSpecification.priceUSD) {
-        actualPriceToPay = roundUpToCharmPrice(actualPriceToPay);
-      }
-
       let fiatRates;
       let fluxUSDRate;
       if (myShortCache.has('fluxRates')) {
         fluxUSDRate = myShortCache.get('fluxRates');
       } else {
-        fiatRates = await axios.get(`${config.pricing.fluxRatesBaseUrl}/rates`, axiosConfig).catch((error) => log.error(error));
+        fiatRates = await axios.get('https://viprates.runonflux.io/rates', axiosConfig).catch((error) => log.error(error));
         if (fiatRates && fiatRates.data) {
           const rateObj = fiatRates.data[0].find((rate) => rate.code === 'USD');
           if (!rateObj) {
@@ -508,7 +503,7 @@ async function getAppFiatAndFluxPrice(req, res) {
           fluxUSDRate = rateObj.rate * btcRateforFlux;
           myShortCache.set('fluxRates', fluxUSDRate);
         } else {
-          fiatRates = await axios.get(`${config.pricing.coingeckoBaseUrl}/api/v3/simple/price?vs_currencies=usd&ids=zelcash`, axiosConfig);
+          fiatRates = await axios.get('https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=zelcash', axiosConfig);
           if (fiatRates && fiatRates.data && fiatRates.data.zelcash && fiatRates.data.zelcash.usd) {
             fluxUSDRate = fiatRates.data.zelcash.usd;
             myShortCache.set('fluxRates', fluxUSDRate);
@@ -556,7 +551,6 @@ module.exports = {
   getAppPrice,
   getAppFluxOnChainPrice,
   checkFreeAppUpdate,
-  roundUpToCharmPrice,
   // Re-export for backward compatibility
   specificationFormatter,
 };

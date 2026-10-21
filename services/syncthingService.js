@@ -2,7 +2,6 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const childProcess = require('node:child_process');
-const { EventEmitter } = require('node:events');
 
 const axios = require('axios');
 const config = require('config');
@@ -11,64 +10,14 @@ const { XMLParser } = require('fast-xml-parser');
 
 const { AsyncLock } = require('./utils/asyncLock');
 const { FluxController } = require('./utils/fluxController');
-const fluxEventBus = require('./utils/fluxEventBus');
-const { appsFolderPath } = require('./utils/appConstants');
-const {
-  passwdTable, groupTable, tablesSha256, TABLES_SHA256,
-} = require('./utils/numericIdTables');
-const volumeService = require('./utils/volumeService');
 const log = require('../lib/log');
 const messageHelper = require('./messageHelper');
 const serviceHelper = require('./serviceHelper');
 const verificationHelper = require('./verificationHelper');
-const { Privilege, authOf } = require('./utils/privileges');
 
 const syncthingURL = `http://${config.syncthing.ip}:${config.syncthing.port}`;
 
-// Sent rather than inherited, so the page size a caller totals against is the one
-// it asked for. syncthing's own default is this value; a default is not a contract.
-const LOCAL_CHANGED_PAGE_SIZE = 65536;
-
-// The most pages one folder is read across in a single pass - a bound of our own,
-// because the entry count belongs to the app that writes the files and these requests
-// are paid again every monitor pass.
-//
-// Sixteen pages is 1,048,576 entries, sixteen times the largest folder the network
-// carries: across 456 syncthing folders the biggest holds 63,999 entries, the 99th
-// percentile 40,771. So no app that resembles one reaches the bound, and one that
-// does is reported truncated rather than walked for as long as it takes.
-const LOCAL_CHANGED_MAX_PAGES = 16;
-
-const isArcane = Boolean(process.env.FLUXOS_PATH);
-
-// Whether this process is the one that installs, spawns and owns the syncthing
-// daemon - the question the repair path, the ownership fix and the binary wait
-// are really asking. "Is this Arcane" was only ever a proxy for it, and reading
-// either environment variable alone gets a case wrong.
-//
-// Two conditions, because they are two different facts:
-//   - Arcane ships syncthing and supervises it itself, so FluxOS stands back.
-//   - A syncthing that is not on this host cannot be stopped, reinstalled or
-//     chowned by this process whatever the node type. Today's code would try.
-//
-// config.syncthing.ip defaults to 127.0.0.1, so an ordinary legacy node
-// supervises exactly as before and an ordinary Arcane node does not.
-const SYNCTHING_LOCAL_ADDRESSES = ['127.0.0.1', 'localhost', '::1'];
-
-/**
- * Whether this process owns the syncthing daemon, given where syncthing is and
- * whether this is Arcane. A pure function of the two facts so the rule can be
- * exercised - the module-level answer below is fixed at load and a test cannot
- * reach the other branches through it.
- * @param {string} syncthingIp config.syncthing.ip
- * @param {boolean} arcane
- * @returns {boolean}
- */
-function supervisesSyncthing(syncthingIp, arcane) {
-  return SYNCTHING_LOCAL_ADDRESSES.includes(syncthingIp) && !arcane;
-}
-
-const fluxosSupervisesSyncthing = supervisesSyncthing(config.syncthing.ip, isArcane);
+const isArcane = Boolean(process.env.SYNCTHING_PATH);
 
 /**
  * If the binary is executable
@@ -76,88 +25,12 @@ const fluxosSupervisesSyncthing = supervisesSyncthing(config.syncthing.ip, isArc
 let syncthingBinaryPresent = false;
 
 /**
- * Whether the sentinel has already taken syncthing on.
+ * If syncthing is running okay. This does several checks. (See getDeviceId function)
+ * We optimistically set this to true to avoid race conditions, as the webserver
+ * is started before the syncthing checks. If there is actually a problem with
+ * syncthing, it will get set to false on the next iteration.
  */
-let sentinelStarted = false;
-
-/**
- * Whether the syncthing running now has been announced as resolving owners by
- * number. Stopping syncthing clears it, so each new process is announced.
- */
-let ownersByNumberAnnounced = false;
-
-/**
- * What syncthing's listener for its peers was first known to be, null until it is
- * known, and who is told when it is.
- */
-let listenerState = null;
-const listenerStateEvents = new EventEmitter();
-
-/**
- * Whether this process has checked the numeric id tables on disk. Only FluxOS
- * writes them, so they are checked once on the sentinel's first pass and again
- * before every launch of syncthing.
- */
-let numericIdTablesChecked = false;
-
-/**
- * What this node knows about syncthing, which is three answers and not two:
- * UNMEASURED is the absence of a verdict, not a soft one.
- */
-const SYNCTHING_HEALTH = Object.freeze({
-  OK: 'ok',
-  UNHEALTHY: 'unhealthy',
-  UNMEASURED: 'unmeasured',
-});
-
-/**
- * When the sentinel took responsibility for measuring syncthing, and when a
- * probe last found it up and configured. Health is DERIVED from these rather
- * than stored as a verdict, and only success is ever recorded.
- *
- * A stored boolean has to be lowered by somebody, so every path that fails to
- * reach the lowering line reports health it has no evidence for: a throw out of
- * the repair path, a sentinel that never starts because the binary is missing, a
- * probe that throws rather than returning, or the sentinel dying outright. None
- * of those can be fixed by patching the lowering line, because the fault is in a
- * default that asserts health with nothing behind it. Staleness cannot be
- * skipped - no fresh success IS the failure, whatever the reason.
- *
- * It also absorbs the blip tolerance. A window is what a consecutive-failure
- * counter was approximating, and it is right even on the passes that never ran.
- *
- * Staleness only means something once somebody is measuring, which is why there
- * are two stamps and not one. Before the sentinel starts there is no reading to
- * be stale, and inventing one gets it wrong in whichever direction it is
- * invented: a healthy default asserts a probe that never ran, and an unhealthy
- * one blames syncthing for a check this node has not made. So that state says
- * so, and the webserver can answer for the node while it holds.
- */
-let measurementStartedAt = null;
-let lastHealthyProbeAt = null;
-/**
- * The health this node last said out loud, so a change is reported when it
- * HAPPENS rather than on every pass that finds the same thing - the same
- * bookkeeping idService keeps for the fitness verdict.
- */
-let lastReportedHealth = SYNCTHING_HEALTH.UNMEASURED;
-
-/**
- * Milliseconds on the monotonic clock. Both stamps are elapsed-time decisions
- * and nothing reads them outside this process, so wall time buys nothing and
- * costs the one case this window exists for: a node boots, ntp steps the clock,
- * and a window measured on Date.now() either expires on the spot or never.
- * @returns {number}
- */
-function monotonicMs() {
-  return Number(process.hrtime.bigint() / 1000000n);
-}
-const SYNCTHING_HEALTH_WINDOW_MS = config.syncthing.healthWindowMs;
-const SYNCTHING_SENTINEL_INTERVAL_MS = config.syncthing.sentinelIntervalMs;
-// The device id is the SHA-256 of syncthing's cert (protocol.NewDeviceID); it is
-// fixed for the life of the install, so it is read once and served from here.
-// Cleared when syncthing is stopped, the only point a new cert could appear.
-let cachedDeviceId = null;
+let syncthingStatusOk = true;
 
 const parserOptions = {
   ignoreAttributes: false,
@@ -177,28 +50,31 @@ const stc = new FluxController();
 /**
  *
  * Temporary function until Arcane is deployed
+ * @param {string} configDir The uesrs config dir
+ * @param {string} syncthingDir The syncthing config dir
  * @param {string} configFile  The syncthing config file
  * @returns {Promise<boolean>}
  */
-async function changeSyncthingOwnership(configFile) {
+async function changeSyncthingOwnership(configDir, syncthingDir, configFile) {
   const user = os.userInfo().username;
   const owner = `${user}:${user}`;
 
   // As syncthing is running as root, we need to change owenership to running user
-  // eslint-disable-next-line no-use-before-define
-  const dirs = syncthingOwnedDirs();
+  const { error: chownConfigDirError } = await serviceHelper.runCommand('chown', {
+    runAsRoot: true,
+    logError: false,
+    params: [owner, configDir],
+  });
 
-  // eslint-disable-next-line no-restricted-syntax
-  for (const dir of dirs) {
-    // eslint-disable-next-line no-await-in-loop
-    const { error } = await serviceHelper.runCommand('chown', {
-      runAsRoot: true,
-      logError: false,
-      params: [owner, dir],
-    });
+  if (chownConfigDirError) return false;
 
-    if (error) return false;
-  }
+  const { error: chownSyncthingError } = await serviceHelper.runCommand('chown', {
+    runAsRoot: true,
+    logError: false,
+    params: [owner, syncthingDir],
+  });
+
+  if (chownSyncthingError) return false;
 
   const { error: chmodError } = await serviceHelper.runCommand('chmod', {
     runAsRoot: true,
@@ -212,53 +88,17 @@ async function changeSyncthingOwnership(configFile) {
 }
 
 /**
- * Whether this process owns the syncthing daemon on this node. The rule above,
- * answered for this process - exported so nothing else has to re-derive it from
- * the node type and get a different answer.
- * @returns {boolean}
- */
-function ownsSyncthing() {
-  return fluxosSupervisesSyncthing;
-}
-
-/**
- * Where syncthing's configuration and identity live. SYNCTHING_PATH relocates
- * it, so everything that creates, chowns, spawns into or reads that directory
- * has to resolve it the same way. Resolved in one place because they did not:
- * the repair path built ~/.config/syncthing directly while the config read
- * honoured the variable, so an operator who set it had FluxOS start a daemon in
- * one directory and read another's config.xml - and the api key it
- * authenticates every syncthing call with comes out of that file.
- * @returns {string}
- */
-function syncthingHomeDir() {
-  return process.env.SYNCTHING_PATH || path.join(os.homedir(), '.config', 'syncthing');
-}
-
-/**
- * The directories the FluxOS user has to own, since syncthing runs as root and
- * writes its config.xml there. The home always, and ~/.config above it only
- * while the home is still inside it: the parent is chowned so the user can
- * create the directory in the first place, and following the home wherever an
- * operator relocates it would hand the user something like /var/lib.
- * @returns {string[]}
- */
-function syncthingOwnedDirs() {
-  const syncthingDir = syncthingHomeDir();
-  const configDir = path.join(os.homedir(), '.config');
-
-  return path.dirname(syncthingDir) === configDir ? [configDir, syncthingDir] : [syncthingDir];
-}
-
-/**
  * To get syncthing config xml file
  * @returns {Promise<(string | null)>} config file (XML).
  */
 async function getConfigFile() {
-  const configFile = path.join(syncthingHomeDir(), 'config.xml');
+  const homedir = os.homedir();
+  const configDir = path.join(homedir, '.config');
+  const syncthingDir = process.env.SYNCTHING_PATH || path.join(configDir, 'syncthing');
+  const configFile = path.join(syncthingDir, 'config.xml');
 
-  if (fluxosSupervisesSyncthing) {
-    const ownershipChanged = await changeSyncthingOwnership(configFile);
+  if (!isArcane) {
+    const ownershipChanged = await changeSyncthingOwnership(configDir, syncthingDir, configFile);
     if (!ownershipChanged) return null;
   }
 
@@ -380,93 +220,311 @@ async function performRequest(method = 'get', urlpath = '', data, config) {
     return successResponse;
   } catch (error) {
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    // The axios code is a category - ERR_BAD_REQUEST spans every 4xx - so the
-    // HTTP status rides along as itself: a caller telling "no such folder"
-    // (404) from a denial (403) needs the number, and the message's wording
-    // belongs to axios, not to us. Null when no HTTP answer arrived at all.
-    errorResponse.data.httpStatus = error.response?.status ?? null;
     return errorResponse;
   }
 }
-
-/**
- * The failure of a syncthing request, as an exception rather than an envelope.
- *
- * Carries the HTTP status because absence and refusal are different answers and
- * only the number separates them: a folder syncthing does not know answers 404,
- * a stale api key answers 403, and axios reports both as ERR_BAD_REQUEST. A
- * caller that acts on absence reads `httpStatus`; one that does not ignores it.
- */
-class SyncthingError extends Error {
-  constructor(message, { name, code, httpStatus } = {}) {
-    super(message || 'syncthing request failed');
-    // axios's own name and code, so the envelope the Api half rebuilds is the
-    // one these endpoints have always answered
-    this.name = name || 'SyncthingError';
-    this.code = code;
-    this.httpStatus = httpStatus ?? null;
-  }
-}
-
-/**
- * A syncthing request: its data, or a throw.
- *
- * performRequest answers in band because that is the shape the wire needs, and
- * a route serialises it unchanged. Nothing above this line wants the envelope
- * or its vocabulary, so this is the seam - internal callers speak data and
- * exceptions, and the Api half puts the envelope back on.
- * @param {string} method HTTP method.
- * @param {string} urlpath Syncthing REST path.
- * @param {object} [data] Request body.
- * @param {object} [config] Axios config.
- * @returns {Promise<*>} The response data.
- */
-async function request(method, urlpath, data, config) {
-  const response = await performRequest(method, urlpath, data, config);
-  if (response.status === 'success') return response.data;
-  const details = response.data || {};
-  throw new SyncthingError(details.message, {
-    name: details.name,
-    code: details.code,
-    httpStatus: details.httpStatus,
-  });
-}
-
 /**
  * To get meta
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message.
  */
-async function getMeta() {
+async function getMeta(req, res) {
+  // does not require authentication
+  const response = await performRequest('get', '/meta.js');
   // "var metadata = {\"deviceID\":\"K6VOO4G-5RLTF3B-JTUFMHH-JWITKGM-63DTTMT-I6BMON6-7E3LVFW-V5WAIAO\"};\n"
-  return request('get', '/meta.js');
+  return res ? res.json(response) : response;
 }
 
 /**
- * Syncthing's own health check. The one syncthing endpoint that needs no api key.
- * @returns {Promise<object>} System health, {"status": "OK"}.
+ * To get Syhcthing health
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} System health, {"status": "OK"}.
  */
-async function getHealth() {
-  return request('get', '/rest/noauth/health');
+async function getHealth(req, res) {
+  const response = await performRequest('get', '/rest/noauth/health');
+  return res ? res.json(response) : response;
 }
 
 // === STATISTICS ENDPOINTS ===
 
+/**
+ * To get device statistics
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} General statistics about devices.
+ */
+async function statsDevice(req, res) {
+  const response = await performRequest('get', '/rest/stats/device');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get folder statistics
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} General statistics about folders.
+ */
+async function statsFolder(req, res) {
+  const response = await performRequest('get', '/rest/stats/folder');
+  return res ? res.json(response) : response;
+}
+
 // === SYSTEM ENDPOINTS ===
 
 /**
- * Pause a device, or every device when none is named. A paused device holds no
- * connection, so every folder shared with it stops moving data until it resumes.
- * @param {string} [device] Device ID.
- * @returns {Promise<*>} Syncthing's answer.
+ * To get list of directories matching the path given by the optional parameter current
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of directories in json array format.
  */
-async function systemPause(device) {
+async function systemBrowse(req, res) {
+  let { current } = req.params;
+  current = current || req.query.current;
+  let apiPath = '/rest/system/browse';
+  if (current) {
+    apiPath += `?current=${current}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the list of configured devices and some metadata associated with them. The list also contains the local device itself as not connected.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of configured devices and some metadata in json format.
+ */
+async function systemConnections(req, res) {
+  const response = await performRequest('get', '/rest/system/connections');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the set of debug facilities and which of them are currently enabled.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} List of debug facilities and which of them are currently enabled.
+ */
+async function systemDebug(req, res) {
+  let method = 'get';
+  let { disable } = req.params;
+  disable = disable || req.query.disable;
+  let { enable } = req.params;
+  enable = enable || req.query.enable;
+  let apiPath = '/rest/system/debug';
+  if (enable || disable) {
+    method = 'post';
+  }
+  if (enable && disable) {
+    apiPath += `?enable=${enable}&disable=${disable}`;
+  } else if (enable) {
+    apiPath += `?enable=${enable}`;
+  } else if (disable) {
+    apiPath += `?disable=${disable}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the contents of the local discovery cache
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Contents of the local discovery cache
+ */
+async function systemDiscovery(req, res) {
+  let method = 'get';
+  let { device } = req.params;
+  device = device || req.query.device;
+  let { addr } = req.params;
+  addr = addr || req.query.addr;
+  let apiPath = '/rest/system/discovery';
+  if (device || addr) {
+    method = 'post';
+  }
+  if (device && addr) { // both must be defined otherwise get
+    method = 'post';
+    apiPath += `?device=${device}&addr=${addr}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Post with empty body to remove all recent errors.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemErrorClear(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/error/clear');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the list of recent errors. Post with an error message in the body (plain text) to register a new error.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemError(req, res) {
+  let method = 'get';
+  let { message } = req.params;
+  message = message || req.query.message;
+  const apiPath = '/rest/system/error';
+  if (message) {
+    method = 'post';
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest(method, apiPath, message);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Post with an error message in the body (plain text) to register a new error.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postSystemError(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    const message = serviceHelper.ensureObject(body);
+    try {
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest('post', '/rest/system/error', message);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To get the list of recent log entries. The optional {since} parameter limits the results to message newer than the given timestamp in RFC 3339 format.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemLog(req, res) {
+  let { since } = req.params;
+  since = since || req.query.since;
+  let apiPath = '/rest/system/log';
+  if (since) {
+    apiPath += `?since=${since}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the list of recent log entries formatted as a text log instead of a JSON object. The optional {since} parameter limits the results to message newer than the given timestamp in RFC 3339 format.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemLogTxt(req, res) {
+  let { since } = req.params;
+  since = since || req.query.since;
+  let apiPath = '/rest/system/log.txt';
+  if (since) {
+    apiPath += `?since=${since}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To get the path locations used internally for storing configuration, database, and others.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemPaths(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/system/paths');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To pause the given device or all devices. Takes the optional parameter {device} (device ID). When omitted, pauses all devices.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemPause(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
   let apiPath = '/rest/system/pause';
   if (device) {
     apiPath += `?device=${device}`;
   }
-  return request('post', apiPath);
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -475,115 +533,285 @@ async function systemPause(device) {
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function systemPing() {
-  return request('get', '/rest/system/ping'); // can also be 'post', same
+async function systemPing(req, res) {
+  const response = await performRequest('get', '/rest/system/ping'); // can also be 'post', same
+  return res ? res.json(response) : response;
 }
 
 /**
- * Restart the syncthing process. Every folder's transfers stop and start again,
- * which is why the folder-level nudge exists for the cases that only need one
- * folder's index re-exchanged.
- * @returns {Promise<*>} Syncthing's answer.
+ * To erase the current index database and restart Syncthing. With no query parameters, the entire database is erased from disk. By specifying the {folder} parameter with a valid folder ID, only information for that folder will be erased.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function systemRestart() {
+async function systemReset(req, res) {
+  // note: scary call
+  let { folder } = req.params;
+  folder = folder || req.query.folder;
+  let apiPath = '/rest/system/reset';
+  if (folder) {
+    apiPath += `?folder=${folder}`;
+  }
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To erase the current index folderId database and restart Syncthing.
+ * @param {string} folderId Request.
+ * @param {object} res Response.
+ * @returns {object} returns the output of syncthing reponse of rest/system/reset
+ */
+async function systemResetFolderId(folderId) {
+  let apiPath = '/rest/system/reset';
+  if (folderId) {
+    apiPath += `?folder=${folderId}`;
+  } else {
+    throw new Error('folder parameter is mandatory');
+  }
+  return performRequest('post', apiPath);
+}
+
+/**
+ * To immediately restart Syncthing
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemRestart(req, res) {
   log.info('Restarting Syncthing...');
-  const data = await request('post', '/rest/system/restart');
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/restart');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
   log.info('Syncthing restarted');
-  return data;
+  return res ? res.json(response) : response;
 }
 
 /**
- * Resume a device, or every device when none is named.
- * @param {string} [device] Device ID.
- * @returns {Promise<*>} Syncthing's answer.
+ * To resume the given device or all devices. Takes the optional parameter {device} (device ID). When omitted, resumes all devices
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function systemResume(device) {
+async function systemResume(req, res) {
+  let { device } = req.params;
+  device = device || req.query.device;
   let apiPath = '/rest/system/resume';
   if (device) {
     apiPath += `?device=${device}`;
   }
-  return request('post', apiPath);
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', apiPath);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
 }
 
 /**
- * The running syncthing's version.
- * @returns {Promise<object>} Version information.
+ * To cause Syncthing to exit and not restart.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function systemVersion() {
-  return request('get', '/rest/system/version');
+async function systemShutdown(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/shutdown');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns information about current system status and resource usage.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemStatus(req, res) {
+  const response = await performRequest('get', '/rest/system/status');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Check for a possible upgrade, returns an object describing the newest version and upgrade possibility.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemUpgrade(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/system/upgrade');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To perform an upgrade to the newest released version and restart.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postSystemUpgrade(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('post', '/rest/system/upgrade');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the current Syncthing version information.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function systemVersion(req, res) {
+  const response = await performRequest('get', '/rest/system/version');
+  return res ? res.json(response) : response;
 }
 
 // === CONFIG ENDPOINTS ===
 
 /**
- * The entire syncthing configuration - every folder and every device.
- * @returns {Promise<object>} The configuration.
+ * Returns the entire config.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getConfig() {
-  return request('get', '/rest/config');
+async function getConfig(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/config');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
 }
 
 /**
- * The configured folders, or the one folder with the given id.
- * @param {string} [id] Folder ID. Omitted, every folder.
- * @returns {Promise<Array|object>} The folder configuration.
+ * Replaces the entire config.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getConfigFolders(id) {
+async function postConfig(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest('put', '/rest/config', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Returns whether a restart of Syncthing is required for the current config to take effect.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigRestartRequired(req, res) {
+  const response = await performRequest('get', '/rest/config/restart-required');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the folder for the given ID.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigFolders(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
+  }
+  let { id } = req.params;
+  id = id || req.query.id;
   let apiPath = '/rest/config/folders';
   if (id) {
     if (!goodSyncthingChars.test(id)) {
-      throw new Error('Invalid ID supplied');
+      const response = messageHelper.createErrorMessage('Invalid ID supplied');
+      return res ? res.json(response) : response;
     }
     apiPath += `/${id}`;
   }
-  return request('get', apiPath);
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
 }
 
 /**
- * The configured devices, or the one device with the given id.
- * @param {string} [id] Device ID. Omitted, every device.
- * @returns {Promise<Array|object>} The device configuration.
+ * Returns the device for the given ID.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getConfigDevices(id) {
+async function getConfigDevices(req, res) {
+  if (!req) {
+    // eslint-disable-next-line no-param-reassign
+    req = {
+      params: {},
+      query: {},
+    };
+  }
+  let { id } = req.params;
+  id = id || req.query.id;
   let apiPath = '/rest/config/devices';
   if (id) {
     if (!goodSyncthingChars.test(id)) {
-      throw new Error('Invalid ID supplied');
+      const response = messageHelper.createErrorMessage('Invalid ID supplied');
+      return res ? res.json(response) : response;
     }
     apiPath += `/${id}`;
   }
-  return request('get', apiPath);
-}
-
-/**
- * Whether folder ownership can be written: the syncthing running now resolves
- * owners against the numeric id tables, so every owner travels by number. Read
- * at the moment it is asked, from the running processes. Where this process
- * does not supervise syncthing, whoever does (Arcane's unit) gives it that.
- * @returns {Promise<boolean>}
- */
-async function ownersTravelByNumber() {
-  if (!fluxosSupervisesSyncthing) return true;
-  // eslint-disable-next-line no-use-before-define
-  return (await syncthingOwnerView()) === 'numeric';
-}
-
-/**
- * Whether a folder write turns syncthing's ownership sync on for any folder.
- * @param {object|Array<object>} folderConfig One folder, or the folder list a PUT replaces.
- * @returns {boolean}
- */
-function writesOwnership(folderConfig) {
-  const folders = Array.isArray(folderConfig) ? folderConfig : [folderConfig];
-  return folders.some((folder) => folder?.syncOwnership === true);
+  const response = await performRequest('get', apiPath);
+  return res ? res.json(response) : response;
 }
 
 /**
  * To modify config for folders. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the folder
- *
- * A write that turns ownership sync on is refused until ownersTravelByNumber():
- * a syncthing that resolves the host's names would send them, and a peer gives
- * the file whatever id that name has on its own host.
  * @param {string} method Request method.
  * @param {string} newConfig new config to be replaced.
  * @param {string} id folder ID.
@@ -598,12 +826,41 @@ async function adjustConfigFolders(method, newConfig, id) {
     }
     apiPath += `/${id}`;
   }
-  if (writesOwnership(newConfig) && !(await ownersTravelByNumber())) {
-    fluxEventBus.count('syncthing:ownershipWriteRefused');
-    return messageHelper.createErrorMessage('Folder ownership is not written until syncthing resolves owners against the numeric id tables');
-  }
   const response = await performRequest(method, apiPath, newConfig);
   return response;
+}
+
+/**
+ * To modify config for folders. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the folder
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigFolders(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { id } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigFolders(method, newConfig, id);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
 }
 
 /**
@@ -627,13 +884,58 @@ async function adjustConfigDevices(method, newConfig, id) {
 }
 
 /**
+ * To modify config for devices. PUT replaces the entire config, PATCH replaces only the given child objects and DELETE removes the devices
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDevices(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { id } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigDevices(method, newConfig, id);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
  * Returns a template folder configuration object with all default values, which only needs a unique ID to be applied
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigDefaultsFolder() {
-  return request('get', '/rest/config/defaults/folder');
+async function getConfigDefaultsFolder(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/folder');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns a template device configuration object with all default values, which only needs a unique ID to be applied
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDefaultsDevice(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/device');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -650,21 +952,150 @@ async function adjustConfigDefaultsFolder(method, newConfig) {
 }
 
 /**
+ * To modify config for defult values for folders, PUT replaces the default config (omitted values are reset to the hard-coded defaults), PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsFolder(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigDefaultsFolder(method, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify config for defult values for devices, PUT replaces the default config (omitted values are reset to the hard-coded defaults), PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsDevice(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/defaults/device', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * returns an object listing ignore patterns to be used by default on folders, as an array of single-line strings
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigDefaultsIgnores(req, res) {
+  const response = await performRequest('get', '/rest/config/defaults/ignores');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To replace the default ignore patterns from an object of the same format
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigDefaultsIgnores(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = 'put';
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/defaults/ignores', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
  * Returns the options object
  * @param {object} req Request.
  * @param {object} res Response.
  * @returns {object} Message
  */
-async function getConfigOptions() {
-  return request('get', '/rest/config/options');
+async function getConfigOptions(req, res) {
+  const response = await performRequest('get', '/rest/config/options');
+
+  return res ? res.json(response) : response;
 }
 
 /**
- * The syncthing GUI's own configuration.
- * @returns {Promise<object>} The gui configuration.
+ * Returns the gui object
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getConfigGui() {
-  return request('get', '/rest/config/gui');
+async function getConfigGui(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/config/gui');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns the ldap object
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getConfigLdap(req, res) {
+  const response = await performRequest('get', '/rest/config/ldap');
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -680,7 +1111,199 @@ async function adjustConfigOptions(method, newConfig) {
   return response;
 }
 
+/**
+ * To modify options object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigOptions(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await adjustConfigOptions(method, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify gui object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigGui(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/gui', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To modify ldap object, PUT replaces the entire object and PATCH replaces only the given child objects.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postConfigLdap(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const method = (processedBody.method || 'put').toLowerCase();
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, '/rest/config/ldap', newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
 // === CLUSTER ENDPOINTS ===
+
+/**
+ * Lists remote devices which have tried to connect, but are not yet configured in the instance.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getClusterPendigDevices(req, res) {
+  const response = await performRequest('get', '/rest/cluster/pending/devices');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To remove records about a pending remote device which tried to connect.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postClusterPendigDevices(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { device } = processedBody;
+      const method = (processedBody.method || 'delete').toLowerCase();
+      let apiPath = '/rest/cluster/pending/devices';
+      if (device) {
+        apiPath += `?device=${device}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Lists folders which remote devices have offered to us, but are not yet shared from our instance to them. Takes the optional {device} parameter to only return folders offered by a specific remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getClusterPendigFolders(req, res) {
+  const response = await performRequest('get', '/rest/cluster/pending/folders');
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To remove records about a pending folder announced from a remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postClusterPendigFolders(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'delete').toLowerCase();
+      let apiPath = '/rest/cluster/pending/folders';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
 
 // === FOLDER ENDPOINTS ===
 
@@ -699,334 +1322,471 @@ async function getFolderIdErrors(folderid) {
   return performRequest('get', apiPath);
 }
 
+/**
+ * Returns the list of errors encountered during scanning or pulling. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getFolderErrors(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    if (!folder) {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await getFolderIdErrors(folder);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of archived files that could be recovered. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getFolderVersions(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/folder/versions';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * To restore archived versions of a given set of files. Expects an object with attributes named after the relative file paths, with timestamps as values matching valid versionTime entries in the corresponding getFolderVersions() response object. Takes one mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postFolderVersions(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/folder/versions';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
 // === DATABASE ENDPOINTS ===
 
 /**
- * How complete a folder is, optionally as one device sees it.
- *
- * `remoteState` is only set when a device is named, and it is the connectivity
- * discriminator a caller needs: completion is computed from the last known
- * index, so an offline peer still reports 100.
- * @param {object} [selector] Selector.
- * @param {string} [selector.folder] Folder ID.
- * @param {string} [selector.device] Device ID.
- * @returns {Promise<object>} Completion percentage and byte/item counts.
+ * Returns the directory tree of the global model. takes one mandatory {folder} parameter and two optional parameters {levels} and {prefix}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getDbCompletion({ folder, device } = {}) {
-  let apiPath = '/rest/db/completion';
-  const query = qs.stringify({ folder, device });
-  if (query) apiPath += `?${query}`;
-  return request('get', apiPath);
-}
-
-/**
- * Read a folder's ignore patterns, for internal callers. Returns the standard
- * message shape - { status, data: { ignore, expanded } } on success - and never
- * throws, so the caller checks status rather than catching.
- * @param {string} folderId syncthing folder id
- * @returns {Promise<object>} message
- */
-async function getFolderIgnores(folderId) {
-  return performRequest('get', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`);
-}
-
-/**
- * Set a folder's ignore patterns, for internal callers. Syncthing owns and
- * writes .stignore itself (atomically, and it never replicates it), so this is
- * how FluxOS sets the ignores rather than writing the file. REPLACES the whole
- * set - pass the complete desired list. Returns the standard message shape and
- * never throws.
- * @param {string} folderId syncthing folder id
- * @param {Array<string>} lines the full ignore pattern list
- * @returns {Promise<object>} message
- */
-async function setFolderIgnores(folderId, lines) {
-  return performRequest('post', `/rest/db/ignores?folder=${encodeURIComponent(folderId)}`, { ignore: lines });
-}
-
-/**
- * A folder's current status.
- *
- * Throws with `httpStatus` 404 when syncthing holds no such folder, which is an
- * answer rather than a failure - the caller that acts on absence reads it.
- * @param {string} folder Folder ID.
- * @returns {Promise<object>} The folder status.
- */
-async function getDbStatus(folder) {
-  if (!folder) {
-    throw new Error('folder parameter is mandatory');
-  }
-  return request('get', `/rest/db/status?folder=${folder}`);
-}
-
-// What syncthing adds to a folder's byte counts for each entry that is not a file.
-// Its counts sum a stored size per entry, and that size depends on the release:
-// v1 gives every directory and symlink 128; v2.0.0 to v2.1.1 store every directory
-// as 128 and a symlink as 0; from v2.1.2 every non-file entry is stored as 0, and
-// a directory received from an older peer is zeroed on the way in. Each node's
-// counts come from its own daemon, so its own release decides.
-const SYNTHETIC_ENTRY_BYTES = 128;
-
-/**
- * How many bytes a syncthing release counts for each directory and each symlink -
- * see SYNTHETIC_ENTRY_BYTES.
- * @param {string} version syncthing's version string, e.g. v2.0.15
- * @returns {{directory: number, symlink: number}}
- * @throws When the version cannot be parsed.
- */
-function nonFileEntryBytesForVersion(version) {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(typeof version === 'string' ? version : '');
-  if (!match) throw new Error(`syncthing reported a version that cannot be read: ${JSON.stringify(version)}`);
-  const [major, minor, patch] = match.slice(1).map(Number);
-  if (major < 2) return { directory: SYNTHETIC_ENTRY_BYTES, symlink: SYNTHETIC_ENTRY_BYTES };
-  if (major === 2 && (minor === 0 || (minor === 1 && patch < 2))) return { directory: SYNTHETIC_ENTRY_BYTES, symlink: 0 };
-  return { directory: 0, symlink: 0 };
-}
-
-/**
- * How many bytes this node's syncthing counts for each directory and each symlink.
- *
- * Read from the running daemon on every call, never remembered: the release can
- * change across a restart, and an old answer about a newer daemon would take
- * bytes off counts that never carried them.
- * @returns {Promise<{directory: number, symlink: number}>}
- * @throws When the version cannot be read or parsed, which leaves the counts
- *   unreadable, as a status read that failed does.
- */
-async function nonFileEntryBytes() {
-  const { version } = await systemVersion();
-  return nonFileEntryBytesForVersion(version);
-}
-
-// Bytes less the synthetic size of the directories and symlinks counted in them.
-function fileBytesOf(bytes, directories, symlinks, entry) {
-  return Math.max(0, (bytes || 0) - entry.directory * (directories || 0) - entry.symlink * (symlinks || 0));
-}
-
-/**
- * db/status with what its indexes hold in FILES: globalFileBytes, needFileBytes and
- * inSyncFileBytes. See getDbStatusInFileBytes.
- * @param {object} status db/status.
- * @param {{directory: number, symlink: number}} entry from nonFileEntryBytes
- * @returns {object}
- */
-function statusInFileBytes(status, entry) {
-  const inSync = (global, need) => Math.max(0, (global || 0) - (need || 0));
-  return {
-    ...status,
-    globalFileBytes: fileBytesOf(status.globalBytes, status.globalDirectories, status.globalSymlinks, entry),
-    needFileBytes: fileBytesOf(status.needBytes, status.needDirectories, status.needSymlinks, entry),
-    inSyncFileBytes: fileBytesOf(
-      status.inSyncBytes,
-      inSync(status.globalDirectories, status.needDirectories),
-      inSync(status.globalSymlinks, status.needSymlinks),
-      entry,
-    ),
-  };
-}
-
-/**
- * A folder's status, with what its indexes hold in FILES.
- *
- * syncthing's globalBytes, needBytes and inSyncBytes include a synthetic size for
- * directories and symlinks on releases before v2.1.2 (see SYNTHETIC_ENTRY_BYTES), so
- * a folder of empty directories reads as holding data. globalFileBytes,
- * needFileBytes and inSyncFileBytes take that size off, by entry count, and are the
- * figures to decide from; the raw ones are syncthing's own, for display.
- *
- * The status is read before the version: a restart between the two can only pair
- * an older daemon's counts with a newer daemon's version, which takes nothing off.
- * @param {string} folder Folder ID.
- * @returns {Promise<object>} db/status, plus globalFileBytes, needFileBytes and inSyncFileBytes.
- * @throws What getDbStatus throws, and when the version cannot be read.
- */
-async function getDbStatusInFileBytes(folder) {
-  const status = await getDbStatus(folder);
-  return statusInFileBytes(status, await nonFileEntryBytes());
-}
-
-/**
- * The files a receive-only folder holds that the cluster's index does not.
- *
- * db/status counts them (receiveOnlyChangedFiles) but will not say WHAT they are, and
- * a count cannot tell a customer's world from the scaffolding FluxOS puts on every
- * volume - the zero-length file an f: mount needs so docker does not create a
- * directory in its place, and the directories m:/ml: mounts ask for. This returns the
- * entries themselves, each with its name, size and modification time, so the caller
- * can answer both "is any of this the owner's" and "how recently was it written"
- * without walking the volume.
- *
- * Only ever populated for a receiveonly or receiveencrypted folder; syncthing reports
- * nothing here for a sendreceive one whatever is on disk (folder_summary.go).
- *
- * PAGED, and the caller must read to the end of it. A page carries at most `perpage`
- * entries, so a caller that totals one page totals a PREFIX of the folder on anything
- * larger - and two nodes summing different prefixes of their own folders compare
- * numbers that no longer order by how much each holds.
- *
- * @param {string} folder Folder ID.
- * @param {number} [page] 1-based page number.
- * @param {number} [perpage] entries per page; syncthing's own default is 65536.
- * @returns {Promise<object>} { files: [{ name, size, modified, deleted, type }], page, perpage }
- */
-async function getDbLocalChanged(folder, page = 1, perpage = LOCAL_CHANGED_PAGE_SIZE) {
-  if (!folder) {
-    throw new Error('folder parameter is mandatory');
-  }
-  return request('get', `/rest/db/localchanged?folder=${folder}&page=${page}&perpage=${perpage}`);
-}
-
-/**
- * A folder's local changes, handed to a caller one page at a time.
- *
- * The paging is syncthing's, so it is answered here rather than by each caller: a
- * caller that reads one page reads a PREFIX of any folder larger than it, and two
- * nodes each totalling their own prefix produce figures that no longer order by how
- * much each holds.
- *
- * A PAGE AT A TIME, never accumulated. How many entries exist is the app's to decide
- * - it writes the files into its own volume - so a list of them all is a list this
- * process does not get to size. A caller that folds each page costs the same whatever
- * the folder holds; one that collects them does not.
- *
- * Bounded for the same reason: these requests are paid every monitor pass, so an app
- * carrying enough files could make the pass itself the expense. A folder that reaches
- * the bound is reported truncated, and what the caller totalled is then a floor -
- * which is all the ranking needs, because a folder that large outranks a normal one
- * on any page of it.
- *
- * A short page ends it. A full page does not: the next request decides, and a folder
- * whose entry count is an exact multiple of the page size answers that one with no
- * list at all, which is the end rather than a failure. Only the FIRST page can say
- * the folder is unreadable.
- *
- * @param {string} folder Folder ID.
- * @param {Function} onBatch Receives each page's entries.
- * @returns {Promise<{read: boolean, pages: number, truncated: boolean}>} read false
- *   when the folder could not be read at all - which is not "holds nothing"
- */
-async function eachDbLocalChanged(folder, onBatch) {
-  for (let page = 1; ; page += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    const answer = await getDbLocalChanged(folder, page, LOCAL_CHANGED_PAGE_SIZE);
-    const batch = answer?.files;
-    if (!Array.isArray(batch)) return { read: page > 1, pages: page - 1, truncated: false };
-    onBatch(batch);
-    if (batch.length < LOCAL_CHANGED_PAGE_SIZE) return { read: true, pages: page, truncated: false };
-    if (page >= LOCAL_CHANGED_MAX_PAGES) return { read: true, pages: page, truncated: true };
+async function getDbBrowse(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { levels } = req.params;
+    levels = levels || req.query.levels;
+    let { prefix } = req.params;
+    prefix = prefix || req.query.prefix;
+    let apiPath = '/rest/db/browse';
+    if (!folder) {
+      throw new Error('folder parameter is mandatory');
+    }
+    const qq = {
+      folder,
+      levels,
+      prefix,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `?${qqStr}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
 /**
- * Whether every connected peer of a folder holds everything this node has
- * announced for it. A peer that is not connected cannot be waited for.
- * @param {object} folder Folder configuration
- * @param {string} myId This node's device id
- * @param {Set<string>} connectedPeers Device ids with a live connection
- * @returns {Promise<boolean>}
+ * Returns the completion percentage (0 to 100) and byte / item counts. Takes optional {device} and {folder} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function folderCompleteOnPeers(folder, myId, connectedPeers) {
-  const peers = folder.devices.map((device) => device.deviceID).filter((id) => id !== myId && connectedPeers.has(id));
-  if (!peers.length) return true;
-  const completions = await Promise.all(peers.map((device) => getDbCompletion({ folder: folder.id, device })));
-  return completions.every((completion) => completion.needBytes === 0 && completion.needItems === 0 && completion.needDeletes === 0);
-}
-
-/**
- * Syncthing's statistics per device, keyed by device id. lastSeen is when the
- * device last connected or disconnected, to the second, and "now" while it is
- * connected; a device this node has never been connected to reads 1970-01-01.
- * @returns {Promise<Object<string, {lastSeen: string, lastConnectionDurationS: number}>>}
- */
-async function getDeviceStats() {
-  return request('get', '/rest/stats/device');
-}
-
-/**
- * Syncthing's own status: startTime is when this syncthing process started.
- * @returns {Promise<{myID: string, startTime: string}>}
- */
-async function getSystemStatus() {
-  return request('get', '/rest/system/status');
-}
-
-/**
- * Scans a folder now. Syncthing answers once the scan is done, so this resolves
- * when it is, and rejects when syncthing refuses it (the folder is missing,
- * paused or restarting) or the scan outlasts the call's timeout. The watcher
- * batches changes for ten seconds, so a file written inside that window is
- * unknown to syncthing, and to every peer, until something scans it.
- *
- * Never a folder whose app volume is not mounted: a scan there finds the
- * volume's files gone and sends their deletion to every peer. Rejects with code
- * VOLUME_NOT_MOUNTED instead, and asks syncthing nothing.
- *
- * What a scan costs: every file is checked, and only new or changed ones are
- * read and hashed. Measured with syncthing 2.0.15 on a Ryzen 7 1700 node's app
- * disk, page cache dropped:
- *
- *   files      | data     | nothing changed | every file new
- *   10,000     | 40 MB    | 1.3-1.6 s       | 9.2 s
- *   100,000    | 0.41 GB  | 14-17 s         | 96 s
- *   1,000,000  | 1 GB     | 142-178 s       | 1,049 s
- *   10         | 10 GB    | 0.04 s          | 49 s
- *
- * About 0.15 ms per file checked, plus about 0.9 ms per new small file or
- * 205 MB/s of new data. A folder of a million files cannot be scanned from
- * scratch inside ten minutes.
- *
- * A caller that stops waiting does not stop the scan: syncthing runs it to the
- * end and records what it has scanned as it goes, so a later scan of the same
- * folder checks rather than reads what this one covered.
- * @param {string} folderId Folder id
- * @param {object} [options]
- * @param {number} [options.timeoutMs] How long the scan may take; the client's
- *   own timeout when omitted.
- * @returns {Promise<object>} Syncthing's reply
- */
-async function scanFolder(folderId, { timeoutMs } = {}) {
-  if (!(await volumeService.isPathMounted(path.join(appsFolderPath, folderId)))) {
-    throw Object.assign(new Error(`${folderId} was not scanned: its volume is not mounted`), { code: 'VOLUME_NOT_MOUNTED' });
+async function getDbCompletion(req, res) {
+  try {
+    // tolerate being called internally with only a query (no params): callers like
+    // checkIfPeersAreSynced pass { query: {...} }, so req.params is undefined and a
+    // bare `const { folder } = req.params` would throw. Default the containers.
+    const { params = {}, query = {} } = req || {};
+    const folder = params.folder || query.folder;
+    const device = params.device || query.device;
+    let apiPath = '/rest/db/completion';
+    if (folder || device) apiPath += '?';
+    const qq = {
+      folder,
+      device,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
   }
-  return request('post', `/rest/db/scan?folder=${encodeURIComponent(folderId)}`, undefined, timeoutMs ? { timeout: timeoutMs } : undefined);
 }
 
 /**
- * Announces everything this node holds in its sendreceive folders and waits for
- * the connected peers to hold it too. The scan is what makes it a drain: the
- * watcher batches changes for ten seconds, and a file written inside that window
- * is unknown to syncthing until something scans it.
- *
- * The scans spend the drain's own time, and each folder's settles on its own: a
- * folder whose scan failed or ran out of time is still waited on, for what its
- * peers hold of everything written before. From around 350,000 files even a
- * scan that finds nothing changed outlasts the shutdown budget (apiServer.js
- * SHUTDOWN_BUDGET_MS) - see scanFolder.
- * @param {number} timeoutMs How long the whole drain may take, its scans included
- * @returns {Promise<string[]>} Ids of the folders a connected peer had not completed at the deadline
+ * Returns most data available about a given file, including version and availability. Takes {folder} and {file} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function drainFoldersToPeers(timeoutMs) {
-  const deadline = monotonicMs() + timeoutMs;
-  const folders = (await getConfigFolders()).filter((folder) => folder.type === 'sendreceive');
-  if (!folders.length) return [];
-  const myId = await getDeviceId();
-  const { connections = {} } = await request('get', '/rest/system/connections');
-  const connectedPeers = new Set(Object.keys(connections).filter((id) => connections[id]?.connected));
-  const scans = await Promise.allSettled(folders.map((folder) => scanFolder(folder.id, {
-    timeoutMs: Math.max(1, deadline - monotonicMs()),
-  })));
-  scans.forEach((scan, i) => {
-    if (scan.status === 'rejected') log.warn(`Shutdown drain: the scan of ${folders[i].id} did not finish: ${scan.reason.message}`);
+async function getDbFile(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { file } = req.params;
+    file = file || req.query.file;
+    let apiPath = '/rest/db/file';
+    if (folder || file) apiPath += '?';
+    const qq = {
+      folder,
+      file,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the content of the .stignore as the ignore field. Takes one parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbIgnores(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/ignores';
+    if (folder) apiPath += `?folder=${folder}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of files which were changed locally in a receive-only folder. Takes one mandatory parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbLocalchanged(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/localchanged';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns lists of files which are needed by this device in order for it to become in sync. Takes one mandatory parameter, {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbNeed(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let apiPath = '/rest/db/need';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the list of files which are needed by that remote device in order for it to become in sync with the shared folder. Takes the mandatory parameters {folder} and {device}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbRemoteNeed(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { device } = req.params;
+    device = device || req.query.device;
+    let apiPath = '/rest/db/remoteneed';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    if (device) {
+      apiPath += `&device=${device}`;
+    } else {
+      throw new Error('device parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns information about the current status of a folder. Takes the mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getDbStatus(req, res) {
+  try {
+    const folder = req?.params?.folder || req?.query?.folder;
+    let apiPath = '/rest/db/status';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Updates the content of the .stignore echoing it back as a response. Takes one parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbIgnores(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
   });
-  let pending = folders;
-  while (pending.length && monotonicMs() < deadline) {
-    // eslint-disable-next-line no-await-in-loop
-    const complete = await Promise.all(pending.map((folder) => folderCompleteOnPeers(folder, myId, connectedPeers)));
-    pending = pending.filter((folder, i) => !complete[i]);
-    // eslint-disable-next-line no-await-in-loop
-    if (pending.length) await serviceHelper.delay(500);
-  }
-  return pending.map((folder) => folder.id);
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/ignores';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Request override of a send only folder. Override means to make the local version latest, overriding changes made on other devices. This API call does nothing if the folder is not a send only folder. Takes the mandatory parameter {folder}
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbOverride(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/override';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * Moves the file to the top of the download queue.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbPrio(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const { file } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/prio';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      if (file) {
+        apiPath += `&file=${file}`;
+      } else {
+        throw new Error('file parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
+/**
+ * To request revert of a receive only folder. Reverting a folder means to undo all local changes. This API call does nothing if the folder is not a receive only folder. Takes the mandatory parameter {folder}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbRevert(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/revert';
+      if (folder) {
+        apiPath += `?folder=${folder}`;
+      } else {
+        throw new Error('folder parameter is mandatory');
+      }
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
 }
 
 /**
@@ -1043,43 +1803,378 @@ async function dbRevert(folder) {
   return performRequest('post', apiPath);
 }
 
+/**
+ * To request immediate scan. Takes the optional parameters {folder} (folder ID), {sub} (path relative to the folder root) and {next} (time in seconds)
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function postDbScan(req, res) {
+  let body = '';
+  req.on('data', (data) => {
+    body += data;
+  });
+  req.on('end', async () => {
+    try {
+      const processedBody = serviceHelper.ensureObject(body);
+      const newConfig = processedBody.config;
+      const { folder } = processedBody;
+      const { sub } = processedBody;
+      const { next } = processedBody;
+      const method = (processedBody.method || 'post').toLowerCase();
+      let apiPath = '/rest/db/scan';
+      if (folder || sub || next) apiPath += '?';
+      const qq = {
+        folder,
+        sub,
+        next,
+      };
+      const qqStr = qs.stringify(qq);
+      apiPath += `${qqStr}`;
+      const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+      let response = null;
+      if (authorized === true) {
+        response = await performRequest(method, apiPath, newConfig);
+      } else {
+        response = messageHelper.errUnauthorizedMessage();
+      }
+      return res ? res.json(response) : response;
+    } catch (error) {
+      log.error(error);
+      const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      return res ? res.json(errorResponse) : errorResponse;
+    }
+  });
+}
+
 // === DEBUG ===
+
+/**
+ * Summarizes the completion precentage for each remote device.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugPeerCompletion(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/debug/peerCompletion');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * Returns statistics about each served REST API endpoint, to diagnose how much time was spent generating the responses.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugHttpmetrics(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/debug/httpmetrics');
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To capture a profile of what Syncthing is doing on the CPU
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugCpuprof(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    try {
+      response = await axios.get('/rest/debug/cpuprof', {
+        responseType: 'stream', // Specify response type as stream
+        timeout: 60000,
+      });
+      if ('content-type' in response.data.headers) {
+        res.setHeader('Content-Type', response.data.headers['content-type']);
+      } else {
+        res.setHeader('Content-Type', 'application/octet-stream');
+      }
+      return response.data.pipe(res);
+    } catch (error) {
+      return res ? res.json(error) : JSON.stringify(error);
+    }
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To capture a profile of what Syncthing is doing with the heap memory.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugHeapprof(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    try {
+      response = await axios.get('/rest/debug/heapprof', {
+        responseType: 'stream', // Specify response type as stream
+        timeout: 60000,
+      });
+      if ('content-type' in response.data.headers) {
+        res.setHeader('Content-Type', response.data.headers['content-type']);
+      } else {
+        res.setHeader('Content-Type', 'application/octet-stream');
+      }
+      return response.data.pipe(res);
+    } catch (error) {
+      return res ? res.json(error) : JSON.stringify(error);
+    }
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Collect information about the running instance for troubleshooting purposes.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugSupport(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  let response = null;
+  if (authorized === true) {
+    response = await performRequest('get', '/rest/debug/support', undefined, 60000);
+  } else {
+    response = messageHelper.errUnauthorizedMessage();
+  }
+  return res ? res.json(response) : response;
+}
+
+/**
+ * To Show diagnostics about a certain file in a shared folder. Takes the {folder} and {file} parameters.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function debugFile(req, res) {
+  try {
+    let { folder } = req.params;
+    folder = folder || req.query.folder;
+    let { file } = req.params;
+    file = file || req.query.file;
+    let apiPath = '/rest/debug/file';
+    if (folder) {
+      apiPath += `?folder=${folder}`;
+    } else {
+      throw new Error('folder parameter is mandatory');
+    }
+    if (file) {
+      apiPath += `&file=${file}`;
+    } else {
+      throw new Error('file parameter is mandatory');
+    }
+    const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+    let response = null;
+    if (authorized === true) {
+      try {
+        response = await axios.get(apiPath, {
+          responseType: 'stream', // Specify response type as stream
+          timeout: 60000,
+        });
+        if ('content-type' in response.data.headers) {
+          res.setHeader('Content-Type', response.data.headers['content-type']);
+        } else {
+          res.setHeader('Content-Type', 'application/octet-stream');
+        }
+        return response.data.pipe(res);
+      } catch (error) {
+        return res ? res.json(error) : JSON.stringify(error);
+      }
+    } else {
+      response = messageHelper.errUnauthorizedMessage();
+    }
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
 
 // === EVENT ENDPOINTS ===
 
 /**
- * Syncthing's event stream, from `since` onwards.
- *
- * The endpoint long-polls: with a `timeout` hold requested, syncthing keeps the
- * request open up to that many seconds before answering "nothing new", so the
- * client-side abort must come strictly after the server-side hold rather than
- * at the shared instance's 5s default.
- * @param {object} [options] Options.
- * @param {string} [options.events] Comma separated event types to subscribe to.
- * @param {number} [options.since] Last event id already seen.
- * @param {number} [options.limit] Maximum events to return.
- * @param {number} [options.timeout] Seconds syncthing may hold the request open.
- * @param {AbortSignal} [options.signal] Interrupts the long poll on shutdown.
- * @returns {Promise<Array>} The events.
+ * To receive Syncthing events. takes {events}, {since}, {limit} and {timeout} parameters to filter the result.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
  */
-async function getEvents({
-  events, since, limit, timeout, signal,
-} = {}) {
-  let apiPath = '/rest/events';
-  const query = qs.stringify({
-    events, since, limit, timeout,
-  });
-  if (query) apiPath += `?${query}`;
-  const holdS = Number(timeout);
-  const config = {};
-  if (Number.isFinite(holdS) && holdS > 0) config.timeout = (holdS + 10) * 1000;
-  // axios honours config.signal
-  if (signal) config.signal = signal;
-  // 3rd arg is the request body (none for GET); 4th is the axios config
-  return request('get', apiPath, undefined, config);
+async function getEvents(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  if (authorized !== true) {
+    const response = messageHelper.errUnauthorizedMessage();
+    return res ? res.json(response) : response;
+  }
+  try {
+    let { events } = req.params;
+    events = events || req.query.events;
+    let { since } = req.params;
+    since = since || req.query.since;
+    let { limit } = req.params;
+    limit = limit || req.query.limit;
+    let { timeout } = req.params;
+    timeout = timeout || req.query.timeout;
+    let apiPath = '/rest/events';
+    if (events || since || limit || timeout) apiPath += '?';
+    const qq = {
+      events,
+      since,
+      limit,
+      timeout,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    // the events endpoint long-polls: with a `timeout` hold requested, syncthing
+    // keeps the request open up to that many seconds before answering "nothing
+    // new" - the client-side abort must come strictly after the server-side hold,
+    // not at the shared instance's 5s default
+    const holdS = Number(timeout);
+    const requestConfig = {};
+    if (Number.isFinite(holdS) && holdS > 0) requestConfig.timeout = (holdS + 10) * 1000;
+    // a caller (e.g. the events consumer) may pass an AbortSignal to interrupt the
+    // long-poll on shutdown; axios honours config.signal
+    if (req.signal) requestConfig.signal = req.signal;
+    // 3rd arg is the request body (none for GET); 4th is the axios config
+    const response = await performRequest('get', apiPath, undefined, requestConfig);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * To receive LocalChangeDetected and RemoteChangeDetected event types. takes {since}, {limit} and {timeout} parameters to filter the result.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getEventsDisk(req, res) {
+  const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+  if (authorized !== true) {
+    const response = messageHelper.errUnauthorizedMessage();
+    return res ? res.json(response) : response;
+  }
+  try {
+    let { since } = req.params;
+    since = since || req.query.since;
+    let { limit } = req.params;
+    limit = limit || req.query.limit;
+    let { timeout } = req.params;
+    timeout = timeout || req.query.timeout;
+    let apiPath = '/rest/events/disk';
+    if (since || limit || timeout) apiPath += '?';
+    const qq = {
+      since,
+      limit,
+      timeout,
+    };
+    const qqStr = qs.stringify(qq);
+    apiPath += `${qqStr}`;
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
 }
 
 // === MISC SERVICES ENDPOINTS ===
+
+/**
+ * Verifies and formats a device ID. Takes one parameter, {id}.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcDeviceID(req, res) {
+  try {
+    let { id } = req.params;
+    id = id || req.query.id;
+    let apiPath = '/rest/svc/deviceid';
+    if (id) {
+      apiPath += `?id=${id}`;
+    } else {
+      throw new Error('id parameter is mandatory');
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns a strong random generated string (alphanumeric) of the specified length. Takes the {length} parameter.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcRandomString(req, res) {
+  let { length } = req.params;
+  length = length || req.query.length;
+  let apiPath = '/rest/svc/random/string';
+  try {
+    if (length) {
+      const parsedLength = Number(length);
+      if (!Number.isFinite(parsedLength) || parsedLength < 0 || parsedLength > 10000) {
+        const authorized = res ? await verificationHelper.verifyPrivilege('adminandfluxteam', req) : true;
+        if (authorized !== true) {
+          const response = messageHelper.errUnauthorizedMessage();
+          return res ? res.json(response) : response;
+        }
+      }
+      apiPath += `?length=${length}`;
+    }
+    const response = await performRequest('get', apiPath);
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
+
+/**
+ * Returns the data sent in the anonymous usage report.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @returns {object} Message
+ */
+async function getSvcReport(req, res) {
+  try {
+    const response = await performRequest('get', '/rest/svc/report');
+    return res ? res.json(response) : response;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
 
 // === CUSTOM ===
 
@@ -1087,21 +2182,13 @@ async function getEvents({
  * Returns device id, also checks that syncthing is installed and running and we have the api key.
  * @returns {Promise<null | string>} Message
  */
-/**
- * One health probe of the local syncthing: it is up and configured when the
- * meta, health and ping endpoints all answer as expected. Reads no shared state
- * and sets no flag - the caller decides what a single result means.
- * @returns {Promise<{ok: boolean, deviceId: (string|null)}>}
- */
-async function probeSyncthing() {
-  // Serialised so concurrent callers do not each open three requests at once.
+async function getDeviceId() {
+  // not sure why this is necessary. If we only want one at a time, should implement a cache too.
   await asyncLock.enable();
 
-  let meta = null;
-  let healthy = null;
-  let pingResponse = null;
-
-  let deviceId = null;
+  let meta = {};
+  let healthy = {};
+  let pingResponse = {};
 
   try {
     // if aborted, axios will reject immediately, without any network activity
@@ -1109,79 +2196,36 @@ async function probeSyncthing() {
     healthy = await getHealth();
     // check that flux has proper api key
     pingResponse = await systemPing();
-    // Parsed in here too: a meta body that answers but does not parse is a
-    // failed probe, not an exception thrown at whoever asked.
-    if (meta && pingResponse?.ping === 'pong' && healthy?.status === 'OK') {
-      deviceId = JSON.parse(meta.slice(15).slice(0, -2)).deviceID || null;
-    }
   } catch {
     // do nothing
   } finally {
     asyncLock.disable();
   }
 
-  if (stc.aborted) return { ok: false, deviceId: null };
+  if (stc.aborted) return null;
 
-  return deviceId ? { ok: true, deviceId } : { ok: false, deviceId: null };
-}
-
-/**
- * The node's own syncthing device id. Immutable for the life of the install, so
- * it is read once and cached; peers asking for it (getDeviceIdApi) then cost a
- * lookup rather than three requests to syncthing. Does not touch the health flag
- * - advertising the id and judging syncthing's health are separate concerns.
- * @returns {Promise<string|null>} The device id, or null if syncthing has not
- *   yet answered since start.
- */
-async function getDeviceId() {
-  if (cachedDeviceId) return cachedDeviceId;
-
-  const { deviceId } = await probeSyncthing();
-  if (deviceId) cachedDeviceId = deviceId;
-  return cachedDeviceId;
-}
-
-/**
- * Probe syncthing and record the result. The sentinel calls this on its loop so
- * health reflects a deliberate schedule rather than whatever incoming peer
- * traffic last happened to trigger.
- *
- * Only a success is written, and it writes a time, not a verdict. There is
- * deliberately no "mark it down" branch to skip - see lastHealthyProbeAt.
- * @returns {Promise<boolean>} The probe result.
- */
-async function refreshSyncthingHealth() {
-  const { ok, deviceId } = await probeSyncthing();
-
-  if (ok) {
-    lastHealthyProbeAt = monotonicMs();
-    if (deviceId) cachedDeviceId = deviceId;
+  if (meta.status === 'success' && pingResponse.data?.ping === 'pong' && healthy.data?.status === 'OK') {
+    syncthingStatusOk = true;
+    const adjustedString = meta.data.slice(15).slice(0, -2);
+    const deviceObject = JSON.parse(adjustedString);
+    const { deviceID } = deviceObject;
+    return deviceID;
   }
 
-  // Said on the transition only. Every pass logging a failed probe would bury
-  // the moment the node actually stopped being usable.
-  //
-  // Against what was last REPORTED, not against a reading taken at the top of
-  // this same call. A derived state changes with the clock rather than with an
-  // event, so the two readings either side of one probe are the same reading
-  // almost every time: the window falls due between passes, not during one, and
-  // a comparison that narrow fires only if it expires inside the probe itself.
-  // Remembering what was said last is what makes arrival detectable at all, and
-  // it catches UNMEASURED -> UNHEALTHY too - a syncthing that never once
-  // answered, which is the more serious of the two.
-  const state = healthState(); // eslint-disable-line no-use-before-define
-  if (state !== lastReportedHealth) {
-    if (state === SYNCTHING_HEALTH.UNHEALTHY) {
-      log.error(`Syncthing has not answered a health probe for ${SYNCTHING_HEALTH_WINDOW_MS / 1000}s; marking syncthing not running`);
-    } else if (state === SYNCTHING_HEALTH.OK && lastReportedHealth === SYNCTHING_HEALTH.UNHEALTHY) {
-      // The other end of the same edge. Only from UNHEALTHY: a first probe
-      // landing after boot is the node starting up, not a recovery.
-      log.info('Syncthing answered a health probe; marking syncthing running');
-    }
-    lastReportedHealth = state;
-  }
+  syncthingStatusOk = false;
 
-  return ok;
+  // const { stdout } = await serviceHelper.runCommand('ps', {
+  //   params: ['-fC', 'syncthing'],
+  //   logError: false,
+  // });
+
+  // ToDo: tidy this up
+  log.error('Syncthing is either not running or misconfigured');
+  // log.error(stdout);
+  // log.error(meta);
+  // log.error(healthy);
+  // log.error(pingResponse);
+  return null;
 }
 
 /**
@@ -1202,48 +2246,11 @@ async function getDeviceIdApi(_, res) {
 }
 
 /**
- * What this node can say about syncthing. Derived, so anything that stops
- * probes landing - a broken repair path, a sentinel that never started, a dead
- * loop - reads as UNHEALTHY rather than as healthy, and anything that stops
- * measurement beginning reads as UNMEASURED rather than as either.
- * @returns {string} A SYNCTHING_HEALTH value.
- */
-function healthState() {
-  if (measurementStartedAt === null) return SYNCTHING_HEALTH.UNMEASURED;
-
-  if (lastHealthyProbeAt !== null) {
-    return monotonicMs() - lastHealthyProbeAt < SYNCTHING_HEALTH_WINDOW_MS
-      ? SYNCTHING_HEALTH.OK
-      : SYNCTHING_HEALTH.UNHEALTHY;
-  }
-
-  // Measuring, with nothing good yet: one window to land a first probe, and
-  // after that the silence is the answer. A legacy node whose syncthing binary
-  // is missing waits here for ever, so this is the arm that reports it.
-  return monotonicMs() - measurementStartedAt < SYNCTHING_HEALTH_WINDOW_MS
-    ? SYNCTHING_HEALTH.UNMEASURED
-    : SYNCTHING_HEALTH.UNHEALTHY;
-}
-
-/**
- * FluxOS is now the thing answering for syncthing's health, so from here
- * silence is a fault rather than an absence. The sentinel calls this before its
- * binary wait, not after: a legacy node missing the executable never leaves
- * that loop, and that is a node whose syncthing is broken, not one nobody has
- * looked at yet.
- */
-function noteMeasurementStarted() {
-  measurementStartedAt = monotonicMs();
-}
-
-/**
- * Whether syncthing is known to be up. Unmeasured is not up - nothing should
- * scrape or depend on a daemon no probe has reached - but it is not a fault
- * either, which is why fitness asks healthState instead.
- * @returns {Boolean}
+ * Returns if syncthing service is running ok
+ * @returns {Boolean} True if getDeviceId last execution was successful
  */
 function isRunning() {
-  return healthState() === SYNCTHING_HEALTH.OK;
+  return syncthingStatusOk;
 }
 
 /**
@@ -1280,72 +2287,6 @@ async function installSyncthingIdempotently() {
 }
 
 /**
- * The port syncthing listens on for its peers: two above the api port, eg 16129.
- * @returns {number}
- */
-function syncthingListenPort() {
-  // use env so can run this module as standalone for testing
-  const apiPort = process.env.FLUX_APIPORT || userconfig?.initial.apiport || config.server?.apiport;
-  return +apiPort + 2;
-}
-
-/**
- * What syncthing's listener for its peers on its port can be known to be: bound;
- * unable to bind, which syncthing reports as an error on that listener, or as no
- * listener there at all; or syncthing not running, which is its health verdict.
- */
-const SYNCTHING_LISTENER = {
-  LISTENING: 'listening',
-  CANNOT_LISTEN: 'cannotListen',
-  NOT_RUNNING: 'notRunning',
-};
-
-/**
- * Reads what syncthing's listener for its peers is now, from syncthing's own
- * status: null while that is not yet known.
- * @returns {Promise<string|null>} A SYNCTHING_LISTENER value, or null.
- */
-async function readListenerState() {
-  const status = await getSystemStatus().catch(() => null);
-  if (!status) {
-    // eslint-disable-next-line no-use-before-define
-    return healthState() === SYNCTHING_HEALTH.UNHEALTHY ? SYNCTHING_LISTENER.NOT_RUNNING : null;
-  }
-  // Syncthing reports a listener without an error only once it is bound.
-  const listener = status.connectionServiceStatus?.[`tcp://:${syncthingListenPort()}`];
-  if (!listener || listener.error) return SYNCTHING_LISTENER.CANNOT_LISTEN;
-  return SYNCTHING_LISTENER.LISTENING;
-}
-
-/**
- * Notes what syncthing's listener for its peers is, the first time that is known.
- * @returns {Promise<void>}
- */
-async function noteListenerState() {
-  if (listenerState) return;
-  const state = await readListenerState();
-  if (!state) return;
-  listenerState = state;
-  log.info(`Syncthing's listener for its peers on port ${syncthingListenPort()} is known: ${state}`);
-  fluxEventBus.publish('syncthing:listenerKnown', { state, port: syncthingListenPort() });
-  listenerStateEvents.emit('known', state);
-}
-
-/**
- * Calls `listener` with what syncthing's listener for its peers is, once that is
- * known: now, if it already is.
- * @param {function(string): void} listener Called with a SYNCTHING_LISTENER value.
- * @returns {void}
- */
-function onListenerStateKnown(listener) {
-  if (listenerState) {
-    listener(listenerState);
-    return;
-  }
-  listenerStateEvents.once('known', listener);
-}
-
-/**
  * Function that adjusts syncthing folders and restarts the service if needed
  * @returns {Promise<void>}
  */
@@ -1355,19 +2296,17 @@ async function adjustSyncthing() {
   log.info('Adjusting syncthing.');
 
   try {
-    // best effort, as before: a read that fails leaves that block's settings
-    // alone and the next pass retries, rather than abandoning the whole adjust
-    const currentConfigOptions = await getConfigOptions().catch(() => null);
-    const currentDefaultsFolderOptions = await getConfigDefaultsFolder().catch(() => null);
+    const currentConfigOptions = await getConfigOptions();
+    const currentDefaultsFolderOptions = await getConfigDefaultsFolder();
     // use env so can run this module as standalone for testing
-    const myPort = syncthingListenPort();
+    const apiPort = process.env.FLUX_APIPORT || userconfig?.initial.apiport || config.server?.apiport;
+    const myPort = +apiPort + 2; // end with 9 eg 16139
     // adjust configuration
     const newConfig = {
       globalAnnounceEnabled: false,
       localAnnounceEnabled: false,
       natEnabled: false, // let flux handle upnp and nat port mapping
-      // TCP alone - see syncthingMonitorHelpers.peerSyncthingAddresses.
-      listenAddresses: [`tcp://:${myPort}`],
+      listenAddresses: [`tcp://:${myPort}`, `quic://:${myPort}`],
     };
     const newConfigDefaultFolders = {
       syncOwnership: true,
@@ -1376,30 +2315,31 @@ async function adjustSyncthing() {
       sendXattrs: true,
       maxConflicts: 0,
     };
-    if (currentConfigOptions) {
-      if (currentConfigOptions.globalAnnounceEnabled !== newConfig.globalAnnounceEnabled
-        || currentConfigOptions.localAnnounceEnabled !== newConfig.localAnnounceEnabled
-        || currentConfigOptions.natEnabled !== newConfig.natEnabled
-        || serviceHelper.ensureString(currentConfigOptions.listenAddresses) !== serviceHelper.ensureString(newConfig.listenAddresses)) {
+    if (currentConfigOptions.status === 'success') {
+      if (currentConfigOptions.data.globalAnnounceEnabled !== newConfig.globalAnnounceEnabled
+        || currentConfigOptions.data.localAnnounceEnabled !== newConfig.localAnnounceEnabled
+        || currentConfigOptions.data.natEnabled !== newConfig.natEnabled
+        || serviceHelper.ensureString(currentConfigOptions.data.listenAddresses) !== serviceHelper.ensureString(newConfig.listenAddresses)) {
         // patch our config
         await adjustConfigOptions('patch', newConfig);
       }
     }
-    if (currentDefaultsFolderOptions) {
-      if (currentDefaultsFolderOptions.syncOwnership !== newConfigDefaultFolders.syncOwnership
-        || currentDefaultsFolderOptions.sendOwnership !== newConfigDefaultFolders.sendOwnership
-        || currentDefaultsFolderOptions.syncXattrs !== newConfigDefaultFolders.syncXattrs
-        || currentDefaultsFolderOptions.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
+    if (currentDefaultsFolderOptions.status === 'success') {
+      if (currentDefaultsFolderOptions.data.syncOwnership !== newConfigDefaultFolders.syncOwnership
+        || currentDefaultsFolderOptions.data.sendOwnership !== newConfigDefaultFolders.sendOwnership
+        || currentDefaultsFolderOptions.data.syncXattrs !== newConfigDefaultFolders.syncXattrs
+        || currentDefaultsFolderOptions.data.sendXattrs !== newConfigDefaultFolders.sendXattrs) {
         // patch our defaults folder config
         await adjustConfigDefaultsFolder('patch', newConfigDefaultFolders);
       }
     }
     // remove default folder
-    // best effort: a configuration that cannot be read leaves the default folder
-    // in place, exactly as an unsuccessful read did before
-    const allFolders = await getConfigFolders().catch(() => []);
-    if (allFolders.find((syncthingFolder) => syncthingFolder.id === 'default')) {
-      await adjustConfigFolders('delete', undefined, 'default');
+    const allFolders = await getConfigFolders();
+    if (allFolders.status === 'success') {
+      const defaultFolderExists = allFolders.data.find((syncthingFolder) => syncthingFolder.id === 'default');
+      if (defaultFolderExists) {
+        await adjustConfigFolders('delete', undefined, 'default');
+      }
     }
     // enable gui debugging for development nodes only
     if (config.development) {
@@ -1415,6 +2355,10 @@ async function adjustSyncthing() {
         }
       }
     }
+    const restartRequired = await getConfigRestartRequired();
+    if (restartRequired.status === 'success' && restartRequired.data.requiresRestart === true) {
+      await systemRestart();
+    }
   } catch (error) {
     log.error(error);
   }
@@ -1427,124 +2371,72 @@ async function adjustSyncthing() {
 async function configureDirectories() {
   if (stc.aborted) return;
 
+  const homedir = os.homedir();
+  const configDir = path.join(homedir, '.config');
+  const syncthingDir = path.join(configDir, 'syncthing');
+
   const user = os.userInfo().username;
   const owner = `${user}:${user}`;
 
   await serviceHelper.runCommand('mkdir', {
-    params: ['-p', syncthingHomeDir()],
+    params: ['-p', syncthingDir],
   });
 
-  // eslint-disable-next-line no-restricted-syntax
-  for (const dir of syncthingOwnedDirs()) {
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.runCommand('chown', {
-      runAsRoot: true,
-      params: [owner, dir],
-    });
-  }
-}
-
-/**
- * The node's own syncthing device id as already read, without asking syncthing.
- * The sentinel reads it on every pass; null until syncthing has first answered,
- * and again from a stop until it answers after it.
- * @returns {string|null}
- */
-function heldDeviceId() {
-  return cachedDeviceId;
-}
-
-// Syncthing's graceful stop sends each peer connection a close message and
-// waits up to protocol.CloseTimeout - ten seconds - for it to go out, so a
-// stop given less than that can find it still running.
-const SYNCTHING_STOP_TIMEOUT_MS = 15 * 1000;
-const SYNCTHING_KILL_TIMEOUT_MS = 5 * 1000;
-const SYNCTHING_EXIT_POLL_MS = 250;
-
-/**
- * The pgrep and pkill match for a syncthing in the host's PID namespace. An
- * app container's syncthing runs in its own, and is the app's. Run as root: a
- * non-root pgrep cannot read a root process's namespace, and matches nothing.
- * @returns {string[]}
- */
-function hostSyncthingMatch() {
-  return ['-x', 'syncthing', '--ns', '1', '--nslist', 'pid'];
-}
-
-/**
- * The syncthing processes running in the host's PID namespace.
- * @returns {Promise<string[]>}
- */
-async function hostSyncthingPids() {
-  const { stdout } = await serviceHelper.runCommand('pgrep', {
+  await serviceHelper.runCommand('chown', {
     runAsRoot: true,
-    params: hostSyncthingMatch(),
-    logError: false,
+    params: [owner, configDir],
   });
-  return (stdout ?? '').split('\n').map((pid) => pid.trim()).filter(Boolean);
+
+  await serviceHelper.runCommand('chown', {
+    runAsRoot: true,
+    params: [owner, syncthingDir],
+  });
 }
 
 /**
- * Whether a syncthing process is running in the host's PID namespace.
- * @returns {Promise<boolean>}
- */
-async function syncthingProcessRunning() {
-  return (await hostSyncthingPids()).length > 0;
-}
-
-/**
- * Waits for every syncthing process to exit.
- * @param {number} timeoutMs
- * @returns {Promise<boolean>} Whether none is left; false at the timeout, or
- *   once the controller is aborted.
- */
-async function syncthingExitsWithin(timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  // eslint-disable-next-line no-await-in-loop
-  while (await syncthingProcessRunning()) {
-    if (stc.aborted || Date.now() >= deadline) return false;
-    // eslint-disable-next-line no-await-in-loop
-    await serviceHelper.delay(SYNCTHING_EXIT_POLL_MS);
-  }
-  return true;
-}
-
-/**
- * Stops syncthing if it is running, and returns once it has exited: a syncthing
- * started while the last one still holds its lock exits at once.
- *
- * Throws when it is still running after SIGKILL, so nothing is started beside it.
+ * Stops syncthing if it is running.
  * @returns {Promise<void>}
  */
 async function stopSyncthing() {
-  // The device id is derived from syncthing's cert; a stop is the only window in
-  // which that cert could be replaced, so the cached id is dropped here.
-  cachedDeviceId = null;
-  // The next syncthing is a new process, announced in its turn.
-  ownersByNumberAnnounced = false;
   if (stc.aborted) return;
 
-  if (!(await syncthingProcessRunning())) return;
+  const { stdout: syncthingRunningA } = await serviceHelper.runCommand('pgrep', {
+    params: ['syncthing'],
+    logError: false,
+  });
+
+  if (!syncthingRunningA) return;
 
   log.info('Stopping syncthing service gracefully');
-  await serviceHelper.runCommand('pkill', {
+
+  // killall will error if process not found (Sends SIGTERM by default)
+  await serviceHelper.runCommand('killall', {
     runAsRoot: true,
-    params: hostSyncthingMatch(),
+    params: ['syncthing'],
     logError: false,
   });
-  if (await syncthingExitsWithin(SYNCTHING_STOP_TIMEOUT_MS)) return;
-  if (stc.aborted) return;
 
-  log.warn(`Syncthing is still running ${SYNCTHING_STOP_TIMEOUT_MS / 1000}s after SIGTERM; sending SIGKILL`);
+  // pkill will error if process not found (Sends SIGTERM by default)
   await serviceHelper.runCommand('pkill', {
     runAsRoot: true,
-    params: ['-KILL', ...hostSyncthingMatch()],
+    params: ['syncthing'],
     logError: false,
   });
-  if (await syncthingExitsWithin(SYNCTHING_KILL_TIMEOUT_MS)) return;
-  if (stc.aborted) return;
 
-  throw new Error(`Syncthing is still running ${SYNCTHING_KILL_TIMEOUT_MS / 1000}s after SIGKILL; not starting another`);
+  await serviceHelper.delay(1 * 1000);
+
+  const { stdout: syncthingRunningB } = await serviceHelper.runCommand('pgrep', {
+    params: ['syncthing'],
+    logError: false,
+  });
+
+  if (syncthingRunningB) {
+    log.info('Sending SIGKILL to syncthing service');
+    await serviceHelper.runCommand('kill', {
+      runAsRoot: true,
+      params: ['-9', 'syncthing'],
+    });
+  }
 }
 
 /**
@@ -1558,217 +2450,25 @@ async function stopSyncthingSentinel() {
   axiosCache.reset();
   // Stop metrics collection
   stopMetricsCollection(); // eslint-disable-line no-use-before-define
-  // Cleared last: a start arriving during the stop is a second sentinel beside
-  // the one being torn down.
-  sentinelStarted = false;
   log.info('Syncthing sentinel stopped');
 }
 
-// syncthing resolves owners against the numeric id tables (numericIdTables.js)
-// in place of the host's user and group names, so every owner travels as its
-// number and a change of owner alone is a change. It runs in a mount namespace
-// of its own with the tables bound over /etc/passwd and /etc/group, and starts
-// only once both are bound. The table paths are "$1" and "$2", and syncthing's
-// own arguments follow them.
-//
-// The namespace is a slave of the host's, so an app volume mounted after
-// syncthing starts reaches it, and its own binds reach nothing else. A slave
-// receives only from a shared mount, which systemd makes of every mount at boot
-// and FluxOS makes of the one holding the app volumes where it is not.
-const NUMERIC_ID_SYNCTHING = 'mount --bind "$1" /etc/passwd && mount --bind "$2" /etc/group && shift 2 && exec syncthing "$@"';
-
 /**
- * Where this node keeps the numeric id tables syncthing is given.
- * @returns {{dir: string, passwd: string, group: string}}
- */
-function numericIdTablePaths() {
-  const dir = path.join(syncthingHomeDir(), 'numeric-ids');
-  return { dir, passwd: path.join(dir, 'passwd'), group: path.join(dir, 'group') };
-}
-
-/**
- * Writes the numeric id tables unless both are already on disk as
- * TABLES_SHA256 names them.
- * @param {'start'|'launch'} moment The sentinel's first pass, or a launch of syncthing
- * @returns {Promise<void>}
- */
-async function ensureNumericIdTables(moment) {
-  const tables = numericIdTablePaths();
-  await fs.mkdir(tables.dir, { recursive: true });
-  const [passwd, group] = await Promise.all([
-    fs.readFile(tables.passwd, 'utf8').catch(() => null),
-    fs.readFile(tables.group, 'utf8').catch(() => null),
-  ]);
-  if (passwd === null || group === null || tablesSha256(passwd, group) !== TABLES_SHA256) {
-    await fs.writeFile(tables.passwd, passwdTable());
-    await fs.writeFile(tables.group, groupTable());
-  }
-  numericIdTablesChecked = true;
-  fluxEventBus.count('syncthing:idTablesChecked', moment);
-}
-
-/**
- * What the syncthing processes running in the host's PID namespace resolve
- * owners against, read through each process's own view of the filesystem.
- * @returns {Promise<'numeric'|'names'|'absent'|'unknown'>} numeric when every
- *   process's passwd and group are this node's numeric id tables, names when
- *   any process's are not, absent when none runs, unknown when the answer
- *   could not be read.
- */
-async function syncthingOwnerView() {
-  const pids = await hostSyncthingPids();
-  if (!pids.length) return 'absent';
-
-  // A bind mount is the file itself: same device, same inode.
-  const tables = numericIdTablePaths();
-  const seen = pids.flatMap((pid) => [`/proc/${pid}/root/etc/passwd`, `/proc/${pid}/root/etc/group`]);
-  const { stdout, error } = await serviceHelper.runCommand('stat', {
-    runAsRoot: true,
-    params: ['-L', '-c', '%d:%i', tables.passwd, tables.group, ...seen],
-    logError: false,
-  });
-  // A process that exited between the two reads is not evidence either way.
-  if (error) return 'unknown';
-  const [passwdId, groupId, ...processIds] = stdout.trim().split('\n');
-  const bound = processIds.every((id, i) => id === (i % 2 === 0 ? passwdId : groupId));
-  return bound ? 'numeric' : 'names';
-}
-
-/**
- * Announces, once per syncthing process, that it resolves owners by number.
- */
-function noteOwnersByNumber() {
-  if (ownersByNumberAnnounced) return;
-  ownersByNumberAnnounced = true;
-  log.info('Syncthing resolves owners against the numeric id tables; folder ownership travels by number');
-  fluxEventBus.publish('syncthing:ownersByNumber', {});
-}
-
-/**
- * Why a private mount namespace cannot give syncthing the numeric id tables
- * here, asked by trying the first bind on its own.
- * @param {{passwd: string}} tables
- * @returns {Promise<string>}
- */
-async function numericIdLaunchFailure(tables) {
-  const { error } = await serviceHelper.runCommand('unshare', {
-    runAsRoot: true,
-    params: ['--mount', '--propagation', 'slave', 'mount', '--bind', tables.passwd, '/etc/passwd'],
-    logError: false,
-  });
-  return error ? error.message : 'a private mount namespace with the numeric id tables can be made, and syncthing still did not start';
-}
-
-/**
- * The path itself when it exists, otherwise its nearest ancestor that does.
- * @param {string} target
- * @returns {Promise<string>}
- */
-async function nearestExistingPath(target) {
-  let candidate = target;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      await fs.stat(candidate);
-      return candidate;
-    } catch {
-      const parent = path.dirname(candidate);
-      if (parent === candidate) return candidate;
-      candidate = parent;
-    }
-  }
-}
-
-/**
- * The mount that holds, or will hold, the app volumes, and how it propagates:
- * shared when a volume mounted on it later reaches a namespace that is its
- * slave.
- * @returns {Promise<{target: string, propagation: string}|null>} findmnt's
- *   TARGET and PROPAGATION fields, or null when unreadable
- */
-async function appVolumesMount() {
-  const { stdout, error } = await serviceHelper.runCommand('findmnt', {
-    params: ['-J', '-o', 'TARGET,PROPAGATION', '-T', await nearestExistingPath(appsFolderPath)],
-    logError: false,
-  });
-  if (error) return null;
-  try {
-    const [mount] = JSON.parse(stdout).filesystems;
-    return mount?.target ? { target: mount.target, propagation: mount.propagation ?? '' } : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * The mount that holds the app volumes, made shared when it is not: on every
- * node that can mount an app volume, FluxOS has the privilege to. That mount
- * alone: every app volume is mounted directly on it, and the mounts below it
- * keep their own propagation.
- * @returns {Promise<{target: string, propagation: string}|null>} as appVolumesMount
- */
-async function sharedAppVolumesMount() {
-  const isShared = (mount) => Boolean(mount?.propagation.split(',').includes('shared'));
-  const mount = await appVolumesMount();
-  if (!mount || isShared(mount)) return mount;
-  const { error } = await serviceHelper.runCommand('mount', {
-    runAsRoot: true,
-    params: ['--make-shared', mount.target],
-    logError: false,
-  });
-  if (error) {
-    log.warn(`The mount ${mount.target} propagates as '${mount.propagation}' and could not be made shared: ${error.message}`);
-    return mount;
-  }
-  log.info(`Made the mount ${mount.target} shared, from '${mount.propagation}', so app volumes mounted after syncthing starts reach it`);
-  fluxEventBus.count('syncthing:appVolumesMountShared');
-  return appVolumesMount();
-}
-
-/**
- * Keeps the supervised syncthing up, and resolving owners against the numeric
- * id tables. A syncthing that answers but resolves them against anything else
- * is replaced like one that does not answer.
+ * Temporary function until moved over to Arcane
  * @param {boolean} installed If syncthing is installed
  * @returns {Promise<void>}
  */
 async function ensureSyncthingRunning(installed) {
-  const tables = numericIdTablePaths();
-  // The owner view below compares syncthing's passwd and group with these
-  // files, so they exist before it is first read.
-  const checkedAtStart = !numericIdTablesChecked;
-  if (checkedAtStart) await ensureNumericIdTables('start');
-  if (installed && (await probeSyncthing()).ok) {
-    const view = await syncthingOwnerView();
-    if (view === 'numeric') {
-      noteOwnersByNumber();
-      return;
-    }
-    if (view !== 'names') return;
-    log.warn('Syncthing is running with the host\'s user and group names. Restarting it with the numeric id tables.');
-    fluxEventBus.publish('syncthing:namesVisible', {});
-  } else {
-    log.error('Unable to get syncthing deviceId. Reconfiguring syncthing.');
-  }
+  if (installed && await getDeviceId()) return;
+
+  log.error('Unable to get syncthing deviceId. Reconfiguring syncthing.');
   await stopSyncthing();
   await installSyncthingIdempotently();
   await configureDirectories();
 
-  const syncthingHome = syncthingHomeDir();
+  const homedir = os.homedir();
+  const syncthingHome = path.join(homedir, '.config/syncthing');
   const logFile = path.join(syncthingHome, 'syncthing.log');
-
-  // A syncthing that cannot see the volumes mounted after it starts would sync
-  // the bare mountpoints beneath them.
-  const appVolumes = await sharedAppVolumesMount();
-  const propagation = appVolumes?.propagation;
-  if (!propagation?.split(',').includes('shared')) {
-    fluxEventBus.count('syncthing:launchFailed');
-    log.error(`Syncthing is not started: the mount holding ${appsFolderPath} propagates as '${propagation ?? 'unreadable'}', not shared, so app volumes mounted after syncthing starts would never reach it`);
-    return;
-  }
-
-  if (!checkedAtStart) await ensureNumericIdTables('launch');
 
   log.info('Spawning Syncthing instance...');
 
@@ -1777,29 +2477,40 @@ async function ensureSyncthingRunning(installed) {
   // whatever the operator installed as.
   // this can throw
 
-  // Started through a shell that backgrounds it and exits, so syncthing is not
-  // a descendant of FluxOS. pm2 stops and restarts FluxOS by signalling every
-  // process in its tree, and syncthing has to keep running through that: across
-  // a restart, and through the drain FluxOS runs over it while it shuts down.
-  // Started paused: every folder and device waits for the monitor, which resumes
-  // the devices and unpauses each folder once its role is decided.
+  // having issues with nodemon and pm2. Using pm2 --no-treekill stops syncthing getting
+  // killed, but then get issues with nodemon not dying.
+
+  // adding old spawn with shell in the interim.
+
   childProcess.spawn(
-    // Quoted: every path comes from SYNCTHING_PATH, and this runs through a shell.
-    `sudo nohup unshare --mount --propagation slave sh -c '${NUMERIC_ID_SYNCTHING}' syncthing '${tables.passwd}' '${tables.group}' `
-    + `--logfile '${logFile}' --logflags=3 --log-max-old-files=2 --log-max-size=26214400 --allow-newer-config --no-browser --paused --home '${syncthingHome}' >/dev/null 2>&1 </dev/null &`,
+    `sudo nohup syncthing --logfile ${logFile} --logflags=3 --log-max-old-files=2 --log-max-size=26214400 --allow-newer-config --no-browser --home ${syncthingHome} >/dev/null 2>&1 </dev/null &`,
     { shell: true },
   ).unref();
 
+  // childProcess.spawn(
+  //   'sudo',
+  //   [
+  //     'nohup',
+  //     'syncthing',
+  //     '--logfile',
+  //     logFile,
+  //     '--logflags=3',
+  //     '--log-max-old-files=2',
+  //     '--log-max-size=26214400',
+  //     '--allow-newer-config',
+  //     '--no-browser',
+  //     '--home',
+  //     syncthingHome,
+  //   ],
+  //   {
+  //     detached: true,
+  //     stdio: 'ignore',
+  //     // uid: 0,
+  //   },
+  // ).unref();
+
   // let syncthing set itself up
   await stc.sleep(5 * 1000);
-
-  const view = await syncthingOwnerView();
-  if (view === 'numeric') {
-    noteOwnersByNumber();
-  } else if (view === 'absent') {
-    fluxEventBus.count('syncthing:launchFailed');
-    log.error(`Syncthing did not start with the numeric id tables: ${await numericIdLaunchFailure(tables)}`);
-  }
 }
 
 /**
@@ -1815,14 +2526,9 @@ async function runSyncthingSentinel() {
   }
 
   try {
-    if (fluxosSupervisesSyncthing) {
+    if (!isArcane) {
       await ensureSyncthingRunning(installed);
-      fluxEventBus.count('syncthing:supervisionPass');
     }
-
-    // The health signal is maintained here, deliberately, on every node type -
-    // not as a side effect of peer deviceid requests, and not skipped on Arcane.
-    await refreshSyncthingHealth();
 
     if (stc.aborted) return 0;
 
@@ -1833,38 +2539,23 @@ async function runSyncthingSentinel() {
       await adjustSyncthing();
     }
 
-    await noteListenerState();
-
-    return SYNCTHING_SENTINEL_INTERVAL_MS;
+    return 60 * 1000;
   } catch (error) {
     if (error.name === 'AbortError') return 0;
 
-    await noteListenerState();
-
     log.error(error);
-    return 2 * SYNCTHING_SENTINEL_INTERVAL_MS;
+    return 2 * 60 * 1000;
   } finally {
     stc.lock.disable();
   }
 }
 
 /**
- * Starts the main syncthing monitoring loop. Start-once, because boot asks more
- * than once: startFluxFunctions retries itself every 15s after a throw and each
- * retry arrives here. The loop and the metrics interval already refuse a second
- * start; the stamp and the binary wait above them do not, so the guard sits at
- * the top. Restarting the window on every retry would leave a node whose
- * syncthing never answered permanently unmeasured - the one state that refuses
- * nobody - and stack another binary waiter on each pass.
- * @returns {Promise<void>}
+ * Starts the main syncthing monitoring loop
+ * @returns {<void>}
  */
 async function startSyncthingSentinel() {
-  if (sentinelStarted) return;
-  sentinelStarted = true;
-
-  noteMeasurementStarted();
-
-  while (fluxosSupervisesSyncthing && !syncthingBinaryPresent) {
+  while (!isArcane && !syncthingBinaryPresent) {
     // eslint-disable-next-line no-await-in-loop
     const { error } = await serviceHelper.runCommand('syncthing', { logError: false, params: ['--version'] });
 
@@ -1882,56 +2573,11 @@ async function startSyncthingSentinel() {
 }
 
 /**
- * Test helper: puts the node in a measured state and moves the last-healthy
- * stamp so isRunning() answers `value`.
+ * Test helper
  * @param {Boolean} value
  */
 function setSyncthingRunningState(value) {
-  measurementStartedAt = monotonicMs() - SYNCTHING_HEALTH_WINDOW_MS;
-  lastHealthyProbeAt = value ? monotonicMs() : monotonicMs() - SYNCTHING_HEALTH_WINDOW_MS;
-  lastReportedHealth = value ? SYNCTHING_HEALTH.OK : SYNCTHING_HEALTH.UNHEALTHY;
-}
-
-/**
- * Test helper: unsets the measurement stamp and the start latch, as on a node
- * whose sentinel has not started.
- */
-function setSyncthingUnmeasured() {
-  measurementStartedAt = null;
-  lastHealthyProbeAt = null;
-  lastReportedHealth = SYNCTHING_HEALTH.UNMEASURED;
-  sentinelStarted = false;
-}
-
-/**
- * Test helper: sets whether this process has checked the numeric id tables.
- * @param {boolean} value
- */
-function setNumericIdTablesChecked(value) {
-  numericIdTablesChecked = value;
-}
-
-/**
- * Test helper: sets whether the running syncthing has been announced as
- * resolving no names.
- * @param {boolean} value
- */
-function setOwnersByNumberAnnounced(value) {
-  ownersByNumberAnnounced = value;
-}
-
-function setListenerState(value) {
-  listenerState = value;
-}
-
-/**
- * Test helper: clears the cached device id and restores the health window.
- */
-function resetDeviceIdCache() {
-  cachedDeviceId = null;
-  measurementStartedAt = monotonicMs() - SYNCTHING_HEALTH_WINDOW_MS;
-  lastHealthyProbeAt = monotonicMs();
-  lastReportedHealth = SYNCTHING_HEALTH.OK;
+  syncthingStatusOk = value;
 }
 
 // handy for testing
@@ -2156,19 +2802,6 @@ async function collectSyncthingMetrics() {
                   errors,
                 };
                 metrics.overall.issues.push(`Folder ${folder.label || folderId} has ${errors + pullErrors} error(s)`);
-                // The counts alone cannot be diagnosed from a log dump -
-                // surface the file-level causes, bounded so a sick folder
-                // cannot flood the log.
-                // eslint-disable-next-line no-await-in-loop
-                const folderErrorsResponse = await getFolderIdErrors(folderId);
-                const fileErrors = folderErrorsResponse.status === 'success' ? (folderErrorsResponse.data?.errors ?? []) : [];
-                const shown = fileErrors.slice(0, 5);
-                shown.forEach((fileError) => {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileError.path}: ${fileError.error}`);
-                });
-                if (fileErrors.length > shown.length) {
-                  log.error(`Syncthing folder ${folder.label || folderId}: ${fileErrors.length - shown.length} further file error(s) not shown`);
-                }
               }
             }
           } catch (error) {
@@ -2198,22 +2831,14 @@ async function collectSyncthingMetrics() {
       metrics.overall.issues.push(`Failed to collect folder metrics: ${error.message}`);
     }
 
-    // Drain syncthing's system error buffer. The buffer is cumulative for
-    // the daemon's lifetime and the daemon outlives FluxOS restarts, so each
-    // entry is an occurrence, not a state: log its content, clear the
-    // buffer, and report unhealthy only for the pass the errors arrived in.
+    // Collect system errors
     try {
       const errorsResponse = await performRequest('get', '/rest/system/error');
-      if (errorsResponse.status === 'success' && errorsResponse.data?.errors?.length) {
+      if (errorsResponse.status === 'success' && errorsResponse.data?.errors) {
         metrics.errors.system = errorsResponse.data.errors;
-        metrics.overall.healthy = false;
-        metrics.overall.issues.push(`${metrics.errors.system.length} syncthing system error(s) this pass`);
-        metrics.errors.system.forEach((systemError) => {
-          log.error(`Syncthing system error at ${systemError.when}: ${systemError.message}`);
-        });
-        const clearResponse = await performRequest('post', '/rest/system/error/clear');
-        if (clearResponse.status !== 'success') {
-          log.warn(`Failed to clear syncthing system errors, they will re-log next pass: ${clearResponse.data?.message}`);
+        if (metrics.errors.system.length > 0) {
+          metrics.overall.healthy = false;
+          metrics.overall.issues.push(`${metrics.errors.system.length}`);
         }
       }
     } catch (error) {
@@ -2252,7 +2877,7 @@ function saveMetricsSnapshot(metrics) {
  */
 async function getSyncthingMetrics(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const metrics = await collectSyncthingMetrics();
@@ -2260,11 +2885,11 @@ async function getSyncthingMetrics(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2276,7 +2901,7 @@ async function getSyncthingMetrics(req, res) {
  */
 async function getSyncthingHealthSummary(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const metrics = await collectSyncthingMetrics();
@@ -2312,11 +2937,11 @@ async function getSyncthingHealthSummary(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2328,7 +2953,7 @@ async function getSyncthingHealthSummary(req, res) {
  */
 async function getSyncthingMetricsHistory(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       let { limit } = req.params;
@@ -2344,11 +2969,11 @@ async function getSyncthingMetricsHistory(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2358,7 +2983,7 @@ async function getSyncthingMetricsHistory(req, res) {
  */
 async function collectAndSaveMetrics() {
   try {
-    if (!isRunning()) {
+    if (!syncthingStatusOk) {
       log.debug('Syncthing not running, skipping metrics collection');
       return undefined;
     }
@@ -2686,7 +3311,7 @@ async function getPeerSyncDiagnostics() {
  */
 async function getPeerSyncDiagnosticsApi(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    const authorized = res ? await verificationHelper.verifyPrivilege('fluxteam', req) : true;
     let response = null;
     if (authorized === true) {
       const diagnostics = await getPeerSyncDiagnostics();
@@ -2694,11 +3319,11 @@ async function getPeerSyncDiagnosticsApi(req, res) {
     } else {
       response = messageHelper.errUnauthorizedMessage();
     }
-    return res.json(response);
+    return res ? res.json(response) : response;
   } catch (error) {
     log.error(error);
     const errorResponse = messageHelper.createErrorMessage(error.message, error.name, error.code);
-    return res.json(errorResponse);
+    return res ? res.json(errorResponse) : errorResponse;
   }
 }
 
@@ -2706,69 +3331,102 @@ module.exports = {
   startSyncthingSentinel,
   stopSyncthingSentinel,
   getDeviceId,
-  getSystemStatus,
   getDeviceIdApi,
-  probeSyncthing,
-  refreshSyncthingHealth,
-  heldDeviceId,
-  supervisesSyncthing,
-  ownsSyncthing,
   getMeta,
   getHealth,
+  statsDevice,
+  statsFolder,
+  systemBrowse,
+  systemConnections,
+  systemDiscovery,
+  systemDebug,
+  systemErrorClear,
+  systemError,
+  postSystemError,
+  systemLog,
+  systemLogTxt,
+  systemPaths,
   systemPause,
+  systemReset,
+  systemResetFolderId,
   systemRestart,
   systemResume,
+  systemShutdown,
+  systemStatus,
+  systemUpgrade,
+  postSystemUpgrade,
   systemVersion,
   systemPing,
   syncthingController,
   // CONFIG
   getConfig,
+  postConfig,
+  getConfigRestartRequired,
   getConfigFolders,
   getConfigDevices,
+  postConfigFolders,
+  postConfigDevices,
+  getConfigDefaultsFolder,
+  getConfigDefaultsDevice,
+  postConfigDefaultsFolder,
+  postConfigDefaultsDevice,
+  getConfigDefaultsIgnores,
+  postConfigDefaultsIgnores,
+  getConfigOptions,
+  getConfigGui,
+  getConfigLdap,
+  postConfigOptions,
+  postConfigGui,
+  postConfigLdap,
   // Cluster
+  getClusterPendigDevices,
+  postClusterPendigDevices,
+  getClusterPendigFolders,
+  postClusterPendigFolders,
   // Folder
   getFolderIdErrors,
+  getFolderErrors,
+  getFolderVersions,
+  postFolderVersions,
   // DATABASE ENDPOINTS
+  getDbBrowse,
   getDbCompletion,
-  getFolderIgnores,
-  setFolderIgnores,
+  getDbFile,
+  getDbIgnores,
+  getDbLocalchanged,
+  getDbNeed,
+  getDbRemoteNeed,
   getDbStatus,
-  getDbStatusInFileBytes,
-  nonFileEntryBytes,
-  nonFileEntryBytesForVersion,
-  statusInFileBytes,
-  getDbLocalChanged,
-  eachDbLocalChanged,
+  postDbIgnores,
+  postDbOverride,
+  postDbPrio,
+  postDbRevert,
   dbRevert,
-  drainFoldersToPeers,
-  getDeviceStats,
-  scanFolder,
+  postDbScan,
   // EVENTS
   getEvents,
+  getEventsDisk,
   // MISC
+  getSvcDeviceID,
+  getSvcRandomString,
+  getSvcReport,
   // DEBUG
+  debugCpuprof,
+  debugFile,
+  debugHttpmetrics,
+  debugHeapprof,
+  debugPeerCompletion,
+  debugSupport,
   // helpers
   adjustConfigFolders,
   adjustConfigDevices,
   // status
   isRunning,
-  onListenerStateKnown,
-  SYNCTHING_LISTENER,
-  healthState,
-  syncthingHomeDir,
-  SYNCTHING_HEALTH,
-  noteMeasurementStarted,
   // testing exports
   getAxiosCache,
   configureDirectories,
   installSyncthingIdempotently,
   setSyncthingRunningState,
-  setSyncthingUnmeasured,
-  setNumericIdTablesChecked,
-  setOwnersByNumberAnnounced,
-  setListenerState,
-  noteListenerState,
-  resetDeviceIdCache,
   adjustSyncthing,
   getConfigFile,
   runSyncthingSentinel,

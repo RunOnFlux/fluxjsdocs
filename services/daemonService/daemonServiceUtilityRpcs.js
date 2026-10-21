@@ -2,7 +2,6 @@ const messageHelper = require('../messageHelper');
 const daemonServiceUtils = require('./daemonServiceUtils');
 const serviceHelper = require('../serviceHelper');
 const verificationHelper = require('../verificationHelper');
-const { Privilege, authOf } = require('../utils/privileges');
 
 let response = messageHelper.createErrorMessage();
 
@@ -26,7 +25,7 @@ async function createMultiSig(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -75,7 +74,7 @@ async function estimateFee(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -96,7 +95,7 @@ async function estimatePriority(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -123,7 +122,7 @@ async function validateAddress(req, res) {
     return response;
   }
 
-  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
+  const authorized = await verificationHelper.verifyPrivilege('admin', req);
   if (authorized !== true) {
     delete response.data.ismine;
     delete response.data.iswatchonly;
@@ -151,7 +150,7 @@ async function verifyMessage(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 /**
@@ -197,7 +196,7 @@ async function zValidateAddress(req, res) {
   }
   response = await daemonServiceUtils.executeCall(rpccall, rpcparameters);
 
-  return res.json(response);
+  return res ? res.json(response) : response;
 }
 
 module.exports = {

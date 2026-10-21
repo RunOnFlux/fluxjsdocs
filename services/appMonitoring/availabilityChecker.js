@@ -4,6 +4,7 @@ const config = require('config');
 const serviceHelper = require('../serviceHelper');
 const generalService = require('../generalService');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
+const verificationHelper = require('../verificationHelper');
 const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const upnpService = require('../upnpService');
 const networkStateService = require('../networkStateService');
@@ -11,7 +12,13 @@ const fluxHttpTestServer = require('../utils/fluxHttpTestServer');
 const { decryptEnterpriseApps } = require('../appQuery/appQueryService');
 const log = require('../../lib/log');
 const { extractIp, extractPort } = require('../utils/socketAddressUtils');
-const { nodeSigner } = require('../utils/nodeSigner');
+
+// Helper function to sign check app data
+async function signCheckAppData(message) {
+  const privKey = await fluxNetworkHelper.getFluxNodePrivateKey();
+  const signature = await verificationHelper.signMessage(message, privKey);
+  return signature;
+}
 
 // Helper function to handle test shutdown
 async function handleTestShutdown(testingPort, testHttpServer, isArcane, options = {}) {
@@ -26,7 +33,7 @@ async function handleTestShutdown(testingPort, testHttpServer, isArcane, options
 
   if (updateFirewall) {
     await fluxNetworkHelper
-      .deleteTestPortRule(testingPort)
+      .deleteAllowPortRule(testingPort)
       .catch((e) => log.error(e));
   }
 
@@ -45,101 +52,6 @@ async function handleTestShutdown(testingPort, testHttpServer, isArcane, options
   }
 }
 
-const UPNP_DOS_MESSAGE = 'Not possible to run applications on the node, router returning exceptions when creating UPNP ports mappings';
-const PORTS_DOS_MESSAGE_PREFIX = 'Ports tested not reachable from outside';
-
-/**
- * Whether the node's DOS message is this check's. There is one message for every
- * reason a node can be out of service, so this check sets it only when none
- * stands and clears only its own.
- * @param {string|null} message The node's DOS message.
- * @returns {boolean}
- */
-function isOwnDosMessage(message) {
-  return Boolean(message) && (message === UPNP_DOS_MESSAGE || message.startsWith(PORTS_DOS_MESSAGE_PREFIX));
-}
-
-/**
- * Counts one failure of this check toward its own DOS, kept apart from the node's
- * so another check clearing the node's DOS does not reset it. Once the count
- * reaches the DOS threshold the node is out of service with `message`, unless
- * another check's DOS already stands.
- * @param {object} dosState
- * @param {number} threshold
- * @param {string} message
- * @returns {boolean} Whether this check holds the node's DOS now.
- */
-function countPortFailure(dosState, threshold, message) {
-  // eslint-disable-next-line no-param-reassign
-  dosState.portFailureScore = Math.min((dosState.portFailureScore ?? 0) + 4, threshold);
-  if (dosState.portFailureScore < threshold) return false;
-  if (dosState.dosMessage && !isOwnDosMessage(dosState.dosMessage)) return false;
-  // eslint-disable-next-line no-param-reassign
-  dosState.dosMessage = message;
-  // eslint-disable-next-line no-param-reassign
-  dosState.dosStateValue = Math.max(dosState.dosStateValue, threshold);
-  return true;
-}
-
-/**
- * Ends this check's count, and the node's DOS when it is this check's, now that
- * every port it tests is reachable.
- * @param {object} dosState
- * @returns {void}
- */
-function releaseOwnDos(dosState) {
-  // eslint-disable-next-line no-param-reassign
-  dosState.portFailureScore = 0;
-  if (!isOwnDosMessage(dosState.dosMessage)) return;
-  // eslint-disable-next-line no-param-reassign
-  dosState.dosMessage = null;
-  // eslint-disable-next-line no-param-reassign
-  dosState.dosStateValue = 0;
-}
-
-let wakeNextPass = null;
-
-/**
- * Waits `ms` before the next pass, or less: the router refusing a mapping, a
- * UPnP removal becoming pending, or the last one going, starts the next pass at
- * once. Every wait between passes is this one, and a wake only ends it: there
- * is never more than one pass.
- * @param {number} ms
- * @returns {Promise<void>}
- */
-async function waitForNextPass(ms) {
-  const woken = new Promise((resolve) => { wakeNextPass = resolve; });
-  await Promise.race([serviceHelper.delay(ms), woken]);
-  wakeNextPass = null;
-}
-
-/**
- * Starts the next pass now, if the check is waiting for it.
- */
-function wakeCheck() {
-  if (wakeNextPass) wakeNextPass();
-}
-
-upnpService.routerEvents.on('mappingRefused', wakeCheck);
-upnpService.routerEvents.on('removalPending', wakeCheck);
-upnpService.routerEvents.on('removalsClear', wakeCheck);
-
-/**
- * Whether the router has refused a mapping for a reason of its own - a full
- * table, no answer - since this check last asked: any mapping, an install's, a
- * restore's or this check's own. Read once per pass, so a pass counts once
- * however many it refused.
- * @param {object} dosState
- * @returns {boolean}
- */
-function routerRefusedSinceLastPass(dosState) {
-  const refusals = upnpService.routerRefusals();
-  const refused = refusals > dosState.routerRefusalsSeen;
-  // eslint-disable-next-line no-param-reassign
-  dosState.routerRefusalsSeen = refusals;
-  return refused;
-}
-
 /**
  * Check my apps availability by testing ports from external nodes
  * @param {Function} installedAppsFn - Function to get installed apps
@@ -150,10 +62,32 @@ function routerRefusedSinceLastPass(dosState) {
  * @returns {Promise<void>}
  */
 async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane) {
-  const { timeoutsMs: timeouts, thresholds } = config.fluxapps.appsPortCheck;
+  const timeouts = {
+    default: 3_600_000,
+    error: 60_000,
+    failure: 15_000,
+    dos: 300_000,
+    appError: 240_000,
+  };
+
+  const thresholds = {
+    dos: 100,
+    portsHighEdge: 100,
+    portsLowEdge: 80,
+  };
+
+  if (dosState.dosMountMessage || dosState.dosDuplicateAppMessage) {
+    // eslint-disable-next-line no-param-reassign
+    dosState.dosMessage = dosState.dosMountMessage || dosState.dosDuplicateAppMessage;
+    // eslint-disable-next-line no-param-reassign
+    dosState.dosStateValue = thresholds.dos;
+
+    await serviceHelper.delay(timeouts.appError);
+    setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
+    return;
+  }
 
   const isUpnp = upnpService.isUPNP();
-  let routerRefused = false;
   const testHttpServer = new fluxHttpTestServer.FluxHttpTestServer();
 
   const setNextPort = () => {
@@ -180,7 +114,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
     if (!syncStatus.data.synced) {
       log.info('Flux Node daemon not synced. Application checks are disabled');
-      await waitForNextPass(timeouts.appError);
+      await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -190,7 +124,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
 
     if (!isNodeConfirmed) {
       log.info('Flux Node not Confirmed. Application checks are disabled');
-      await waitForNextPass(timeouts.appError);
+      await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -198,7 +132,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     const localSocketAddress = await fluxNetworkHelper.getLocalSocketAddress();
     if (!localSocketAddress) {
       log.info('No Public IP found. Application checks are disabled');
-      await waitForNextPass(timeouts.appError);
+      await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -206,13 +140,13 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     const installedAppsRes = await installedAppsFn();
     if (installedAppsRes.status !== 'success') {
       log.error('Failed to get installed Apps');
-      await waitForNextPass(timeouts.appError);
+      await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
 
     // Decrypt enterprise apps (version 8 with encrypted content)
-    ({ inPlace: installedAppsRes.data } = await decryptEnterpriseApps(installedAppsRes.data));
+    installedAppsRes.data = await decryptEnterpriseApps(installedAppsRes.data);
 
     const apps = installedAppsRes.data;
     const appPorts = [];
@@ -248,7 +182,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     if (isPortBanned) {
       log.info(`checkMyAppsAvailability - Testing port ${dosState.testingPort} is banned`);
       setNextPort();
-      await waitForNextPass(timeouts.failure);
+      await serviceHelper.delay(timeouts.failure);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -258,18 +192,17 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       if (isPortUpnpBanned) {
         log.info(`checkMyAppsAvailability - Testing port ${dosState.testingPort} is UPNP banned`);
         setNextPort();
-        await waitForNextPass(timeouts.failure);
+        await serviceHelper.delay(timeouts.failure);
         setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
         return;
       }
     }
 
-    // A router that has yet to remove a mapping of this node fails the check,
-    // and is given no test mapping until it has.
-    if (isUpnp && upnpService.removalPending()) {
-      log.info('checkMyAppsAvailability - the router has yet to remove a mapping of this node; no test mapping until it has');
-      countPortFailure(dosState, thresholds.dos, UPNP_DOS_MESSAGE);
-      await waitForNextPass(dosState.portFailureScore >= thresholds.dos ? timeouts.dos : timeouts.error);
+    const isPortUserBlocked = fluxNetworkHelper.isPortUserBlocked(dosState.testingPort);
+    if (isPortUserBlocked) {
+      log.info(`checkMyAppsAvailability - Testing port ${dosState.testingPort} is user blocked`);
+      setNextPort();
+      await serviceHelper.delay(timeouts.failure);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -277,49 +210,56 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     if (appPorts.includes(dosState.testingPort)) {
       log.info(`checkMyAppsAvailability - Skipped checking ${dosState.testingPort} - in use`);
       setNextPort();
-      await waitForNextPass(timeouts.failure);
+      await serviceHelper.delay(timeouts.failure);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
 
-    // An external observer: this asks a peer whether it can reach US, and a Flux
-    // node sharing our public address cannot answer that. Null when there is no
-    // such node, which the retry below already handles.
-    const remoteSocketAddress = await networkStateService.getRandomExternalObserver(localSocketAddress);
+    const remoteSocketAddress = await networkStateService.getRandomSocketAddress(localSocketAddress);
     if (!remoteSocketAddress) {
-      await waitForNextPass(timeouts.appError);
+      await serviceHelper.delay(timeouts.appError);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
 
     if (failedNodesTestPortsCache.has(remoteSocketAddress)) {
-      await waitForNextPass(timeouts.failure);
+      await serviceHelper.delay(timeouts.failure);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
 
     const firewallActive = isArcane ? true : await fluxNetworkHelper.isFirewallActive();
     if (firewallActive) {
-      await fluxNetworkHelper.allowTestPort(dosState.testingPort);
+      await fluxNetworkHelper.allowPort(dosState.testingPort);
     }
 
     if (isUpnp) {
-      // the test server is HTTP: TCP is all it needs
-      const upnpMapResult = await upnpService.mapUpnpPort(dosState.testingPort, 'Flux_Test_App', { protocols: ['TCP'] });
-      routerRefused = routerRefusedSinceLastPass(dosState);
-      if (routerRefused) countPortFailure(dosState, thresholds.dos, UPNP_DOS_MESSAGE);
-      if (!upnpMapResult.mapped) {
-        log.info(`checkMyAppsAvailability - Testing port ${dosState.testingPort} failed to create UPnP mapping: ${upnpMapResult.reason}`);
+      const upnpMapResult = await upnpService.mapUpnpPort(dosState.testingPort, 'Flux_Test_App');
+      if (!upnpMapResult) {
+        if (dosState.lastUPNPMapFailed) {
+          // eslint-disable-next-line no-param-reassign
+          dosState.dosStateValue += 4;
+          if (dosState.dosStateValue >= thresholds.dos) {
+            // eslint-disable-next-line no-param-reassign
+            dosState.dosMessage = 'Not possible to run applications on the node, router returning exceptions when creating UPNP ports mappings';
+          }
+        }
+        // eslint-disable-next-line no-param-reassign
+        dosState.lastUPNPMapFailed = true;
+        log.info(`checkMyAppsAvailability - Testing port ${dosState.testingPort} failed to create UPnP mapping`);
         setNextPort();
         await handleTestShutdown(dosState.testingPort, testHttpServer, isArcane, {
           skipFirewall: !firewallActive,
+          skipUpnp: true,
           skipHttpServer: true,
         });
-        const upnpDelay = dosState.portFailureScore >= thresholds.dos ? timeouts.dos : timeouts.error;
-        await waitForNextPass(upnpDelay);
+        const upnpDelay = dosState.dosMessage ? timeouts.dos : timeouts.error;
+        await serviceHelper.delay(upnpDelay);
         setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
         return;
       }
+      // eslint-disable-next-line no-param-reassign
+      dosState.lastUPNPMapFailed = false;
     }
 
     const listening = new Promise((resolve, reject) => {
@@ -344,7 +284,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
         skipUpnp: !isUpnp,
         skipHttpServer: true,
       });
-      await waitForNextPass(timeouts.error);
+      await serviceHelper.delay(timeouts.error);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -355,9 +295,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       headers: { 'content-type': '' },
     };
 
-    const signer = await nodeSigner();
-    if (!signer) throw new Error('checkMyAppsAvailability - this node cannot sign the port test');
-
+    const pubKey = await fluxNetworkHelper.getFluxNodePublicKey();
     const localIp = extractIp(localSocketAddress);
     const localPort = extractPort(localSocketAddress);
     const remoteIp = extractIp(remoteSocketAddress);
@@ -368,11 +306,10 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       port: String(localPort),
       appname: 'appPortsTest',
       ports: [dosState.testingPort],
-      pubKey: signer.pubKey,
+      pubKey,
     };
 
-    const signature = signer.sign(JSON.stringify(data));
-    if (!signature) throw new Error('checkMyAppsAvailability - the port test could not be signed');
+    const signature = await signCheckAppData(JSON.stringify(data));
     data.signature = signature;
 
     const resMyAppAvailability = await axios
@@ -391,7 +328,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
     });
 
     if (!resMyAppAvailability) {
-      await waitForNextPass(timeouts.failure);
+      await serviceHelper.delay(timeouts.failure);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -405,7 +342,7 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
 
     if (!['success', 'error'].includes(responseStatus)) {
       log.warn(`checkMyAppsAvailability - Unexpected response status: ${responseStatus}`);
-      await waitForNextPass(timeouts.error);
+      await serviceHelper.delay(timeouts.error);
       setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
       return;
     }
@@ -433,10 +370,16 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
         dosState.originalPortFailed = null;
       }
       waitMs = timeouts.failure;
-    } else if (portTestFailed) {
+    } else if (portTestFailed && dosState.dosStateValue < thresholds.dos) {
+      // eslint-disable-next-line no-param-reassign
+      dosState.dosStateValue += 4;
+      setRandomPort();
+      waitMs = timeouts.failure;
+    } else if (portTestFailed && dosState.dosStateValue >= thresholds.dos) {
       const failedPorts = setRandomPort();
-      countPortFailure(dosState, thresholds.dos, `${PORTS_DOS_MESSAGE_PREFIX}, DMZ or UPNP required! All ports that have failed: ${JSON.stringify(failedPorts)}`);
-      waitMs = dosState.portFailureScore >= thresholds.dos ? timeouts.dos : timeouts.failure;
+      // eslint-disable-next-line no-param-reassign
+      dosState.dosMessage = `Ports tested not reachable from outside, DMZ or UPNP required! All ports that have failed: ${JSON.stringify(failedPorts)}`;
+      waitMs = timeouts.dos;
     } else if (!portTestFailed && portsNotWorking.size > thresholds.portsLowEdge) {
       portsNotWorking.delete(dosState.testingPort);
       setRandomPort();
@@ -447,42 +390,37 @@ async function checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorkin
       dosState.nextTestingPort = null;
       // eslint-disable-next-line no-param-reassign
       dosState.originalPortFailed = null;
-      // a router refusing others' mappings is not cleared by one that took this test's
-      if (!routerRefused) releaseOwnDos(dosState);
+      // eslint-disable-next-line no-param-reassign
+      dosState.dosMessage = dosState.dosMountMessage || dosState.dosDuplicateAppMessage || null;
+      // eslint-disable-next-line no-param-reassign
+      dosState.dosStateValue = dosState.dosMessage ? thresholds.dos : 0;
       waitMs = timeouts.default;
     }
 
     if (portTestFailed) {
-      log.error(`checkMyAppsAvailability - Port ${dosState.testingPort} unreachable. Detected from ${remoteIp}:${remotePort}. Port failure score: ${dosState.portFailureScore}`);
+      log.error(`checkMyAppsAvailability - Port ${dosState.testingPort} unreachable. Detected from ${remoteIp}:${remotePort}. DosState: ${dosState.dosStateValue}`);
     } else {
-      log.info(`${responseMessage} Detected from ${remoteIp}:${remotePort} on port ${dosState.testingPort}. Port failure score: ${dosState.portFailureScore}`);
+      log.info(`${responseMessage} Detected from ${remoteIp}:${remotePort} on port ${dosState.testingPort}. DosState: ${dosState.dosStateValue}`);
     }
 
     if (portsNotWorking.size) {
       log.error(`checkMyAppsAvailability - Count: ${portsNotWorking.size}. portsNotWorking: ${JSON.stringify(Array.from(portsNotWorking))}`);
     }
 
-    // A router that refused this node a mapping or has yet to remove one is
-    // looked at again soon, so the pass that finds it working again comes
-    // soon; a refusal during this pass gave no wake, the check not waiting.
-    const routerFaulting = routerRefused
-      || upnpService.routerRefusals() > dosState.routerRefusalsSeen
-      || upnpService.removalPending();
-    if (isUpnp && routerFaulting) {
-      waitMs = Math.min(waitMs, dosState.portFailureScore >= thresholds.dos ? timeouts.dos : timeouts.error);
-    }
-    await waitForNextPass(waitMs);
+    await serviceHelper.delay(waitMs);
     setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
   } catch (error) {
+    if (!dosState.dosMessage && (dosState.dosMountMessage || dosState.dosDuplicateAppMessage)) {
+      // eslint-disable-next-line no-param-reassign
+      dosState.dosMessage = dosState.dosMountMessage || dosState.dosDuplicateAppMessage;
+    }
     await handleTestShutdown(dosState.testingPort, testHttpServer, isArcane, { skipUpnp: !isUpnp });
     log.error(`checkMyAppsAvailability - Error: ${error}`);
-    await waitForNextPass(timeouts.appError);
+    await serviceHelper.delay(timeouts.appError);
     setImmediate(() => checkMyAppsAvailability(installedAppsFn, dosState, portsNotWorking, failedNodesTestPortsCache, isArcane));
   }
 }
 
 module.exports = {
   checkMyAppsAvailability,
-  releaseOwnDos,
-  countPortFailure,
 };

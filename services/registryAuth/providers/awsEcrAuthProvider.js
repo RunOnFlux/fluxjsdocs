@@ -6,13 +6,14 @@
  * AWS credentials and environment variable/IAM role authentication.
  */
 
-const workerRunner = require('../../utils/workerRunner');
+// eslint-disable-next-line import/no-unresolved
+const { ECRClient, DescribeRepositoriesCommand, GetAuthorizationTokenCommand } = require('@aws-sdk/client-ecr');
 const { RegistryAuthProvider } = require('./base/registryAuthProvider');
 
 class AwsEcrAuthProvider extends RegistryAuthProvider {
   constructor(config, appName) {
     super(config, appName);
-    this.clientConfig = null;
+    this.ecrClient = null;
     this.ecrRegion = config.region || process.env.AWS_DEFAULT_REGION;
 
     // Initialize ECR client
@@ -42,27 +43,12 @@ class AwsEcrAuthProvider extends RegistryAuthProvider {
         clientConfig.credentials.sessionToken = this.config.sessionToken;
       }
 
-      this.clientConfig = clientConfig;
+      this.ecrClient = new ECRClient(clientConfig);
     } catch (error) {
       const wrappedError = new Error(`Failed to initialize AWS ECR client: ${error.message}`);
       this.recordError(wrappedError);
       throw wrappedError;
     }
-  }
-
-  /**
-   * Run a single ECR call against the configured registry.
-   *
-   * @param {string} operation ECR operation name.
-   * @param {object} params Parameters for that operation.
-   * @returns {Promise<object>} The fields of the ECR response the provider uses.
-   */
-  async runEcrCommand(operation, params) {
-    return workerRunner.runInWorker('awsEcrAuthWorker', {
-      operation,
-      clientConfig: this.clientConfig,
-      params,
-    });
   }
 
   /**
@@ -95,7 +81,7 @@ class AwsEcrAuthProvider extends RegistryAuthProvider {
    * @returns {Promise<object>} Fresh ECR credentials
    */
   async refreshCredentials() {
-    if (!this.clientConfig) {
+    if (!this.ecrClient) {
       const error = new Error('ECR client not initialized');
       this.recordError(error);
       throw error;
@@ -107,7 +93,9 @@ class AwsEcrAuthProvider extends RegistryAuthProvider {
         commandParams.registryIds = this.config.registryIds;
       }
 
-      const response = await this.runEcrCommand('getAuthorizationToken', commandParams);
+      const command = new GetAuthorizationTokenCommand(commandParams);
+
+      const response = await this.ecrClient.send(command);
 
       if (!response.authorizationData || response.authorizationData.length === 0) {
         throw new Error('No authorization data received from ECR');
@@ -286,7 +274,7 @@ class AwsEcrAuthProvider extends RegistryAuthProvider {
     return {
       ...baseError,
       region: this.ecrRegion,
-      clientInitialized: Boolean(this.clientConfig),
+      clientInitialized: Boolean(this.ecrClient),
       configurationValid: this.validateConfiguration(),
       credentialSources: {
         explicit: Boolean(this.config.accessKeyId && this.config.secretAccessKey),
@@ -309,7 +297,11 @@ class AwsEcrAuthProvider extends RegistryAuthProvider {
     }
 
     try {
-      await this.runEcrCommand('describeRepositories', { maxResults: 1 });
+      const command = new DescribeRepositoriesCommand({
+        maxResults: 1, // Minimal request
+      });
+
+      await this.ecrClient.send(command);
       return true;
     } catch (error) {
       this.recordError(error);
