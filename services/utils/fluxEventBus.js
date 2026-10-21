@@ -1,8 +1,96 @@
+// The harness-only telemetry surface: an event stream, a set of counters and a
+// set of state snapshots, all dead in production (`testEventStream` is false
+// there, and every entry point below returns before doing any work).
+//
+// THE RULE, and it is what keeps the ring a sensible size: FACTS AS EVENTS,
+// CADENCE AS A COUNTER, STATE AS A SNAPSHOT.
+//
+// An event marks something that HAPPENED - a block processed, a container
+// actuated, a spec stored. Every one of the publishers in this codebase is of
+// that kind, and because things happening are rare, a 1024-entry ring is
+// generous. A heartbeat - "the loop ran again and did nothing" - is not a fact
+// about the system, it is a fact about the clock, and putting one in here
+// spends a SHARED budget that every other consumer draws from. The chatty
+// publisher does not pay that cost; whichever other event a test needed pays
+// it, silently.
+//
+// So when a test needs to know a loop has run N times, or which branch it took
+// on each pass, that is a TALLY, not a stream: increment a counter with
+// `count()` and let the reader ask for the number over /flux/testcounters,
+// rather than broadcasting twenty messages a minute so it can count them.
+// Publish an event only for the thing that actually happened.
+//
+// And when a test needs to know what a node holds NOW - its peers, its
+// connections - that is a SNAPSHOT: register a reader with `snapshot()` and let
+// the test ask /flux/teststate/<name>. The reader runs at the moment of asking,
+// so the answer is never older than the request. A state rebuilt from events is
+// only as complete as the events are, and a public route that reports the same
+// state is cached for production's sake; neither answers "what is true now".
+
 const { EventEmitter } = require('node:events');
 const config = require('config');
 const log = require('../../lib/log');
 
 const RING_BUFFER_SIZE = 1024;
+
+// Points in the product where the harness can pause a code path, to hold open a
+// window it otherwise cannot reach. Each is named here, so holding a name no
+// code path passes is refused rather than waited on for ever.
+const Checkpoint = Object.freeze({
+  // A node is becoming the primary of a g: component: committed, not yet running.
+  MASTERSLAVE_BEFORE_START: 'masterSlave:beforeStart',
+  // A node becoming the primary of a g: component has its folder sending and its
+  // restart covered, and has not yet asked for the container to run. Keyed by
+  // the component identifier.
+  MASTERSLAVE_BEFORE_RUN: 'masterSlave:beforeRun',
+  // An adoption of a controller opinion holds the component's slot and has found
+  // no opinion recorded; it has not yet read the operator lock or docker. Keyed by
+  // the component identifier.
+  RECONCILER_BEFORE_ADOPT: 'reconciler:beforeAdopt',
+  // A reconcile pass is about to start a stopped container and has not yet
+  // checked that no controller opinion was written since it read the verdict.
+  // Keyed by the component identifier.
+  RECONCILER_BEFORE_START: 'reconciler:beforeStart',
+  // An election pass is about to decide a g: component it does not skip. Keyed
+  // by the component identifier.
+  MASTERSLAVE_BEFORE_DECISION: 'masterSlave:beforeDecision',
+  // A state-sync attempt's budget has run out and the attempt is still open.
+  APPSYNC_BEFORE_BUDGET_SPENT: 'appSync:beforeBudgetSpent',
+  // A state sync has every answer it needs and the node has not yet become
+  // authoritative from them, so it still refuses to answer a peer's sync.
+  APPSYNC_BEFORE_AUTHORITATIVE: 'appSync:beforeAuthoritative',
+  // A start decision is about to ask a peer what it holds. Keyed by the peer's
+  // socket address.
+  MASTERSLAVE_BEFORE_PEER_PROBE: 'masterSlave:beforePeerProbe',
+  // A receive-only folder has read its sync status as synced and has not yet
+  // checked the disk holds what that status claims. Keyed by folder id.
+  SYNCTHING_BEFORE_PROMOTION_CHECK: 'syncthing:beforePromotionCheck',
+  // The elected leader has read its sync status and has not yet checked the disk
+  // it would seed from holds what that status claims. Keyed by folder id.
+  SYNCTHING_BEFORE_SEED_CHECK: 'syncthing:beforeSeedCheck',
+  // The syncthing monitor has found a single-writer folder sending on a node
+  // that does not hold it, and has not yet asked for it to be held as a
+  // standby. Keyed by folder id.
+  SYNCTHING_BEFORE_STANDBY_HOLD: 'syncthing:beforeStandbyHold',
+  // The syncthing monitor has read the folder list its pass opens with, and has
+  // not yet published which folders this node holds writable.
+  SYNCTHING_AFTER_FOLDER_READ: 'syncthing:afterFolderRead',
+  // The syncthing monitor has computed a folder's config from the folder list
+  // its pass opened with, and has not written it. Keyed by folder id.
+  SYNCTHING_BEFORE_FOLDER_WRITE: 'syncthing:beforeFolderWrite',
+  // A node confirmed as a folder's cold-start seed is about to decide whether it
+  // seeds. Keyed by folder id.
+  SYNCTHING_BEFORE_SEED_DECISION: 'syncthing:beforeSeedDecision',
+  // A node deciding to seed a folder has read its peers and is about to record
+  // that it seeds. Keyed by folder id.
+  SYNCTHING_BEFORE_SEED_RECORD: 'syncthing:beforeSeedRecord',
+  // This node has recorded a move of its own address and has not yet acted on
+  // it. Keyed by the address it moved to.
+  OWN_ADDRESS_BEFORE_RECONCILE: 'ownAddress:beforeReconcile',
+});
+const CHECKPOINT_NAMES = new Set(Object.values(Checkpoint));
+// Holds a key for every key of its checkpoint.
+const ANY_KEY = '*';
 
 // Express compression middleware buffers res.write() calls to build
 // compressible chunks. SSE writes are too small to trigger a flush on
@@ -16,15 +104,39 @@ function sseWrite(res, data) {
 class FluxEventBus extends EventEmitter {
   #buffer;
   #writeIndex;
+  #writeCount;
   #nextId;
   #enabled;
+  #counters;
+  #holds;
+  #parked;
+  #snapshots;
 
   constructor(enabled) {
     super();
     this.#buffer = new Array(RING_BUFFER_SIZE);
     this.#writeIndex = 0;
-    this.#nextId = 1;
+    // How many events this bus has published, which is what since() needs to
+    // know whether the ring has wrapped. Kept separate from #nextId: ids are
+    // seeded from the clock and carry no count information.
+    this.#writeCount = 0;
+    // Seeded from the monotonic clock (microseconds since boot) so event ids
+    // stay monotonic across a FluxOS restart on a running host: a fresh process
+    // mints ids larger than anything the previous one served, so a consumer
+    // filtering on last-seen-id - any SSE client sending Last-Event-ID - does
+    // not silently discard every post-restart event. Starting from 1 made the
+    // whole post-restart stream invisible to such a consumer until the counter
+    // happened to climb past the id it last saw, which on a busy node is never.
+    // Not monotonic across a HOST reboot (the clock restarts near zero), which
+    // is fine - no consumer survives one.
+    this.#nextId = Number(process.hrtime.bigint() / 1000n);
     this.#enabled = enabled ?? (config.has('testEventStream') && config.get('testEventStream') === true);
+    this.#counters = new Map();
+    // checkpoint name -> keys held, ANY_KEY for all of them
+    this.#holds = new Map();
+    // code paths paused at a checkpoint: { name, key, resume }
+    this.#parked = [];
+    this.#snapshots = new Map();
   }
 
   get enabled() { return this.#enabled; }
@@ -39,16 +151,18 @@ class FluxEventBus extends EventEmitter {
     };
     this.#buffer[this.#writeIndex] = entry;
     this.#writeIndex = (this.#writeIndex + 1) % RING_BUFFER_SIZE;
+    this.#writeCount += 1;
     try {
       this.emit('event', entry);
     } catch (err) { log.error(`FluxEventBus listener error: ${err.message}`); }
   }
 
   since(afterId) {
-    const totalWritten = this.#nextId - 1;
-    const count = Math.min(totalWritten, RING_BUFFER_SIZE);
+    const count = Math.min(this.#writeCount, RING_BUFFER_SIZE);
     if (count === 0) return [];
-    const startIdx = totalWritten > RING_BUFFER_SIZE ? this.#writeIndex : 0;
+    // Once the ring has wrapped, the oldest surviving entry is the one about to
+    // be overwritten; before that it is slot 0.
+    const startIdx = this.#writeCount > RING_BUFFER_SIZE ? this.#writeIndex : 0;
     const result = [];
     for (let i = 0; i < count; i++) {
       const idx = (startIdx + i) % RING_BUFFER_SIZE;
@@ -58,6 +172,170 @@ class FluxEventBus extends EventEmitter {
       }
     }
     return result;
+  }
+
+  // The id of the oldest entry the ring still holds, or 0 while it has never
+  // wrapped (nothing has been dropped, so every id is still reachable).
+  //
+  // Ids are minted with a single ++, so they are contiguous: anything between a
+  // consumer's last-seen id and this one was published and then overwritten.
+  // Without this, since() cannot tell "nothing happened since you last looked"
+  // apart from "plenty happened and I threw it away", and a consumer that
+  // reconnects into a gap waits out its whole budget for an event that already
+  // came and went - failing at the deadline, as a product bug, rather than at
+  // the cause.
+  oldestRetainedId() {
+    if (this.#writeCount === 0 || this.#writeCount <= RING_BUFFER_SIZE) return 0;
+    const oldest = this.#buffer[this.#writeIndex];
+    return oldest ? oldest.id : 0;
+  }
+
+  // Cadence, not facts - see the rule at the top of this file. A no-op when
+  // disabled, exactly like publish().
+  //
+  // count('masterSlave:cycles')                       -> counters['masterSlave:cycles']
+  // count('masterSlave:decision', id, 'heldOnPeer')   -> counters['masterSlave:decision'][id].heldOnPeer
+  count(name, ...path) {
+    if (!this.#enabled) return;
+    let node = this.#counters.get(name);
+    if (!node) {
+      node = path.length ? new Map() : 0;
+      this.#counters.set(name, node);
+    }
+    if (!path.length) {
+      this.#counters.set(name, (typeof node === 'number' ? node : 0) + 1);
+      return;
+    }
+    let cursor = node;
+    for (let i = 0; i < path.length - 1; i += 1) {
+      let next = cursor.get(path[i]);
+      if (!(next instanceof Map)) {
+        next = new Map();
+        cursor.set(path[i], next);
+      }
+      cursor = next;
+    }
+    const leaf = path[path.length - 1];
+    cursor.set(leaf, (cursor.get(leaf) || 0) + 1);
+  }
+
+  // Pauses the caller here while the harness holds this checkpoint for this key,
+  // and returns at once otherwise - always, when disabled. It never changes what
+  // the caller does next, only when. A paused caller is announced as
+  // checkpoint:held, so a test knows the window is open.
+  async checkpoint(name, key) {
+    if (!this.#enabled || !this.#isHeld(name, key)) return;
+    await new Promise((resume) => {
+      this.#parked.push({ name, key, resume });
+      this.publish('checkpoint:held', { name, key });
+    });
+  }
+
+  // Whether a caller reaching `name` for `key` now would pause there. For a
+  // caller that runs straight through unless held, and so takes the pause only
+  // when there is one to take. Always false when disabled.
+  isCheckpointHeld(name, key) {
+    return this.#enabled && this.#isHeld(name, key);
+  }
+
+  #isHeld(name, key) {
+    const keys = this.#holds.get(name);
+    return !!keys && (keys.has(ANY_KEY) || keys.has(key));
+  }
+
+  // Every caller that reaches `name` for `key` from now on pauses there, until
+  // released. ANY_KEY holds it for every key.
+  holdCheckpoint(name, key = ANY_KEY) {
+    if (!CHECKPOINT_NAMES.has(name)) throw new Error(`No checkpoint named ${name}`);
+    if (!this.#holds.has(name)) this.#holds.set(name, new Set());
+    this.#holds.get(name).add(key);
+  }
+
+  // Drops the hold on `name` for `key` and resumes every caller it was pausing.
+  releaseCheckpoint(name, key = ANY_KEY) {
+    if (!CHECKPOINT_NAMES.has(name)) throw new Error(`No checkpoint named ${name}`);
+    this.#holds.get(name)?.delete(key);
+    this.#resumeUnheld();
+  }
+
+  releaseAllCheckpoints() {
+    this.#holds.clear();
+    this.#resumeUnheld();
+  }
+
+  #resumeUnheld() {
+    const stillHeld = [];
+    for (const parked of this.#parked) {
+      if (this.#isHeld(parked.name, parked.key)) stillHeld.push(parked);
+      else parked.resume();
+    }
+    this.#parked = stillHeld;
+  }
+
+  // POST { name, key, action: 'hold' | 'release' | 'releaseAll' }. 404s when
+  // disabled, like the counters.
+  checkpointsHandler(req, res) {
+    if (!this.#enabled) {
+      res.status(404).json({ status: 'error', data: { message: 'Test checkpoints not enabled' } });
+      return;
+    }
+    const { name, key, action } = req.body || {};
+    try {
+      if (action === 'hold') this.holdCheckpoint(name, key);
+      else if (action === 'release') this.releaseCheckpoint(name, key);
+      else if (action === 'releaseAll') this.releaseAllCheckpoints();
+      else throw new Error(`Unknown checkpoint action ${action}`);
+    } catch (error) {
+      res.status(400).json({ status: 'error', data: { message: error.message } });
+      return;
+    }
+    res.json({ status: 'success', data: { parked: this.#parked.map((p) => ({ name: p.name, key: p.key })) } });
+  }
+
+  counters() {
+    const plain = (value) => {
+      if (!(value instanceof Map)) return value;
+      const out = {};
+      for (const [k, v] of value) out[k] = plain(v);
+      return out;
+    };
+    return plain(this.#counters);
+  }
+
+  // State, not facts or cadence - see the rule at the top of this file. The
+  // reader is called on every request and never between them. A no-op when
+  // disabled, so production holds no reference to it.
+  //
+  // snapshot('peers', () => ({ outbound: [...], inbound: [...] }))
+  snapshot(name, reader) {
+    if (!this.#enabled) return;
+    this.#snapshots.set(name, reader);
+  }
+
+  snapshotHandler(req, res) {
+    if (!this.#enabled) {
+      res.status(404).json({ status: 'error', data: { message: 'Test state not enabled' } });
+      return;
+    }
+    const { name } = req.params;
+    const reader = this.#snapshots.get(name);
+    if (!reader) {
+      res.status(404).json({ status: 'error', data: { message: `No test state named ${name}` } });
+      return;
+    }
+    try {
+      res.json({ status: 'success', data: reader() });
+    } catch (err) {
+      res.status(500).json({ status: 'error', data: { message: err.message } });
+    }
+  }
+
+  countersHandler(req, res) {
+    if (!this.#enabled) {
+      res.status(404).json({ status: 'error', data: { message: 'Test counters not enabled' } });
+      return;
+    }
+    res.json({ status: 'success', data: this.counters() });
   }
 
   sseHandler(req, res) {
@@ -75,6 +353,13 @@ class FluxEventBus extends EventEmitter {
     res.flushHeaders();
 
     const lastId = parseInt(req.headers['last-event-id'], 10) || 0;
+    // A resuming consumer that fell behind the ring is told so, and told how
+    // much, before it is handed the survivors. Silence here is what turns a
+    // dropped event into a timeout somewhere else entirely.
+    const oldestRetained = this.oldestRetainedId();
+    if (lastId > 0 && oldestRetained > lastId + 1) {
+      sseWrite(res, `event: stream:gap\ndata: ${JSON.stringify({ afterId: lastId, oldestRetainedId: oldestRetained, dropped: oldestRetained - lastId - 1 })}\nid: ${lastId}\n\n`);
+    }
     const missed = this.since(lastId);
     for (const entry of missed) {
       sseWrite(res, `event: ${entry.event}\ndata: ${JSON.stringify(entry.data)}\nid: ${entry.id}\n\n`);
@@ -99,5 +384,6 @@ class FluxEventBus extends EventEmitter {
 
 const fluxEventBus = new FluxEventBus();
 fluxEventBus.FluxEventBus = FluxEventBus;
+fluxEventBus.Checkpoint = Checkpoint;
 
 module.exports = fluxEventBus;

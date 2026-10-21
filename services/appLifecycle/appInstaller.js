@@ -6,6 +6,7 @@ const verificationHelper = require('../verificationHelper');
 const dockerService = require('../dockerService');
 const dbHelper = require('../dbHelper');
 const messageHelper = require('../messageHelper');
+const { InstallOutcome } = require('../utils/installOutcome');
 const generalService = require('../generalService');
 const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxNetworkHelper = require('../fluxNetworkHelper');
@@ -23,14 +24,13 @@ const { systemArchitecture } = require('../appSystem/systemIntegration');
 const { checkApplicationImagesCompliance, verifyRepository } = require('../appSecurity/imageManager');
 const { startAppMonitoring } = require('../appManagement/appInspector');
 const imageVerifier = require('../utils/imageVerifier');
-// pgpService is used in commented out code
-// eslint-disable-next-line no-unused-vars
-const pgpService = require('../pgpService');
 const registryCredentialHelper = require('../utils/registryCredentialHelper');
 const upnpService = require('../upnpService');
 const globalState = require('../utils/globalState');
 const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
+const mountParser = require('../utils/mountParser');
+const { ensureStignoreCovers } = require('../appSystem/syncthingIgnorePolicy');
 const { findCommonArchitectures } = require('../utils/appUtilities');
 const log = require('../../lib/log');
 const { localAppsInformation, scannedHeightCollection } = require('../utils/appConstants');
@@ -40,74 +40,37 @@ const hwRequirements = require('../appRequirements/hwRequirements');
 const config = require('config');
 const fluxEventBus = require('../utils/fluxEventBus');
 const volumeService = require('../utils/volumeService');
+const { Privilege, authOf } = require('../utils/privileges');
 
 // Legacy apps that use old gateway IP assignment method
 const appsThatMightBeUsingOldGatewayIpAssignment = ['HNSDoH', 'dane', 'fdm', 'Jetpack2', 'fdmdedicated', 'isokosse', 'ChainBraryDApp', 'health', 'ethercalc'];
 
-// Helper functions and constants for installApplicationHard
-const util = require('util');
+// The octets those legacy apps pin by name (charCodeAt of the last character).
+// Reserve them in the free-octet scan so a non-legacy app can't take one before
+// the legacy app heals onto its fixed octet.
+const legacyPinnedOctets = appsThatMightBeUsingOldGatewayIpAssignment.map((name) => name.charCodeAt(name.length - 1));
 
-const dockerPullStreamPromise = util.promisify(dockerService.dockerPullStream);
+// Helper functions and constants for installApplicationHard
+
 
 const supportedArchitectures = ['amd64', 'arm64'];
 
 /**
- * Perform Docker cleanup (prune containers, networks, volumes, images)
+ * Reclaim disk before an install by removing unreferenced docker images.
+ *
+ * Only images. Containers, networks and volumes were pruned here too, keyed on
+ * docker's notion of "unused" - nothing attached right now - which is equally
+ * true of a healthy app whose container is momentarily down, of a container
+ * FluxOS is running for its own purposes, and of anything the node operator
+ * left stopped. The guard in front of this only ever knew about installed app
+ * components, so those other three were never covered. An image, by contrast,
+ * is unreferenced or it is not, and re-pulling one is a download rather than a
+ * loss.
+ *
  * @param {object} res - Response object for streaming
  * @returns {Promise<void>}
  */
 async function performDockerCleanup(res) {
-  const dockerContainers = {
-    status: 'Clearing up unused docker containers...',
-  };
-  log.info(dockerContainers);
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerContainers));
-    if (res.flush) res.flush();
-  }
-  await dockerService.pruneContainers();
-  const dockerContainers2 = {
-    status: 'Docker containers cleaned.',
-  };
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerContainers2));
-    if (res.flush) res.flush();
-  }
-
-  const dockerNetworks = {
-    status: 'Clearing up unused docker networks...',
-  };
-  log.info(dockerNetworks);
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerNetworks));
-    if (res.flush) res.flush();
-  }
-  await dockerService.pruneNetworks();
-  const dockerNetworks2 = {
-    status: 'Docker networks cleaned.',
-  };
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerNetworks2));
-    if (res.flush) res.flush();
-  }
-
-  const dockerVolumes = {
-    status: 'Clearing up unused docker volumes...',
-  };
-  log.info(dockerVolumes);
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerVolumes));
-    if (res.flush) res.flush();
-  }
-  await dockerService.pruneVolumes();
-  const dockerVolumes2 = {
-    status: 'Docker volumes cleaned.',
-  };
-  if (res) {
-    res.write(serviceHelper.ensureString(dockerVolumes2));
-    if (res.flush) res.flush();
-  }
-
   const dockerImages = {
     status: 'Clearing up unused docker images...',
   };
@@ -145,29 +108,15 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
     if (res.flush) res.flush();
   }
 
+  if (!test) {
+    const appPorts = appSpecifications.ports ?? (appSpecifications.port ? [appSpecifications.port] : []);
+    const { failed, locked } = await fluxNetworkHelper.allowAppPorts(appPorts.map((port) => serviceHelper.ensureNumber(port)));
+    // Clients outside the node reach the ports over IPv4 either way, so the install goes on.
+    if (locked) log.warn(`Ports of ${appName} not opened in the firewall: ufw is locked by another ufw command`);
+    failed.forEach(({ rule, error }) => log.warn(`Port of ${appName} not opened in the firewall: ufw ${rule}: ${error}`));
+  }
+
   if (!test && appSpecifications.ports) {
-    const firewallActive = await fluxNetworkHelper.isFirewallActive();
-    if (firewallActive) {
-      // eslint-disable-next-line no-restricted-syntax
-      for (const port of appSpecifications.ports) {
-        // eslint-disable-next-line no-await-in-loop
-        const portResponse = await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(port));
-        if (portResponse.status === true) {
-          const portStatus = {
-            status: `Port ${port} OK`,
-          };
-          log.info(portStatus);
-          if (res) {
-            res.write(serviceHelper.ensureString(portStatus));
-            if (res.flush) res.flush();
-          }
-        } else {
-          throw new Error(`Error: Port ${port} FAILed to open.`);
-        }
-      }
-    } else {
-      log.info('Firewall not active, application ports are open');
-    }
     const isUPNP = upnpService.isUPNP();
     if (isUPNP) {
       log.info('Custom port specified, mapping ports');
@@ -175,7 +124,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
       for (const port of appSpecifications.ports) {
         // eslint-disable-next-line no-await-in-loop
         const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(port), `Flux_App_${appName}`);
-        if (portResponse === true) {
+        if (portResponse.mapped) {
           const portStatus = {
             status: `Port ${port} mapped OK`,
           };
@@ -185,35 +134,17 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
             if (res.flush) res.flush();
           }
         } else {
-          throw new Error(`Error: Port ${port} FAILed to map.`);
+          throw new Error(`Error: Port ${port} FAILed to map. ${portResponse.reason}`);
         }
       }
     }
   } else if (!test && appSpecifications.port) {
     // v1 compatibility
-    const firewallActive = await fluxNetworkHelper.isFirewallActive();
-    if (firewallActive) {
-      const portResponse = await fluxNetworkHelper.allowPort(serviceHelper.ensureNumber(appSpecifications.port));
-      if (portResponse.status === true) {
-        const portStatus = {
-          status: `Port ${appSpecifications.port} OK`,
-        };
-        log.info(portStatus);
-        if (res) {
-          res.write(serviceHelper.ensureString(portStatus));
-          if (res.flush) res.flush();
-        }
-      } else {
-        throw new Error(`Error: Port ${appSpecifications.port} FAILed to open.`);
-      }
-    } else {
-      log.info('Firewall not active, application ports are open');
-    }
     const isUPNP = upnpService.isUPNP();
     if (isUPNP) {
       log.info('Custom port specified, mapping ports');
       const portResponse = await upnpService.mapUpnpPort(serviceHelper.ensureNumber(appSpecifications.port), `Flux_App_${appName}`);
-      if (portResponse === true) {
+      if (portResponse.mapped) {
         const portStatus = {
           status: `Port ${appSpecifications.port} mapped OK`,
         };
@@ -223,7 +154,7 @@ async function setupApplicationPorts(appSpecifications, appName, isComponent, re
           if (res.flush) res.flush();
         }
       } else {
-        throw new Error(`Error: Port ${appSpecifications.port} FAILed to map.`);
+        throw new Error(`Error: Port ${appSpecifications.port} FAILed to map. ${portResponse.reason}`);
       }
     }
   }
@@ -243,6 +174,14 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
   const architecture = await systemArchitecture();
   if (!supportedArchitectures.includes(architecture)) {
     throw new Error(`Invalid architecture ${architecture} detected.`);
+  }
+
+  // POLICY IS A PRECONDITION, as it is at registration. The blocked-repository list lives
+  // in the signed bundle, so a node without one cannot establish that an image is not
+  // banned - and installing on the assumption it is fine is the mistake that cannot be
+  // taken back, because the container is running by the time anything else notices.
+  if (!globalState.policyReady) {
+    throw new Error('Cannot verify application images: network policy not yet obtained.');
   }
 
   // check blacklist
@@ -292,7 +231,7 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
   pullConfig.provider = imgVerifier.provider;
 
   // eslint-disable-next-line no-unused-vars
-  await dockerPullStreamPromise(pullConfig, res);
+  await dockerService.pullImage(pullConfig, res);
 
   const pullStatus = {
     status: isComponent ? `Pulling component ${appSpecifications.name} of Flux App ${appName}` : `Pulling global Flux App ${appName} was successful`,
@@ -305,48 +244,146 @@ async function verifyAndPullImage(appSpecifications, appName, isComponent, res, 
 }
 
 /**
+ * Ensures the per-app docker network (fluxDockerNetwork_<appName>) exists,
+ * creating it with a free /24 (172.23.<octet>.0/24) if absent. Safe to call on
+ * every install and from the reconciler's heal path, where a pruned network
+ * (docker prune, daemon restart) must be re-created before any container can be
+ * re-created onto it.
+ *
+ * When the network already exists this returns EARLY, with no allocation.
+ * Creating the network re-applies the container firewall with its bridge
+ * (dockerService.dockerCreateNetwork) before any container is created on it.
+ *
+ * Allocation is deterministic (lowest free octet) but collision-safe: many heals can
+ * run concurrently after a mass prune, so a create that loses its octet to another
+ * app - or to a non-flux network whose subnet docker rejects - is retried against the
+ * NEXT free octet, giving up only on true exhaustion. A premature give-up would throw,
+ * and on the vanished-container path that throw escalates to an app uninstall, so the
+ * loop must never fail while octets are free. The subnet is not persisted; nothing
+ * outside the container depends on it (ports are host-mapped, gelf targets resolve
+ * from the collector's live container IP at create time).
+ * @param {string} appName bare app name (the network is per-app, not per-component)
+ * @param {object} [res] optional express response for install-status streaming
+ * @returns {Promise<object|string>} the created-or-existing network response
+ */
+async function ensureAppDockerNetwork(appName, res) {
+  const fluxNetworkStatus = {
+    status: `Checking Flux App network of ${appName}...`,
+  };
+  log.info(fluxNetworkStatus);
+  if (res) {
+    res.write(serviceHelper.ensureString(fluxNetworkStatus));
+    if (res.flush) res.flush();
+  }
+
+  if (await dockerService.dockerNetworkState(`fluxDockerNetwork_${appName}`) === 'exists') {
+    const existsStatus = {
+      status: `Flux App network of ${appName} already exists.`,
+    };
+    log.info(existsStatus);
+    if (res) {
+      res.write(serviceHelper.ensureString(existsStatus));
+      if (res.flush) res.flush();
+    }
+    return `Flux App Network of ${appName} already exists.`;
+  }
+
+  let fluxNet = null;
+  if (appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
+    // legacy apps pinned their gateway octet by name (it was baked into their
+    // config); they must keep it rather than take the next free one.
+    fluxNet = await dockerService.createFluxAppDockerNetwork(appName, appName.charCodeAt(appName.length - 1)).catch((error) => log.error(error));
+  } else {
+    // Take the lowest free 172.23.x.0/24, advancing past any octet a create loses
+    // (a concurrent heal of another app, or a non-flux network holding the subnet).
+    // Seed the exclude set with the legacy-pinned octets so a non-legacy app can't
+    // squat an octet a legacy app must heal onto. Give up only when the octet space
+    // is genuinely exhausted, never on a fixed count - see the JSDoc for why a
+    // premature throw is dangerous here.
+    const tried = new Set(legacyPinnedOctets);
+    while (!fluxNet) {
+      // eslint-disable-next-line no-await-in-loop
+      const octet = await dockerService.getFreeFluxAppNetworkOctet(tried);
+      if (octet === null) {
+        throw new Error(`Flux App network of ${appName} failed to initiate. No free 172.23.x.0/24 subnet available on this node.`);
+      }
+      // eslint-disable-next-line no-await-in-loop
+      fluxNet = await dockerService.createFluxAppDockerNetwork(appName, octet).catch((error) => log.error(error));
+      if (!fluxNet) tried.add(octet);
+    }
+  }
+  if (!fluxNet) {
+    throw new Error(`Flux App network of ${appName} failed to initiate. Not possible to create docker application network.`);
+  }
+  log.info(serviceHelper.ensureString(fluxNet));
+  const fluxNetResponse = {
+    status: `Docker network of ${appName} initiated.`,
+  };
+  if (res) {
+    res.write(serviceHelper.ensureString(fluxNetResponse));
+    if (res.flush) res.flush();
+  }
+  return fluxNet;
+}
+
+/**
  * To register an app locally. Performs pre-installation checks - database in place, Flux Docker network in place and if app already installed. Then registers app in database and performs hard install. If registration fails, the app is removed locally.
  * @param {object} appSpecs App specifications.
  * @param {object} componentSpecs Component specifications.
  * @param {object} res Response.
  * @param {boolean} test indicates if it is just to test the app install.
- * @param {boolean} sendRemovalMessage whether to broadcast removal message to network if installation fails.
- * @returns {Promise<boolean>} Returns true if installation was successful, false otherwise.
+ * @param {boolean} sendRemovalMessage whether the teardown broadcasts the removal.
+ *   True wherever this node does not already hold the app: an announcement landing
+ *   during the install claims it, and nothing else takes that claim back before it
+ *   expires. False for a rebuild, whose claim the node is keeping.
+ * @returns {Promise<string>} One of InstallOutcome.
  */
-async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false) {
+async function attemptRegisterAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false) {
   // cpu, ram, hdd were assigned to correct tiered specs.
   // get applications specifics from app messages database
   // check if hash is in blockchain
   // register and launch according to specifications in message
+  // Whether THIS call raised the install hold. The guards below refuse because
+  // someone else is holding the node, and a refusal must not release their hold
+  // on its way out.
+  let acquired = false;
+  // Whether this node's local table has named the app during this call. The
+  // announcement is built from that table, so the row is the claim, and the
+  // teardown below has one to take back only once it exists.
+  let claimed = false;
   try {
     if (globalState.removalInProgress) {
       const rStatus = messageHelper.createWarningMessage('Another application is undergoing removal. Installation not possible.');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
-        res.end();
+        if (res.flush) res.flush();
       }
-      return false;
+      return InstallOutcome.BUSY;
     }
     if (globalState.installationInProgress) {
       const rStatus = messageHelper.createWarningMessage('Another application is undergoing installation. Installation not possible');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
-        res.end();
+        if (res.flush) res.flush();
       }
-      return false;
+      return InstallOutcome.BUSY;
     }
     globalState.installationInProgress = true;
+    acquired = true;
+    // A test install holds nothing: it writes the app's row like any other install
+    // and throws it away, so the announcement must not read that row as a claim.
+    if (test) globalState.testInstallingApps.add(appSpecs.name);
     const tier = await generalService.nodeTier().catch((error) => log.error(error));
     if (!tier) {
       const rStatus = messageHelper.createErrorMessage('Failed to get Node Tier');
       log.error(rStatus);
       if (res) {
         res.write(serviceHelper.ensureString(rStatus));
-        res.end();
+        if (res.flush) res.flush();
       }
-      return false;
+      return InstallOutcome.DECLINED;
     }
 
     const localSocketAddr = await fluxNetworkHelper.getLocalSocketAddress();
@@ -397,14 +434,13 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
     }
     const appResult = await dbHelper.findOneInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
     if (appResult && !isComponent) {
-      globalState.installationInProgress = false;
       const rStatus = messageHelper.createErrorMessage(`Flux App ${appName} already installed`);
       log.error(rStatus);
       if (res) {
         res.write(rStatus);
-        res.end();
+        if (res.flush) res.flush();
       }
-      return false;
+      return InstallOutcome.ALREADY_INSTALLED;
     }
 
     // Lazy-load appQueryService to avoid circular dependency issues
@@ -419,7 +455,10 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
       throw new Error('Unable to check running Apps');
     }
     const appsInstalled = installedAppsRes.data;
-    const decryptedAppsInstalled = await appQueryService.decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
+    const { readable: decryptedAppsInstalled, unreadable } = await appQueryService.decryptEnterpriseApps(appsInstalled, { formatSpecs: false });
+    if (unreadable.length) {
+      log.warn(`Component names unavailable for undecryptable apps: ${unreadable.map((app) => app.name).join(', ')}`);
+    }
     const runningApps = runningAppsRes.data;
     const installedAppComponentNames = [];
     decryptedAppsInstalled.forEach((app) => {
@@ -451,47 +490,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
     await appNetworkLinker.checkAppNetworkRequirements(appSpecifications);
 
     if (!isComponent) {
-      let dockerNetworkAddrValue = Math.floor(Math.random() * 256);
-      if (appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
-        dockerNetworkAddrValue = appName.charCodeAt(appName.length - 1);
-      }
-      const fluxNetworkStatus = {
-        status: `Checking Flux App network of ${appName}...`,
-      };
-      log.info(fluxNetworkStatus);
-      if (res) {
-        res.write(serviceHelper.ensureString(fluxNetworkStatus));
-        if (res.flush) res.flush();
-      }
-      let fluxNet = null;
-      for (let i = 0; i <= 20; i += 1) {
-        // eslint-disable-next-line no-await-in-loop
-        fluxNet = await dockerService.createFluxAppDockerNetwork(appName, dockerNetworkAddrValue).catch((error) => log.error(error));
-        if (fluxNet || appsThatMightBeUsingOldGatewayIpAssignment.includes(appName)) {
-          break;
-        }
-        dockerNetworkAddrValue = Math.floor(Math.random() * 256);
-      }
-      if (!fluxNet) {
-        throw new Error(`Flux App network of ${appName} failed to initiate. Not possible to create docker application network.`);
-      }
-      log.info(serviceHelper.ensureString(fluxNet));
-      const fluxNetworkInterfaces = await dockerService.getFluxDockerNetworkPhysicalInterfaceNames();
-      const accessRemoved = await fluxNetworkHelper.removeDockerContainerAccessToNonRoutable(fluxNetworkInterfaces);
-      const accessRemovedRes = {
-        status: accessRemoved ? `Private network access removed for ${appName}` : `Error removing private network access for ${appName}`,
-      };
-      if (res) {
-        res.write(serviceHelper.ensureString(accessRemovedRes));
-        if (res.flush) res.flush();
-      }
-      const fluxNetResponse = {
-        status: `Docker network of ${appName} initiated.`,
-      };
-      if (res) {
-        res.write(serviceHelper.ensureString(fluxNetResponse));
-        if (res.flush) res.flush();
-      }
+      await ensureAppDockerNetwork(appName, res);
     }
 
     const appInstallation = {
@@ -524,6 +523,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
         log.warn(`Found existing database entry for ${appSpecifications.name} during registration. Cleaning up stale entry.`);
         await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, cleanupQuery, {});
         log.info(`Stale database entry for ${appSpecifications.name} removed. Proceeding with fresh insert.`);
+        claimed = true;
       }
 
       const insertResult = await dbHelper.insertOneToDatabase(appsDatabase, localAppsInformation, dbSpecs);
@@ -531,6 +531,7 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
         throw new Error(`CRITICAL: Failed to create database entry for ${appSpecifications.name}. Database insert returned undefined - likely duplicate key error or database failure. Aborting installation to prevent orphaned Docker containers.`);
       }
       log.info(`Database entry created for ${appSpecifications.name} BEFORE Docker container creation`);
+      claimed = true;
       const hddTier = `hdd${tier}`;
       const ramTier = `ram${tier}`;
       const cpuTier = `cpu${tier}`;
@@ -619,26 +620,13 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
     const successStatus = messageHelper.createSuccessMessage(`Flux App ${appName} successfully installed and launched`);
     log.info(successStatus);
     if (res) {
+      // Written, not closed. Every caller here is mid-stream on a response its
+      // own endpoint opened; closing it from in here is what let a failed
+      // reinstall answer with the teardown's success line.
       res.write(serviceHelper.ensureString(successStatus));
-      res.end();
-    }
-    globalState.installationInProgress = false;
-
-    // Broadcast this node's running apps AFTER releasing the install lock.
-    // onInstallComplete() -> checkAndNotifyPeersOfRunningApps() relies on
-    // containerHealthMonitor.monitorAndRecoverApps() to force-include syncthing
-    // apps whose components are not all simultaneously "running" at this instant
-    // (e.g. a component mid receive-only resync). That recovery path bails out
-    // while globalState.isOperationInProgress() is true, so broadcasting before
-    // installationInProgress is cleared would exclude the just-installed app from
-    // its own announcement. checkAndNotifyPeersOfRunningApps never throws (it
-    // catches internally), so running it after res.end() is safe.
-    if (!test && onInstallComplete) {
-      await onInstallComplete();
-      fluxEventBus.publish('app:installed', { name: appSpecifications.name, hash: appSpecifications.hash });
+      if (res.flush) res.flush();
     }
   } catch (error) {
-    globalState.installationInProgress = false;
     const errorResponse = messageHelper.createErrorMessage(
       error.message || error,
       error.name,
@@ -657,22 +645,93 @@ async function registerAppLocally(appSpecs, componentSpecs, res, test = false, s
         res.write(serviceHelper.ensureString(removeStatus));
         if (res.flush) res.flush();
       }
-      await appUninstaller.removeAppLocally(appSpecs.name, res, true, true, sendRemovalMessage);
+      // endResponse false: the endpoint opened this response and closes it. With
+      // true, this teardown's own "was successfuly removed" landed as the last
+      // thing the caller saw, and the reinstall failure that caused it was
+      // written into a response that had already closed.
+      await appUninstaller.removeAppLocally(appSpecs.name, res, true, false, sendRemovalMessage && claimed);
       log.info(`Cleanup completed for ${appSpecs.name} after installation failure`);
     }
 
-    return false;
+    // The app is gone from this node - the teardown above removed it. A caller
+    // that reads this as "nothing happened" leaves a half-removed app behind;
+    // one that reads BUSY as this destroys a running app for a scheduling
+    // collision. They are not the same answer.
+    return InstallOutcome.FAILED;
   } finally {
-    if (test) {
+    // THE ONE PLACE THE HOLD IS RELEASED, so every way out of this function releases
+    // it - including the early returns above. A path that leaves without releasing
+    // costs the node every install, redeploy, spawn and reinstall pass it is offered
+    // until FluxOS restarts.
+    if (acquired) globalState.installationInProgress = false;
+    // Bound to the hold: a call that did not take it never wrote the app's row
+    // and never set the mark, so it has neither to take back. The mark is set
+    // under the hold with nothing awaited in between, so holding it is the same
+    // fact as having marked.
+    if (test && acquired) {
       try {
         await appUninstaller.removeAppLocally(appSpecs.name, null, true, false, false);
         log.info(`Test cleanup completed for ${appSpecs.name}`);
       } catch (cleanupError) {
         log.error(`Error during test cleanup for ${appSpecs.name}: ${cleanupError.message}`);
       }
+      // Released after the teardown, not before: the row is what the announcement
+      // reads, and it exists until the teardown has deleted it.
+      globalState.testInstallingApps.delete(appSpecs.name);
     }
   }
-  return true;
+
+  // Announced once the finally above has released the install hold: a broadcast
+  // cycle takes as long as it takes, and every other install, removal and redeploy
+  // on this node refuses while the hold is up. Below the block rather than ordered
+  // by hand inside it, so the release cannot drift back after it.
+  // checkAndNotifyPeersOfRunningApps never throws.
+  if (!test && onInstallComplete) {
+    await onInstallComplete();
+    fluxEventBus.publish('app:installed', { name: appSpecs.name, hash: appSpecs.hash });
+  }
+  return InstallOutcome.INSTALLED;
+}
+
+/**
+ * Register an app on this node, and publish what the attempt did.
+ *
+ * AN ATTEMPT THAT DOES NOT INSTALL IS AS MUCH A RESULT AS ONE THAT DOES. An install
+ * publishes `app:installed`; every other outcome publishes `app:installOutcome` carrying
+ * which one it was. The response stream cannot carry the difference: `already installed` is
+ * an error envelope and `another application is undergoing installation` is a warning in one
+ * place and an error in another, so a waiter reading the wording cannot tell the app being
+ * there from the node being busy.
+ *
+ * The outcomes are published as themselves rather than flattened into a failure, because
+ * they are not the same fact about the node. ALREADY_INSTALLED means the app is there, BUSY
+ * means ask again, DECLINED and FAILED mean it is not - and FAILED alone means this attempt
+ * is what took it away.
+ *
+ * A throw is reported under FAILED: the app is in whatever state the teardown reached, which
+ * is what FAILED means everywhere else.
+ * @param {object} appSpecs App specifications.
+ * @param {object} componentSpecs Component specifications, when one component is being installed.
+ * @param {object} res Response stream, when a caller holds one.
+ * @param {boolean} [test] A test install, torn down again on the way out.
+ * @param {boolean} [sendRemovalMessage] Whether a teardown announces itself.
+ * @returns {Promise<string>} One of InstallOutcome.
+ */
+async function registerAppLocally(appSpecs, componentSpecs, res, test = false, sendRemovalMessage = false) {
+  // Published for every outcome but INSTALLED, which has app:installed of its own.
+  const announce = (outcome) => {
+    if (test || outcome === InstallOutcome.INSTALLED) return;
+    fluxEventBus.publish('app:installOutcome', { name: appSpecs?.name, outcome });
+  };
+  let outcome;
+  try {
+    outcome = await attemptRegisterAppLocally(appSpecs, componentSpecs, res, test, sendRemovalMessage);
+  } catch (error) {
+    announce(InstallOutcome.FAILED);
+    throw error;
+  }
+  announce(outcome);
+  return outcome;
 }
 
 /**
@@ -864,9 +923,12 @@ async function installApplicationHard(appSpecifications, appName, isComponent, r
  * @param {boolean} isComponent True if a Docker Compose component.
  * @param {object} res Response.
  * @param {object} fullAppSpecs Full app specifications.
+ * @param {object} [options]
+ * @param {boolean} [options.start] False creates the container without starting
+ *   it, for a caller whose next reconcile pass starts it.
  * @returns {Promise<void>} Return statement is only used here to interrupt the function and nothing is returned.
  */
-async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs) {
+async function installApplicationSoft(appSpecifications, appName, isComponent, res, fullAppSpecs, { start = true } = {}) {
   // Verify the apps this app must be networked with (networkWith token) are
   // installed locally and owned by the same owner. Enforced here too — not just
   // in softRegisterAppLocally — so direct callers that bypass it (container
@@ -889,6 +951,23 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
     if (res.flush) res.flush();
   }
 
+  // A DIRECTORY THE SPECIFICATION DECLARES LOCAL IS NOT CREATED BEFORE THE RULE THAT
+  // KEEPS IT OFF THE NETWORK. This path installs onto a volume that already exists, so
+  // nothing seeds .stignore - that is volume creation's, which only the hard path
+  // reaches. A name this specification adds would be covered by the monitor's next
+  // converge, while syncthing's watcher indexes a new directory within its own delay
+  // and the container is writing into it by then. What replicates in that window stays
+  // on every peer: an ignore stops a file syncing, it does not withdraw one already
+  // sent.
+  //
+  // Asked of the spec, so it costs nothing for a component that declares no such
+  // directory or whose volume is not replicated at all.
+  const unsyncedSubdirs = mountParser.getUnsyncedSubdirs(appSpecifications.containerData);
+  const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
+  if (unsyncedSubdirs.length && mountParser.getComponentSyncMode(appSpecifications.containerData)) {
+    await ensureStignoreCovers(dockerService.getAppIdentifier(identifier), unsyncedSubdirs);
+  }
+
   // Mount paths must exist before the container is created (Syncthing cleanup can
   // remove them while a container is stopped); ensure them at the orchestration layer.
   await volumeService.ensureMountPathsExist(appSpecifications, appName, isComponent, fullAppSpecs);
@@ -896,7 +975,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
 
   // Attach this component to the private network of every app it is linked with
   // so it can reach their components by docker DNS name.
-  const componentContainerName = dockerService.getAppIdentifier(isComponent ? `${appSpecifications.name}_${appName}` : appName);
+  const componentContainerName = dockerService.getAppIdentifier(identifier);
   await appNetworkLinker.connectComponentToLinkedApps(componentContainerName, fullAppSpecs);
 
   const startStatus = {
@@ -907,7 +986,7 @@ async function installApplicationSoft(appSpecifications, appName, isComponent, r
     res.write(serviceHelper.ensureString(startStatus));
     if (res.flush) res.flush();
   }
-  if (!appSpecifications.containerData.includes('g:')) {
+  if (start && !appSpecifications.containerData.includes('g:')) {
     const identifier = isComponent ? `${appSpecifications.name}_${appName}` : appName;
     const app = await dockerService.appDockerStart(identifier);
     if (!app) {
@@ -940,8 +1019,17 @@ async function installAppLocally(req, res) {
     }
     let blockAllowance = config.fluxapps.ownerAppAllowance;
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
     if (authorized) {
+      // registerAppLocally refuses a concurrent removal or installation but not a
+      // redeploy or the periodic reinstall pass, and those hold the node across a
+      // teardown they intend to rebuild from. Asked here, before anything is
+      // written, so the refusal is still a status line rather than an envelope in
+      // a half-streamed body.
+      const heldBy = globalState.operationHolding();
+      if (heldBy) {
+        throw new Error(`Another application is undergoing ${heldBy}. Installation not possible.`);
+      }
       let appSpecifications;
       // anyone can deploy temporary app
       // favor temporary to launch test temporary apps
@@ -954,8 +1042,19 @@ async function installAppLocally(req, res) {
         blockAllowance = config.fluxapps.temporaryAppAllowance;
       }
       if (!appSpecifications) {
-        // only owner can deploy permanent message or existing app
-        const ownerAuthorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+        // Placing a registered app on a node is not the node operator's call, for
+        // the same reason removing one is not: hosting an app is not owning it.
+        // This branch resolves an app BY NAME from the marketplace, the global
+        // registry or a permanent message, so an operator reaching it is choosing
+        // which customer's app runs on hardware they control - and for a g:/r: app
+        // the new instance syncs that customer's data down to it. The spawner
+        // decides placement; the owner decides everything else.
+        //
+        // The temporary-message branch above is untouched and stays open to any
+        // logged-in user: that is how an app is tested before it is registered,
+        // it is addressed by hash rather than by name, and it expires on its own
+        // (temporaryAppAllowance).
+        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
@@ -1037,7 +1136,9 @@ async function installAppLocally(req, res) {
       await checkAppRequirements(appSpecifications); // entire app
 
       res.setHeader('Content-Type', 'application/json');
-      await registerAppLocally(appSpecifications, undefined, res); // can throw
+      // A placement this node does not hold yet - refused above if it did - so a
+      // failed install retracts the claim rather than keeping it.
+      await registerAppLocally(appSpecifications, undefined, res, false, true); // can throw
     } else {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
@@ -1049,7 +1150,17 @@ async function installAppLocally(req, res) {
       error.name,
       error.code,
     );
-    res.json(errorResponse);
+    if (res.headersSent) {
+      res.write(serviceHelper.ensureString(errorResponse));
+    } else {
+      res.json(errorResponse);
+    }
+  } finally {
+    // This response has one owner and it is here. registerAppLocally writes its
+    // progress into it and does not close it, so a failure that arrives after
+    // the stream has started still reaches the caller instead of landing in a
+    // response the installer had already ended.
+    if (!res.writableEnded) res.end();
   }
 }
 
@@ -1102,8 +1213,14 @@ async function testAppInstall(req, res) {
     let blockAllowance = config.fluxapps.ownerAppAllowance;
 
     // needs to be logged in
-    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
     if (authorized) {
+      // A test install creates and starts real containers, so it takes the node
+      // the same way a real one does.
+      const heldBy = globalState.operationHolding();
+      if (heldBy) {
+        throw new Error(`Another application is undergoing ${heldBy}. Test installation not possible.`);
+      }
       let appSpecifications;
 
       // anyone can deploy temporary app
@@ -1118,8 +1235,19 @@ async function testAppInstall(req, res) {
       }
 
       if (!appSpecifications) {
-        // only owner can deploy permanent message or existing app
-        const ownerAuthorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+        // Placing a registered app on a node is not the node operator's call, for
+        // the same reason removing one is not: hosting an app is not owning it.
+        // This branch resolves an app BY NAME from the marketplace, the global
+        // registry or a permanent message, so an operator reaching it is choosing
+        // which customer's app runs on hardware they control - and for a g:/r: app
+        // the new instance syncs that customer's data down to it. The spawner
+        // decides placement; the owner decides everything else.
+        //
+        // The temporary-message branch above is untouched and stays open to any
+        // logged-in user: that is how an app is tested before it is registered,
+        // it is addressed by hash rather than by name, and it expires on its own
+        // (temporaryAppAllowance).
+        const ownerAuthorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
         if (!ownerAuthorized) {
           const errMessage = messageHelper.errUnauthorizedMessage();
           res.json(errMessage);
@@ -1211,7 +1339,6 @@ async function testAppInstall(req, res) {
           status: `Test installation validation passed. Installation skipped due to architecture incompatibility: this node is ${localArch} but app requires [${commonArchitectures.join(', ')}]`,
         };
         res.write(serviceHelper.ensureString(successMessage));
-        res.end();
         return;
       }
 
@@ -1228,16 +1355,28 @@ async function testAppInstall(req, res) {
       error.name,
       error.code,
     );
-    res.json(errorResponse);
+    if (res.headersSent) {
+      res.write(serviceHelper.ensureString(errorResponse));
+    } else {
+      res.json(errorResponse);
+    }
+  } finally {
+    // This response has one owner and it is here. registerAppLocally writes its
+    // progress into it and does not close it, so a failure that arrives after
+    // the stream has started still reaches the caller instead of landing in a
+    // response the installer had already ended.
+    if (!res.writableEnded) res.end();
   }
 }
 
 module.exports = {
   registerAppLocally,
+  ensureAppDockerNetwork,
   installApplicationHard,
   installApplicationSoft,
   installAppLocally,
   checkAppRequirements,
   testAppInstall,
   setOnInstallComplete,
+  setupApplicationPorts,
 };

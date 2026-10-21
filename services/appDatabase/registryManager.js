@@ -6,10 +6,16 @@ const serviceHelper = require('../serviceHelper');
 const verificationHelper = require('../verificationHelper');
 const daemonServiceMiscRpcs = require('../daemonService/daemonServiceMiscRpcs');
 const fluxEventBus = require('../utils/fluxEventBus');
+const globalState = require('../utils/globalState');
+const { appSyncEvents, EVENTS: SYNC_EVENTS } = require('../utils/appSyncEvents');
 // Removed appsService to avoid circular dependency - will use dynamic require where needed
 const { checkAndDecryptAppSpecs, encryptEnterpriseFromSession } = require('../utils/enterpriseHelper');
 const { specificationFormatter, updateToLatestAppSpecifications } = require('../utils/appUtilities');
-const fluxStorageResolver = require('../utils/fluxStorageResolver');
+const placementFeasibility = require('../appPlacement/placementFeasibility');
+const { withRegistryWrite } = require('./registryWriteLock');
+const appMessageChain = require('../utils/appMessageChain');
+const mountParser = require('../utils/mountParser');
+const signatureVerifier = require('../signatureVerifier');
 const {
   SIGTERM_EXPIRY_MS,
   globalAppsInformation,
@@ -23,8 +29,70 @@ const {
   appsHashesCollection,
   scannedHeightCollection,
 } = require('../utils/appConstants');
+const { Privilege, authOf } = require('../utils/privileges');
+const localRemovalQueue = require('../appLifecycle/localRemovalQueue');
+const {
+  extractIp, ipsMatch, normalizeSocketAddress,
+} = require('../utils/socketAddressUtils');
 
-let reindexRunning = false;
+// The most moves followed from one address. A node announces each move it makes,
+// so a real chain is one or two long; the bound only ends a chain that loops.
+const MAX_ADDRESS_MOVES_FOLLOWED = 8;
+
+// The rebuild running now, and the one that follows it for every caller that asked after it began.
+let rebuildRunning = null;
+let rebuildFollowing = null;
+
+/**
+ * The state of this node's app registry: the app sync state, the height its
+ * explorer has scanned to (null before the first scan), how many apps it holds,
+ * how many app transactions the explorer has recorded, how many of those this
+ * node still has no message for, and how many of the missing ones it has
+ * stopped looking for. A node answers in every sync state, READY or not.
+ * @param {object} _req - Request object (unused)
+ * @param {object} res - Response object
+ * @returns {Promise<object>} {syncState, scannedHeight, apps, transactions, missingMessages, messagesNotFound}
+ */
+async function getRegistryStatus(_req, res) {
+  try {
+    const dbopen = dbHelper.databaseConnection();
+    const appsDatabase = dbopen.db(config.database.appsglobal.database);
+    const daemonDatabase = dbopen.db(config.database.daemon.database);
+    // The totals count the _id index rather than reading every document; the
+    // missing counts are answered by the message index.
+    const wholeCollection = { hint: { _id: 1 } };
+    const [scanned, apps, transactions, missingMessages, messagesNotFound] = await Promise.all([
+      dbHelper.findOneInDatabase(
+        daemonDatabase,
+        scannedHeightCollection,
+        { generalScannedHeight: { $gte: 0 } },
+        { projection: { _id: 0, generalScannedHeight: 1 } },
+      ),
+      dbHelper.countInDatabase(appsDatabase, globalAppsInformation, {}, wholeCollection),
+      dbHelper.countInDatabase(daemonDatabase, appsHashesCollection, {}, wholeCollection),
+      dbHelper.countInDatabase(daemonDatabase, appsHashesCollection, { message: false }),
+      dbHelper.countInDatabase(daemonDatabase, appsHashesCollection, { message: false, messageNotFound: true }),
+    ]);
+    const status = {
+      syncState: globalState.appSyncState,
+      scannedHeight: scanned ? serviceHelper.ensureNumber(scanned.generalScannedHeight) : null,
+      apps,
+      transactions,
+      missingMessages,
+      messagesNotFound,
+    };
+    const statusResponse = messageHelper.createDataMessage(status);
+    return res ? res.json(statusResponse) : statusResponse;
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    return res ? res.json(errorResponse) : errorResponse;
+  }
+}
 
 /**
  * Get all app hashes from the blockchain
@@ -67,6 +135,20 @@ async function getAppHashes(_req, res) {
  * @param {string} appname - Optional app name filter
  * @returns {Promise<Array>} Array of app locations
  */
+/**
+ * The names of the apps the network lists at `socketAddress`.
+ * @param {string} socketAddress
+ * @returns {Promise<string[]>}
+ */
+async function appsListedAt(socketAddress) {
+  const ip = normalizeSocketAddress(socketAddress);
+  if (!ip) return [];
+  const database = dbHelper.databaseConnection().db(config.database.appsglobal.database);
+  const rows = await database.collection(globalAppsLocations)
+    .find({ ip }, { projection: { _id: 0, name: 1 } }).toArray();
+  return [...new Set(rows.map((row) => row.name))];
+}
+
 async function appLocation(appname) {
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
@@ -91,16 +173,324 @@ async function appLocation(appname) {
   return results;
 }
 
+// A recorded address move is a node announcing, signed, that it no longer
+// answers at its old socket address and now answers at the new one: one per old
+// address, the latest it announced. Events are stored as they arrive, before
+// anything checks them, so only a version 1 move between two different
+// addresses counts.
+const MOVE_PROJECTION = Object.freeze({
+  _id: 0, ip: 1, broadcastedAt: 1, 'data.newIP': 1, 'data.version': 1, 'envelope.pubKey': 1,
+});
+
+/**
+ * Add a stored ipchanged event to `moves` when it is a move: version 1, between
+ * two different addresses. `signer` is the key that signed it, or null.
+ * @param {Map<string, {to: string, at: number, signer: string|null}>} moves
+ * @param {object} event
+ * @returns {string|null} The address it moves to, or null when it is not a move.
+ */
+function addMove(moves, event) {
+  const from = normalizeSocketAddress(event.ip);
+  const to = typeof event.data?.newIP === 'string' ? normalizeSocketAddress(event.data.newIP) : null;
+  const at = new Date(event.broadcastedAt).getTime();
+  if (event.data?.version !== 1 || !from || !to || to === from || !Number.isFinite(at)) return null;
+  moves.set(from, { to, at, signer: event.envelope?.pubKey ?? null });
+  return to;
+}
+
+/**
+ * The recorded moves away from `addresses`, and away from every address those
+ * lead to, read by address rather than by scanning every move.
+ * @param {string[]} addresses Socket addresses.
+ * @returns {Promise<Map<string, {to: string, at: number}>>} As addressMoves.
+ */
+async function addressMovesFrom(addresses) {
+  const collection = dbHelper.databaseConnection().db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const moves = new Map();
+  const asked = new Set();
+  let frontier = addresses;
+  for (let hop = 0; hop < MAX_ADDRESS_MOVES_FOLLOWED && frontier.length; hop += 1) {
+    // an address may be stored with its port or, when it is the default, without
+    const pending = [...new Set(frontier.flatMap((address) => [address, normalizeSocketAddress(address)]).filter(Boolean))]
+      .filter((address) => !asked.has(address));
+    if (!pending.length) break;
+    pending.forEach((address) => asked.add(address));
+    // eslint-disable-next-line no-await-in-loop
+    const events = await collection.find(
+      { ip: { $in: pending }, type: 'ipchanged', expireAt: { $gt: new Date() } },
+      { projection: MOVE_PROJECTION },
+    ).toArray();
+    frontier = events.map((event) => addMove(moves, event)).filter(Boolean);
+  }
+  return moves;
+}
+
+/**
+ * The recorded moves to `address`.
+ * @param {string} address A socket address.
+ * @returns {Promise<Map<string, {to: string, at: number, signer: string|null}>>}
+ *   old socket address -> the move, as addressMovesFrom gives it
+ */
+async function addressMovesTo(address) {
+  const collection = dbHelper.databaseConnection().db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const events = await collection.find(
+    { type: 'ipchanged', 'data.newIP': normalizeSocketAddress(address), expireAt: { $gt: new Date() } },
+    { projection: MOVE_PROJECTION },
+  ).toArray();
+  const moves = new Map();
+  events.forEach((event) => addMove(moves, event));
+  return moves;
+}
+
+/**
+ * The query condition for every stored address at an IP, whatever its port.
+ *
+ * Every location and every move is stored under its node's address in ip:port
+ * form, so the IP and the colon after it match exactly the addresses at that
+ * IP: never one that only begins with it.
+ * @param {string} ip An IP, or a socket address whose IP is meant.
+ * @returns {RegExp|null} null when there is no IP
+ */
+function storedAtIp(ip) {
+  const bare = extractIp(ip);
+  if (!bare) return null;
+  return new RegExp(`^${bare.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`);
+}
+
+/**
+ * The socket addresses at `ip` that a recorded move leaves.
+ * @param {string} ip An IP, or a socket address whose IP is meant.
+ * @returns {Promise<string[]>}
+ */
+async function addressesMovedFromIp(ip) {
+  const atIp = storedAtIp(ip);
+  if (!atIp) return [];
+  const collection = dbHelper.databaseConnection().db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const events = await collection.find(
+    { ip: atIp, type: 'ipchanged', expireAt: { $gt: new Date() } },
+    { projection: { _id: 0, ip: 1 } },
+  ).toArray();
+  return [...new Set(events.map((event) => event.ip))];
+}
+
+/**
+ * Where each node that spoke for an address is now. A message signed at an
+ * address speaks for the node that held it when it was signed; when that node
+ * has since moved, what it said holds at the address it moved to.
+ * @param {Array<{ip: string, at: number}>} sayings Each address, and when its message was signed (ms).
+ * @returns {Promise<string[]>} One address per saying: where the node moved to, or `ip` as given when it has not moved.
+ */
+async function currentAddressesOf(sayings) {
+  const moves = await addressMovesFrom(sayings.map(({ ip }) => ip));
+  return sayings.map(({ ip, at }) => {
+    const to = followAddressMoves(ip, moves, at);
+    return to === normalizeSocketAddress(ip) ? ip : to;
+  });
+}
+
+/**
+ * The listed node whose recorded moves end at `address`, or null: an address
+ * it moved on from is no longer the node's. A node moves only itself, so every
+ * move followed is one signed by the key the list holds for the node, and each
+ * is newer than the one before it.
+ * @param {string} address A socket address.
+ * @param {Array<{ip: string, pubkey: string}>} nodeList The deterministic list.
+ * @returns {Promise<object|null>}
+ */
+async function listedNodeMovedTo(address, nodeList) {
+  const target = normalizeSocketAddress(address);
+  const sources = new Set((await addressesLeadingTo(address)).map(normalizeSocketAddress));
+  sources.delete(target);
+  const candidates = nodeList.filter((node) => sources.has(normalizeSocketAddress(node.ip)));
+  // eslint-disable-next-line no-restricted-syntax
+  for (const node of candidates) {
+    // eslint-disable-next-line no-await-in-loop
+    const moves = await addressMovesFrom([node.ip]);
+    let current = normalizeSocketAddress(node.ip);
+    let since = 0;
+    for (let hop = 0; hop < MAX_ADDRESS_MOVES_FOLLOWED; hop += 1) {
+      const move = moves.get(current);
+      if (!move || move.at <= since || move.signer !== node.pubkey) break;
+      current = move.to;
+      since = move.at;
+    }
+    if (current === target) return node;
+  }
+  return null;
+}
+
+/**
+ * The addresses whose recorded moves lead to `address`, and `address` itself.
+ * @param {string} address A socket address.
+ * @returns {Promise<string[]>}
+ */
+async function addressesLeadingTo(address) {
+  const collection = dbHelper.databaseConnection().db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const found = new Set([address]);
+  let frontier = [address];
+  for (let hop = 0; hop < MAX_ADDRESS_MOVES_FOLLOWED && frontier.length; hop += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const events = await collection.find(
+      { type: 'ipchanged', 'data.newIP': { $in: [...new Set(frontier.flatMap((to) => [to, normalizeSocketAddress(to)]))] }, expireAt: { $gt: new Date() } },
+      { projection: { _id: 0, ip: 1 } },
+    ).toArray();
+    frontier = events.map((event) => event.ip).filter((ip) => !found.has(ip));
+    frontier.forEach((ip) => found.add(ip));
+  }
+  return [...found];
+}
+
+/**
+ * Where a node known at `socketAddr` as of `knownAt` answers now. Each move
+ * followed must be newer than the address it moves from was known to be good, so
+ * a node that moved away and back again ends at the address it holds now.
+ * @param {string} socketAddr
+ * @param {Map<string, {to: string, at: number}>} moves From addressMoves.
+ * @param {number} [knownAt] When `socketAddr` was last known to be the node's (ms).
+ * @returns {string} The address, normalised; `socketAddr` when it has not moved.
+ */
+function followAddressMoves(socketAddr, moves, knownAt = 0) {
+  let address = normalizeSocketAddress(socketAddr);
+  let since = knownAt;
+  for (let hop = 0; hop < MAX_ADDRESS_MOVES_FOLLOWED; hop += 1) {
+    const move = moves.get(address);
+    if (!move || move.at <= since) break;
+    address = move.to;
+    since = move.at;
+  }
+  return address;
+}
+
+/**
+ * The full socket address of the node FDM names an app's primary.
+ *
+ * FDM names it by IP alone. A node runs at most one instance of an app per IP,
+ * so the app's location at that IP is the node, and its port is the one to ask
+ * it on. A move carries a node's rows to where it is now as it is applied, so
+ * the locations are where their nodes are. With no location at that IP, the IP
+ * may be one a node has since moved from, which FDM names until it catches up:
+ * the one move away from it that ends at a holder of the app is that node.
+ *
+ * When neither settles it - locations at the IP at different addresses, or no
+ * move or several leading to a holder - the IP comes back as given.
+ * @param {string} appName
+ * @param {string} fdmIp The primary FDM names.
+ * @returns {Promise<string>} A full socket address, or `fdmIp` unresolved.
+ */
+async function primaryAddressOf(appName, fdmIp) {
+  const locations = await appLocation(appName);
+  const atIp = new Set(locations
+    .filter((location) => ipsMatch(location.ip, fdmIp))
+    .map((location) => normalizeSocketAddress(location.ip)));
+  if (atIp.size === 1) return [...atIp][0];
+  if (atIp.size > 1) return fdmIp;
+  const holders = new Set(locations.map((location) => normalizeSocketAddress(location.ip)));
+  const moves = await addressMovesFrom(await addressesMovedFromIp(fdmIp));
+  const reached = new Set(
+    [...moves.keys()]
+      .filter((from) => ipsMatch(from, fdmIp))
+      .map((from) => followAddressMoves(from, moves))
+      .filter((to) => holders.has(to)),
+  );
+  return reached.size === 1 ? [...reached][0] : fdmIp;
+}
+
+/**
+ * The moves the event-derived view follows: version 1 ipchanged events, one per
+ * old address (the newest), as stored.
+ * @param {string[]|null} addresses Only the moves away from these, when given.
+ * @returns {Promise<Array<{_id: string, newIP: string, changedAt: Date}>>}
+ */
+async function movesForView(addresses) {
+  const collection = dbHelper.databaseConnection().db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const query = {
+    type: 'ipchanged', 'data.version': 1, 'data.newIP': { $type: 'string' }, expireAt: { $gt: new Date() },
+  };
+  if (addresses) query.ip = { $in: addresses };
+  const events = await collection.find(query, { projection: { _id: 0, ip: 1, broadcastedAt: 1, 'data.newIP': 1 } })
+    .sort({ broadcastedAt: -1 }).toArray();
+  const moves = new Map();
+  events
+    .filter((event) => !moves.has(event.ip))
+    .forEach((event) => moves.set(event.ip, { _id: event.ip, newIP: event.data.newIP, changedAt: event.broadcastedAt }));
+  return [...moves.values()];
+}
+
+/**
+ * An aggregation expression for where the node that held `address` at `at` is
+ * now, following `moves` (from movesForView) the way followAddressMoves does:
+ * each move followed is newer than the address it leaves was known to be the
+ * node's. Stops at the first address with no such move.
+ * @param {*} address Expression for the address.
+ * @param {*} at Expression for when it was known to be the node's.
+ * @param {Array<object>} moves
+ * @param {number} [hop]
+ * @returns {object}
+ */
+function followMovesExpr(address, at, moves, hop = 0) {
+  if (hop === MAX_ADDRESS_MOVES_FOLLOWED) return address;
+  const move = `move${hop}`;
+  return {
+    $let: {
+      vars: {
+        [move]: {
+          $first: {
+            $filter: {
+              input: { $literal: moves },
+              as: 'c',
+              cond: { $and: [{ $eq: ['$$c._id', address] }, { $gt: ['$$c.changedAt', at] }] },
+            },
+          },
+        },
+      },
+      in: {
+        $cond: [
+          { $eq: [{ $ifNull: [`$$${move}`, null] }, null] },
+          address,
+          followMovesExpr(`$$${move}.newIP`, `$$${move}.changedAt`, moves, hop + 1),
+        ],
+      },
+    },
+  };
+}
+
+/**
+ * An aggregation expression for the newest of the document's `shutdowns` at
+ * `address`, or null. Shutdowns made at different addresses can resolve to one.
+ * @param {*} address Expression for the address.
+ * @returns {object}
+ */
+function newestShutdownAt(address) {
+  return {
+    $let: {
+      vars: { address },
+      in: {
+        $reduce: {
+          input: { $filter: { input: '$shutdowns', as: 's', cond: { $eq: ['$$s._id', '$$address'] } } },
+          initialValue: null,
+          in: { $cond: [{ $or: [{ $eq: ['$$value', null] }, { $gt: ['$$this.eventAt', '$$value.eventAt'] }] }, '$$this', '$$value'] },
+        },
+      },
+    },
+  };
+}
+
 // Derives running app locations from the event log. Will replace appLocation() once callers are switched.
 //
 // Performance: shutdown/v1 filtering happens at IP level BEFORE unwinding to individual apps.
-// Lookups use $filter + $first against small arrays (shutdowns ~10, ipChanges ~5) which is
+// Lookups use $filter + $first against small arrays (shutdowns ~10) which is
 // O(IPs * arraySize) — fast because the arrays are small. The v2Timestamps lookup for v1
 // filtering is O(v1Count * v2IPs) which dominates at ~2.4M comparisons at steady state.
 //
 // MongoDB 7.2+ optimization: $getField supports dynamic field references, enabling
 // $arrayToObject maps with O(1) key lookup via $getField({ field: '$$var.ip', input: '$map' }).
 // This would reduce all lookups to O(n) total. Blocked by MongoDB 7.0 on CI (SERVER-74371).
+//
+// Every report, removal and shutdown speaks for the node that held its address when it was
+// made; when that node has since moved, it holds at the address the node moved to. The moves
+// are read first, and each facet is split by whether an event was made at an address a move
+// leaves: only that part is resolved, against the moves as a literal. With no moves the
+// pipeline is the one without them.
 async function appLocationFromEvents(options = {}) {
   const { appname, ip } = options;
   const dbopen = dbHelper.databaseConnection();
@@ -116,18 +506,28 @@ async function appLocationFromEvents(options = {}) {
 
   const initialMatch = {
     $or: [
-      { type: { $in: ['apprunning', 'appremoved', 'ipchanged'] }, expireAt: { $gt: now } },
+      { type: { $in: ['apprunning', 'appremoved'] }, expireAt: { $gt: now } },
       { type: { $in: ['sigterm', 'evicted'] } },
     ],
   };
-  if (ip) initialMatch.ip = ip;
+  const scope = ip ? await addressesLeadingTo(ip) : null;
+  if (scope) initialMatch.ip = { $in: scope };
+  const moves = await movesForView(scope);
+  const movedFrom = moves.map((move) => move._id);
+  // A facet's stages, and when there are moves a second facet `<name>Moved` for the
+  // events made at an address a move leaves, ending in `resolve`.
+  const splitByMove = (name, stages, resolve) => (moves.length ? {
+    [name]: [{ $match: { ip: { $nin: movedFrom } } }, ...stages],
+    [`${name}Moved`]: [{ $match: { ip: { $in: movedFrom } } }, ...stages, resolve],
+  } : { [name]: stages });
+  const resolveReport = { $addFields: { at: followMovesExpr('$ip', '$broadcastedAt', moves) } };
 
   const pipeline = [
     { $match: initialMatch },
     { $sort: { broadcastedAt: -1 } },
     {
       $facet: {
-        v2: [
+        ...splitByMove('v2', [
           { $match: { type: 'apprunning', 'data.apps': { $exists: true } } },
           { $group: { _id: '$ip', doc: { $first: '$$ROOT' } } },
           { $replaceRoot: { newRoot: '$doc' } },
@@ -142,8 +542,8 @@ async function appLocationFromEvents(options = {}) {
               runningSince: '$data.runningSince',
             },
           },
-        ],
-        v1: [
+        ], resolveReport),
+        ...splitByMove('v1', [
           ...v1NameFilter,
           { $match: { type: 'apprunning', 'data.name': { $exists: true } } },
           {
@@ -165,12 +565,12 @@ async function appLocationFromEvents(options = {}) {
               staticIp: '$data.staticIp',
             },
           },
-        ],
+        ], resolveReport),
         v2Timestamps: [
           { $match: { type: 'apprunning', 'data.apps': { $exists: true } } },
           { $group: { _id: '$ip', latestV2: { $first: '$broadcastedAt' } } },
         ],
-        removals: [
+        ...splitByMove('removals', [
           { $match: { type: 'appremoved' } },
           ...removalNameFilter,
           {
@@ -179,8 +579,8 @@ async function appLocationFromEvents(options = {}) {
               removedAt: { $first: '$broadcastedAt' },
             },
           },
-        ],
-        shutdowns: [
+        ], { $addFields: { '_id.ip': followMovesExpr('$_id.ip', '$removedAt', moves) } }),
+        ...splitByMove('shutdowns', [
           { $match: { type: { $in: ['sigterm', 'evicted'] } } },
           { $addFields: { _eventAt: { $ifNull: ['$broadcastedAt', '$createdAt'] } } },
           { $sort: { _eventAt: -1 } },
@@ -192,13 +592,15 @@ async function appLocationFromEvents(options = {}) {
               type: { $first: '$type' },
             },
           },
-        ],
-        ipChanges: [
-          { $match: { type: 'ipchanged' } },
-          { $group: { _id: '$ip', newIP: { $first: '$data.newIP' }, changedAt: { $first: '$broadcastedAt' } } },
-        ],
+        ], { $addFields: { _id: followMovesExpr('$_id', '$eventAt', moves) } }),
       },
     },
+    // A report keeps the address it was made at in `ip`; one made where a move leaves
+    // gains the address its node holds now in `at`.
+    ...(moves.length ? [{
+      $addFields: Object.fromEntries(['v2', 'v1', 'removals', 'shutdowns']
+        .map((name) => [name, { $concatArrays: [`$${name}`, `$${name}Moved`] }])),
+    }] : []),
     // Filter v2 at IP level before unwinding — shutdown check against small array
     {
       $addFields: {
@@ -208,7 +610,7 @@ async function appLocationFromEvents(options = {}) {
             as: 'entry',
             cond: {
               $let: {
-                vars: { sd: { $first: { $filter: { input: '$shutdowns', as: 's', cond: { $eq: ['$$s._id', '$$entry.ip'] } } } } },
+                vars: { sd: newestShutdownAt({ $ifNull: ['$$entry.at', '$$entry.ip'] }) },
                 in: {
                   $or: [
                     { $eq: ['$$sd', null] },
@@ -239,7 +641,7 @@ async function appLocationFromEvents(options = {}) {
                 },
                 {
                   $let: {
-                    vars: { sd: { $first: { $filter: { input: '$shutdowns', as: 's', cond: { $eq: ['$$s._id', '$$entry.ip'] } } } } },
+                    vars: { sd: newestShutdownAt({ $ifNull: ['$$entry.at', '$$entry.ip'] }) },
                     in: {
                       $or: [
                         { $eq: ['$$sd', null] },
@@ -267,46 +669,31 @@ async function appLocationFromEvents(options = {}) {
               _id: 0,
               name: '$_v2Filtered.apps.name',
               hash: '$_v2Filtered.apps.hash',
-              ip: '$_v2Filtered.ip',
+              ip: { $ifNull: ['$_v2Filtered.at', '$_v2Filtered.ip'] },
               broadcastedAt: '$_v2Filtered.broadcastedAt',
               runningSince: { $ifNull: ['$_v2Filtered.apps.runningSince', '$_v2Filtered.runningSince'] },
               osUptime: '$_v2Filtered.osUptime',
               staticIp: '$_v2Filtered.staticIp',
               removals: 1,
-              ipChanges: 1,
             },
           },
           {
             $addFields: {
+              // the newest: removals made at different addresses can resolve to one
               _removedAt: {
                 $ifNull: [
-                  { $let: {
-                    vars: { r: { $first: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } } } },
+                  { $max: { $map: {
+                    input: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } },
+                    as: 'r',
                     in: '$$r.removedAt',
-                  } },
+                  } } },
                   new Date(0),
                 ],
               },
             },
           },
           { $match: { $expr: { $gt: ['$broadcastedAt', '$_removedAt'] } } },
-          {
-            $addFields: {
-              _ipChange: { $first: { $filter: { input: '$ipChanges', as: 'c', cond: { $eq: ['$$c._id', '$ip'] } } } },
-            },
-          },
-          {
-            $addFields: {
-              ip: {
-                $cond: [
-                  { $and: [{ $ne: ['$_ipChange', null] }, { $gt: ['$_ipChange.changedAt', '$broadcastedAt'] }] },
-                  '$_ipChange.newIP',
-                  '$ip',
-                ],
-              },
-            },
-          },
-          { $project: { removals: 0, ipChanges: 0, _removedAt: 0, _ipChange: 0 } },
+          { $project: { removals: 0, _removedAt: 0 } },
         ],
         fromV1: [
           { $unwind: '$_v1Filtered' },
@@ -315,46 +702,31 @@ async function appLocationFromEvents(options = {}) {
               _id: 0,
               name: '$_v1Filtered.name',
               hash: '$_v1Filtered.hash',
-              ip: '$_v1Filtered.ip',
+              ip: { $ifNull: ['$_v1Filtered.at', '$_v1Filtered.ip'] },
               broadcastedAt: '$_v1Filtered.broadcastedAt',
               runningSince: '$_v1Filtered.runningSince',
               osUptime: '$_v1Filtered.osUptime',
               staticIp: '$_v1Filtered.staticIp',
               removals: 1,
-              ipChanges: 1,
             },
           },
           {
             $addFields: {
+              // the newest: removals made at different addresses can resolve to one
               _removedAt: {
                 $ifNull: [
-                  { $let: {
-                    vars: { r: { $first: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } } } },
+                  { $max: { $map: {
+                    input: { $filter: { input: '$removals', as: 'r', cond: { $and: [{ $eq: ['$$r._id.ip', '$ip'] }, { $eq: ['$$r._id.name', '$name'] }] } } },
+                    as: 'r',
                     in: '$$r.removedAt',
-                  } },
+                  } } },
                   new Date(0),
                 ],
               },
             },
           },
           { $match: { $expr: { $gt: ['$broadcastedAt', '$_removedAt'] } } },
-          {
-            $addFields: {
-              _ipChange: { $first: { $filter: { input: '$ipChanges', as: 'c', cond: { $eq: ['$$c._id', '$ip'] } } } },
-            },
-          },
-          {
-            $addFields: {
-              ip: {
-                $cond: [
-                  { $and: [{ $ne: ['$_ipChange', null] }, { $gt: ['$_ipChange.changedAt', '$broadcastedAt'] }] },
-                  '$_ipChange.newIP',
-                  '$ip',
-                ],
-              },
-            },
-          },
-          { $project: { removals: 0, ipChanges: 0, _removedAt: 0, _ipChange: 0 } },
+          { $project: { removals: 0, _removedAt: 0 } },
         ],
       },
     },
@@ -377,6 +749,8 @@ async function appLocationFromEvents(options = {}) {
     },
     { $project: { _id: 0 } },
   ];
+  // the addresses that moved to `ip` are read too; what they said holds here only once resolved
+  if (ip) pipeline.push({ $match: { ip } });
 
   const results = await collection.aggregate(pipeline).toArray();
   return results;
@@ -405,6 +779,28 @@ async function appInstallingLocation(appname) {
   };
   const results = await dbHelper.findInDatabase(database, globalAppsInstallingLocations, query, projection);
   return results;
+}
+
+/**
+ * How many nodes are claiming each app, counted in one grouped pass.
+ *
+ * The spawner needs this for every candidate at once, to decide which apps
+ * still need a node before it picks one. Asking per app would be a read per
+ * candidate; this is a single scan of a collection that holds only live claims,
+ * since they expire on a TTL index.
+ *
+ * Names are lowercased because an app is addressed case-insensitively
+ * everywhere else here, so a caller must not have to know which case the
+ * claiming node happened to send.
+ * @returns {Promise<Map<string, number>>} Lowercased app name to claim count.
+ */
+async function installingCountsByApp() {
+  const dbopen = dbHelper.databaseConnection();
+  const database = dbopen.db(config.database.appsglobal.database);
+  const rows = await dbHelper.aggregateInDatabase(database, globalAppsInstallingLocations, [
+    { $group: { _id: { $toLower: '$name' }, count: { $sum: 1 } } },
+  ]);
+  return new Map(rows.map((row) => [row._id, row.count]));
 }
 
 /**
@@ -760,6 +1156,99 @@ async function getApplicationSpecifications(appName) {
 }
 
 /**
+ * What the flux team may know about an app whose specification they cannot
+ * read: the names of its components, whether each is election managed, and what
+ * the app costs in total.
+ *
+ * Deliberately NOT specification-shaped. A redacted specification is the
+ * dangerous thing here: it is indistinguishable from a complete one, so an
+ * update composed from it writes its blanks back over the customer's app.
+ * Nothing can mistake this shape for a spec or submit it as one.
+ *
+ * Two different claims, which is why they are two fields:
+ *
+ * `resources` is public information that happens to be sealed today. v9 keeps
+ * the totals OUTSIDE the encrypted envelope on purpose - a node has to judge
+ * whether it can host an app without being able to read it - and binds them
+ * into the AAD so a relayer cannot understate them. Returning them here is that
+ * same decision, made for a spec version that has not shipped it yet.
+ *
+ * `components` is not. v9 seals the component list and publishes only a count,
+ * so handing over the names is a deliberate exception rather than a claim they
+ * are harmless: the container tools address a component as `<component>_<app>`,
+ * so logs, terminal, monitoring and file changes cannot function without them.
+ * The exception is granted to an authenticated flux team caller, on a node that
+ * already holds the plaintext, and to nobody else.
+ *
+ * Withheld either way: environment parameters, repository credentials, secrets,
+ * commands, image tags, ports and domains.
+ *
+ * @param {object} req - Request object
+ * @param {object} res - Response object
+ */
+async function getApplicationComponentNamesAPI(req, res) {
+  try {
+    let { appname } = req.params;
+    appname = appname || req.query.appname;
+
+    if (!appname) {
+      throw new Error('No Application Name specified');
+    }
+
+    const mainAppName = appname.split('_')[1] || appname;
+
+    // fluxteam, not appownerorfluxteam: an owner reads the specification itself
+    // and has no use for this, and the node operator is not a party to a
+    // customer's app at all.
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
+    if (!authorized) {
+      const errMessage = messageHelper.errUnauthorizedMessage();
+      return res.json(errMessage);
+    }
+
+    const specifications = await getApplicationSpecifications(mainAppName);
+    if (!specifications) {
+      throw new Error(`Application: ${mainAppName} not found`);
+    }
+
+    const components = specifications.version >= 4 && Array.isArray(specifications.compose)
+      ? specifications.compose
+      : [specifications];
+
+    // Totals, not per-component sizing: it is what an app costs, it is what the
+    // app list renders, and it is the granularity v9 publishes. Named for the
+    // fields a v8 spec carries - v9 calls the same three cpu, memoryMb and
+    // storageGb.
+    const resources = components.reduce((total, component) => ({
+      cpu: total.cpu + (Number(component.cpu) || 0),
+      ram: total.ram + (Number(component.ram) || 0),
+      hdd: total.hdd + (Number(component.hdd) || 0),
+    }), { cpu: 0, ram: 0, hdd: 0 });
+
+    const response = messageHelper.createDataMessage({
+      components: components.map((component) => ({
+        name: component.name,
+        // The classifier the election itself uses. A sync flag counts only on the
+        // primary mount, so this must agree with what decides the component's
+        // fate rather than with anywhere the letters happen to appear.
+        masterSlave: mountParser.isGComponent(component.containerData || ''),
+      })),
+      resources,
+    });
+
+    return res.json(response);
+  } catch (error) {
+    log.error(error);
+    const errorResponse = messageHelper.createErrorMessage(
+      error.message || error,
+      error.name,
+      error.code,
+    );
+    return res.json(errorResponse);
+  }
+}
+
+/**
  * Get application specification via API
  * @param {object} req - Request object
  * @param {object} res - Response object
@@ -783,10 +1272,6 @@ async function getApplicationSpecificationAPI(req, res) {
     // query params take precedence over params (they were set explictly)
     decrypt = req.query.decrypt || decrypt;
 
-    // opt-in flag: expand F_S_ storage links into their real values for the app owner
-    // (or Flux support). Off by default so normal spec reads never pay the storage fetch.
-    const resolveStorage = req.query.resolvestorage === 'true';
-
     const specifications = await getApplicationSpecifications(appname);
     const mainAppName = appname.split('_')[1] || appname;
 
@@ -799,30 +1284,6 @@ async function getApplicationSpecificationAPI(req, res) {
     );
 
     if (!decrypt) {
-      if (resolveStorage) {
-        // Reveal storage-backed values for non-enterprise apps in cleartext. Enterprise apps
-        // must use the encrypted decryption path so secrets never travel in clear.
-        if (isEnterprise) {
-          throw new Error('Enterprise apps require decryption to resolve Flux Storage values.');
-        }
-
-        const ownerAuthorized = await verificationHelper.verifyPrivilege('appowner', req, mainAppName);
-        const fluxTeamAuthorized = ownerAuthorized === true
-          ? false
-          : await verificationHelper.verifyPrivilege('appownerabove', req, mainAppName);
-
-        if (ownerAuthorized !== true && fluxTeamAuthorized !== true) {
-          const errMessage = messageHelper.errUnauthorizedMessage();
-          res.json(errMessage);
-          return null;
-        }
-
-        const resolvedSpecifications = await fluxStorageResolver.attachResolvedStorage(specifications, appname);
-        const resolvedResponse = messageHelper.createDataMessage(resolvedSpecifications);
-        res.json(resolvedResponse);
-        return null;
-      }
-
       if (isEnterprise) {
         specifications.compose = [];
         specifications.contacts = [];
@@ -842,47 +1303,30 @@ async function getApplicationSpecificationAPI(req, res) {
       throw new Error('Header with enterpriseKey is mandatory for enterprise Apps.');
     }
 
-    const ownerAuthorized = await verificationHelper.verifyPrivilege(
-      'appowner',
-      req,
-      mainAppName,
+    // Decrypting a spec is the owner's alone. A partly-redacted one would be
+    // neither usable nor safe: an update composed from a spec whose
+    // environmentParameters and repoauth have been blanked writes those blanks
+    // back over the customer's app, and everything left in it is still theirs.
+    //
+    // The flux team decrypts out of band instead, which keeps a decryption a
+    // deliberate act by a named person rather than a side effect of opening a
+    // page.
+    const authorized = await verificationHelper.verifyPrivilege(
+      Privilege.APP_OWNER,
+      authOf(req),
+      { appName: mainAppName },
     );
 
-    const fluxTeamAuthorized = ownerAuthorized === true
-      ? false
-      : await verificationHelper.verifyPrivilege(
-        'appownerabove',
-        req,
-        mainAppName,
-      );
-
-    if (ownerAuthorized !== true && fluxTeamAuthorized !== true) {
+    if (authorized !== true) {
       const errMessage = messageHelper.errUnauthorizedMessage();
       res.json(errMessage);
       return null;
     }
 
-    if (fluxTeamAuthorized) {
-      specifications.compose.forEach((component) => {
-        const comp = component;
-        comp.environmentParameters = [];
-        comp.repoauth = '';
-      });
-    }
-
-    // Optionally expand F_S_ storage links into their values before re-encryption, so the
-    // resolved content rides the same client session key instead of travelling in clear.
-    // Resolved into a clone (after any support-team blanking above) so the source spec and
-    // its cache are untouched.
-    let specificationsToEncrypt = specifications;
-    if (resolveStorage) {
-      specificationsToEncrypt = await fluxStorageResolver.attachResolvedStorage(specifications, appname);
-    }
-
     // this seems a bit weird, but the client can ask for the specs encrypted or decrypted.
     // If decrypted, they pass us another session key and we use that to encrypt.
     specifications.enterprise = await encryptEnterpriseFromSession(
-      specificationsToEncrypt,
+      specifications,
       daemonHeight,
       encryptedEnterpriseKey,
     );
@@ -975,10 +1419,14 @@ async function updateApplicationSpecificationAPI(req, res) {
       }
     }
 
+    // The owner alone, as for the decrypt path above. This upgrades the stored
+    // spec and hands it back whole, encrypted to a session key the caller
+    // supplies - environmentParameters and repoauth included - which is the
+    // spec its owner is about to re-sign, and nobody else's business.
     const authorized = await verificationHelper.verifyPrivilege(
-      'appownerabove',
-      req,
-      mainAppName,
+      Privilege.APP_OWNER,
+      authOf(req),
+      { appName: mainAppName },
     );
 
     if (!authorized) {
@@ -1158,6 +1606,8 @@ async function checkApplicationRegistrationNameConflicts(appSpecFormatted, hash)
         } else {
           log.warn(`Flux App ${appSpecFormatted.name} active specifications are outdated. Will be cleaned on next expiration`);
         }
+      } else {
+        throw new Error(`Flux App ${appSpecFormatted.name} already registered. Flux App has to be registered under different name. Hash is older than our current app.`);
       }
     } else {
       throw new Error(`Flux App ${appSpecFormatted.name} already registered. Flux App has to be registered under different name.`);
@@ -1173,79 +1623,6 @@ async function checkApplicationRegistrationNameConflicts(appSpecFormatted, hash)
     throw new Error(`Flux App ${appSpecFormatted.name} already assigned to Flux main application. Flux App has to be registered under different name.`);
   }
   return true;
-}
-
-/**
- * Update app specifications for rescan/reindex
- * @param {object} appSpecs - Application specifications
- * @returns {Promise<boolean>} Update result
- */
-async function updateAppSpecsForRescanReindex(appSpecs) {
-  const db = dbHelper.databaseConnection();
-  const database = db.db(config.database.appsglobal.database);
-
-  const query = { name: appSpecs.name };
-  const options = {
-    upsert: true,
-  };
-  const projection = {
-    projection: {
-      _id: 0,
-    },
-  };
-  const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-  if (appInfo) {
-    if (appInfo.height < appSpecs.height) {
-      await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
-      fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    }
-  } else {
-    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, options);
-    fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-  }
-  return true;
-}
-
-/**
- * Store app specification in permanent storage
- * @param {object} appSpec - Application specification
- * @returns {Promise<object>} Storage result
- */
-async function storeAppSpecificationInPermanentStorage(appSpec) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-
-    await dbHelper.insertOneToDatabase(database, globalAppsInformation, appSpec);
-
-    fluxEventBus.publish('app:specStored', { name: appSpec.name, hash: appSpec.hash });
-    log.info(`App specification stored permanently for ${appSpec.name}`);
-    return { status: 'success', message: 'App specification stored' };
-  } catch (error) {
-    log.error(`Error storing app specification: ${error.message}`);
-    throw error;
-  }
-}
-
-/**
- * Remove app specification from storage
- * @param {string} appName - Application name
- * @returns {Promise<object>} Removal result
- */
-async function removeAppSpecificationFromStorage(appName) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-
-    const query = { name: new RegExp(`^${appName}$`, 'i') };
-    const result = await dbHelper.removeInDatabase(database, globalAppsInformation, query);
-
-    log.info(`App specification removed for ${appName}`);
-    return { status: 'success', deletedCount: result.deletedCount };
-  } catch (error) {
-    log.error(`Error removing app specification: ${error.message}`);
-    throw error;
-  }
 }
 
 /**
@@ -1325,13 +1702,15 @@ async function getRunningApps() {
 
 /**
  * To get all apps running on a specific IP address. Returns all apps running on this ip
- * @param {string} ip IP address to check
+ * @param {string} ip An IP, or a socket address whose IP is meant.
  * @returns {Promise<Array>} Array of apps running on the specified IP
  */
 async function getRunningAppIpList(ip) {
+  const atIp = storedAtIp(ip);
+  if (!atIp) return [];
   const dbopen = dbHelper.databaseConnection();
   const database = dbopen.db(config.database.appsglobal.database);
-  const query = { ip: new RegExp(`^${ip}`) };
+  const query = { ip: atIp };
   const projection = {
     projection: {
       _id: 0,
@@ -1426,49 +1805,33 @@ async function expireGlobalApplications() {
         _id: 0, name: 1, hash: 1, expire: 1, height: 1,
       },
     };
-    const results = await dbHelper.findInDatabase(databaseApps, globalAppsInformation, queryApps, projectionApps);
-    const appsToExpire = [];
-    results.forEach((appSpecs) => {
-      // Determine default expire based on whether app was registered after PON fork
-      const defaultExpire = appSpecs.height >= config.fluxapps.daemonPONFork
-        ? config.fluxapps.blocksLasting * 4
-        : config.fluxapps.blocksLasting;
-      const expireIn = appSpecs.expire || defaultExpire;
-      let actualExpirationHeight = appSpecs.height + expireIn;
-
-      // If app was registered before fork block and we are past fork block
-      // the chain moves 4x faster, so we need to adjust the expiration
-      if (appSpecs.height < config.fluxapps.daemonPONFork && explorerHeight >= config.fluxapps.daemonPONFork) {
-        const originalExpirationHeight = appSpecs.height + expireIn;
-        if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
-          // Calculate blocks that were supposed to live after fork block
-          const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
-          // Multiply by 4 to account for 4x faster chain
-          const adjustedBlocksAfterFork = blocksAfterFork * 4;
-          // New expiration = fork block + adjusted blocks
-          actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
+    // Read, decide and delete under the registry write lock: a promotion cannot store a renewal
+    // between the read and the delete, and a rebuild's rename cannot bring back an app deleted here.
+    const appNamesToExpire = await withRegistryWrite(async () => {
+      const results = await dbHelper.findInDatabase(databaseApps, globalAppsInformation, queryApps, projectionApps);
+      const appsToExpire = results.filter((appSpecs) => !appMessageChain.isInForce(appSpecs.height, appSpecs.expire, explorerHeight));
+      const expired = [];
+      // eslint-disable-next-line no-restricted-syntax
+      for (const app of appsToExpire) {
+        // Delete the spec that was read as expired, not whatever holds the name now.
+        // eslint-disable-next-line no-await-in-loop
+        const deleted = await dbHelper.findOneAndDeleteInDatabase(databaseApps, globalAppsInformation, { name: app.name, hash: app.hash }, projectionApps);
+        if (!deleted) {
+          log.info(`Application ${app.name} was updated while expiring, keeping it`);
+          // eslint-disable-next-line no-continue
+          continue;
         }
-      }
+        log.info(`Expiring application ${app.name}`);
+        expired.push(app.name);
 
-      if (actualExpirationHeight < explorerHeight) { // registered/updated on height, expires in expireIn is lower than current height
-        appsToExpire.push(appSpecs);
+        const queryDeleteAppErrors = { name: app.name };
+        // eslint-disable-next-line no-await-in-loop
+        await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
+        // eslint-disable-next-line no-await-in-loop
+        await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsBroadcasts, { 'data.name': app.name });
       }
+      return expired;
     });
-    const appNamesToExpire = appsToExpire.map((res) => res.name);
-    // remove appNamesToExpire apps from global database
-    // eslint-disable-next-line no-restricted-syntax
-    for (const app of appsToExpire) {
-      log.info(`Expiring application ${app.name}`);
-      const queryDeleteApp = { name: app.name };
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.findOneAndDeleteInDatabase(databaseApps, globalAppsInformation, queryDeleteApp, projectionApps);
-
-      const queryDeleteAppErrors = { name: app.name };
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsLocations, queryDeleteAppErrors);
-      // eslint-disable-next-line no-await-in-loop
-      await dbHelper.removeDocumentsFromCollection(databaseApps, globalAppsInstallingErrorsBroadcasts, { 'data.name': app.name });
-    }
 
     // get list of locally installed apps.
     // Use dynamic require to avoid circular dependency
@@ -1481,6 +1844,7 @@ async function expireGlobalApplications() {
     const appsInstalled = installedAppsRes.data;
     // remove any installed app which height is lower (or not present) but is not infinite app
     const appsToRemove = [];
+    const locallyExpired = [];
     appsInstalled.forEach((app) => {
       if (appNamesToExpire.includes(app.name)) {
         appsToRemove.push(app);
@@ -1488,161 +1852,198 @@ async function expireGlobalApplications() {
         appsToRemove.push(app);
       } else if (app.height === 0) {
         // do nothing, forever lasting local app
-      } else {
-        // Determine default expire based on whether app was registered after PON fork
-        const defaultExpire = app.height >= config.fluxapps.daemonPONFork
-          ? config.fluxapps.blocksLasting * 4
-          : config.fluxapps.blocksLasting;
-        const expireIn = app.expire || defaultExpire;
-        let actualExpirationHeight = app.height + expireIn;
-
-        // If app was registered before fork block and we are past fork block
-        // the chain moves 4x faster, so we need to adjust the expiration
-        if (app.height < config.fluxapps.daemonPONFork && explorerHeight >= config.fluxapps.daemonPONFork) {
-          const originalExpirationHeight = app.height + expireIn;
-          if (originalExpirationHeight > config.fluxapps.daemonPONFork) {
-            // Calculate blocks that were supposed to live after fork block
-            const blocksAfterFork = originalExpirationHeight - config.fluxapps.daemonPONFork;
-            // Multiply by 4 to account for 4x faster chain
-            const adjustedBlocksAfterFork = blocksAfterFork * 4;
-            // New expiration = fork block + adjusted blocks
-            actualExpirationHeight = config.fluxapps.daemonPONFork + adjustedBlocksAfterFork;
-          }
-        }
-
-        if (actualExpirationHeight < explorerHeight) {
-          appsToRemove.push(app);
-        }
+      } else if (!appMessageChain.isInForce(app.height, app.expire, explorerHeight)) {
+        locallyExpired.push(app);
       }
     });
+    // The installed record is only refreshed from a renewal by reinstallOldApplications, every
+    // 16-36 blocks, so for a while after a renewal it still carries the old expiry. Ask the
+    // global spec before uninstalling: removing an app the network has just renewed deletes
+    // its data on this node for nothing.
+    if (locallyExpired.length) {
+      const globalSpecs = await dbHelper.findInDatabase(
+        databaseApps,
+        globalAppsInformation,
+        { name: { $in: locallyExpired.map((app) => app.name) } },
+        {
+          projection: {
+            _id: 0, name: 1, owner: 1, expire: 1, height: 1,
+          },
+        },
+      );
+      locallyExpired.forEach((app) => {
+        const globalSpec = globalSpecs.find((spec) => spec.name === app.name);
+        // the same owner's app, not a re-registration of its released name by someone else
+        if (globalSpec && signatureVerifier.sameSigningIdentity(globalSpec.owner, app.owner)
+          && appMessageChain.isInForce(globalSpec.height, globalSpec.expire, explorerHeight)) {
+          log.info(`Application ${app.name} is expired locally but renewed on the network, keeping it`);
+          return;
+        }
+        appsToRemove.push(app);
+      });
+    }
     const appsToRemoveNames = appsToRemove.map((app) => app.name);
-
-    // remove appsToRemoveNames apps from locally running
-    // Use dynamic require to avoid circular dependency
-    // eslint-disable-next-line global-require
-    const appUninstaller = require('../appLifecycle/appUninstaller');
-    // eslint-disable-next-line no-restricted-syntax
-    for (const appName of appsToRemoveNames) {
+    appsToRemoveNames.forEach((appName) => {
       log.warn(`Application ${appName} is expired, removing`);
       log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (registryManager)`);
-      // eslint-disable-next-line no-await-in-loop
-      await appUninstaller.removeAppLocally(appName, null, true, false, true);
-      // eslint-disable-next-line no-await-in-loop
-      await serviceHelper.delay(1 * 60 * 1000); // wait for 1 min
-    }
+    });
+    localRemovalQueue.queueRemovals(appsToRemoveNames);
   } catch (error) {
     log.error(error);
   }
 }
 
 /**
- * To update app specifications.
- * @param {object} appSpecs App specifications.
+ * The permanent messages of an app name that count (appMessageChain.messagesThatCount), oldest
+ * first.
+ * @param {string} appName
+ * @returns {Promise<object[]>}
  */
-async function insertAppSpecifications(appSpecs) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    const query = { name: appSpecs.name };
-    const existing = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, { projection: { _id: 0, height: 1 } });
-    if (existing && existing.height >= appSpecs.height) return true;
-    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: true });
-    fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
-    return true;
-  } catch (error) {
-    log.error(`insertAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
-    return false;
-  }
-}
-
-async function updateAppSpecifications(appSpecs) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-    const query = { name: appSpecs.name };
-    const projection = { projection: { _id: 0 } };
-    const appInfo = await dbHelper.findOneInDatabase(database, globalAppsInformation, query, projection);
-    if (!appInfo || appInfo.height >= appSpecs.height) return true;
-    await dbHelper.replaceOneInDatabase(database, globalAppsInformation, query, appSpecs, { upsert: false });
-    fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
-    await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
-    return true;
-  } catch (error) {
-    log.error(`updateAppSpecifications failed for ${appSpecs.name}: ${error.message}`);
-    return false;
-  }
+async function appMessagesThatCount(appName) {
+  const db = dbHelper.databaseConnection();
+  const messages = await dbHelper.findInDatabase(
+    db.db(config.database.appsglobal.database),
+    globalAppsMessages,
+    { 'appSpecifications.name': appName },
+    { projection: { _id: 0 } },
+  );
+  return dbHelper.appMessagesThatCount(db.db(config.database.daemon.database), messages);
 }
 
 /**
- * Rebuild the global apps information collection from messages collection.
- *
- * Wrapper around dbHelper.reindexGlobalAppsInformation. Rebuilds the
- * globalAppsInformation collection from appsMessages via aggregation,
- * then removes any locally installed apps that are no longer in the
- * global spec set (expired).
- *
- * @returns {Promise<boolean>} True on success
+ * The permanent message that governs an app: the newest that counts (appMessageChain), or null.
+ * @param {string} appName
+ * @returns {Promise<object|null>}
  */
-async function reindexGlobalAppsInformation() {
+async function governingAppMessage(appName) {
+  const counted = await appMessagesThatCount(appName);
+  return counted.length > 0 ? counted[counted.length - 1] : null;
+}
+
+/**
+ * Whether a permanent message is the one that governs its app: the newest that counts
+ * (appMessageChain). A message fetched late (missing-hash sync) must not end an app that a newer
+ * message keeps alive, and another owner's registration of a held name governs nothing.
+ * @param {string} appName
+ * @param {string} hash
+ * @returns {Promise<boolean>}
+ */
+async function isGoverningAppMessage(appName, hash) {
+  const governing = await governingAppMessage(appName);
+  return governing !== null && governing.hash === hash;
+}
+
+/**
+ * Stores a promoted message's specifications as its app's global spec when that message is in
+ * force (appMessageChain): the one that governs the name in the message log, and alive at the
+ * current block. Any other message changes nothing: a newer one governs the app, or its term has ended.
+ * A registration and an update are stored alike, so an update renews an app this node's expiry
+ * pass has already removed, and this node holds what a rebuild from the log would.
+ * @param {object} appSpecs the message's specifications, with its hash and height
+ * @returns {Promise<boolean>} false when the write failed
+ */
+async function storeAppSpecificationInForce(appSpecs) {
+  return withRegistryWrite(async () => {
+    try {
+      if (!await isGoverningAppMessage(appSpecs.name, appSpecs.hash)) return true;
+      const syncStatus = daemonServiceMiscRpcs.isDaemonSynced();
+      const currentHeight = syncStatus && syncStatus.data ? syncStatus.data.height : 0;
+      if (!appMessageChain.isInForce(appSpecs.height, appSpecs.expire, currentHeight)) return true;
+      const db = dbHelper.databaseConnection();
+      const database = db.db(config.database.appsglobal.database);
+      await dbHelper.replaceOneInDatabase(database, globalAppsInformation, { name: appSpecs.name }, appSpecs, { upsert: true });
+      fluxEventBus.publish('app:specStored', { name: appSpecs.name, hash: appSpecs.hash });
+      await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsLocations, { name: appSpecs.name });
+      await dbHelper.removeDocumentsFromCollection(database, globalAppsInstallingErrorsBroadcasts, { 'data.name': appSpecs.name });
+      return true;
+    } catch (error) {
+      log.error(`storeAppSpecificationInForce failed for ${appSpecs.name}: ${error.message}`);
+      return false;
+    }
+  });
+}
+
+async function rebuildRegistry() {
+  log.info('Reindexing global application list');
+
+  const db = dbHelper.databaseConnection();
+  const appsGlobalDb = db.db(config.database.appsglobal.database);
+  const appsLocalDb = db.db(config.database.appslocal.database);
+  const daemonDb = db.db(config.database.daemon.database);
+
+  const scannedHeightResult = await dbHelper.findOneInDatabase(
+    daemonDb,
+    scannedHeightCollection,
+    { generalScannedHeight: { $gte: 0 } },
+    { projection: { _id: 0, generalScannedHeight: 1 } },
+  );
+  if (!scannedHeightResult) {
+    throw new Error('Scanning not initiated');
+  }
+  const scannedHeight = serviceHelper.ensureNumber(
+    scannedHeightResult.generalScannedHeight,
+  );
+
+  const appsToRemove = await dbHelper.reindexGlobalAppsInformation(
+    appsGlobalDb,
+    appsLocalDb,
+    globalAppsMessages,
+    globalAppsInformation,
+    localAppsInformation,
+    scannedHeight,
+    daemonDb,
+  );
+
+  log.info('Reindexing of global application list finished.');
+
+  appsToRemove.forEach((appName) => {
+    log.warn(`Application ${appName} is expired, removing`);
+    log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (reindex)`);
+  });
+  localRemovalQueue.queueRemovals(appsToRemove);
+}
+
+async function runRebuild() {
   try {
-    if (reindexRunning) {
-      return 'Previous app reindex not yet finished. Skipping.';
-    }
-    reindexRunning = true;
-    log.info('Reindexing global application list');
-
-    const db = dbHelper.databaseConnection();
-    const appsGlobalDb = db.db(config.database.appsglobal.database);
-    const appsLocalDb = db.db(config.database.appslocal.database);
-    const daemonDb = db.db(config.database.daemon.database);
-
-    const scannedHeightResult = await dbHelper.findOneInDatabase(
-      daemonDb,
-      scannedHeightCollection,
-      { generalScannedHeight: { $gte: 0 } },
-      { projection: { _id: 0, generalScannedHeight: 1 } },
-    );
-    if (!scannedHeightResult) {
-      throw new Error('Scanning not initiated');
-    }
-    const scannedHeight = serviceHelper.ensureNumber(
-      scannedHeightResult.generalScannedHeight,
-    );
-
-    const appsToRemove = await dbHelper.reindexGlobalAppsInformation(
-      appsGlobalDb,
-      appsLocalDb,
-      globalAppsMessages,
-      globalAppsInformation,
-      localAppsInformation,
-      scannedHeight,
-    );
-
-    log.info('Reindexing of global application list finished.');
-
-    if (appsToRemove.length) {
-      // eslint-disable-next-line global-require
-      const appUninstaller = require('../appLifecycle/appUninstaller');
-      for (const appName of appsToRemove) {
-        log.warn(`Application ${appName} is expired, removing`);
-        log.warn(`REMOVAL REASON: App expired - ${appName} reached expiration date (reindex)`);
-        // eslint-disable-next-line no-await-in-loop
-        await appUninstaller.removeAppLocally(appName, null, true, false, true);
-        // eslint-disable-next-line no-await-in-loop
-        await serviceHelper.delay(60_000);
-      }
-    }
-
-    return true;
+    await rebuildRegistry();
   } catch (error) {
     log.error(error);
     throw error;
   } finally {
-    reindexRunning = false;
+    rebuildRunning = null;
   }
+}
+
+async function rebuildAfter(running) {
+  try {
+    await running;
+  } catch {
+    // the rebuild that follows reads the log afresh, whatever this one did
+  }
+  rebuildFollowing = null;
+  // eslint-disable-next-line no-use-before-define
+  return reindexGlobalAppsInformation();
+}
+
+/**
+ * Rebuild the global apps information collection from the message log, and queue the removal of
+ * every installed app it no longer lists (localRemovalQueue).
+ *
+ * Resolves once a rebuild that began after this call has swapped the registry in, without
+ * waiting for the removals. A call made while a rebuild runs is answered by one more rebuild after
+ * it, which every such call shares, so a message stored after the running rebuild read the log is
+ * in the registry this call resolves with.
+ *
+ * @returns {Promise<true>}
+ */
+async function reindexGlobalAppsInformation() {
+  if (!rebuildRunning) {
+    rebuildRunning = runRebuild();
+    await rebuildRunning;
+    return true;
+  }
+  if (!rebuildFollowing) rebuildFollowing = rebuildAfter(rebuildRunning);
+  return rebuildFollowing;
 }
 
 /**
@@ -1664,6 +2065,7 @@ async function reconstructAppMessagesHashCollection() {
     const permHashSet = new Set(permanentMessages.map((m) => m.hash));
 
     const ops = [];
+    let markedMissing = 0;
     // eslint-disable-next-line no-restricted-syntax
     for (const appHash of appHashes) {
       const filter = { hash: appHash.hash, txid: appHash.txid };
@@ -1682,6 +2084,7 @@ async function reconstructAppMessagesHashCollection() {
           },
         });
       } else if (!hasPermanent && appHash.message) {
+        markedMissing += 1;
         ops.push({
           updateOne: {
             filter,
@@ -1708,6 +2111,9 @@ async function reconstructAppMessagesHashCollection() {
     );
     changed += backfillResult.modifiedCount;
 
+    // a message this node no longer holds is fetched from peers on the next block
+    if (markedMissing > 0) appSyncEvents.emit(SYNC_EVENTS.HASH_UNRESOLVED);
+
     return { changed };
   } catch (error) {
     log.error(error);
@@ -1723,7 +2129,7 @@ async function reconstructAppMessagesHashCollection() {
  */
 async function reconstructAppMessagesHashCollectionAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized) {
       const result = await reconstructAppMessagesHashCollection();
       const message = messageHelper.createSuccessMessage(result);
@@ -1774,7 +2180,7 @@ async function registerAppGlobalyApi(req, res) {
   });
   req.on('end', async () => {
     try {
-      const authorized = await verificationHelper.verifyPrivilege('user', req);
+      const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
       if (!authorized) {
         const errMessage = messageHelper.errUnauthorizedMessage();
         res.json(errMessage);
@@ -1834,6 +2240,11 @@ async function registerAppGlobalyApi(req, res) {
 
       // parameters are now proper format and assigned. Check for their validity, if they are within limits, have propper ports, repotag exists, string lengths, specs are ok
       await appValidator.verifyAppSpecifications(appSpecFormatted, daemonHeight, true);
+
+      // placement feasibility at the front door, while the spec is still
+      // decrypted: an impossible spec is rejected before it is paid for, a
+      // diversity-constrained one is accepted with a warning
+      await placementFeasibility.checkPlacementFeasibility(appSpecFormatted, 'registerAppGlobalyApi');
 
       if (appSpecFormatted.version === 7 && appSpecFormatted.nodes.length > 0) {
         // eslint-disable-next-line no-restricted-syntax
@@ -1938,6 +2349,8 @@ async function reindexGlobalAppsLocation() {
     await database.collection(globalAppStateEvents).createIndex({ ip: 1, type: 1, dedupKey: 1 }, { unique: true });
     await database.collection(globalAppStateEvents).createIndex({ broadcastedAt: 1 });
     await database.collection(globalAppStateEvents).createIndex({ createdAt: 1 });
+    await database.collection(globalAppStateEvents).createIndex({ type: 1, expireAt: 1 }, { name: 'events by type and expiry' });
+    await database.collection(globalAppStateEvents).createIndex({ 'data.newIP': 1 }, { name: 'moves by the address they lead to', partialFilterExpression: { type: 'ipchanged' } });
     await database.collection(globalAppsLocations).createIndex({ name: 1 }, { name: 'query for getting app location based on app specs name' });
     await database.collection(globalAppsLocations).createIndex({ hash: 1 }, { name: 'query for getting app location based on app hash' });
     await database.collection(globalAppsLocations).createIndex({ ip: 1 }, { name: 'query for getting app location based on ip' });
@@ -1951,13 +2364,17 @@ async function reindexGlobalAppsLocation() {
 }
 
 /**
- * To reindex global apps location via API. Only accessible by admins and Flux team members.
+ * To reindex global apps location via API.
+ *
+ * Flux team only. It drops the location store and the app state events, and
+ * until peers announce again this node serves every location read from an
+ * empty store.
  * @param {object} req Request.
  * @param {object} res Response.
  */
 async function reindexGlobalAppsLocationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await reindexGlobalAppsLocation();
       const message = messageHelper.createSuccessMessage('Reindex successfull');
@@ -1984,7 +2401,7 @@ async function reindexGlobalAppsLocationAPI(req, res) {
  */
 async function reindexGlobalAppsInformationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       await reindexGlobalAppsInformation();
       const message = messageHelper.createSuccessMessage('Reindex successfull');
@@ -2011,37 +2428,11 @@ async function reindexGlobalAppsInformationAPI(req, res) {
  * @returns {Promise<boolean>} True if successful
  */
 async function rescanGlobalAppsInformation(height = 0, removeLastInformation = false) {
-  try {
-    const db = dbHelper.databaseConnection();
-    const database = db.db(config.database.appsglobal.database);
-
-    await dbHelper.dropCollection(database, globalAppsInformation).catch((error) => {
-      if (error.message !== 'ns not found') {
-        throw error;
-      }
-    });
-
-    const query = { height: { $gte: height } };
-    const projection = { projection: { _id: 0 } };
-    const results = await dbHelper.findInDatabase(database, globalAppsMessages, query, projection);
-
-    if (removeLastInformation === true) {
-      await dbHelper.removeDocumentsFromCollection(database, globalAppsInformation, query);
-    }
-
-    // eslint-disable-next-line no-restricted-syntax
-    for (const message of results) {
-      const updateForSpecifications = message.appSpecifications;
-      updateForSpecifications.hash = message.hash;
-      updateForSpecifications.height = message.height;
-      // eslint-disable-next-line no-await-in-loop
-      await updateAppSpecsForRescanReindex(updateForSpecifications);
-    }
-    return true;
-  } catch (error) {
-    log.error(error);
-    throw error;
-  }
+  // Rebuilt from the whole message log by the same rule as the reindex: an app not updated since
+  // the requested height is still in force, so a partial replay would lose it.
+  log.info(`rescanGlobalAppsInformation - rebuilding from the full message log (requested from ${height}, removeLastInformation ${removeLastInformation})`);
+  await reindexGlobalAppsInformation();
+  return true;
 }
 
 /**
@@ -2051,7 +2442,7 @@ async function rescanGlobalAppsInformation(height = 0, removeLastInformation = f
  */
 async function rescanGlobalAppsInformationAPI(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
     if (authorized === true) {
       let { blockheight } = req.params; // we accept both help/command and help?command=getinfo
       blockheight = blockheight || req.query.blockheight;
@@ -2109,10 +2500,13 @@ async function rescanGlobalAppsInformationAPI(req, res) {
  * accurate source. Lives here (not in advancedWorkflows) so message verification
  * does not depend on the lifecycle layer — that was a require cycle.
  * @param {object} specifications App specifications.
- * @param {object} verificationTimestamp Message timestamp.
+ * @param {number} [beforeHeight] Block of the message being verified, when it is on chain
+ *   (promotion, replay). Omitted for a live submission, which builds on the newest message.
+ * @param {number} [beforeTimestamp] Its timestamp: a message in the same block signed earlier
+ *   (a registration paid in the same block as its first update) counts as before it.
  * @returns {object|null} App specifications or null if not found.
  */
-async function getPreviousAppSpecifications(specifications, verificationTimestamp) {
+async function getPreviousAppSpecifications(specifications, beforeHeight, beforeTimestamp) {
   // we may not have the application in global apps. This can happen when we receive the message
   // after the app has already expired AND we need to get message right before our message.
   // Thus using messages system that is accurate
@@ -2126,23 +2520,30 @@ async function getPreviousAppSpecifications(specifications, verificationTimestam
   const appsQuery = {
     'appSpecifications.name': specifications.name,
   };
-  const permanentAppMessage = await dbHelper.findInDatabase(database, globalAppsMessages, appsQuery, projection);
+  const logged = await dbHelper.findInDatabase(database, globalAppsMessages, appsQuery, projection);
+  // Only a message that counts can be the previous spec: another owner's registration of a name
+  // held at its block holds nothing (appMessageChain).
+  const permanentAppMessage = await dbHelper.appMessagesThatCount(db.db(config.database.daemon.database), logged);
+  // The previous spec is the message right below ours on chain: the highest height under the
+  // block ours confirmed in (in that block, one signed before ours), or, for a live submission
+  // not yet on chain, the newest one. The bulk hash sync replays history by the same rule
+  // (appHashSyncService findPrevSpec), so a node that synced in bulk and one that followed live
+  // judge a message the same way.
+  //
+  // Chain position, not the signed timestamp: messages confirm out of signing order, and the
+  // timestamp is the signer's to choose, so a former owner could backdate an update to before
+  // the transfer that took the app from them. A same-block tie goes to the later timestamp.
+  const validTypes = ['zelappregister', 'fluxappregister', 'zelappupdate', 'fluxappupdate'];
+  const below = beforeHeight === undefined || beforeHeight === null ? Infinity : beforeHeight;
+  const signedBefore = beforeTimestamp === undefined || beforeTimestamp === null ? -Infinity : beforeTimestamp;
   let latestPermanentRegistrationMessage;
   permanentAppMessage.forEach((foundMessage) => {
-    // has to be registration message
-    const validTypes = ['zelappregister', 'fluxappregister', 'zelappupdate', 'fluxappupdate'];
-    if (validTypes.includes(foundMessage.type)) {
-      if (!latestPermanentRegistrationMessage && foundMessage.timestamp <= verificationTimestamp) {
-        // no message and found message is not newer than our message
-        latestPermanentRegistrationMessage = foundMessage;
-      } else if (latestPermanentRegistrationMessage && latestPermanentRegistrationMessage.height <= foundMessage.height) {
-        // we have some message and the message is quite new
-        if (latestPermanentRegistrationMessage.timestamp < foundMessage.timestamp
-          && foundMessage.timestamp <= verificationTimestamp) {
-          // but our message is newer. foundMessage has to have lower timestamp than our new message
-          latestPermanentRegistrationMessage = foundMessage;
-        }
-      }
+    if (!validTypes.includes(foundMessage.type) || !appMessageChain.isBefore(foundMessage, below, signedBefore)) return;
+    const latest = latestPermanentRegistrationMessage;
+    if (!latest
+      || (foundMessage.height || 0) > (latest.height || 0)
+      || ((foundMessage.height || 0) === (latest.height || 0) && foundMessage.timestamp > latest.timestamp)) {
+      latestPermanentRegistrationMessage = foundMessage;
     }
   });
   if (!latestPermanentRegistrationMessage) {
@@ -2164,12 +2565,52 @@ async function getPreviousAppSpecifications(specifications, verificationTimestam
   return specificationFormatter(appSpecs);
 }
 
+/**
+ * Nodes that have announced a shutdown and not come back: the newest state
+ * event from each is a sigterm still inside SIGTERM_EXPIRY_MS, with no apprunning
+ * broadcast after it.
+ *
+ * @returns {Promise<string[]>} Their socket addresses
+ */
+async function shuttingDownNodes() {
+  const db = dbHelper.databaseConnection();
+  const events = db.db(config.database.appsglobal.database).collection(globalAppStateEvents);
+  const since = new Date(Date.now() - SIGTERM_EXPIRY_MS);
+  const sigterms = await events.find(
+    { type: 'sigterm', broadcastedAt: { $gt: since } },
+    { projection: { _id: 0, ip: 1, broadcastedAt: 1 } },
+  ).toArray();
+  const departing = [];
+  // eslint-disable-next-line no-restricted-syntax
+  for (const { ip, broadcastedAt } of sigterms) {
+    // eslint-disable-next-line no-await-in-loop
+    const back = await events.findOne(
+      { ip, type: 'apprunning', broadcastedAt: { $gt: broadcastedAt } },
+      { projection: { _id: 1 } },
+    );
+    if (!back) departing.push(ip);
+  }
+  return departing;
+}
+
 module.exports = {
+  appsListedAt,
+  shuttingDownNodes,
   getAppHashes,
+  getRegistryStatus,
   getPreviousAppSpecifications,
   appLocation,
+  addressMovesFrom,
+  addressMovesTo,
+  addressesMovedFromIp,
+  currentAddressesOf,
+  addressesLeadingTo,
+  listedNodeMovedTo,
+  followAddressMoves,
+  primaryAddressOf,
   appLocationFromEvents,
   appInstallingLocation,
+  installingCountsByApp,
   appInstallingErrorsLocation,
   countAppInstallingErrors,
   storeAppInstallingMessage,
@@ -2181,6 +2622,7 @@ module.exports = {
   getApplicationGlobalSpecifications,
   getApplicationLocalSpecifications,
   getApplicationSpecifications,
+  getApplicationComponentNamesAPI,
   getApplicationSpecificationAPI,
   updateApplicationSpecificationAPI,
   getApplicationOwner,
@@ -2188,11 +2630,9 @@ module.exports = {
   getGlobalAppsSpecifications,
   availableApps,
   checkApplicationRegistrationNameConflicts,
-  insertAppSpecifications,
-  updateAppSpecifications,
-  updateAppSpecsForRescanReindex,
-  storeAppSpecificationInPermanentStorage,
-  removeAppSpecificationFromStorage,
+  storeAppSpecificationInForce,
+  governingAppMessage,
+  isGoverningAppMessage,
   getAppSpecificationFromDb,
   getAllAppsInformation,
   getInstalledApps,

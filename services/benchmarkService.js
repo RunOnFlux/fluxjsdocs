@@ -11,6 +11,7 @@ const generalService = require('./generalService');
 const upnpService = require('./upnpService');
 const fluxRpc = require('./utils/fluxRpc');
 const dbHelper = require('./dbHelper');
+const { Privilege, authOf } = require('./utils/privileges');
 
 // eslint-disable-next-line no-unused-vars
 const isArcane = Boolean(process.env.FLUXOS_PATH);
@@ -21,6 +22,24 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 let benchdClient = null;
 let lastDbUpdateTimestamp = 0;
+
+/**
+ * The socket fluxbench serves FluxOS on, from FLUXBENCH_CONNECTION
+ * (`unix:///run/fluxbenchd/full.sock`). The install that starts fluxbench on
+ * sockets sets it in FluxOS's service unit, and every call then goes over that
+ * socket and never over TCP: fluxbench binds no TCP port there. Unset, every call
+ * goes over TCP with the bench credentials.
+ * @returns {string|null}
+ */
+function benchdSocketPath() {
+  const connection = process.env.FLUXBENCH_CONNECTION;
+  if (!connection) return null;
+  const parsed = new URL(connection);
+  if (parsed.protocol !== 'unix:' || !parsed.pathname || parsed.pathname === '/') {
+    throw new Error(`FLUXBENCH_CONNECTION must be unix:///<socket path>, not ${connection}`);
+  }
+  return parsed.pathname;
+}
 
 async function buildBenchdClient() {
   // just use process.cwd() or os.homedir() or something
@@ -40,7 +59,10 @@ async function buildBenchdClient() {
 
   const rpcHost = config.benchmark.host;
   const client = new fluxRpc.FluxRpc(`http://${rpcHost}:${rpcPort}`, {
-    auth: { username, password }, timeout: 10_000, mode: 'fluxbenchd',
+    auth: { username, password },
+    socketPath: benchdSocketPath(),
+    timeout: 10_000,
+    mode: 'fluxbenchd',
   });
 
   benchdClient = client;
@@ -183,7 +205,7 @@ async function getStatus(req, res) {
  * @returns {object} Message.
  */
 async function restartNodeBenchmarks(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('adminandfluxteam', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR_OR_FLUX_TEAM, authOf(req));
 
   let response;
 
@@ -205,7 +227,7 @@ async function restartNodeBenchmarks(req, res) {
  * @returns {object} Message.
  */
 async function signFluxTransaction(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('admin', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
   let { hexstring } = req.params;
   hexstring = hexstring || req.query.hexstring;
 
@@ -223,7 +245,7 @@ async function signFluxTransaction(req, res) {
     response = messageHelper.errUnauthorizedMessage();
   }
 
-  return res ? res.json(response) : response;
+  return res.json(response);
 }
 
 /**
@@ -239,7 +261,7 @@ async function signFluxTransactionPost(req, res) {
   req.on('end', async () => {
     const processedBody = serviceHelper.ensureObject(body);
     const { hexstring } = processedBody;
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
 
     let response;
 
@@ -313,7 +335,7 @@ async function help(req, res) {
 
   const response = await executeCall(rpccall, rpcparameters);
 
-  return res ? res.json(response) : response;
+  return res.json(response);
 }
 
 /**
@@ -323,7 +345,7 @@ async function help(req, res) {
  * @returns {object} Message.
  */
 async function stop(req, res) {
-  const authorized = await verificationHelper.verifyPrivilege('admin', req);
+  const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
 
   let response;
 
@@ -426,6 +448,7 @@ if (require.main === module) {
 
 module.exports = {
   // == Export for testing purposes ==
+  buildBenchdClient,
   executeCall,
   // == Benchmarks ==
   getStatus,

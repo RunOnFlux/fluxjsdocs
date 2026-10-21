@@ -1,19 +1,30 @@
 const config = require('config');
 const qs = require('qs');
-const os = require('os');
 const log = require('../lib/log');
 const serviceHelper = require('./serviceHelper');
 const messageHelper = require('./messageHelper');
 const dbHelper = require('./dbHelper');
 const verificationHelper = require('./verificationHelper');
-const generalService = require('./generalService');
-const dockerService = require('./dockerService');
-const syncthingService = require('./syncthingService');
-const fluxNetworkHelper = require('./fluxNetworkHelper');
-const appInspector = require('./appManagement/appInspector');
+const verificationHelperUtils = require('./verificationHelperUtils');
+const nodeHealthService = require('./nodeHealthService');
 const signatureVerifier = require('./signatureVerifier');
+const { Privilege, authOf } = require('./utils/privileges');
 
-const goodchars = /^[1-9a-km-zA-HJ-NP-Z]+$/;
+/**
+ * What /id/checkprivilege answers.
+ *
+ * A published contract, not an internal name: the frontend branches on these
+ * four strings in fourteen places, in a separately deployed repo, and reads them
+ * out of the response body whether the status says success or error. They are
+ * deliberately not Privilege's values - that enum is what a route requires
+ * internally, and the two are free to diverge.
+ */
+const PRIVILEGE_RESPONSE = Object.freeze({
+  NODE_OPERATOR: 'admin',
+  FLUX_TEAM: 'fluxteam',
+  USER: 'user',
+  NONE: 'none',
+});
 
 async function deleteLoginPhrase(phrase) {
   try {
@@ -27,78 +38,7 @@ async function deleteLoginPhrase(phrase) {
     log.error(error);
   }
 }
-const ethRegex = /^0x[a-fA-F0-9]{40}$/;
 
-let syncthingWorking = false;
-
-/**
- * To check if the hardware specification requirements of the node tier are being met by the node (RAM and CPU threads).
- * @returns {boolean} True or an error is thrown.
- */
-async function confirmNodeTierHardware() {
-  try {
-    const tier = await generalService.nodeTier().catch((error) => {
-      log.error(error);
-    });
-
-    const collateral = await generalService.nodeCollateral().catch((error) => {
-      log.error(error);
-    });
-    const nodeRam = os.totalmem() / 1024 / 1024 / 1024;
-    const nodeCpuThreads = os.cpus().length;
-    log.info(`Node Tier: ${tier}`);
-    log.info(`Node Collateral: ${collateral}`);
-    log.info(`Node Total Ram: ${nodeRam}`);
-    log.info(`Node Cpu Threads: ${nodeCpuThreads}`);
-    if (tier === 'bamf' && collateral === 100000) {
-      if (nodeRam < 30) {
-        throw new Error(`Node Total Ram (${nodeRam}) below Stratus requirements`);
-      }
-      if (nodeCpuThreads < 8) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below Stratus requirements`);
-      }
-    } else if (tier === 'super' && collateral === 25000) {
-      if (nodeRam < 7) {
-        throw new Error(`Node Total Ram (${nodeRam}) below Nimbus requirements`);
-      }
-      if (nodeCpuThreads < 4) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below Nimbus requirements`);
-      }
-    } else if (tier === 'basic' && collateral === 10000) {
-      if (nodeRam < 3) {
-        throw new Error(`Node Total Ram (${nodeRam}) below Cumulus requirements`);
-      }
-      if (nodeCpuThreads < 2) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below Cumulus requirements`);
-      }
-    } else if (tier === 'bamf' && collateral === 40000) {
-      if (nodeRam < 61) {
-        throw new Error(`Node Total Ram (${nodeRam}) below new Stratus requirements`);
-      }
-      if (nodeCpuThreads < 16) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below new Stratus requirements`);
-      }
-    } else if (tier === 'super' && collateral === 12500) {
-      if (nodeRam < 30) {
-        throw new Error(`Node Total Ram (${nodeRam}) below new Nimbus requirements`);
-      }
-      if (nodeCpuThreads < 8) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below new Nimbus requirements`);
-      }
-    } else if (tier === 'basic' && collateral === 1000) {
-      if (nodeRam < 3) {
-        throw new Error(`Node Total Ram (${nodeRam}) below new Cumulus requirements`);
-      }
-      if (nodeCpuThreads < 4) {
-        throw new Error(`Node Cpu Threads (${nodeCpuThreads}) below new Cumulus requirements`);
-      }
-    }
-    return true;
-  } catch (error) {
-    log.error(error);
-    return false;
-  }
-}
 
 /**
  * To return a JSON response with the user's login phrase.
@@ -106,91 +46,29 @@ async function confirmNodeTierHardware() {
  * @param {object} res Response.
  * @returns {void} Return statement is only used here to interrupt the function and nothing is returned.
  */
-let firstLoginPhraseExecution = true;
 async function loginPhrase(req, res) {
   try {
-    // check db
+    const fitness = await nodeHealthService.checkNodeFitness();
+    if (!fitness.ok) {
+      res.json(messageHelper.createErrorMessage(fitness.error.message, fitness.error.name, fitness.error.code));
+      return;
+    }
+
     const db = dbHelper.databaseConnection();
     const database = db.db(config.database.local.database);
     const collection = config.database.local.collections.activeLoginPhrases;
-    const query = { loginPhrase: 'TestLoginPhraseForDBTest' };
-    const projection = {};
-    await dbHelper.findOneInDatabase(database, collection, query, projection); // fast find call for db test
-
-    // check synthing availability
-    if (!syncthingService.isRunning() && !firstLoginPhraseExecution) {
-      if (syncthingWorking) {
-        syncthingWorking = false;
-      } else {
-        throw new Error('Syncthing is not running properly');
-      }
-    } else {
-      syncthingWorking = true;
-    }
-    firstLoginPhraseExecution = false;
-    // check docker availablility
-    await dockerService.dockerListImages();
-    // check Node Hardware Requirements are ok.
-    const hwPassed = await confirmNodeTierHardware();
-    if (hwPassed === false) {
-      throw new Error('Node hardware requirements not met');
-    }
-    // check DOS state (contains daemon checks)
-    const dosState = fluxNetworkHelper.getDOSState();
-    if (dosState.status === 'error') {
-      const errorMessage = 'Unable to check DOS state';
-      const errMessage = messageHelper.createErrorMessage(errorMessage);
-      res.json(errMessage);
-      return;
-    }
-    if (dosState.status === 'success') {
-      // nodeHardwareSpecsGood is not part of response yet
-      if (dosState.data.dosState > 10 || dosState.data.dosMessage !== null || dosState.data.nodeHardwareSpecsGood === false) {
-        let errMessage = messageHelper.createErrorMessage(dosState.data.dosMessage, 'DOS', dosState.data.dosState);
-        if (dosState.data.dosMessage !== 'Flux IP detection failed' && dosState.data.dosMessage !== 'Flux collision detection. Another ip:port is confirmed on flux network with the same collateral transaction information.') {
-          errMessage = messageHelper.createErrorMessage(dosState.data.dosMessage, 'CONNERROR', dosState.data.dosState);
-        }
-        if (dosState.data.nodeHardwareSpecsGood === false) {
-          errMessage = messageHelper.createErrorMessage('Minimum hardware required for FluxNode tier not met', 'DOS', 100);
-        }
-        res.json(errMessage);
-        return;
-      }
-    }
-
-    // check Apps DOS state
-    const dosAppsState = appInspector.getAppsDOSState();
-    if (dosAppsState.status === 'success') {
-      // nodeHardwareSpecsGood is not part of response yet
-      if (dosAppsState.data.dosState >= 100) {
-        const errMessage = messageHelper.createErrorMessage(dosAppsState.data.dosMessage, 'DOS', dosAppsState.data.dosState);
-        log.error(errMessage);
-        res.json(errMessage);
-        return;
-      }
-    }
 
     const timestamp = Date.now();
     const validTill = timestamp + (15 * 60 * 1000); // 15 minutes
     const phrase = timestamp + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
 
-    /* const activeLoginPhrases = [
-       {
-         loginPhrase: 1565356121335e9obp7h17bykbbvub0ts488wnnmd12fe1pq88mq0v,
-         createdAt: 2019-08-09T13:08:41.335Z,
-         expireAt: 2019-08-09T13:23:41.335Z
-       }
-    ] */
-    // insert to db
     const newLoginPhrase = {
       loginPhrase: phrase,
       createdAt: new Date(timestamp),
       expireAt: new Date(validTill),
     };
-    const value = newLoginPhrase;
-    await dbHelper.insertOneToDatabase(database, collection, value);
+    await dbHelper.insertOneToDatabase(database, collection, newLoginPhrase);
 
-    // all is ok
     const phraseResponse = messageHelper.createDataMessage(phrase);
     res.json(phraseResponse);
   } catch (error) {
@@ -255,18 +133,7 @@ async function verifyLogin(req, res) {
         throw new Error('No Flux ID is specified');
       }
 
-      if (address[0] !== '1' && address[0] !== '0') {
-        throw new Error('Flux ID is not valid');
-      }
-
-      if (address[0] === '1') {
-        if (!goodchars.test(address)) {
-          throw new Error('Flux ID is not valid');
-        }
-        if (address.length > 34 || address.length < 25) {
-          throw new Error('Flux ID is not valid');
-        }
-      } else if (!ethRegex.test(address)) {
+      if (!signatureVerifier.isValidSigningIdentity(address)) {
         throw new Error('Flux ID is not valid');
       }
 
@@ -312,17 +179,32 @@ async function verifyLogin(req, res) {
             const newLogin = {
               zelid: address,
               loginPhrase: message,
-              signature,
               createdAt,
               expireAt,
             };
-            const userconfig = globalThis.userconfig;
-            let privilage = 'user';
-            if (address === config.fluxTeamFluxID || address === config.fluxSupportTeamFluxID) {
-              privilage = 'fluxteam';
-            } else if (address === userconfig.initial.zelid) {
-              privilage = 'admin';
+            const adminZelid = verificationHelperUtils.nodeOperatorZelid();
+            if (!adminZelid) {
+              // The node answers HTTP before it has read its own configuration, so
+              // this window is reachable on any restart. Granting 'user' here would
+              // hand the operator a session with their own rights stripped and no
+              // indication why; refusing says what is true and costs one retry.
+              throw new Error('Node is still starting and cannot establish privileges yet');
             }
+            let privilage = PRIVILEGE_RESPONSE.USER;
+            if (address === config.fluxTeamFluxID || verificationHelperUtils.isFluxSupportTeamZelid(address)) {
+              privilage = PRIVILEGE_RESPONSE.FLUX_TEAM;
+            } else if (address === adminZelid) {
+              privilage = PRIVILEGE_RESPONSE.NODE_OPERATOR;
+            }
+            // The signature is the session's credential. The login websocket hands it
+            // to whoever holds the login phrase, so it is kept apart from the login,
+            // in a collection whose TTL index expires it a minute after the login. It
+            // is written first, so the websocket finds it as soon as it finds the login.
+            await dbHelper.insertOneToDatabase(database, config.database.local.collections.loginSignatures, {
+              loginPhrase: message,
+              signature,
+              createdAt: new Date(),
+            });
             const loggedUsersCollection = config.database.local.collections.loggedUsers;
             const value = newLogin;
             await dbHelper.insertOneToDatabase(database, loggedUsersCollection, value);
@@ -338,17 +220,6 @@ async function verifyLogin(req, res) {
             const resMessage = messageHelper.createDataMessage(resData);
             res.json(resMessage);
             deleteLoginPhrase(message);
-            setTimeout(async () => {
-              // after 1 minute remove signature from database
-              const updatedDocument = {
-                signature: '',
-              };
-              const update = { $unset: updatedDocument };
-              const options = {
-                upsert: false,
-              };
-              await dbHelper.updateOneInDatabase(database, loggedUsersCollection, query, update, options);
-            }, 60000);
           } else {
             throw new Error('Invalid signature');
           }
@@ -387,18 +258,7 @@ async function provideSign(req, res) {
         throw new Error('No Flux ID is specified');
       }
 
-      if (address[0] !== '1' && address[0] !== '0') {
-        throw new Error('Flux ID is not valid');
-      }
-
-      if (address[0] === '1') {
-        if (!goodchars.test(address)) {
-          throw new Error('Flux ID is not valid');
-        }
-        if (address.length > 34 || address.length < 25) {
-          throw new Error('Flux ID is not valid');
-        }
-      } else if (!ethRegex.test(address)) {
+      if (!signatureVerifier.isValidSigningIdentity(address)) {
         throw new Error('Flux ID is not valid');
       }
 
@@ -446,7 +306,7 @@ async function provideSign(req, res) {
  */
 async function activeLoginPhrases(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       const db = dbHelper.databaseConnection();
 
@@ -479,7 +339,7 @@ async function activeLoginPhrases(req, res) {
  */
 async function loggedUsers(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
@@ -511,11 +371,11 @@ async function loggedUsers(req, res) {
  */
 async function loggedSessions(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
     if (authorized === true) {
       const db = dbHelper.databaseConnection();
 
-      const auth = serviceHelper.ensureObject(req.headers.zelidauth);
+      const auth = serviceHelper.ensureObject(authOf(req));
       const queryFluxID = auth.zelid;
       const database = db.db(config.database.local.database);
       const collection = config.database.local.collections.loggedUsers;
@@ -546,9 +406,9 @@ async function loggedSessions(req, res) {
  */
 async function logoutCurrentSession(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
     if (authorized === true) {
-      const auth = serviceHelper.ensureObject(req.headers.zelidauth);
+      const auth = serviceHelper.ensureObject(authOf(req));
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
       const collection = config.database.local.collections.loggedUsers;
@@ -581,7 +441,7 @@ async function logoutSpecificSession(req, res) {
   });
   req.on('end', async () => {
     try {
-      const authorized = await verificationHelper.verifyPrivilege('user', req);
+      const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
       if (authorized === true) {
         const processedBody = serviceHelper.ensureObject(body);
         const obtainedLoginPhrase = processedBody.loginPhrase;
@@ -616,9 +476,9 @@ async function logoutSpecificSession(req, res) {
  */
 async function logoutAllSessions(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('user', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.USER, authOf(req));
     if (authorized === true) {
-      const auth = serviceHelper.ensureObject(req.headers.zelidauth);
+      const auth = serviceHelper.ensureObject(authOf(req));
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
       const collection = config.database.local.collections.loggedUsers;
@@ -645,7 +505,7 @@ async function logoutAllSessions(req, res) {
  */
 async function logoutAllUsers(req, res) {
   try {
-    const authorized = await verificationHelper.verifyPrivilege('admin', req);
+    const authorized = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, authOf(req));
     if (authorized === true) {
       const db = dbHelper.databaseConnection();
       const database = db.db(config.database.local.database);
@@ -701,18 +561,22 @@ async function wsRespondLoginPhrase(ws, loginphrase) {
       });
       if (result) {
         // user is logged, all ok
-        const userconfig = globalThis.userconfig;
-        let privilage = 'user';
-        if (result.zelid === config.fluxTeamFluxID || result.zelid === config.fluxSupportTeamFluxID) {
-          privilage = 'fluxteam';
-        } else if (result.zelid === userconfig.initial.zelid) {
-          privilage = 'admin';
+        const loginSignature = await dbHelper.findOneInDatabase(database, config.database.local.collections.loginSignatures, query, projection);
+        const adminZelid = verificationHelperUtils.nodeOperatorZelid();
+        if (!adminZelid) {
+          throw new Error('Node is still starting and cannot establish privileges yet');
+        }
+        let privilage = PRIVILEGE_RESPONSE.USER;
+        if (result.zelid === config.fluxTeamFluxID || verificationHelperUtils.isFluxSupportTeamZelid(result.zelid)) {
+          privilage = PRIVILEGE_RESPONSE.FLUX_TEAM;
+        } else if (result.zelid === adminZelid) {
+          privilage = PRIVILEGE_RESPONSE.NODE_OPERATOR;
         }
         const resData = {
           message: 'Successfully logged in',
           zelid: result.zelid,
           loginPhrase: result.loginPhrase,
-          signature: result.signature,
+          signature: loginSignature ? loginSignature.signature : undefined,
           privilage,
           createdAt: result.createdAt,
           expireAt: result.expireAt,
@@ -825,6 +689,7 @@ async function wsRespondSignature(ws, message) {
  * @param {object} req Request.
  * @param {object} res Response.
  */
+
 async function checkLoggedUser(req, res) {
   let body = '';
   req.on('data', (data) => {
@@ -844,44 +709,51 @@ async function checkLoggedUser(req, res) {
       if (!signature) {
         throw new Error('No user Flux ID signature specificed');
       }
-      const request = {
-        headers: {
-          zelidauth: {
-            zelid,
-            loginPhrase: loggedPhrase,
-            signature,
-          },
-        },
-      };
-      const isAdmin = await verificationHelper.verifyPrivilege('admin', request);
+      // Serialised because a privilege check takes the header's value, and a
+      // header value is a string. ensureObject parses it back on the other side.
+      const zelidauth = JSON.stringify({ zelid, loginPhrase: loggedPhrase, signature });
+      const isAdmin = await verificationHelper.verifyPrivilege(Privilege.NODE_OPERATOR, zelidauth);
       if (isAdmin) {
-        const message = messageHelper.createSuccessMessage('admin');
+        const message = messageHelper.createSuccessMessage(PRIVILEGE_RESPONSE.NODE_OPERATOR);
         res.json(message);
         return;
       }
-      const isFluxTeam = await verificationHelper.verifyPrivilege('fluxteam', request);
+      const isFluxTeam = await verificationHelper.verifyPrivilege(Privilege.FLUX_TEAM, zelidauth);
       if (isFluxTeam) {
-        const message = messageHelper.createSuccessMessage('fluxteam');
+        const message = messageHelper.createSuccessMessage(PRIVILEGE_RESPONSE.FLUX_TEAM);
         res.json(message);
         return;
       }
-      const isUser = await verificationHelper.verifyPrivilege('user', request);
+      const isUser = await verificationHelper.verifyPrivilege(Privilege.USER, zelidauth);
       if (isUser) {
-        const message = messageHelper.createSuccessMessage('user');
+        const message = messageHelper.createSuccessMessage(PRIVILEGE_RESPONSE.USER);
         res.json(message);
         return;
       }
-      const message = messageHelper.createErrorMessage('none');
+      const message = messageHelper.createErrorMessage(PRIVILEGE_RESPONSE.NONE);
       res.json(message);
     } catch (error) {
       log.error(error);
-      const errMessage = messageHelper.createErrorMessage(error.message, error.name, error.code);
+      // `message` stays inside the PRIVILEGE_RESPONSE contract even here, because
+      // the frontend reads it AS the privilege whether the status says success or
+      // error, and logs the user out on exactly 'none' (fluxos-frontend
+      // guards.js). A thrown error's text landing in that field set the privilege
+      // to something like 'No user Flux ID specificed' - not 'none' - so the stale
+      // zelidauth stayed in localStorage instead of being cleared, and every later
+      // navigation repeated the same failure. Access still failed closed, since no
+      // route's privilege list contains an error string, but the session never
+      // ended.
+      //
+      // The error is not lost. It is logged above, and `name`/`code` still
+      // separate a failure from a plain refusal, which carries neither.
+      const errMessage = messageHelper.createErrorMessage(PRIVILEGE_RESPONSE.NONE, error.name, error.code);
       res.json(errMessage);
     }
   });
 }
 
 module.exports = {
+  PRIVILEGE_RESPONSE,
   loginPhrase,
   emergencyPhrase,
   verifyLogin,
@@ -896,7 +768,4 @@ module.exports = {
   wsRespondLoginPhrase,
   wsRespondSignature,
   checkLoggedUser,
-
-  // exports for testing purposes
-  confirmNodeTierHardware,
 };

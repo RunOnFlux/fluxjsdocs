@@ -4,9 +4,9 @@ const util = require('node:util');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const execFile = util.promisify(require('node:child_process').execFile);
+const { spawn } = require('node:child_process');
 
 const axios = require('axios').default;
-const config = require('config');
 const qs = require('qs');
 
 const asyncLock = require('./utils/asyncLock');
@@ -506,6 +506,152 @@ function ipInSubnet(ip, subnet) {
 }
 
 /**
+ * Runs a command whose output is consumed as it arrives, rather than collected
+ * and returned.
+ *
+ * Two things follow from streaming, and both are the point. The output is never
+ * held whole, so a listing of any length costs the same and there is no buffer
+ * ceiling to breach. And every chunk that arrives is evidence the command is
+ * still working, which is what makes `idleTimeout` mean "stopped doing
+ * anything" rather than "taking a while" - the distinction that matters for
+ * work whose duration is set by how much data it was given. A total timeout can
+ * only kill the largest inputs, which are the ones the caller most needs to
+ * succeed.
+ *
+ * Root is the only reason these run as a child process at all: app data is
+ * written by containers as root and this process is not root. That needs sudo,
+ * not a shell - so the command is argv throughout and a path is never parsed as
+ * syntax.
+ *
+ * @param {string} userCmd - Command to run
+ * @param {object} options - runAsRoot, params, onLine, idleTimeout, logError
+ * @returns {Promise<{error: Error|null, stderr: string}>}
+ */
+async function runStreamingCommand(userCmd, options = {}) {
+  const {
+    runAsRoot = false, params = [], onLine = null, idleTimeout = 0, logError,
+  } = options;
+
+  const res = { error: null, stderr: '', idleKilled: false };
+
+  if (!userCmd) {
+    res.error = new Error('Command must be present');
+    return res;
+  }
+
+  if (!Array.isArray(params) || !params.every((p) => typeof p === 'string' || typeof p === 'number')) {
+    res.error = new Error('Invalid params for command, must be an Array of strings');
+    return res;
+  }
+
+  const args = params.map(String);
+  let cmd = userCmd;
+  if (runAsRoot) {
+    args.unshift(userCmd);
+    cmd = 'sudo';
+  }
+
+  log.debug(`Run Cmd (streaming): ${cmd} ${args.join(' ')}`);
+
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let idleTimer = null;
+    let idleKilled = false;
+    let settled = false;
+    let remainder = '';
+    // Enough of stderr to explain a failure, and no more: a command that fails
+    // on every entry must not be able to grow this without limit.
+    const STDERR_CAP = 8192;
+
+    // A root child needs a root signal; an unprivileged FluxOS cannot send one
+    // directly. runCommand prefixes sudo and catches its own spawn failures, so
+    // a kill that cannot fork under memory pressure resolves an error rather
+    // than throwing an unhandled 'error' event out of a bare spawn. Not awaited.
+    const killChild = () => {
+      if (runAsRoot) {
+        runCommand('kill', { runAsRoot: true, params: ['-TERM', String(child.pid)], logError: false });
+      } else {
+        child.kill();
+      }
+    };
+
+    const bump = () => {
+      if (!idleTimeout || idleKilled) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleKilled = true;
+        killChild();
+      }, idleTimeout);
+    };
+
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      // Two facts can be true at once - the idle timer fired AND something else
+      // failed - and they must not compete for one slot: a real error (a
+      // consumer throw, a spawn failure) always wins the error field, with the
+      // idle kill carried separately on res.idleKilled. The idle message is the
+      // error only when the kill is the sole cause (close() passes no error for
+      // the exit the kill itself provoked).
+      if (idleKilled) res.idleKilled = true;
+      if (error) {
+        res.error = error;
+      } else if (idleKilled) {
+        res.error = new Error(`command produced no output for ${idleTimeout}ms and was stopped`);
+      }
+      if (res.error && logError !== false) log.error(res.error);
+      resolve(res);
+    };
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      if (settled) return;
+      bump();
+      if (!onLine) return;
+      remainder += chunk;
+      const lines = remainder.split('\n');
+      remainder = lines.pop();
+      try {
+        lines.forEach((line) => { if (line) onLine(line); });
+      } catch (err) {
+        // A consumer that cannot take the output ends the run: swallowed, the
+        // caller would read success off output nothing consumed; unhandled,
+        // the promise never settles and the operation hangs on it.
+        killChild();
+        finish(err);
+      }
+    });
+
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      if (settled) return;
+      bump();
+      if (res.stderr.length < STDERR_CAP) res.stderr += chunk;
+    });
+
+    child.on('error', (err) => finish(err));
+
+    child.on('close', (code) => {
+      if (remainder && onLine && !idleKilled && !settled) {
+        try {
+          onLine(remainder);
+        } catch (err) {
+          finish(err);
+          return;
+        }
+      }
+      // After an idle kill the non-zero exit is the kill's own consequence, not
+      // a second fact - the idle cause is the truthful report, so no error here.
+      finish(code === 0 || idleKilled ? null : new Error(`command exited with code ${code}`));
+    });
+
+    bump();
+  });
+}
+
+/**
  * Runs a command as a child process, without a shell by default.
  * Using a shell is possible with the `shell` option.
  * @param {string} cmd The binary to run. Must be in PATH
@@ -583,70 +729,76 @@ async function runCommand(userCmd, options = {}) {
 }
 
 
+// SemVer 2.0.0's grammar (semver.org): MAJOR.MINOR.PATCH, numbers without leading zeros, then
+// an optional pre-release (-) and build metadata (+), each dot-separated identifiers.
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
+
 /**
- * Parses a raw version string from dpkg-query into an object
- * @param {string} rawVersion version string from dpkg-query. Eg:
- * 0.36.1-4ubuntu0.1 (ufw)
- * @returns {{version, major, minor, patch} | null} The parsed version
+ * A version's parts as SemVer 2.0.0 reads it, with surrounding space and one leading v or =
+ * allowed (v20.8.0).
+ * @param {*} version
+ * @returns {?{core: number[], pre: string[]}} null when it is not a SemVer version: a missing
+ *   part (28.1), a fourth part, a leading zero, a part beyond Number.MAX_SAFE_INTEGER, or
+ *   anything that is not a string.
  */
-function parseVersion(rawVersion) {
-  // modified this to allow for just major and minor or just major. (and also ~ instead of - after version)
-  // I.e:
-  //    dpkg-query --showformat='${Version}' --show netcat-openbsd    1.218-4ubuntu1
-  //    dpkg-query --showformat='${Version}' --show ca-certificates   20230311ubuntu0.22.04.1
-
-  const versionRegex = /^[^\d]?(?:(?<epoch>[0-9]+):)?(?<version>(?<major>0|[1-9][0-9]*)(?:\.(?<minor>0|[1-9][0-9]*)(?:\.(?<patch>0|[1-9][0-9]*))?)?)/;
-
-  const match = versionRegex.exec(rawVersion);
-
-  if (match) {
-    const {
-      groups: {
-        epoch, version, major, minor, patch,
-      },
-    } = match;
-    return {
-      epoch, version, major, minor, patch,
-    };
-  }
-  return null;
+function semverParts(version) {
+  if (typeof version !== 'string') return null;
+  const match = SEMVER.exec(version.trim().replace(/^[v=]/, ''));
+  if (!match) return null;
+  const core = match.slice(1, 4).map(Number);
+  if (!core.every(Number.isSafeInteger)) return null;
+  return { core, pre: match[4] === undefined ? [] : match[4].split('.') };
 }
 
 /**
- * Check if semantic version is bigger or equal to minimum version
- * @param {string} targetVersion Version to check
- * @param {string} minimumVersion minimum version that version must meet
- * @returns {boolean} True if version is equal or higher to minimum version otherwise false.
+ * A version as SemVer 2.0.0 reads it, without its prefix or build metadata.
+ * @param {*} version
+ * @returns {?string} null when it is not a SemVer version (see semverParts).
  */
-function minVersionSatisfy(targetVersion, minimumVersion) {
-  // remove any leading character that is not a digit i.e. v1.2.6 -> 1.2.6
-  const version = targetVersion.replace(/[^\d.]/g, '');
+function parseSemver(version) {
+  const parts = semverParts(version);
+  if (!parts) return null;
+  return `${parts.core.join('.')}${parts.pre.length ? `-${parts.pre.join('.')}` : ''}`;
+}
 
-  const splittedVersion = version.split('.');
-  const major = Number(splittedVersion[0]);
-  const minor = Number(splittedVersion[1]);
-  const patch = Number(splittedVersion[2]);
+/**
+ * Two pre-release identifiers by SemVer precedence: numeric ones by value and below
+ * alphanumeric ones, alphanumeric ones in ASCII order.
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} Negative, zero or positive.
+ */
+function comparePreReleaseIdentifiers(a, b) {
+  const aNumeric = /^\d+$/.test(a);
+  const bNumeric = /^\d+$/.test(b);
+  if (aNumeric && bNumeric) return Number(a) - Number(b);
+  if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
+}
 
-  const splittedVersionMinimum = minimumVersion.split('.');
-  const majorMinimum = Number(splittedVersionMinimum[0]);
-  const minorMinimum = Number(splittedVersionMinimum[1]);
-  const patchMinimum = Number(splittedVersionMinimum[2]);
-  if (major < majorMinimum) {
-    return false;
+/**
+ * Whether a version is at least a minimum, by SemVer 2.0.0 precedence: major, minor and patch
+ * by value; a pre-release is below its release (28.1.1-rc.1 < 28.1.1) and pre-releases are
+ * ordered identifier by identifier, a shorter one first when all it has are equal; build
+ * metadata is ignored (20.10.24+dfsg1 = 20.10.24).
+ * @param {*} version
+ * @param {*} minimum
+ * @returns {boolean} False when either is not a SemVer version (see semverParts).
+ */
+function semverAtLeast(version, minimum) {
+  const a = semverParts(version);
+  const b = semverParts(minimum);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i];
   }
-  if (major > majorMinimum) {
-    return true;
+  if (!a.pre.length || !b.pre.length) return !a.pre.length;
+  for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i += 1) {
+    const order = comparePreReleaseIdentifiers(a.pre[i], b.pre[i]);
+    if (order) return order > 0;
   }
-  if (minor < minorMinimum) {
-    return false;
-  }
-  if (minor > minorMinimum) {
-    return true;
-  }
-  if (patch < patchMinimum) {
-    return false;
-  }
-  return true;
+  return a.pre.length >= b.pre.length;
 }
 
 /**
@@ -689,6 +841,32 @@ async function dirInfo(dir, options = {}) {
   return response;
 }
 
+/**
+ * Carry a large collection through a handler a slice at a time.
+ *
+ * Sync responses fan out heavily - each event becomes a database operation per
+ * app it reports - so processing a whole response at once holds the events,
+ * their derived copies and the driver's encoding of every write in memory
+ * together. Slicing bounds all of that to one slice's worth. Slices run in
+ * order and one at a time, so each is released before the next is built.
+ *
+ * @param {Array} items Collection to process.
+ * @param {number} sliceSize Maximum items handed over at once.
+ * @param {Function} handler Async callback receiving each slice.
+ * @returns {Promise<void>}
+ */
+async function processInSlices(items, sliceSize, handler) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  if (!Number.isInteger(sliceSize) || sliceSize < 1) {
+    throw new Error('processInSlices requires a positive integer slice size');
+  }
+
+  for (let offset = 0; offset < items.length; offset += sliceSize) {
+    // eslint-disable-next-line no-await-in-loop
+    await handler(items.slice(offset, offset + sliceSize));
+  }
+}
+
 module.exports = {
   axiosGet,
   axiosPost,
@@ -706,10 +884,12 @@ module.exports = {
   isDecimalLimit,
   isNonRoutableAddress,
   isPrivateAddress,
-  minVersionSatisfy,
-  parseVersion,
   parseInterval,
+  parseSemver,
   randomDelayMs,
   runCommand,
+  runStreamingCommand,
+  semverAtLeast,
   validIpv4Address,
+  processInSlices,
 };

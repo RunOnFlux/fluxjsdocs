@@ -1,18 +1,15 @@
-const df = require('node-df');
 const fs = require('fs').promises;
 const fs2 = require('fs');
-const util = require('util');
 const log = require('../lib/log');
 const axios = require('axios');
 const path = require('path');
-const { formidable } = require('formidable');
+const { Transform } = require('stream');
+const { pipeline } = require('stream/promises');
+const deviceHelper = require('./deviceHelper');
 const serviceHelper = require('./serviceHelper');
-const messageHelper = require('./messageHelper');
-const verificationHelper = require('./verificationHelper');
-const exec = util.promisify(require('child_process').exec);
 const { URL } = require('url');
-const { sanitizePath, validateFilename, verifyRealPathOfExistingPath } = require('./utils/pathSecurity');
-const { validateUrlWithDns } = require('./utils/urlSecurity');
+const { measureTree } = require('./utils/treeSize');
+const { validateUrl, guardedRequestOptions } = require('./utils/urlSecurity');
 
 /**
  * Maximum number of redirects to follow when validating each redirect target.
@@ -20,8 +17,9 @@ const { validateUrlWithDns } = require('./utils/urlSecurity');
 const MAX_REDIRECTS = 5;
 
 /**
- * Make an HTTP request with validated redirects.
- * Each redirect target is validated against SSRF checks before following.
+ * Make an HTTP request to a URL someone else chose, following its redirects. Each URL is checked
+ * for an allowed protocol and host before it is requested, and every connection is made through
+ * the guarded agents, which refuse a private or reserved address as it is dialled.
  *
  * @param {string} url - The URL to request
  * @param {string} method - HTTP method ('GET' or 'HEAD')
@@ -33,8 +31,7 @@ async function requestWithValidatedRedirects(url, method = 'GET', axiosOptions =
   let currentUrl = url;
   let redirectCount = 0;
 
-  // Validate the initial URL with DNS resolution
-  await validateUrlWithDns(currentUrl);
+  validateUrl(currentUrl);
 
   while (redirectCount < MAX_REDIRECTS) {
     // Make request without following redirects
@@ -44,6 +41,7 @@ async function requestWithValidatedRedirects(url, method = 'GET', axiosOptions =
       maxRedirects: 0,
       validateStatus: (status) => status >= 200 && status < 400,
       ...axiosOptions,
+      ...guardedRequestOptions(),
     }).catch((error) => {
       // Axios throws on 3xx when maxRedirects is 0, extract the response
       if (error.response && error.response.status >= 300 && error.response.status < 400) {
@@ -60,7 +58,7 @@ async function requestWithValidatedRedirects(url, method = 'GET', axiosOptions =
     }
 
     // Handle redirect
-    const location = response.headers.location;
+    const { location } = response.headers;
     if (!location) {
       throw new Error('Redirect response missing Location header');
     }
@@ -68,8 +66,7 @@ async function requestWithValidatedRedirects(url, method = 'GET', axiosOptions =
     // Resolve relative redirects
     const redirectUrl = new URL(location, currentUrl).href;
 
-    // Validate the redirect target before following
-    await validateUrlWithDns(redirectUrl);
+    validateUrl(redirectUrl);
 
     // Clean up stream if present (for responseType: 'stream')
     if (response.data && typeof response.data.destroy === 'function') {
@@ -141,32 +138,70 @@ function convertFileSize(sizes, targetUnit = 'auto', decimal = 2, returnNumber =
 
 /**
  * Get the total size of a folder, including its subdirectories and files.
+ *
+ * Follows no symlink. It used to `stat` its way down with unbounded recursion
+ * and a Promise.all fan-out, which an app owner could turn on the node hosting
+ * them: this measures volumes the apps themselves write to, so a `loop -> ..`
+ * planted in one measured itself until the process died, and an `escape -> /`
+ * measured the host. Both callers run as the FluxOS process, before any
+ * container exists - a copy's capacity check, and the file browser, which
+ * measures every directory it lists.
+ *
+ * Approximate upwards of nothing: an entry that cannot be stat'ed is skipped
+ * and a directory that cannot be opened is walked no further, so a tree only
+ * partly readable reports less than it holds. That is what a size in a listing
+ * means, and what `du` does with the same problem. Anything deciding whether
+ * something FITS needs a bound applied to what actually lands, not this.
+ *
  * @param {string} folderPath - The path to the folder.
- * @returns {string|boolean} - The total size of the folder formatted with the specified multiplier and decimal places, or false if an error occurs.
+ * @returns {Promise<number>} - Total bytes.
  */
 async function getFolderSize(folderPath) {
+  // What the files say, which is what a listing means by the size of a folder
+  // and what every file browser shows. Anything comparing a figure against
+  // free space wants measureTree's `occupied` instead, because that is a count
+  // of blocks and this is not.
+  return measureTree(folderPath, fs);
+}
+
+/**
+ * The size of a whole app volume's directory tree, in bytes. `du` walks it in
+ * one process with bounded memory; getFolderSize recurses in-process and fans
+ * out a Promise per entry at every level, which is fine for the handful of
+ * entries a folder listing shows and unbounded on an app's real data.
+ *
+ * Null rather than false when the size cannot be established: zero is a real
+ * answer for an empty directory, and a falsy sentinel makes the two
+ * indistinguishable at every call site that tests the result for truth.
+ *
+ * @param {string} dirPath - The path of the directory to measure.
+ * @returns {Promise<number|null>} - Size in bytes, or null if it could not be measured.
+ */
+async function getDirectorySizeBytes(dirPath) {
   try {
-    let totalSize = 0;
-    const calculateSize = async (filePath) => {
-      const stats = await fs.stat(filePath);
-
-      if (stats.isFile()) {
-        return stats.size;
-      // eslint-disable-next-line no-else-return
-      } else if (stats.isDirectory()) {
-        const files = await fs.readdir(filePath);
-        const sizes = await Promise.all(files.map((file) => calculateSize(path.join(filePath, file))));
-        return sizes.reduce((acc, size) => acc + size, 0);
-      }
-
-      return 0; // Unknown file type
-    };
-
-    totalSize = await calculateSize(folderPath);
-    return totalSize;
-  } catch (err) {
-    console.error(`Error getting folder size: ${err}`);
-    return false;
+    // Without -s, du reports each directory as it walks it and its own total
+    // last, so the answer is unchanged while the walk becomes observable - which
+    // is what an idle limit needs to mean anything. argv, no shell, for the same
+    // reason as the tar calls.
+    let total = null;
+    const result = await serviceHelper.runStreamingCommand('du', {
+      runAsRoot: true,
+      params: ['-b', dirPath],
+      idleTimeout: 5 * 60 * 1000,
+      onLine: (line) => {
+        const value = Number.parseInt(line.split(/\s+/)[0], 10);
+        if (Number.isFinite(value)) total = value;
+      },
+    });
+    if (result.error) {
+      const message = (result.stderr || result.error.message || '').replace(/\n/g, ' ').trim();
+      log.error(`Error measuring directory ${dirPath}: ${message}`);
+      return null;
+    }
+    return total;
+  } catch (error) {
+    log.error(`Error measuring directory ${dirPath}: ${error.message}`);
+    return null;
   }
 }
 
@@ -219,56 +254,60 @@ async function getRemoteFileSize(fileurl, multiplier, decimal, number = false) {
  * @param {string} multiplier - Unit multiplier for displaying sizes (B, KB, MB, GB).
  * @param {number} decimal - Number of decimal places for precision.
  * @param {string} fields - Optional comma-separated list of fields to include in the response. Possible fields: 'mount', 'size', 'used', 'available', 'capacity', 'filesystem'.
- * @returns {Array|boolean} - Array of objects containing volume information for the specified component, or false if no matching mount is found.
+ * @returns {Promise<{error: Error|null, mounts: object[]}>} - `mounts` is the
+ *          matching mount info (empty when the volume is not mounted - df only
+ *          reports mounted filesystems), and `error` is set only when the mount
+ *          table itself could not be read. An empty `mounts` with no `error` is
+ *          an answer ("not mounted"); an `error` is a failure to answer, which a
+ *          destructive caller must refuse on rather than read as "not mounted".
  */
 async function getVolumeInfo(appname, component, multiplier, decimal, fields) {
   try {
-    const options = {
-      prefixMultiplier: multiplier,
-      isDisplayPrefixMultiplier: false,
-      precision: +decimal,
-    };
-    const dfAsync = util.promisify(df);
-    const dfData = await dfAsync(options);
-    let regex;
-    if (component === 'null') {
-      regex = new RegExp(`flux${appname}$`);
-    } else {
-      regex = new RegExp(`flux${component}_${appname}$`);
-    }
-    const allowedFields = fields ? fields.split(',') : null;
-    const adjustValue = (value) => (multiplier.toLowerCase() === 'b' ? value * 1024 : value);
-    const dfSorted = dfData
-      .filter((entry) => {
-        const testResult = regex.test(entry.mount);
-        return testResult;
-      })
-      .map((entry) => {
-        const filteredEntry = allowedFields
-          ? Object.fromEntries(Object.entries(entry).filter(([key]) => allowedFields.includes(key)))
-          : entry;
+    const mounts = await deviceHelper.listMountedFilesystems();
 
-        if (allowedFields && allowedFields.some((field) => ['size', 'available', 'used'].includes(field))) {
-          ['size', 'available', 'used'].forEach((property) => {
-            if (filteredEntry[property] !== undefined) {
-              filteredEntry[property] = adjustValue(filteredEntry[property]);
-            }
-          });
-        }
-        return filteredEntry;
-      })
-      .filter((entry) => {
-        if (allowedFields) {
-          return Object.keys(entry).length > 0;
-        // eslint-disable-next-line no-else-return
-        } else {
-          return true;
-        }
-      });
-    return dfSorted.length > 0 ? dfSorted : false;
+    // The identifier is `flux<component>_<app>`, and neither name may contain an
+    // underscore (components are alphanumeric, app names alphanumeric plus
+    // internal hyphens), so the pair cannot be ambiguous. Both are validated
+    // against those charsets before reaching here, which is also what keeps them
+    // safe to interpolate into a pattern.
+    const identifier = component === 'null' ? `flux${appname}` : `flux${component}_${appname}`;
+
+    // A path the KERNEL reports as a mountpoint, selected by the request - never
+    // a path built from it. The worst a hostile appname can do is match nothing.
+    const matched = mounts.filter((mount) => path.basename(mount.target) === identifier);
+    if (!matched.length) return { error: null, mounts: [] };
+
+    const divisor = {
+      b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3,
+    }[String(multiplier || 'B').toLowerCase()] ?? 1;
+    // Two argument orders for this function exist in the codebase, so `decimal`
+    // sometimes arrives as a field name. Anything non-numeric means "no rounding"
+    // rather than NaN, which is what the previous implementation produced for
+    // every size it returned to the file API.
+    const precision = Number.isFinite(+decimal) ? +decimal : null;
+    const toUnit = (bytes) => {
+      const value = bytes / divisor;
+      return precision === null ? value : Number(value.toFixed(precision));
+    };
+
+    const allowedFields = fields ? String(fields).split(',') : null;
+    const mountsInfo = matched.map((mount) => {
+      const full = {
+        filesystem: mount.source,
+        size: toUnit(mount.sizeBytes),
+        used: toUnit(mount.usedBytes),
+        available: toUnit(mount.availableBytes),
+        capacity: mount.usePercent / 100,
+        mount: mount.target,
+      };
+      return allowedFields
+        ? Object.fromEntries(Object.entries(full).filter(([key]) => allowedFields.includes(key)))
+        : full;
+    }).filter((entry) => Object.keys(entry).length > 0);
+    return { error: null, mounts: mountsInfo };
   } catch (error) {
     log.error(error);
-    return false;
+    return { error, mounts: [] };
   }
 }
 
@@ -286,8 +325,12 @@ async function getPathFileList(targetpath, multiplier, decimal, filterKeywords =
     // eslint-disable-next-line no-restricted-syntax
     for (const file of files) {
       const filePath = `${targetpath}/${file}`;
+      // lstat, so every entry describes ITSELF. This lists a directory on an
+      // application's own volume, where the application can put a link pointing
+      // anywhere on the node - and following one would answer with the size and
+      // creation time of whatever it names.
       // eslint-disable-next-line no-await-in-loop
-      const stats = await fs.stat(filePath);
+      const stats = await fs.lstat(filePath);
       // eslint-disable-next-line no-await-in-loop
       const passesFilter = filterKeywords.length === 0 || filterKeywords.some((keyword) => {
         const includes = file.includes(keyword);
@@ -327,7 +370,9 @@ async function removeFile(filePath) {
 }
 
 /**
- * Check if a file exists at the specified filePath.
+ * Check if a file exists at the specified filePath. An absent file is an
+ * answer, not a failure, and is not logged; any other error reading the path
+ * is logged and answers false.
  * @param {string} filePath - The path to the file.
  * @returns {boolean} - True if the file exists, false otherwise.
  */
@@ -336,64 +381,199 @@ async function checkFileExists(filePath) {
     await fs.access(filePath);
     return true;
   } catch (error) {
-    log.error(error);
+    if (error.code !== 'ENOENT') log.error(error);
     return false;
+  }
+}
+
+/**
+ * How long a download may go without receiving a byte before it is abandoned.
+ * The request timeout only covers the wait for the response headers; once the
+ * body is streaming nothing else bounds it, and a connection that stops sending
+ * (or dies without the socket noticing) would hold its caller forever.
+ */
+const DOWNLOAD_IDLE_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Attempts per download. A retry resumes from the bytes already on disk when
+ * the server honours a range request.
+ */
+const DOWNLOAD_MAX_ATTEMPTS = 4;
+
+/**
+ * A pass-through that fails the stream when no data has flowed for idleMs. As a
+ * pipeline stage, its failure destroys every other stage, the socket included.
+ *
+ * @param {number} idleMs - Silence allowed between chunks.
+ * @returns {Transform}
+ */
+function idleGuard(idleMs) {
+  let timer = null;
+  const guard = new Transform({
+    transform(chunk, encoding, callback) {
+      // eslint-disable-next-line no-use-before-define
+      arm();
+      callback(null, chunk);
+    },
+    flush(callback) {
+      clearTimeout(timer);
+      callback();
+    },
+    destroy(error, callback) {
+      clearTimeout(timer);
+      callback(error);
+    },
+  });
+  function arm() {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      guard.destroy(new Error(`no data received for ${Math.round(idleMs / 1000)}s`));
+    }, idleMs);
+  }
+  arm();
+  return guard;
+}
+
+/**
+ * The size of a file on disk, or 0 when there is none.
+ *
+ * @param {string} filepath
+ * @returns {Promise<number>}
+ */
+async function sizeOnDisk(filepath) {
+  try {
+    const stats = await fs.stat(filepath);
+    return stats.size;
+  } catch {
+    return 0;
   }
 }
 
 /**
  * Downloads a file from a remote URL and saves it locally.
  *
+ * Every attempt settles: a body that goes silent for longer than the idle
+ * timeout, a connection that drops, or a body shorter than the server announced
+ * all fail the attempt instead of leaving it pending. A failed attempt is
+ * retried, resuming from what is already on disk when the server answers the
+ * range request with 206, and starting over otherwise.
+ *
  * @param {string} url - The URL of the file to download.
  * @param {string} localpath - The local path to save the downloaded file.
  * @param {string} component - The component name for identification.
  * @param {boolean} rename - Flag indicating whether to rename the downloaded file.
- * @returns {boolean} - True if the file is downloaded and saved successfully, false on failure.
+ * @param {object} [options]
+ * @param {number} [options.idleTimeoutMs] - Silence allowed before an attempt is abandoned.
+ * @param {number} [options.maxAttempts] - Attempts before giving up.
+ * @param {number} [options.retryDelayMs] - Pause between attempts.
+ * @returns {Promise<boolean>} - True if the file is downloaded and saved successfully, false on failure.
  */
-async function downloadFileFromUrl(url, localpath, component, rename = false, retries = 0) {
-  try {
-    // Use validated redirect-following request to prevent SSRF via redirects
-    const response = await requestWithValidatedRedirects(url, 'GET', {
-      responseType: 'stream',
-      timeout: 15000,
-    });
+async function downloadFileFromUrl(url, localpath, component, rename = false, options = {}) {
+  const {
+    idleTimeoutMs = DOWNLOAD_IDLE_TIMEOUT_MS,
+    maxAttempts = DOWNLOAD_MAX_ATTEMPTS,
+    retryDelayMs = 5 * 1000,
+  } = options;
+  let filepath = null;
+  // The validator of the copy on disk, sent back as If-Range so a file that
+  // changed between attempts is sent whole instead of spliced onto the old one.
+  let validator = null;
 
-    let filepath = `${localpath}/backup_${component.toLowerCase()}.tar.gz`;
-    if (!rename) {
-      // Extract filename from the final URL (after redirects)
-      const finalUrl = response.finalUrl || url;
-      const parsedUrl = new URL(finalUrl);
-      const fileName = path.basename(parsedUrl.pathname) || 'download';
-      filepath = `${localpath}/${fileName}`;
-    }
-
-    const dirPath = path.dirname(filepath);
-    // Create directory if it doesn't exist
-    await fs.mkdir(dirPath, { recursive: true });
-    const writer = fs2.createWriteStream(filepath);
-    response.data.pipe(writer);
-
-    return new Promise((resolve, reject) => {
-      writer.on('finish', () => {
-        resolve(true);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const offset = filepath ? await sizeOnDisk(filepath) : 0;
+      // identity: a body the server compresses on the fly would be inflated by
+      // axios, so neither its content-length nor a range offset would describe
+      // the bytes written to disk, and the archive saved would not be the file.
+      const headers = { 'Accept-Encoding': 'identity' };
+      if (offset > 0) {
+        headers.Range = `bytes=${offset}-`;
+        if (validator) headers['If-Range'] = validator;
+      }
+      // Use validated redirect-following request to prevent SSRF via redirects
+      // eslint-disable-next-line no-await-in-loop
+      const response = await requestWithValidatedRedirects(url, 'GET', {
+        responseType: 'stream',
+        timeout: 15000,
+        decompress: false,
+        headers,
       });
-      writer.on('error', (err) => {
-        log.error(`Error writing file: ${err.message}`);
-        reject();
-      });
-    });
-  } catch (err) {
-    if (retries < 3) {
-      log.error(err);
-      // eslint-disable-next-line no-param-reassign
-      retries += 1;
-      log.error(`Error downloading file, retrying download:${retries}`);
-      // eslint-disable-next-line no-return-await
-      return await downloadFileFromUrl(url, localpath, component, rename, retries);
+
+      if (!filepath) {
+        filepath = `${localpath}/backup_${component.toLowerCase()}.tar.gz`;
+        if (!rename) {
+          // Extract filename from the final URL (after redirects)
+          const finalUrl = response.finalUrl || url;
+          const parsedUrl = new URL(finalUrl);
+          const fileName = path.basename(parsedUrl.pathname) || 'download';
+          filepath = `${localpath}/${fileName}`;
+        }
+        // Create directory if it doesn't exist
+        // eslint-disable-next-line no-await-in-loop
+        await fs.mkdir(path.dirname(filepath), { recursive: true });
+      }
+
+      // A server that ignores the range answers 200 with the whole file, and a
+      // 206 for some other range cannot be appended - both start over.
+      const contentRange = response.headers['content-range'] || '';
+      const resumed = offset > 0 && response.status === 206 && contentRange.startsWith(`bytes ${offset}-`);
+      let expectedBytes = null;
+      if (resumed) {
+        const total = parseInt(contentRange.split('/')[1], 10);
+        if (Number.isFinite(total)) expectedBytes = total;
+      } else if (response.status === 200) {
+        const length = parseInt(response.headers['content-length'], 10);
+        if (Number.isFinite(length)) expectedBytes = length;
+        // Only a strong ETag may guard a byte range (RFC 9110 13.1.5); a date
+        // is the fallback the same rule allows.
+        const { etag } = response.headers;
+        validator = (etag && !etag.startsWith('W/')) ? etag : (response.headers['last-modified'] || null);
+      } else {
+        response.data.destroy();
+        // a 206 for some other range would come back the same way every time
+        // eslint-disable-next-line no-await-in-loop
+        if (response.status === 206) await fs.rm(filepath, { force: true });
+        throw new Error(`unexpected status ${response.status} for a download from ${offset} bytes`);
+      }
+      if (offset > 0) {
+        log.info(`downloadFileFromUrl - ${url} attempt ${attempt}, ${resumed ? `resuming at ${offset} bytes` : 'range refused, starting over'}`);
+      }
+
+      const writer = fs2.createWriteStream(filepath, { flags: resumed ? 'a' : 'w' });
+      // eslint-disable-next-line no-await-in-loop
+      await pipeline(response.data, idleGuard(idleTimeoutMs), writer);
+
+      // A connection that closes early can end the body cleanly but short
+      // eslint-disable-next-line no-await-in-loop
+      const written = await sizeOnDisk(filepath);
+      if (expectedBytes !== null && written !== expectedBytes) {
+        throw new Error(`download ended at ${written} of ${expectedBytes} bytes`);
+      }
+      return true;
+    } catch (err) {
+      const status = err?.response?.status;
+      log.error(`downloadFileFromUrl - ${url} attempt ${attempt}/${maxAttempts} failed: ${err?.message}`);
+      // 416: the range asked for is not in the file (the copy on disk is not a
+      // prefix of it), so the next attempt starts over from nothing.
+      if (status === 416 && filepath) {
+        // eslint-disable-next-line no-await-in-loop
+        await fs.rm(filepath, { force: true });
+      }
+      // Any other 4xx is the server's final answer (gone, forbidden), not a
+      // network failure, and asking again only keeps the app stopped longer.
+      const final = status >= 400 && status < 500 && ![408, 416, 429].includes(status);
+      if (final) break;
+      if (attempt < maxAttempts) {
+        // eslint-disable-next-line no-await-in-loop
+        await serviceHelper.delay(retryDelayMs);
+      }
     }
-    log.error('Error downloading file:', err);
-    return false;
   }
+  // A partial archive is no use to anyone, and on a game server it can be
+  // gigabytes of the app's own volume until the next restore clears it.
+  if (filepath) await fs.rm(filepath, { force: true }).catch(() => {});
+  return false;
 }
 
 /**
@@ -406,14 +586,95 @@ async function downloadFileFromUrl(url, localpath, component, rename = false, re
 async function untarFile(extractPath, tarFilePath) {
   try {
     await fs.mkdir(extractPath, { recursive: true });
-    const unpackCmd = `sudo tar -xvzf ${tarFilePath} -C ${extractPath}`;
-    await exec(unpackCmd, { maxBuffer: 1024 * 1024 * 10 });
+    // argv, not a command string: a path reaching this from anywhere a user can
+    // name a file would otherwise turn a filename containing $( ) into
+    // arbitrary root execution on the node.
+    //
+    // -v is also gone. It printed every extracted filename into a 10MB buffer,
+    // and a file-count-heavy tree overflowed it - which threw partway through
+    // an extraction, leaving a half-extracted tree and no way back.
+    const result = await serviceHelper.runCommand('tar', {
+      runAsRoot: true,
+      params: ['-xzf', tarFilePath, '-C', extractPath],
+    });
+    if (result.error) {
+      const message = (result.stderr || result.stdout || result.error.message || '').replace(/\n/g, ' ');
+      log.error(`Error during extraction: ${message}`);
+      return { status: false, error: message };
+    }
     return { status: true };
   } catch (error) {
-    const stringstderr = error.stderr.replace(/\n/g, ' ');
-    const stringstdout = error.stdout.replace(/\n/g, ' ');
-    log.error('Error during extraction:', error.stderr || error.stdout);
-    return { status: false, error: stringstderr || stringstdout };
+    log.error('Error during extraction:', error);
+    return { status: false, error: error.message };
+  }
+}
+
+/**
+ * Read a gzipped tar without extracting it. One decompression pass, nothing
+ * written to disk and no space consumed, establishing that the archive is
+ * complete and readable BEFORE anything is deleted to make room for its
+ * contents, and yielding the numbers needed to decide whether those contents
+ * will fit.
+ *
+ * The whole stream has to be inflated: gzip's CRC is in the trailing bytes, so
+ * a truncated or corrupt archive cannot be recognised any other way, and the
+ * ISIZE field beside it wraps at 4 GiB - useless on exactly the archives where
+ * the size answer matters. The listing is counted as it arrives and never held,
+ * so an archive of any member count costs the same to read.
+ *
+ * @param {string} tarFilePath - The path of the tarball (tar.gz) file to read.
+ * @returns {Promise<{status: boolean, entries?: number, bytes?: number, error?: string}>}
+ *          entries is the member count; bytes is their total uncompressed size.
+ */
+async function inspectTarGz(tarFilePath) {
+  try {
+    let entries = 0;
+    let bytes = 0;
+    let sized = 0;
+
+    // argv, and no shell: root is the only reason this is a child process, and
+    // a path reaches tar as an argument rather than as anything parsed.
+    //
+    // `sized` counts the members whose size column actually parsed as a number,
+    // which is what separates a differently-shaped listing from an archive whose
+    // members are all genuinely zero length.
+    const result = await serviceHelper.runStreamingCommand('tar', {
+      runAsRoot: true,
+      params: ['-tzvf', tarFilePath],
+      // Bounded by work rather than by size. These archives are the largest
+      // thing the node handles, and a total limit can only kill the ones that
+      // are merely big - which this then reports to an operator as their backup
+      // being unreadable. Every line of the listing is proof of progress, so
+      // silence this long is a read that has stalled.
+      idleTimeout: 5 * 60 * 1000,
+      onLine: (line) => {
+        entries += 1;
+        const size = line.split(/\s+/)[2];
+        if (/^[0-9]+$/.test(size)) {
+          sized += 1;
+          bytes += Number(size);
+        }
+      },
+    });
+
+    if (result.error) {
+      const message = (result.stderr || result.error.message || '').replace(/\n/g, ' ').trim();
+      log.error(`Error reading archive: ${message}`);
+      return { status: false, error: message };
+    }
+    // The size column is the third field of GNU tar's verbose listing. If no
+    // member's third field parsed as a number the listing is a different tar's
+    // column layout, and reporting its total as zero would walk an unmeasured
+    // archive through the free-space check. Testing the total rather than the
+    // parse would also condemn an archive whose members are all genuinely empty,
+    // which is a real thing to restore.
+    if (entries > 0 && sized === 0) {
+      return { status: false, error: 'archive listing not in the expected format' };
+    }
+    return { status: true, entries, bytes };
+  } catch (error) {
+    log.error('Error reading archive:', error);
+    return { status: false, error: error.message };
   }
 }
 
@@ -428,14 +689,20 @@ async function createTarGz(sourceDirectory, outputFileName) {
   try {
     const outputDirectory = outputFileName.substring(0, outputFileName.lastIndexOf('/'));
     await fs.mkdir(outputDirectory, { recursive: true });
-    const packCmd = `sudo tar -czvf ${outputFileName} -C ${sourceDirectory} .`;
-    await exec(packCmd, { maxBuffer: 1024 * 1024 * 10 });
+    // argv, and without -v, for the same two reasons as untarFile above.
+    const result = await serviceHelper.runCommand('tar', {
+      runAsRoot: true,
+      params: ['-czf', outputFileName, '-C', sourceDirectory, '.'],
+    });
+    if (result.error) {
+      const message = (result.stderr || result.stdout || result.error.message || '').replace(/\n/g, ' ');
+      log.error(`Error creating tarball: ${message}`);
+      return { status: false, error: message };
+    }
     return { status: true };
   } catch (error) {
-    const stringstderr = error.stderr.replace(/\n/g, ' ');
-    const stringstdout = error.stdout.replace(/\n/g, ' ');
-    log.error('Error creating tarball:', error.stderr || error.stdout);
-    return { status: false, error: stringstderr || stringstdout };
+    log.error('Error creating tarball:', error);
+    return { status: false, error: error.message };
   }
 }
 
@@ -448,150 +715,24 @@ async function createTarGz(sourceDirectory, outputFileName) {
  */
 async function removeDirectory(rpath, directory = false) {
   try {
-    let execFinal;
-    if (directory === false) {
-      execFinal = `sudo rm -rf "${rpath}"`;
-    } else {
-      execFinal = `sudo find "${rpath}" -mindepth 1 -exec rm -rf {} +`;
+    // argv, not a command string. Callers build this path from names they did
+    // not choose, so a component containing $( ) or a backtick must reach find
+    // as a literal argument and never as shell input - this runs as root.
+    const result = directory
+      ? await serviceHelper.runCommand('find', {
+        runAsRoot: true,
+        params: [rpath, '-mindepth', '1', '-exec', 'rm', '-rf', '{}', '+'],
+      })
+      : await serviceHelper.runCommand('rm', { runAsRoot: true, params: ['-rf', rpath] });
+
+    if (result.error) {
+      log.error(result.error);
+      return false;
     }
-    await exec(execFinal, { maxBuffer: 1024 * 1024 * 10 });
     return true;
   } catch (error) {
     log.error(error);
     return false;
-  }
-}
-
-/**
- * To upload a specified folder to FluxShare. Checks that there is enough space available. Only accessible by admins.
- * @param {object} req Request.
- * @param {object} res Response.
- */
-async function fileUpload(req, res) {
-  try {
-    let { appname } = req.params;
-    appname = appname || req.query.appname || '';
-    if (!appname) {
-      throw new Error('appname parameter is mandatory.');
-    }
-    const authorized = await verificationHelper.verifyPrivilege('appownerabove', req, appname);
-    if (!authorized) {
-      throw new Error('Unauthorized. Access denied.');
-    }
-    let { component } = req.params;
-    component = component || req.query.component || '';
-    let { filename } = req.params;
-    filename = filename || req.query.filename || '';
-    let { folder } = req.params;
-    folder = folder || req.query.folder || '';
-    let { type } = req.params;
-    type = type || req.query.type || '';
-    if (!type || !component) {
-      throw new Error('component and type parameters are mandatory');
-    }
-    let filepath;
-    const appVolumePath = await getVolumeInfo(appname, component, 'B', 'mount', 0);
-    if (appVolumePath.length > 0) {
-      if (type === 'backup') {
-        filepath = `${appVolumePath[0].mount}/backup/upload/`;
-      } else {
-        // Use appid level to access appdata and all other mount points
-        // Sanitize folder path to prevent directory traversal attacks
-        filepath = sanitizePath(folder, appVolumePath[0].mount);
-      }
-    } else {
-      throw new Error('Application volume not found');
-    }
-    // Verify resolved path stays within the allowed base directory
-    await verifyRealPathOfExistingPath(filepath, appVolumePath[0].mount);
-    const options = {
-      multiples: true,
-      uploadDir: `${filepath}`,
-      maxFileSize: 10 * 1024 * 1024 * 1024, // 10gb
-      hashAlgorithm: false,
-      keepExtensions: true,
-      // eslint-disable-next-line no-unused-vars
-      filename: (name, ext, part, form) => {
-        const { originalFilename } = part;
-        return originalFilename;
-      },
-    };
-    await fs.mkdir(filepath, { recursive: true });
-    const permission = `sudo chmod 777 "${filepath}"`;
-    await exec(permission, { maxBuffer: 1024 * 1024 * 10 });
-    const form = formidable(options);
-
-    form
-      // eslint-disable-next-line no-unused-vars
-      .on('fileBegin', (name, file) => {
-        // Validate filename to prevent path traversal via filename parameter
-        let safeFilename;
-        if (!filename) {
-          // Use form field name - validate it doesn't contain path separators
-          safeFilename = validateFilename(name);
-        } else {
-          // Use provided filename - validate it doesn't contain path separators
-          safeFilename = validateFilename(filename);
-        }
-        // eslint-disable-next-line no-param-reassign
-        file.filepath = `${filepath}/${safeFilename}`;
-      })
-      .on('progress', (bytesReceived, bytesExpected) => {
-        try {
-          res.write(serviceHelper.ensureString([bytesReceived, bytesExpected]));
-          if (res.flush) res.flush();
-        } catch (error) {
-          log.error(error);
-        }
-      })
-      // eslint-disable-next-line no-unused-vars
-      .on('field', (name, field) => {
-
-      })
-      // eslint-disable-next-line no-unused-vars
-      .on('file', (name, file) => {
-        try {
-          res.write(serviceHelper.ensureString(name));
-          if (res.flush) res.flush();
-        } catch (error) {
-          log.error(error);
-        }
-      })
-      .on('aborted', () => {
-        console.error('Request aborted by the user');
-      })
-      .on('error', (error) => {
-        log.error(error);
-        const errorResponse = messageHelper.createErrorMessage(
-          error.message || error,
-          error.name,
-          error.code,
-        );
-        try {
-          res.write(serviceHelper.ensureString(errorResponse));
-          if (res.flush) res.flush();
-        } catch (e) {
-          log.error(e);
-        }
-      })
-      .on('end', () => {
-        try {
-          res.end();
-        } catch (error) {
-          log.error(error);
-        }
-      });
-
-    form.parse(req);
-  } catch (error) {
-    log.error(error);
-    if (res) {
-      try {
-        res.connection.destroy();
-      } catch (e) {
-        log.error(e);
-      }
-    }
   }
 }
 
@@ -605,8 +746,9 @@ module.exports = {
   convertFileSize,
   downloadFileFromUrl,
   untarFile,
+  inspectTarGz,
   createTarGz,
   removeDirectory,
   getFolderSize,
-  fileUpload,
+  getDirectorySizeBytes,
 };
