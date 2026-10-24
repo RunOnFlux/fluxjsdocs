@@ -7,9 +7,10 @@ const messageHelper = require('../messageHelper');
 const dockerService = require('../dockerService');
 const dbHelper = require('../dbHelper');
 const globalState = require('../utils/globalState');
+const folderStates = require('../appMonitoring/folderStates');
 const log = require('../../lib/log');
 const {
-  localAppsInformation, globalAppsInformation, globalAppsMessages, ANNOUNCE_CYCLE_WAIT_MS,
+  localAppsInformation, globalAppsInformation, globalAppsMessages,
 } = require('../utils/appConstants');
 const config = require('config');
 // const advancedWorkflows = require('./advancedWorkflows'); // Moved to dynamic require to avoid circular dependency
@@ -21,6 +22,7 @@ const { checkAndDecryptAppSpecs } = require('../utils/enterpriseHelper');
 const { specificationFormatter } = require('../utils/appSpecHelpers');
 const { stopAppMonitoring } = require('../appManagement/appInspector');
 const appsRuntimeState = require('../appManagement/appsRuntimeState');
+const appPlacements = require('../appManagement/appPlacements');
 const volumeService = require('../utils/volumeService');
 const fluxEventBus = require('../utils/fluxEventBus');
 const appSlice = require('./appSlice');
@@ -108,9 +110,10 @@ async function announceRemoval(appName) {
   // app still names it, and a claim arriving after this message re-creates the
   // row it cleared. Waiting for the cycle in flight puts the two on the wire in
   // the order they happened, so the claim is applied first and this clears it.
-  // A cycle starting from here on reads the mark and leaves the app out.
-  // Bounded: a wedged cycle must not hold up the node's removals.
-  await globalState.announceCycle.readyTimeout(ANNOUNCE_CYCLE_WAIT_MS);
+  // A cycle starting from here on reads the mark and leaves the app out. A cycle
+  // is in flight only from its snapshot to its broadcast, and every call in that
+  // span has its own time limit.
+  await globalState.announceCycle.waitReady({ waitAll: false });
   const ip = await fluxNetworkHelper.getLocalSocketAddress();
   if (!ip) {
     log.warn(`${appName} removed without announcing it - this node's own address is unknown, so peers hold its location row until it expires`);
@@ -155,7 +158,7 @@ async function stopSyncthingAndCleanup(monitoredName, appId, res) {
   // and one kept past the removal offers a volume this node no longer has -
   // outranking a node that still holds the app and seeding an empty folder in its
   // place.
-  globalState.folderHoldings?.delete(appId);
+  folderStates.removed(appId);
   globalState.seedMarks.delete(appId);
 
   try {
@@ -1147,6 +1150,14 @@ async function removeAppLocally(app, res, force = false, endResponse = true, sen
         if (res.flush) res.flush();
       }
       await dbHelper.findOneAndDeleteInDatabase(appsDatabase, localAppsInformation, appsQuery, appsProjection);
+      // The app's volume is gone, and the record of when this node took it with it.
+      // A record left behind is never read, as the app is not installed, and boot
+      // removes it, so the removal stands whether this delete succeeds or not.
+      try {
+        await appPlacements.removePlacement(appName);
+      } catch (error) {
+        log.warn(`removeAppLocally - the placement record of ${appName} was not removed: ${error.message}`);
+      }
       // The app is gone for good: nothing reconciles an app with no row, so its
       // removal records have no reader left. Only this full-uninstall path clears
       // them - softRemoveAppLocally deletes the row too, but as one step of a
